@@ -11,56 +11,56 @@ use crate::chat::slack;
 
 const NARRATION_CAP: usize = 600;
 
-/// ターン失敗で1つのメッセージを再送してよい回数(現行 `TURN_FAILURE_RETRY_CAP`)。
-/// **1回は意図** — 再送で直る失敗(混雑・API の瞬断・型無しの一発)は次の試行で晴れる。
-/// 同じ失敗が2度出るなら本物なので、ループを見せるより人に伝える。
+/// How many times one message may be re-sent after turn failures (`TURN_FAILURE_RETRY_CAP`).
+/// **Once is deliberate** — failures a re-send fixes (congestion, an API blip, a one-off without a type) clear on the next try.
+/// The same failure twice is real, so tell a person rather than show a loop.
 const TURN_FAILURE_RETRY_CAP: u32 = 1;
 
-/// 上限の見張りを始めるまでの猶予(立ち上がりに probe をぶつけない)。
+/// Grace period before the usage-limit watch starts (don't hit start-up with a probe).
 const USAGE_MONITOR_STARTUP_DELAY_MS: u64 = 60_000;
 
-/// 人を待つ上限。hook の宣言(125s)と Bridge の待ち(120s)より内側で畳む。
+/// How long to wait for a person. Wrapped up inside the hook's declared timeout (125s) and the Bridge's wait (120s).
 const PERM_WAIT_MS: u64 = 115_000;
 
-/// 人のクリックを待っているツール許可1件。
+/// One tool permission waiting for a person's click.
 ///
-/// **ワーカーの hook はこの `respond` を握ったまま開いている** — 押されるか満期が来るまで返らない。
+/// **The agent's hook stays open holding this `respond`** — it doesn't return until clicked or expired.
 pub(super) struct PermPending {
-    /// hook へ返す口。押された/諦めた時にここへ答えを流す。
+    /// The way back to the hook. The answer goes here when clicked / given up.
     respond: tokio::sync::oneshot::Sender<serde_json::Value>,
     pub(super) channel: String,
     pub(super) thread_ts: String,
     tool_name: String,
-    /// Deny のときに**そのツールの行**を 🚫 にするための鍵。
+    /// Key for turning **that tool's line** into 🚫 on Deny.
     tool_use_id: String,
-    /// 投稿したプロンプトの ts。満期のときに**消す**ためだけに持つ。
+    /// ts of the posted prompt. Kept only to **delete** it on expiry.
     pub(super) prompt_ts: String,
-    /// 満期(epoch ms)。hook 側の待ちより少し内側で切る。
+    /// Expiry (epoch ms). Cut a little inside the hook's own wait.
     deadline_ms: u64,
 }
 
-/// 1スレッドぶんの沈黙見張り。
+/// The silence watch for one thread.
 ///
-/// **そのスレッド宛のステータス送信口を丸ごと抱える**のが肝で、
-/// 配達 / hook / 見張り発火 / 決着の送信が全て `thinking` の1本の直列タスクを通る = 互いに
-/// 追い越さない。別々に `tokio::spawn` していた頃は「配達の `is typing…`」と「見張り解除の
-/// クリア」が順不同に飛んで打ち消し合っていた。
+/// The key is that it **holds the thread's whole status sender**, so
+/// delivery / hooks / watch firing / settle all go through the one serial task of `thinking` = none
+/// overtakes another. Back when each was its own `tokio::spawn`, "delivery's `is typing…`" and
+/// "the watch's clear" went out in any order and cancelled each other.
 ///
-/// entry を落とすと `slack::Thinking` の Drop が最後にクリアを流す — **キューの最後尾に並ぶ**ので、
-/// 直前に流した set を必ず追い越さずに消える。
+/// Dropping the entry makes `slack::Thinking`'s Drop send a final clear — **it queues at the tail**,
+/// so it never overtakes the set sent just before it.
 pub(super) struct Stall {
-    /// 最後に活動があった時刻(epoch ms)。
+    /// When the last activity happened (epoch ms).
     pub(super) last_activity_ms: u64,
-    /// 見張りが `is thinking…` を出しているか(現行 `Entry.stalled`)。
+    /// Whether the watch is showing `is thinking…` (`Entry.stalled`).
     pub(super) shown: bool,
-    /// 許可プロンプトが出ていて、ワーカーは**意図的に**黙っている。
-    /// 見張りを止める(待っていることは「Permission requested」のプロンプト自身が示す)。
+    /// A permission prompt is up and the agent is silent **on purpose**.
+    /// Stops the watch (the "Permission requested" prompt itself shows that it's waiting).
     pub(super) awaiting_perm: bool,
     pub(super) thinking: slack::Thinking,
 }
 
 impl Bridge {
-    /// スレッドが引けないうちは milestone を出さない(現行4103 と同じ)。
+    /// No milestone until the thread can be looked up.
     pub(super) fn milestone(&mut self, key: Option<&ThreadKey>, event: &str, ctx: &LogCtx) {
         let Some(key) = key else {
             ctx.debug("bridge", &format!("{event} before its thread is known"));
@@ -71,7 +71,7 @@ impl Bridge {
     }
 
     pub(super) async fn on_hook(&mut self, mut ev: HookEvent) {
-        // hook はセッション ID しか運ばない — スレッドは threads.json から引き戻す
+        // Hooks only carry the session ID — look the thread back up from threads.json
         let owning = self
             .threads
             .find_by_session(&ev.session_id)
@@ -81,45 +81,45 @@ impl Bridge {
             session_id: Some(ev.session_id.clone()),
             thread_key: key.clone(),
         };
-        // hook が来た = ワーカーは生きて動いている。沈黙見張りを張り直す(現行は turn 開始と
-        // progress で `armWatchdog` — hook 全種はその上位集合で、どれも「活動の証拠」)
+        // A hook arrived = the agent is alive and working. Re-arm the silence watch (turn start
+        // and progress re-arm it — all hooks are a superset of those, and each is "evidence of activity")
         if let Some(k) = key.clone() {
-            self.touch_thread(&k, ""); // 活動 = 見張り解除。配達と違い新しく出すものは無い
+            self.touch_thread(&k, ""); // activity = lift the stall display. Unlike delivery, there's nothing new to show
         }
-        // どの hook も transcript の在処を運んでくる — 最初に来たもので受信確認の tail を張る
+        // Every hook carries the transcript location — the first one sets up the receipt-check tail
         if let Some(path) = ev.payload["transcript_path"].as_str() {
             let h = self.workers.warm_mut(&ev.session_id);
             if h.transcript_path.as_deref() != Some(path) {
                 h.transcript_path = Some(path.to_string());
-                h.transcript_offset = 0; // 別ファイルになった(resume 等)なら読み直す
+                h.transcript_offset = 0; // a different file (resume etc.) means read from the start
             }
         }
         match ev.kind.as_str() {
             "session_start" => {
-                // **掛け金には触らない。** この合図は起動だけでなく compact / clear でも飛ぶので、
-                // ここで「起動中」に戻すと動いているワーカー宛の配達が queue で詰まる
-                // (2026-08-01 実機。詳しくは `Workers::starting`)
+                // **Don't touch the latch.** This signal fires not only on start-up but also on compact / clear,
+                // so going back to "starting" here jams deliveries to a running agent in the queue
+                // (2026-08-01 on a real machine. Details in `Workers::starting`)
                 self.workers.warm_mut(&ev.session_id).ended = false;
                 self.milestone(key.as_ref(), "session_start", &ctx);
             }
             "session_end" => {
                 self.workers.warm_mut(&ev.session_id).ended = true;
-                // 在庫が死んだ = もう在庫ではない(clearForSession)。
-                // 残すと ready:true のまま次の新規スレッドに引き当てられ、配達ごと失う
+                // A pooled agent died = it's no longer in the pool (clearForSession).
+                // Left in, it stays ready:true, gets taken by the next new thread, and the delivery is lost
                 self.drop_pool_worker(&ev.session_id, "ended", &ctx);
                 self.milestone(key.as_ref(), "session_end", &ctx);
             }
-            // ツールが呼べた = MCP を握っている(継承ワーカーは initialize を見せる機会が
-            // 二度と無い — mcp.rs の call_tool が唯一の証拠を送ってくる)。milestone は出さない
+            // A tool call worked = it holds MCP (an inherited agent never gets another chance to
+            // show initialize — mcp.rs's call_tool sends the only evidence). No milestone
             "mcp_ready" => self.workers.warm_mut(&ev.session_id).mcp_ready = true,
-            // MCP を握った = disposition ツールが呼べる(Stop を強制してよい唯一の証拠)
+            // Holding MCP = the disposition tools can be called (the only evidence that forcing Stop is fine)
             "mcp_initialized" => {
-                // 在庫が「使える」になる唯一の瞬間でもある(`Workers::pool_ready` がこれを読む)
+                // It's also the only moment a pooled agent becomes "usable" (`Workers::pool_ready` reads this)
                 self.workers.warm_mut(&ev.session_id).mcp_ready = true;
                 self.milestone(key.as_ref(), "mcp_initialized", &ctx);
             }
             "user_prompt" => {
-                // 最初のターンを踏んだ = TUI がキーを取れている。掛け金を外して queue を流す
+                // The first turn went through = the TUI takes keys. Release the latch and flush the queue
                 self.workers.clear_starting(&ev.session_id);
                 self.milestone(key.as_ref(), "user_prompt", &ctx);
                 self.on_turn_start(key.as_ref(), &ctx);
@@ -131,7 +131,7 @@ impl Bridge {
             "narration" => self.on_narration(key.as_ref(), &ev.payload, &ctx),
             "stop" => {
                 let out = self.stop_decision(key.as_ref(), &ev, &ctx);
-                // block したならターンは**続く**(再プロンプト)ので、まだ終わりではない
+                // If blocked, the turn **continues** (re-prompt), so it's not over yet
                 if let Some(key) = key.as_ref().filter(|_| out.get("decision").is_none()) {
                     self.sticky.on_turn_end(key);
                 }
@@ -143,19 +143,19 @@ impl Bridge {
         }
     }
 
-    /// ターンが失敗した(`StopFailure`)。理由を分類し、スレッドで待っている人に**日本語で**伝える
-    /// (`case 'error'`)。黙って失敗すると、人からは
-    /// 「ボットが無視した」ようにしか見えない。
+    /// A turn failed (`StopFailure`). Classify the reason and tell the person waiting in the thread
+    /// in plain words. Failing silently looks to a person like
+    /// "the bot ignored me".
     ///
-    /// **ログはスレッドが引ける前に、無条件で出す** — ターン失敗は決して黙る経路ではない。
-    /// 生の payload も一緒に残す: `error_type` は実機で**空のまま**届いたことがあり、記録が
-    /// 無いと「Claude が型を送らなかった」と「こちらが落とした」を区別できない。
+    /// **Log unconditionally, before the thread is looked up** — a turn failure is never a silent path.
+    /// Keep the raw payload too: `error_type` has arrived **empty** on a real machine, and without
+    /// the record we can't tell "Claude sent no type" from "we dropped it".
     ///
-    /// 手順は現行のまま崩さない: ログ → スレッド門番 → **上限ゲート** → **再配達** → 文面。
+    /// Keep the order: log → thread gate → **limit gate** → **re-delivery** → wording.
     fn on_turn_failure(&mut self, ev: &HookEvent, key: Option<&ThreadKey>, ctx: &LogCtx) {
         let sent = ev.payload["error_type"].as_str().unwrap_or("");
-        // 型が空で届いたら、エージェント自身の記録に訊く。実機(2026-09-18)ではサインイン切れが
-        // 空のまま届き、retry と読まれて「もう一度送って」と案内していた — 送り直しは効かない
+        // An empty type means asking the agent's own record. On a real machine (2026-09-18) an expired sign-in
+        // arrived empty, was read as retry, and told people to "send it again" — re-sending doesn't help
         let recorded = if sent.is_empty() && !ev.session_id.is_empty() {
             let remembered = self
                 .workers
@@ -167,8 +167,8 @@ impl Bridge {
         };
         let reason = recorded.unwrap_or(sent);
         let (klass, mut text) = TurnFailureClass::of(reason);
-        // サインイン切れは**このマシンの**話。送り先を言う — このスレッドのメッセージはこのマシンに
-        // 届くので、ここで打つ `login` がこのマシンをサインインし直す
+        // An expired sign-in is about **this machine**. Say where to send it — this thread's messages reach
+        // this machine, so `login` typed here signs this machine back in
         if reason.to_ascii_lowercase().contains("authentication_failed") {
             let machine = &self.machine_name;
             text = crate::t!(
@@ -193,21 +193,21 @@ impl Bridge {
                 },
             ),
         );
-        // スレッドが引けなければここまで。home チャンネルへの写しは出さない
-        // 失敗は1つのスレッドのもので、そこで待っている人には下で伝わる
+        // Stop here if the thread can't be looked up. No copy goes to the home channel:
+        // the failure belongs to one thread, and the person waiting there is told below
         let Some((channel, Some(thread_ts))) = key.map(ThreadKey::split) else {
             return;
         };
         let key = key.expect("thread split above implies a key");
-        // 何よりも先に「これは上限か」。`error_type` は答えられない(実機で空のまま届いたし、
-        // `rate_limit` は混雑にも使われる)ので、ワーカー自身の履歴に訊く。上限への再送は
-        // **唯一絶対に効かない答え**で、しかも人が必要としている1文を沈黙に置き換える
+        // Before anything else: "is this the limit?". `error_type` can't answer (it arrived empty on a real machine,
+        // and `rate_limit` is also used for congestion), so ask the agent's own history. Re-sending into the limit
+        // is **the one answer that never works**, and it replaces the one sentence the person needs with silence
         if !ev.session_id.is_empty() && self.turn_hit_usage_limit(&ev.session_id, key, ctx) {
             self.settle_told(key);
             return;
         }
-        // retry 級は「もう一度配達する」で晴れるもの。配達できたら何も投稿しない —
-        // 人が見るべきは再送したターンの結末そのもの
+        // Retry-class failures clear with "deliver once more". If that delivery works, post nothing —
+        // what the person should see is how the re-sent turn ends
         if klass == TurnFailureClass::Retry
             && self.retry_turn_failure(key, reason, ctx)
         {
@@ -226,16 +226,16 @@ impl Bridge {
         self.ledger.dispose_all(key);
     }
 
-    /// このターンは「上限に当たった」で死んだのか(`turnHitUsageLimit`)。再送の**手前**で訊く —
-    /// 再送だけは絶対に効かないから(壁はリセットまで動かない)。
+    /// Did this turn die from "hit the usage limit" (`turnHitUsageLimit`)? Asked **before** re-sending —
+    /// re-sending is the one thing that never works (the wall doesn't move until the reset).
     ///
-    /// 現行がこれを入れた実測(2026-07-17): 上限に当たった1秒後に StopFailure が届いた。
-    /// `error_type` は**空**だったので `retry` と読まれ、モーダルで固まったワーカーへ静かに
-    /// 再送された。Claude Code はその答え(リセット時刻つき)をそのワーカーの履歴に**既に
-    /// 書いていた**。誰も読まず、沈黙は90分続いた。
+    /// The measurement that led to this (2026-07-17): StopFailure arrived one second after hitting the limit.
+    /// `error_type` was **empty**, so it was read as `retry` and quietly re-sent to an agent stuck
+    /// on a modal. Claude Code had **already written** the answer (with the reset time) into that
+    /// agent's history. Nobody read it, and the silence lasted 90 minutes.
     ///
-    /// true = ゲートを立ててスレッドにも伝えた(呼び手は再送してはいけない)。ゲートは文面と
-    /// 同じくらい大事で、立っていれば**次の**メッセージは入口でリセット時刻を貰える。
+    /// true = raised the gate and told the thread (the caller must not re-send). The gate matters as
+    /// much as the wording: while it's up, the **next** message gets the reset time at the door.
     fn turn_hit_usage_limit(&mut self, session_id: &str, key: &ThreadKey, ctx: &LogCtx) -> bool {
         let remembered = self
             .workers
@@ -247,8 +247,8 @@ impl Bridge {
                 .session_limit_error(remembered.as_deref(), session_id, self.deps.clock.now_ms())
             {
                 Some(Ok(hit)) => hit,
-                // 履歴が読めない・見つからないのは「上限ではない」の証拠にならないが、これ以上
-                // 訊く先が無い。現行と同じく通常のターン失敗の扱いに落とす
+                // An unreadable or missing history is no proof of "not the limit", but there's nowhere
+                // else to ask. Fall back to handling it as an ordinary turn failure
                 Some(Err(e)) => {
                     ctx.info(
                         "bridge",
@@ -277,16 +277,16 @@ impl Bridge {
         true
     }
 
-    /// ターンが失敗し、答えられなかったメッセージがまだ未応答 — 「諦めました」と人に言う前に
-    /// **同じワーカーへもう一度配達する**(`retryTurnFailure`)。
+    /// A turn failed and the message it couldn't answer is still unanswered — before telling the person
+    /// "gave up", **deliver it to the same agent once more** (`retryTurnFailure`).
     ///
-    /// なぜタイマーではなくここか: 失敗は**もう分かっている**(Claude Code がターンの死んだ
-    /// 瞬間に報告する)。これまで未応答を配り直す唯一の道はワーカーの**死**だったので、
-    /// 生きたワーカーの下で失敗したターンは、誰にも答えられないまま台帳に残り続けた。
+    /// Why here and not a timer: the failure is **already known** (Claude Code reports the moment the
+    /// turn dies). Until now the only path that re-delivered unanswered messages was the agent's **death**,
+    /// so a turn that failed under a live agent stayed in the ledger with nobody answering it.
     ///
-    /// 再送するのはワーカーが**本当に聞こえる**とき(Ready)だけ。それ以外は受領タイマーと
-    /// 回収経路が既にそのメッセージの持ち主で、押し込んでも2度目の黙殺になる。
-    /// 戻り値 true = 配達した(呼び手は何も投稿しない)。
+    /// Re-send only when the agent can **really hear** (Ready). Otherwise the receipt timer and the
+    /// recovery path already own that message, and pushing it in would just be ignored a second time.
+    /// Returns true = delivered (the caller posts nothing).
     fn retry_turn_failure(&mut self, key: &ThreadKey, reason: &str, ctx: &LogCtx) -> bool {
         let why = if reason.is_empty() {
             "no type sent"
@@ -335,7 +335,7 @@ impl Bridge {
             );
             return false;
         }
-        // 配達先は window_id を優先(窓名は改名されうる)— Dispatch::Deliver と同じ引き方
+        // Prefer window_id for the target (window names can be renamed) — same lookup as Dispatch::Deliver
         let target = sid
             .as_deref()
             .and_then(|s| self.workers.warm(s))
@@ -349,8 +349,8 @@ impl Bridge {
                 );
                 return false;
             }
-            // 同じ message_id → 台帳は1メッセージ1件なので冪等。received が倒れて受信確認が
-            // 張り直る = これは**新しい配達**なので、それが正しい
+            // Same message_id → the ledger has one entry per message, so idempotent. received resets and the
+            // receipt check re-arms = this is a **new delivery**, so that's right
             self.ledger.track(key, id);
         }
         ctx.info(
@@ -365,9 +365,9 @@ impl Bridge {
         true
     }
 
-    /// `error` フレームの ⚠️ を1本投げる。perm プロンプトと同じ**消えたスレッド根の門番**を
-    /// 通す(消えた根に `thread_ts` 付きで投げると Slack がチャンネル直下に落とす)。
-    /// 呼び手は待たない — probe は数秒かかることがあり、main ループを吊ってはならない。
+    /// Posts one ⚠️ for the `error` frame. Goes through the same **vanished-thread-root gate** as the perm prompt
+    /// (posting with `thread_ts` to a vanished root makes Slack drop it at the channel top level).
+    /// The caller doesn't wait — a probe can take seconds, and the main loop must not hang.
     pub(super) fn post_error_frame(&self, channel: String, thread_ts: String, text: String) {
         let api = self.deps.slack.clone();
         tokio::spawn(async move {
@@ -391,16 +391,16 @@ impl Bridge {
         });
     }
 
-    /// 上限の見張り。**これが無いと上限ゲートは自然に発火しない**
-    /// (ターン失敗の文面から気づく道しか無い)。
+    /// The usage-limit watch. **Without it the limit gate never fires on its own**
+    /// (the only way to notice would be the turn-failure wording).
     ///
-    /// 間隔は平常 60分・上限が見込まれるときは 15分。読むのは Home で `/usage` を1回回すだけで、
-    /// スレッドもセッションも要らない(`user_usage` と同じ道)。
+    /// Interval is 60 minutes normally, 15 minutes when the limit is expected. It only runs `/usage` once on Home,
+    /// needing no thread or session (same path as `user_usage`).
     ///
-    /// やることは2つ:
-    /// - **上限に達している窓があればゲートを立てる**。見るのは全部の窓で、解ける時刻は
-    ///   いちばん遅いものを採る(週の壁はセッションが低くても効く)
-    /// - 80% / 90% を新しく跨いだら、生きているスレッドに1回ずつ警告する
+    /// It does two things:
+    /// - **raise the gate if any window has hit its limit**. All windows are checked, and the latest
+    ///   reset time wins (the weekly wall applies even when the session is low)
+    /// - on newly crossing 80% / 90%, warn each live thread once
     pub(super) async fn usage_tick(&mut self) {
         let now = self.deps.clock.now_ms();
         let due = self.usage_polled_at_ms
@@ -409,7 +409,7 @@ impl Bridge {
             } else {
                 crate::bridge::command::UsageWatch::POLL_MS
             };
-        // 起動直後は少し待つ(立ち上がりに probe をぶつけない)
+        // Wait a bit right after start-up (don't hit start-up with a probe)
         if self.usage_polled_at_ms == 0 {
             self.usage_polled_at_ms = self.started_at_ms + USAGE_MONITOR_STARTUP_DELAY_MS;
             return;
@@ -447,7 +447,7 @@ impl Bridge {
             .unwrap_or(0.0);
         let reset_text = session.map(|r| r.reset.clone()).unwrap_or_default();
 
-        // 使用率が下がった = 窓が変わった。警告の掛け金を戻す
+        // Usage went down = the window rolled over. Reset the warning latch
         if (pct as u32) < self.usage_warned_pct {
             ctx.info(
                 "bridge",
@@ -458,7 +458,7 @@ impl Bridge {
             );
             self.usage_warned_pct = 0;
         }
-        // 予測(この先どれくらいで上限に当たるか)。間隔もこれで決まる
+        // Projection (how soon the limit will be hit). It also sets the interval
         let w = crate::bridge::state::WallClock::now();
         let projection = crate::bridge::state::WallClock::parse_reset(&reset_text, &w)
             .map(|reset| UsageProjection::of(pct, &reset, &w, 300));
@@ -479,7 +479,7 @@ impl Bridge {
             ),
         );
 
-        // 上限のゲート — 達している窓があれば、いちばん遅いリセットまで塞ぐ
+        // The limit gate — if any window has hit it, block until the latest reset
         if let Some(reset) =
             crate::bridge::command::UsageWatch::binding_limit_reset(&rows, now, 100.0)
             && reset != self.limited_until_ms
@@ -505,7 +505,7 @@ impl Bridge {
                 .filter(|p| p.enough_data && p.at_risk)
                 .and_then(|p| p.projected_hit),
         );
-        // 生きているワーカーを抱えたスレッドにだけ1回ずつ
+        // Once each, only to threads holding a live agent
         let targets: Vec<ThreadKey> = self.live_thread_keys();
         ctx.info(
             "bridge",
@@ -528,7 +528,7 @@ impl Bridge {
         self.usage_warned_pct = highest;
     }
 
-    /// 生きたワーカーを抱えているスレッドの鍵。上限警告の宛先(`liveThreads`)。
+    /// Keys of threads holding a live agent. Where limit warnings go (`liveThreads`).
     fn live_thread_keys(&self) -> Vec<ThreadKey> {
         self.threads
             .entries
@@ -544,16 +544,16 @@ impl Bridge {
             .collect()
     }
 
-    /// 沈黙見張りの一撃(500ms tick から。現行はスレッドごとの setTimeout)。
-    /// 判定は [`bridge::stall_action`] — 立てる / 畳む / 何もしない の3値。
+    /// One pass of the silence watch (from the 500ms tick; one setTimeout per thread before).
+    /// The decision is [`bridge::stall_action`] — raise / fold / nothing.
     ///
-    /// 畳むのは未応答が空になった鍵。`on_disposition` が即座に落とすのが本筋だが、台帳は
-    /// `terminate`(exit / logout / resume)でも空になる — **台帳を空にした全経路**をここ1箇所で
-    /// 受けるので、呼び手ごとに後始末を書き足さなくても shimmer が居座らない。
+    /// Folded are keys whose unanswered list is empty. `on_disposition` dropping them at once is the main path, but the ledger
+    /// also empties on `terminate` (exit / logout / resume) — **every path that emptied the ledger** is caught here in one place,
+    /// so the shimmer doesn't linger without each caller adding its own cleanup.
     ///
-    /// ponytail: 一度立てたら張り直さない(現行 `showStall` の冪等と同じ)。Slack が失効させれば
-    /// shimmer は静かに消えるだけで、消し忘れの居座りより害が小さい。張り直すなら compact と
-    /// 同じく tick ごとに `set` を撃つ形にする
+    /// ponytail: once raised it isn't re-sent (idempotent like `showStall`). If Slack expires it,
+    /// the shimmer just quietly goes away, which is less harmful than one that lingers. To refresh it, fire `set`
+    /// every tick like compact does
     pub(super) fn stall_tick(&mut self) {
         self.save_ledger();
         let now = self.deps.clock.now_ms();
@@ -561,7 +561,7 @@ impl Bridge {
             .stall
             .iter()
             .map(|(key, s)| {
-                // 許可待ちは沈黙ではない — 撃たない。ただし決着(Settle)は通す
+                // Waiting for permission isn't silence — don't fire. But let the settle (Settle) through
                 let act = bridge::StallAction::of(
                     !self.ledger.pending(key).is_empty(),
                     s.last_activity_ms,
@@ -575,7 +575,7 @@ impl Bridge {
             .collect();
         for (key, act) in acts {
             match act {
-                // 落とすだけでよい — slack::Thinking の Drop がキューの最後尾からクリアを流す
+                // Just drop it — slack::Thinking's Drop sends the clear from the tail of the queue
                 bridge::StallAction::Settle => drop(self.stall.remove(&key)),
                 bridge::StallAction::Fire => {
                     let Some(e) = self.stall.get_mut(&key) else {
@@ -597,16 +597,16 @@ impl Bridge {
         }
     }
 
-    /// 台帳が変わっていれば pending.json に落とす。tick と、降りる直前から呼ぶ1箇所きり —
-    /// 台帳を触る側に save を撒かないので、経路が増えても書き忘れが起きない。
+    /// Writes the ledger to pending.json if it changed. Called from the tick and right before shutting down, nowhere else —
+    /// saves aren't sprinkled over the code that touches the ledger, so new paths can't forget to write.
     pub(super) fn save_ledger(&mut self) {
         if let Some(Err(e)) = self.ledger.flush(&mut self.threads) {
             LogCtx::default().error("bridge", &format!("pending.json save failed: {e}"));
         }
     }
 
-    /// ワーカーが入力を取り込んだ瞬間。ここが**受領の証拠** — 配達済みを 👀 から 🤖 に替え、
-    /// 前ラウンドの付箋を畳んで新しい付箋を始める。
+    /// The moment the agent took in the input. This is **proof of receipt** — switch delivered ones from 👀 to 🤖,
+    /// fold the previous round's progress message and start a new one.
     fn on_turn_start(&mut self, key: Option<&ThreadKey>, ctx: &LogCtx) {
         let Some(key) = key else { return };
         let ids = self.ledger.mark_received(key);
@@ -620,12 +620,12 @@ impl Bridge {
             .and_then(|(ts, e)| e.channel_id.as_ref().map(|ch| ThreadKey::new(ch, ts)))
     }
 
-    /// 受信確認のバックストップ。**ターン中に押し込んだ分は UserPromptSubmit が発火しない**
-    /// (ステアリングとして消費される)ので、ワーカーの transcript に封筒の message_id が
-    /// 現れたことを受領の証拠にする。移植元 (transcript-watch)。
+    /// Backstop for receipt checks. **Messages pushed in mid-turn don't fire UserPromptSubmit**
+    /// (they're consumed as steering), so the envelope's message_id appearing in the agent's
+    /// transcript counts as proof of receipt.
     ///
-    /// ponytail: 500ms ポーリングの素朴な tail。fs 通知や JSON 行パースが要るなら
-    /// Bun connector の transcript-watch(実装)を移植
+    /// ponytail: a naive 500ms polling tail. Move to fs notifications or JSON line parsing
+    /// if it ever needs them
     pub(super) fn scan_transcripts(&mut self) {
         let tails = self.workers.transcripts();
         for (sid, path, offset) in tails {
@@ -634,9 +634,9 @@ impl Bridge {
             };
             let unreceived = self.ledger.unreceived(&key);
             if unreceived.is_empty() {
-                // 探すものが無い間の出力は読まずに飛ばす(封筒が書かれるのは配達より後 =
-                // track より後なので取りこぼさない)。据え置くと最初のターン中配達で
-                // ターン1回分を一括同期読みして main ループが止まる
+                // While there's nothing to look for, skip the output unread (the envelope is written after delivery =
+                // after track, so nothing is missed). Leaving it would make the first mid-turn delivery
+                // read a whole turn synchronously in one go and stall the main loop
                 if let Ok(m) = std::fs::metadata(&path) {
                     self.workers.warm_mut(&sid).transcript_offset = m.len();
                 }
@@ -654,21 +654,21 @@ impl Bridge {
             let ids = self.ledger.mark_received_ids(&key, &found);
             let taken_in = !ids.is_empty();
             self.received(&key, ids, &ctx);
-            // 受領は新しいラウンドの始まり。UserPromptSubmit が来る道と同じ扱いにする —
-            // ここで畳まないと、フォローアップより**上**にある古い付箋に、その後の
-            // ナレーションとツール行が足され続ける(見た目には「返事が過去へ遡って伸びる」)
+            // Receipt starts a new round. Handle it like the UserPromptSubmit path —
+            // without folding here, the old progress message **above** the follow-up keeps getting
+            // narration and tool lines appended (it looks like "the reply grows back into the past")
             if taken_in {
                 self.sticky.on_turn_start(&key);
             }
         }
     }
 
-    /// PermissionRequest hook の答え。Bridge は**この判断の唯一の権限者**ではなく、
-    /// 常設規則で決まるものだけ即答し、決まらないものは辞退して Claude Code 自身の
-    /// 許可経路に任せる(`{}` = 口を出さない)。
+    /// The answer to the PermissionRequest hook. The Bridge is **not the sole authority** on this:
+    /// it answers right away only what standing rules decide, and declines the rest, leaving it to Claude Code's own
+    /// permission path (`{}` = stay out of it).
     ///
-    /// **常設規則が最初に効く**のが肝: これが無いとワーカーは自分の返信ツールの許可を
-    /// 人に訊きにいき、誰も押さないまま止まる(警句)。
+    /// **Standing rules going first** is the key: without them the agent asks a person for permission to use
+    /// its own reply tool, and stalls with nobody clicking (a known pitfall).
     fn perm_decision(&mut self, ev: &HookEvent, ctx: &LogCtx) -> Option<serde_json::Value> {
         let p = &ev.payload;
         let tool = p["tool_name"].as_str().unwrap_or_default();
@@ -689,18 +689,18 @@ impl Bridge {
                     ctx.info("bridge", &format!("perm tool={tool} -> DENIED: {because}"));
                     crate::bridge::command::ToolPermission::decision_output("deny", because)
                 }
-                // 規則では決まらない — 人に訊く。答えは後から来るのでここでは返さない
+                // Rules don't decide it — ask a person. The answer comes later, so nothing is returned here
                 crate::bridge::command::ToolPermission::Ask => return None,
             },
         )
     }
 
-    /// 常設規則で決まればその場で答え、決まらなければ Slack に訊きにいって `respond` を預かる。
-    /// スレッドが引けない・投稿に失敗した場合は辞退(`{}`)して Claude Code 自身の経路に落とす —
-    /// 黙って拒むより手が残る。
+    /// Answer on the spot if standing rules decide it; otherwise ask on Slack and hold on to `respond`.
+    /// If the thread can't be looked up or posting fails, decline (`{}`) and fall back to Claude Code's own path —
+    /// better to leave options than to deny silently.
     async fn on_perm(&mut self, ev: &mut HookEvent, key: Option<&ThreadKey>, ctx: &LogCtx) {
         let Some(respond) = ev.respond.take() else {
-            return; // 答えを待っていない = 何もしない
+            return; // not waiting for an answer = do nothing
         };
         if let Some(out) = self.perm_decision(ev, ctx) {
             let _ = respond.send(out);
@@ -718,7 +718,7 @@ impl Bridge {
             let _ = respond.send(serde_json::json!({}));
             return;
         };
-        // 人が前に押した範囲なら訊かない。狭い方(スレッド)から見る
+        // Don't ask for a scope the person already approved. Check the narrower one (thread) first
         for (granted, scope) in [
             (
                 self.threads.thread_tool_allowed(&thread_ts, &tool),
@@ -738,9 +738,9 @@ impl Bridge {
                 return;
             }
         }
-        // 消えたスレッド根に thread_ts 付きで投げると、Slack はそれを**チャンネル直下の
-        // 発言**として落とす = チャンネルが荒れる。投げる前に根の生存を確かめ、消えていれば
-        // プロンプトを出さずに deny する(DM は根がそうやって消えないので確認しない)。
+        // Posting with thread_ts to a vanished thread root makes Slack drop it as a **top-level
+        // channel message** = channel clutter. Check the root is alive before posting, and if it's gone,
+        // deny without showing a prompt (DMs aren't checked: their roots don't vanish that way).
         if !channel.starts_with('D') && self.deps.slack.thread_root_gone(&channel, &thread_ts).await {
             ctx.info(
                 "bridge",
@@ -755,7 +755,7 @@ impl Bridge {
             ));
             return;
         }
-        // reqId は Bridge の中だけで意味を持つ札。時刻 + pid + 連番で十分に一意
+        // reqId is a tag that only means something inside the Bridge. Time + pid + counter is unique enough
         let req_id = format!("{:x}-{}", self.deps.clock.now_ms(), self.perm_pending.len());
         let input = ev.payload["tool_input"].clone();
         let prompt_ts = match self
@@ -780,7 +780,7 @@ impl Bridge {
                  awaiting click"
             ),
         );
-        // ここから先ワーカーは人待ちで黙る。見張りを止める
+        // From here the agent is silent waiting for a person. Stop the watch
         self.suspend_stall_for_perm(&ThreadKey::new(&channel, &thread_ts));
         self.perm_pending.insert(
             req_id,
@@ -799,11 +799,11 @@ impl Bridge {
         );
     }
 
-    /// 許可プロンプトを出した = ワーカーは**意図的に**黙る。見張りを止め、
-    /// 既に出ている `is thinking…` も消す(待っていることはプロンプト自身が示している)。
+    /// A permission prompt went up = the agent goes silent **on purpose**. Stop the watch and
+    /// clear any `is thinking…` already shown (the prompt itself shows that it's waiting).
     fn suspend_stall_for_perm(&mut self, key: &ThreadKey) {
         let Some(e) = self.stall.get_mut(key) else {
-            return; // このラウンドの見張りがまだ無い(初回ターン)— 止めるものが無い
+            return; // no watch for this round yet (first turn) — nothing to stop
         };
         e.awaiting_perm = true;
         if std::mem::replace(&mut e.shown, false) {
@@ -811,9 +811,9 @@ impl Bridge {
         }
     }
 
-    /// 許可が決着した。`rearm` = 人が押した(沈黙の計測をやり直す)。
-    /// 満期のときは **false** — 今まさに「時間切れ」と言ったのに見張りを張り直さない
-    /// (本当の活動が来たら touch_thread が張り直す)。
+    /// A permission was settled. `rearm` = a person clicked (restart measuring silence).
+    /// **false** on expiry — having just said "timed out", don't re-arm the watch
+    /// (real activity will re-arm it via touch_thread).
     fn resume_stall_after_perm(&mut self, key: &ThreadKey, rearm: bool) {
         let Some(e) = self.stall.get_mut(key) else {
             return;
@@ -827,11 +827,11 @@ impl Bridge {
         }
     }
 
-    /// 承認ボタンが押された。**押した瞬間にワーカーへ答える** — その後でプロンプトを
-    /// 押された結果に描き替える(投稿の書き替えが遅れてもワーカーは待たない)。
+    /// An approval button was clicked. **Answer the agent the moment it's clicked** — then redraw the prompt
+    /// to show the result (the agent doesn't wait even if rewriting the post is slow).
     pub(super) async fn on_perm_click(&mut self, click: slack::PermClick) {
         let Some(p) = self.perm_pending.remove(&click.req_id) else {
-            // 既に押された / 満期で畳んだ。二度目のクリックは何もしない
+            // Already clicked / folded on expiry. A second click does nothing
             return;
         };
         let ctx = LogCtx {
@@ -860,10 +860,10 @@ impl Bridge {
         let key = ThreadKey::new(&p.channel, &p.thread_ts);
         self.resume_stall_after_perm(&key, true);
         if !allow {
-            // 断ったツールの行を 🚫 に。満期の注記行とは**別の道**
+            // Turn the denied tool's line into 🚫. A **separate path** from the expiry note line
             self.sticky.on_perm_denied(&key, &p.tool_use_id);
         }
-        // 以後この範囲では訊かない、を覚える。**人が押したときにしか書かれない**
+        // Remember "don't ask again in this scope". **Only written when a person clicks**
         match click.action.as_str() {
             "allow-thread" => self.grant_tool(&p.thread_ts, &p.tool_name, true, &ctx),
             "allow-channel" => self.grant_tool(&p.channel, &p.tool_name, false, &ctx),
@@ -883,8 +883,8 @@ impl Bridge {
         }
     }
 
-    /// 人が押さないまま満期。ワーカーは既に諦めて次へ進んでいるので、**残ったプロンプトを消す** —
-    /// 残すと後から押された Allow が「効いたのに何も起きない」になる(#2)。
+    /// Expired with nobody clicking. The agent already gave up and moved on, so **delete the leftover prompt** —
+    /// left in place, a later Allow click would "work but do nothing".
     pub(super) async fn expire_perm_prompts(&mut self) {
         let now = self.deps.clock.now_ms();
         let expired: Vec<String> = self
@@ -910,7 +910,7 @@ impl Bridge {
             );
             let _ = p.respond.send(serde_json::json!({}));
             let key = ThreadKey::new(&p.channel, &p.thread_ts);
-            // 張り直さない — いま「時間切れ」と言ったばかりなので、本当の活動が来るまで黙る
+            // Don't re-arm — having just said "timed out", stay quiet until real activity comes
             self.resume_stall_after_perm(&key, false);
             self.sticky.on_perm_timeout(&key);
             if let Err(e) = self.deps.slack.delete_message(&p.channel, &p.prompt_ts).await {
@@ -919,8 +919,8 @@ impl Bridge {
         }
     }
 
-    /// 「以後このスレッド/チャンネルでは訊かない」を access.json に書く。
-    /// **人がボタンを押したときにしか呼ばれない** — セッションが自分で書く道は無い。
+    /// Writes "don't ask again in this thread / channel" to access.json.
+    /// **Only called when a person clicks a button** — a session has no way to write it itself.
     fn grant_tool(&mut self, scope: &str, tool: &str, thread: bool, ctx: &LogCtx) {
         let (where_, saved) = if thread {
             self.threads.grant_thread_tool(scope, tool);
@@ -938,14 +938,14 @@ impl Bridge {
         }
     }
 
-    /// PreToolUse / PostToolUse → 付箋のツール行。行に**しない**ツールの判定は board 側の不変条件。
+    /// PreToolUse / PostToolUse → a tool line in the progress message. Which tools **don't** get a line is an invariant of the board.
     fn on_progress(&mut self, key: Option<&ThreadKey>, p: &serde_json::Value) {
         let Some(key) = key else { return };
         let name = p["tool_name"].as_str().unwrap_or_default();
-        // ツール名の無い progress は「ツールの素性がまだ決まっていない」活動 ping。
-        // **行にしない**(見張りの張り直しは呼び手が hook 種別に関わらず済ませている)。
-        // 行にすると名前が空の行が生まれ、畳めないので**連続した Read/検索の run を分断する**
-        // (位置の門番)。
+        // A progress with no tool name is an activity ping "before the tool is known".
+        // **No line for it** (the caller already re-armed the watch regardless of the hook kind).
+        // A line would have an empty name and can't be folded, so it **splits a run of consecutive Read/search lines**
+        // (the position gate).
         if name.is_empty() {
             return;
         }
@@ -960,21 +960,21 @@ impl Bridge {
             &result_text,
         );
         let summary = slack::StickyBoard::summarize(name, &p["tool_input"]);
-        // id が無いと全ツールが1行を上書きし合う — 名前+引数で代用する
+        // Without an id every tool overwrites the same line — use name + arguments instead
         let id = match p["tool_use_id"].as_str().unwrap_or_default() {
             "" => format!("{name}:{summary}"),
             id => id.to_string(),
         };
-        // subagent の素性。top-level の agent_id/agent_type は
-        // **subagent の中で走ったツールにだけ**付く(main セッションでは無い)。
-        // 起こした側の id は tool_response に載り、foreground は camelCase、
-        // background/teammate は snake_case で来る。両方受ける。
+        // Where the subagent came from. The top-level agent_id/agent_type are only on
+        // **tools run inside a subagent** (not in the main session).
+        // The spawner's id is in tool_response: camelCase for foreground,
+        // snake_case for background/teammate. Accept both.
         let agent = slack::sticky::AgentRef {
             agent_id: p["agent_id"].as_str().map(str::to_string),
             agent_type: p["agent_type"].as_str().map(str::to_string),
-            // 拾うのは **Agent/Task の PostToolUse だけ**。他のツールの結果に同名の
-            // フィールドがあっても掴まない。3つの形があり、
-            // background/teammate は content が null なので最後の落穂拾いが効かない
+            // Picked up **only from Agent/Task PostToolUse**. A same-named field in another
+            // tool's result is ignored. There are three shapes, and
+            // background/teammate has content null, so the last-resort scan doesn't work for them
             spawned_agent_id: ((name == "Agent" || name == "Task")
                 && p["hook_event_name"].as_str() == Some("PostToolUse"))
             .then(|| {
@@ -985,14 +985,14 @@ impl Bridge {
                     .or_else(|| Self::agent_id_in_text(&result_text))
             })
             .flatten(),
-            // background/teammate を名前で結ぶための起動名(`input.name`)
+            // The launch name (`input.name`) for tying background/teammate by name
             launched_name: p["tool_input"]["name"].as_str().map(str::to_string),
         };
         self.sticky
             .upsert_tool(key, &id, name, &summary, status, &agent, &p["tool_input"]);
     }
 
-    /// 結果テキストに素で書かれた `agentId: <id>`(最後の落穂拾い。`/agentId:\s*(\w+)/`)。
+    /// `agentId: <id>` written plainly in the result text (last resort. `/agentId:\s*(\w+)/`).
     fn agent_id_in_text(result_text: &str) -> Option<String> {
         let rest = result_text.split_once("agentId:")?.1.trim_start();
         let id: String = rest
@@ -1002,15 +1002,15 @@ impl Bridge {
         (!id.is_empty()).then_some(id)
     }
 
-    /// MessageDisplay の delta を message_id ごとに繋ぎ、`final` で1行に確定する。
+    /// Joins MessageDisplay deltas per message_id and settles them into one line on `final`.
     fn on_narration(&mut self, key: Option<&ThreadKey>, p: &serde_json::Value, ctx: &LogCtx) {
         let Some(key) = key else { return };
         let msg_id = p["message_id"].as_str().unwrap_or_default();
-        // message_id は空で届きうる — スレッドで名前空間を切らないと全スレッドが1本の
-        // バッファを共有して混線する(NUL は Slack の id に現れない区切り)
+        // message_id can arrive empty — without a per-thread namespace every thread shares one
+        // buffer and they cross (NUL never appears in Slack ids, so it works as a separator)
         let slot = format!("{key}\u{0}{msg_id}");
         let buf = self.narration.entry(slot.clone()).or_default();
-        // 蓄積は放っておくと無限に伸びる — 1行の予算を超えたらもう足さない
+        // Left alone the buffer grows forever — stop appending once it exceeds one line's budget
         if buf.len() < NARRATION_CAP {
             buf.push_str(p["delta"].as_str().unwrap_or_default());
         }
@@ -1034,7 +1034,7 @@ impl Bridge {
         }
     }
 
-    /// ターンを終わらせてよいか。答えないとワーカーが最大5秒吊るので、必ず値を返す。
+    /// May the turn end? Unanswered, the agent hangs up to 5 seconds, so always return a value.
     fn stop_decision(
         &self,
         key: Option<&ThreadKey>,
@@ -1082,9 +1082,9 @@ impl Bridge {
         }
     }
 
-    /// ツールが「答えた」— 台帳から落とし、付箋を決着させる。
+    /// A tool "answered" — drop it from the ledger and settle the progress message.
     pub(super) async fn on_disposition(&mut self, d: Disposition) {
-        // reply / no_reply / edit は thread_ts を運ばないことがある — セッションから根を引き戻す
+        // reply / no_reply / edit may not carry thread_ts — look the root back up from the session
         let root = d.thread_ts.clone().or_else(|| {
             self.threads
                 .find_by_session(&d.session_id)
@@ -1109,13 +1109,13 @@ impl Bridge {
             session_id: Some(d.session_id.clone()),
             thread_key: Some(key.clone()),
         };
-        // 答えが出た = shimmer の役目は終わり(reply / no_reply / edit_message のどれでも)。
-        // 落とすだけでよい — slack::Thinking の Drop がキューの最後尾からクリアを流すので、
-        // 直前に見張りが投げた `is thinking…` を追い越さずに必ず後から消える
+        // An answer came = the shimmer's job is done (any of reply / no_reply / edit_message).
+        // Just drop it — slack::Thinking's Drop sends the clear from the tail of the queue, so
+        // it always clears after, never overtaking, the `is thinking…` the watch just sent
         self.stall.remove(&key);
         let before = self.ledger.pending(&key).len();
         if d.message_ids.is_empty() {
-            self.ledger.dispose_all(&key); // ids 無しはスレッド全消化
+            self.ledger.dispose_all(&key); // no ids = the whole thread is done
         } else {
             self.ledger.disposed(&key, &d.message_ids);
         }
@@ -1127,7 +1127,7 @@ impl Bridge {
                 d.kind
             ),
         );
-        // 返信・編集は最後の絵を出してから記録として残す。沈黙とリアクションは付箋ごと消す
+        // Reply and edit show the final picture and stay as a record. Silence and reactions remove the whole progress message
         if matches!(d.kind, "reply" | "edit")
             && let Some((posted, body)) = self.sticky.take_final(&key)
         {
@@ -1149,10 +1149,10 @@ impl Bridge {
         }
     }
 
-    /// 付箋の1枚を Slack に反映する。post だけは ts を覚えるので待つ(update は投げっぱなし)。
+    /// Pushes one progress message to Slack. Only post waits, since it remembers the ts (update is fire-and-forget).
     async fn flush_sticky(&mut self, key: &ThreadKey, posted: Option<String>, body: String) {
         if body.is_empty() {
-            return; // Slack は空 text の update を弾く
+            return; // Slack rejects an update with empty text
         }
         let (channel, root) = key.split();
         let ctx = LogCtx {
@@ -1180,10 +1180,10 @@ impl Bridge {
     }
 }
 
-/// 1回の `/usage` 読み取りから立てたバーンレート予測。
+/// A burn-rate projection built from one `/usage` reading.
 ///
-/// `enough_data` が false のときは(現行同様)警告もロックもしてはいけない。
-/// `at_risk` = 窓が reset する**前**に 100% に達する見込み。
+/// When `enough_data` is false, neither warn nor lock.
+/// `at_risk` = expected to reach 100% **before** the window resets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UsageProjection {
     pub enough_data: bool,
@@ -1192,22 +1192,22 @@ pub struct UsageProjection {
 }
 
 impl UsageProjection {
-    /// 週の窓(7日)。
+    /// The weekly window (7 days).
     pub const WEEK_MINUTES: i64 = 7 * 24 * 60;
 
-    /// 予測ノイズガード: これだけ経っていない/使われていない窓は「データ不足」。
+    /// Projection noise guard: a window with less time or use than this is "not enough data".
     const MIN_ELAPSED_MINUTES: i64 = 30;
     const MIN_PCT: f64 = 5.0;
 
-    /// 判断材料が足りないときの答え。**警告もロックもしない。**
+    /// The answer when there's too little to go on. **Neither warns nor locks.**
     const NONE: UsageProjection = UsageProjection {
         enough_data: false,
         at_risk: false,
         projected_hit: None,
     };
 
-    /// 窓の開始 = reset − window、burn = pct / 経過分、上限到達 = now + 残り% / burn。
-    /// reset が過去(= `minutes_to` が None)なら読みが壊れているので安全側に倒す。
+    /// Window start = reset − window, burn = pct / elapsed minutes, limit hit = now + remaining% / burn.
+    /// A reset in the past (= `minutes_to` is None) means a broken reading, so err on the safe side.
     pub fn of(
         pct: f64,
         reset: &WallClock,
@@ -1235,13 +1235,13 @@ impl UsageProjection {
     }
 }
 
-// ── 節8: ターン失敗の分類 — 級と文面は**1つの表** ─────
-// 級(retry / tell-user)と文面は1つの判断の2つの面。2枚の表に分けると片方だけが直されて
-// 食い違うので、現行はここを1枚に統合してある。**文面は原文コピー**(互換の約束)。
+// ── Turn failure classification — class and wording are **one table** ─────
+// The class (retry / tell-user) and the wording are two sides of one decision. Split into two tables, only one gets
+// fixed and they drift apart, so they're merged into one here. **The wording is copied verbatim** (compatibility promise).
 
-/// ターン失敗の扱い。`Retry` は「未応答をもう一度配達する」級。
+/// How a turn failure is handled. `Retry` is the "deliver the unanswered message again" class.
 ///
-/// **再配達自体はまだ無い**(別コミット)ので、いまはどちらも文面を出す。
+/// **Re-delivery itself doesn't exist yet** (separate commit), so for now both show wording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnFailureClass {
     Retry,
@@ -1249,8 +1249,8 @@ pub enum TurnFailureClass {
 }
 
 impl TurnFailureClass {
-    /// `error` フレームの `error_type` を**部分一致・大小無視**で引く表。
-    /// (`error_type` に含まれる語, 扱い, 英語, 日本語)
+    /// Table that looks up the `error` frame's `error_type` by **substring, case-insensitive**.
+    /// (word contained in `error_type`, handling, English, Japanese)
     const TABLE: &'static [(&'static str, TurnFailureClass, &'static str, &'static str)] = &[
         (
             "rate_limit",
@@ -1308,11 +1308,11 @@ impl TurnFailureClass {
         ),
     ];
 
-    /// ターン失敗を分類し、**同時に**人が動ける言葉にする(`turnFailure`)。
+    /// Classifies a turn failure and **at the same time** puts it in words a person can act on (`turnFailure`).
     ///
-    /// 10番目の `unknown`、そして知らない型・**空の型**はすべて `Retry` に落ちる — 空は実際に
-    /// 起きる(2026-07-14 に実機で観測、次のターンは同じ資格で成功した)。何も飲み込まない:
-    /// 生のキーワードは唯一の手掛かりなので文面に残す。
+    /// The 10th, `unknown`, and any unknown or **empty type** all fall to `Retry` — empty really
+    /// happens (seen on a real machine on 2026-07-14; the next turn succeeded with the same credentials). Nothing is swallowed:
+    /// the raw keyword is the only clue, so it stays in the wording.
     pub fn of(reason: &str) -> (TurnFailureClass, String) {
         let r = reason.to_lowercase();
         if let Some((_, klass, en, ja)) = Self::TABLE.iter().find(|(needle, ..)| r.contains(needle)) {
@@ -1348,8 +1348,8 @@ impl std::fmt::Display for TurnFailureClass {
     }
 }
 
-/// usage 上限中に来た依頼へ返す1本。ホスト = Asia/Tokyo はこのリポの usage 機能全体の
-/// 前提 — 固定 +9:00 で足すだけ。
+/// The one reply to a request that arrives while the usage limit is hit. Host = Asia/Tokyo is an assumption of
+/// this repo's whole usage feature — it just adds a fixed +9:00.
 pub fn limited_notice(limited_until_ms: u64) -> String {
     let at = WallClock::tokyo(limited_until_ms).format("%-m/%-d %H:%M");
     crate::t!(
@@ -1358,9 +1358,9 @@ pub fn limited_notice(limited_until_ms: u64) -> String {
     )
 }
 
-/// 上限が近い(80% / 90% を跨いだ)。生きているスレッドに1回ずつ出す。
-/// `reset` は `/usage` が印字した reset 節(そのまま出す)、`projected_hit` はこのペースで
-/// 使い続けたときに上限へ当たる見込みの時刻。
+/// The limit is near (crossed 80% / 90%). Sent once to each live thread.
+/// `reset` is the reset clause `/usage` printed (shown as is); `projected_hit` is when the limit
+/// is expected to be hit at this pace.
 fn usage_warning_notice(pct: u32, reset: &str, projected_hit: Option<WallClock>) -> String {
     let mut lines = vec![crate::t!(
         "⚠️ You're close to your usage limit — current session *{pct}% used*",
@@ -1383,13 +1383,13 @@ fn usage_warning_notice(pct: u32, reset: &str, projected_hit: Option<WallClock>)
 mod tests {
     use super::*;
 
-    /// 壁時計1つ。テストの主役は年月日ではないので、1行で書けるようにする。
+    /// One wall-clock time. The date isn't what the tests are about, so make it writable in one line.
     fn wc(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> WallClock {
         WallClock::new(year, month, day, hour, minute).expect("valid wall clock")
     }
 
-    /// 分類は**部分一致・大小無視**。表に無いものと空はどちらも retry 級に落ち、
-    /// 生のキーワードは文面に残る(唯一の手掛かりなので隠さない)。
+    /// Classification is **substring, case-insensitive**. Anything not in the table and empty both fall to the retry class,
+    /// and the raw keyword stays in the wording (it's the only clue, so don't hide it).
     #[test]
     fn turn_failure_classifies_and_speaks() {
         use TurnFailureClass::*;
@@ -1405,7 +1405,7 @@ mod tests {
         assert_eq!(k, Retry);
         assert_eq!(t, "No reply was written (`unknown`). Send it again.");
 
-        // 実機で起きた「型が空のまま」— 飲み込まず、キーワード無しの文面で言う
+        // "Type arrived empty", as happened on a real machine — don't swallow it; say it with keyword-less wording
         let (k, t) = TurnFailureClass::of("");
         assert_eq!(k, Retry);
         assert_eq!(t, "No reply was written. Send it again.");
@@ -1413,14 +1413,14 @@ mod tests {
 
     #[test]
     fn format_limit_reply_names_the_reset_time() {
-        // 実測値(Python zoneinfo で確認): epoch ms → Asia/Tokyo の壁時計
+        // Measured values (checked with Python zoneinfo): epoch ms → Asia/Tokyo wall clock
         let out = limited_notice(1_782_635_400_000); // 2026-06-28 17:30 JST
         assert!(out.contains("6/28 17:30"), "{out}");
         assert_eq!(
             out,
             "⏸️ You've reached your Claude Code usage limit. New requests are paused until it resets around 6/28 17:30 (Asia/Tokyo) — send yours again after that."
         );
-        // 分が0埋めされる例
+        // An example where minutes are zero-padded
         let out = limited_notice(1_785_283_500_000); // 2026-07-29 09:05 JST
         assert!(out.contains("7/29 09:05"), "{out}");
     }
@@ -1435,7 +1435,7 @@ mod tests {
         let reset = wc(2026, 7, 29, 15, 0);
         let p = UsageProjection::of(3.0, &reset, &now, 300); // pct<5% → enough_data=false
         assert!(!p.enough_data);
-        // 窓が丸ごと未経過(reset がちょうど window 先)でも同じく取らない
+        // Also not taken when the whole window hasn't elapsed (reset exactly one window ahead)
         assert!(!UsageProjection::of(40.0, &reset, &now, 300).enough_data);
     }
 
@@ -1443,13 +1443,13 @@ mod tests {
     fn project_usage_at_risk_when_burn_rate_outpaces_reset() {
         let now = sample_now();
         let reset = wc(2026, 7, 29, 17, 30);
-        // 経過 300-270=30分で40%消費 → burn=1.333%/min → 残り60% ÷ 1.333 = 45分後に到達
-        // reset までの270分より早く枯渇する → at_risk
+        // Elapsed 300-270=30 min with 40% used → burn=1.333%/min → remaining 60% ÷ 1.333 = hit in 45 min
+        // Runs out sooner than the 270 min until reset → at_risk
         let p = UsageProjection::of(40.0, &reset, &now, 300);
         assert!(p.enough_data);
         assert!(p.at_risk);
         assert_eq!(p.projected_hit, Some(wc(2026, 7, 29, 13, 45)));
-        // 週窓(10080分)は経過が長く burn が緩いので、同じ %でも枯渇しないことがある
+        // The weekly window (10080 min) has a long elapsed time and a gentle burn, so the same % may not run out
         let week_reset = wc(2026, 8, 3, 9, 0);
         let w = UsageProjection::of(20.0, &week_reset, &now, UsageProjection::WEEK_MINUTES);
         assert!(w.enough_data);

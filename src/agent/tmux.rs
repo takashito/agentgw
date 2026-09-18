@@ -1,36 +1,38 @@
-//! tmux でプロセスを飼う道具。**ここに claude という語は出てこない** —
-//! どのエージェント実体も同じ窓の作り方・送り方をする。
+//! Tools for keeping processes in tmux. **The word claude does not appear here** —
+//! every agent implementation creates and feeds its windows the same way.
 
-/// ワーカーが住む tmux セッション。**tmux は前方一致で解決する**ので、手で打つときも
-/// 最後まで書く(`-t agentgw` は `agentgw-workers` に当たる)。
+/// The tmux session the agents live in. **tmux resolves names by prefix**, so type the
+/// full name by hand too (`-t agentgw` hits `agentgw-workers`).
 pub const TMUX_SESSION: &str = "agentgw-workers";
 
-/// 本文を打ち込んでから Enter を撃つまでの待ち。**縮めるな**。
+/// The pause between typing the text and sending Enter. **Do not shorten it**.
 ///
-/// 直後に撃つと Enter(CR)が本文の残りと同じ read にまとまり、TUI は「貼り付けの続き」と
-/// 見て改行として飲む。入力欄に本文+末尾改行が残ったまま送信されず、UserPromptSubmit も
-/// 発火しないので、スレッドが無言で固まる(2026-07-30 実機: 1.3KB の封筒で発生)。
+/// Sent right away, Enter (CR) lands in the same read as the tail of the text, and the TUI
+/// treats it as "more of the paste" and swallows it as a newline. The text plus a trailing
+/// newline stays in the input box unsent, UserPromptSubmit never fires, and the thread goes
+/// silent (2026-07-30 on a real machine: happened with a 1.3KB envelope).
 ///
-/// 実測(1253B を 5 回ずつ、読み手の1 read あたりの詰まりを 60ms / 250ms に固定して計測):
-/// - 待ちなし    → CR が本文と同じ read に混ざる 5/5(両条件とも)
-/// - 200ms 待ち  → 単独の read で届く 5/5(両条件とも)
+/// Measured (1253B, 5 runs each, with the reader's per-read backlog pinned at 60ms / 250ms):
+/// - no pause    → CR mixed into the same read as the text 5/5 (both conditions)
+/// - 200ms pause → arrives in its own read 5/5 (both conditions)
 ///
-/// 読み手が暇なら待ちなしでも単独で届く — pty のバッファ(1022B)を超える本文で TUI が
-/// 描画に詰まっている間だけ起きる競合なので、短い封筒では再現しない。
+/// When the reader is idle, CR arrives on its own even without a pause — the race only
+/// happens while the TUI is busy drawing a text larger than the pty buffer (1022B), so short
+/// envelopes don't reproduce it.
 const SETTLE_BEFORE_ENTER: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// `-t` に渡せる形まで解決済みの窓。
+/// A window already resolved to a form `-t` accepts.
 ///
-/// 生の窓名(`1-1`)と解決済みターゲット(`agentgw-workers:1-1`)を同じ `&str` で
-/// 扱っていたのが取り違えの温床だった — 生の名前を `capture-pane -t` に渡すと
-/// エラーにならず「いま居るセッションの同名窓」を読んでしまう。ここを通せば書けない。
+/// Handling raw window names (`1-1`) and resolved targets (`agentgw-workers:1-1`) as the
+/// same `&str` bred mix-ups — a raw name passed to `capture-pane -t` doesn't error, it reads
+/// "the window of that name in the current session". Going through this type makes that unwritable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Window(String);
 
 impl Window {
-    /// 生の窓(`@N` か窓名)から。`@N`(window_id)はそのまま使える — 窓名と違って
-    /// 改名で動かない。窓名で来たものだけセッションで修飾する(素の名前を送ると
-    /// tmux が「今いるセッション」に当ててしまう)。
+    /// From a raw window (`@N` or a window name). `@N` (window_id) can be used as is — unlike
+    /// a window name it doesn't move on rename. Only window names get qualified with the
+    /// session (a bare name makes tmux pick "the current session").
     pub fn of(window: &str) -> Self {
         if window.starts_with('@') {
             Window(window.to_string())
@@ -39,8 +41,8 @@ impl Window {
         }
     }
 
-    /// すでに `-t` にそのまま渡せる形の文字列から(サインイン用セッションなど、
-    /// ワーカーセッションの窓ではないもの)。
+    /// From a string that can already go straight to `-t` (the sign-in session and other
+    /// things that aren't windows in the agent session).
     pub(crate) fn raw(target: impl Into<String>) -> Self {
         Window(target.into())
     }
@@ -50,24 +52,24 @@ impl Window {
     }
 }
 
-/// ログ行にそのまま埋められるように — 現行のログは解決済みターゲットを出している。
+/// So it can be embedded in log lines as is — the logs print the resolved target.
 impl std::fmt::Display for Window {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
 }
 
-/// 現行の`WORKER_KILL_GRACE_MS` / `WORKER_KILL_HARD_MS` = 1500ms、
-/// ポーリング間隔 100ms(`pollMs`)。
+/// `WORKER_KILL_GRACE_MS` / `WORKER_KILL_HARD_MS` = 1500ms,
+/// polling interval 100ms (`pollMs`).
 pub const KILL_GRACE_MS: u64 = 1_500;
 const KILL_HARD_MS: u64 = 1_500;
 const KILL_POLL_MS: u64 = 100;
 
-/// ワーカー本体のプロセス。
+/// The agent's own process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pid(pub u32);
 
-/// ログ行にそのまま埋められるように — 現行のログは裸の pid を出している。
+/// So it can be embedded in log lines as is — the logs print the bare pid.
 impl std::fmt::Display for Pid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
@@ -75,9 +77,9 @@ impl std::fmt::Display for Pid {
 }
 
 impl Pid {
-    /// pid 指名の kill。**パターン kill(pkill -f)は本番のワーカーを巻き込むので使わない。**
-    /// TERM → grace_ms まで生存ポーリング → 残っていれば -9 → さらに 1500ms。
-    /// 返すのは「生きていた pid を実際に落としたか」。元から居ない・-9 でも死なない、はどちらも false。
+    /// Kill by pid. **Never kill by pattern (pkill -f): it takes production agents with it.**
+    /// TERM → poll for liveness up to grace_ms → -9 if still there → another 1500ms.
+    /// Returns whether a live pid was actually taken down. Already gone, or surviving -9, are both false.
     pub async fn kill_graceful(&self, grace_ms: u64) -> bool {
         let pid = self.0;
         if !self.alive() {
@@ -100,15 +102,15 @@ impl Pid {
         gone
     }
 
-    /// SIGTERM だけ撃って**待たない**。複数のワーカーを畳むとき、`kill_graceful` の猶予が
-    /// 直列に積み上がるのを避ける先撃ち用(撃ってから改めて `kill_graceful` を回すと、
-    /// 猶予が重なって消化される)。
+    /// Sends SIGTERM only and **does not wait**. A pre-shot for tearing down several agents,
+    /// so `kill_graceful`'s grace periods don't pile up in series (running `kill_graceful`
+    /// afterwards lets the grace periods overlap).
     pub fn term(&self) -> bool {
         self.signal("-TERM")
     }
 
-    /// `kill` の exit code だけ見る。`output()` なのは `-0` の "No such process" を
-    /// ログに漏らさないため。
+    /// Looks only at `kill`'s exit code. `output()` keeps `-0`'s "No such process" out of
+    /// the log.
     fn signal(&self, sig: &str) -> bool {
         std::process::Command::new("kill")
             .args([sig, &self.0.to_string()])
@@ -116,7 +118,7 @@ impl Pid {
             .is_ok_and(|o| o.status.success())
     }
 
-    /// `kill -0` = 生存プローブ(シグナルは飛ばない)。
+    /// `kill -0` = liveness probe (no signal is sent).
     fn alive(&self) -> bool {
         self.signal("-0")
     }
@@ -132,14 +134,14 @@ impl Pid {
     }
 }
 
-/// tmux 実行の注入口。テストは fake、実弾は本物。
+/// Injection point for running tmux. Tests use a fake, real runs the real thing.
 pub struct Tmux {
     #[allow(clippy::type_complexity)]
     pub run: Box<dyn Fn(&[&str]) -> Result<String, String> + Send + Sync>,
 }
 
 impl Tmux {
-    /// 本物の tmux。
+    /// The real tmux.
     pub fn real() -> Tmux {
         Tmux {
             run: Box::new(|args| {
@@ -158,23 +160,23 @@ impl Tmux {
         }
     }
 
-    /// 押し込み: literal タイプ → 一拍 → Enter。3KB 一発で通ることは実測済み。
+    /// Push-in: literal typing → a beat → Enter. 3KB in one go is measured to work.
     pub fn deliver(&self, w: &Window, text: &str) -> Result<(), String> {
         let t = w.as_str();
-        // `--` は先頭が `-` のテキスト対策
+        // `--` guards against text starting with `-`
         (self.run)(&["send-keys", "-t", t, "-l", "--", text])?;
         std::thread::sleep(SETTLE_BEFORE_ENTER);
         (self.run)(&["send-keys", "-t", t, "Enter"])?;
         Ok(())
     }
 
-    /// 窓の見えている範囲のテキスト。TUI の状態(/compact の進捗、モデル名)はここから読む。
+    /// The visible text of the window. TUI state (/compact progress, model name) is read from here.
     pub fn capture(&self, w: &Window) -> Result<String, String> {
         (self.run)(&["capture-pane", "-p", "-t", w.as_str()])
     }
 
-    /// scrollback ごと読む。`claude auth login` は "Login successful." を出した直後にシェルへ戻り、
-    /// 次のポーリングまでにマーカーが画面外へ流れる。
+    /// Reads including scrollback. `claude auth login` returns to the shell right after printing
+    /// "Login successful.", and the marker scrolls off screen before the next poll.
     pub fn capture_history(&self, w: &Window, lines: u32) -> Result<String, String> {
         (self.run)(&[
             "capture-pane",
@@ -186,36 +188,36 @@ impl Tmux {
         ])
     }
 
-    /// tmux のキー名を1発(`Escape` / `Enter` / `BTab` = shift+tab)。
+    /// One tmux key name (`Escape` / `Enter` / `BTab` = shift+tab).
     pub fn send_key(&self, w: &Window, key: &str) -> Result<(), String> {
         (self.run)(&["send-keys", "-t", w.as_str(), key]).map(|_| ())
     }
 
-    /// Escape 1発(TUI のプロンプト取り消し)。
+    /// One Escape (cancels the TUI prompt).
     pub fn send_escape(&self, w: &Window) -> Result<(), String> {
         self.send_key(w, "Escape")
     }
 
-    /// Enter 1発。
+    /// One Enter.
     pub fn send_enter(&self, w: &Window) -> Result<(), String> {
         self.send_key(w, "Enter")
     }
 
-    /// TUI へ1行打ち込む(`/compact` などのスラッシュコマンド)。`deliver` と同じ literal + Enter。
+    /// Types one line into the TUI (slash commands like `/compact`). Same literal + Enter as `deliver`.
     pub fn send_command(&self, w: &Window, cmd: &str) -> Result<(), String> {
         (self.run)(&["send-keys", "-t", w.as_str(), "-l", "--", cmd])?;
         self.send_enter(w)
     }
 
-    /// 窓ごと落とす。**window_id(`@N`)指名で** — 名前は改名で動く。
+    /// Kills the whole window. **By window_id (`@N`)** — names move on rename.
     pub fn kill_window(&self, w: &Window) -> Result<(), String> {
         (self.run)(&["kill-window", "-t", w.as_str()]).map(|_| ())
     }
 
-    /// 窓を建てて `line` を走らせる。返すのは window_id(`@N`)。
-    /// 窓名は中で走るプログラムの画面タイトルで改名されるので当てにしない。
+    /// Creates a window and runs `line` in it. Returns the window_id (`@N`).
+    /// The window name gets renamed to the screen title of the program inside, so don't rely on it.
     pub fn spawn(&self, window: &str, cwd: &str, line: &str) -> Result<Window, String> {
-        // セッションが無ければ先に作る(has-session は非0で「無い」を返すので Err を無視)
+        // Create the session first if missing (has-session returns non-zero for "missing", so ignore the Err)
         let id = if (self.run)(&["has-session", "-t", TMUX_SESSION]).is_err() {
             (self.run)(&[
                 "new-session",
@@ -248,7 +250,7 @@ impl Tmux {
             ])?
         };
         let id = id.trim().to_string();
-        // 改名を封じる。名前フォールバックが効き続けるように(失敗しても spawn は成功)
+        // Lock out renaming so the name fallback keeps working (spawn succeeds even if this fails)
         for opt in ["automatic-rename", "allow-rename"] {
             if let Err(e) = (self.run)(&["set-option", "-w", "-t", &id, opt, "off"]) {
                 crate::bridge::state::LogCtx::default()
@@ -258,10 +260,10 @@ impl Tmux {
         Ok(Window::of(&id))
     }
 
-    /// 窓の棚卸し。**tmux が唯一の権威** — Bridge の記憶は再起動で消えるが、窓は残る。
+    /// Inventory of windows. **tmux is the only authority** — the Bridge's memory is lost on restart, windows stay.
     ///
-    /// **窓名は最後に置く** — 画面タイトルに改名されて空白が入りうるので、先頭3つを
-    /// 切ったあとの残り全部が名前、と読めるようにしておく。
+    /// **The window name goes last** — it can be renamed to a screen title containing spaces,
+    /// so everything after the first three fields is read as the name.
     pub fn rows(&self) -> Vec<WindowRow> {
         let Ok(out) = (self.run)(&[
             "list-windows",
@@ -285,11 +287,11 @@ impl Tmux {
             .collect()
     }
 
-    /// 窓の中で走っているプロセスの pid。**list-windows の列挙で見る** —
-    /// display-message は存在しない窓について別の窓の答えを exit 0 で返す(既知の罠)。
+    /// The pid of the process running in the window. **Looked up from the list-windows listing** —
+    /// display-message answers for a nonexistent window with another window's answer and exit 0 (a known trap).
     ///
-    /// window_id が第一の手がかり。名前照合はフォールバック — Bridge 再起動後で id を
-    /// 忘れていても窓を再発見できないと、毎回 respawn して古いワーカーがリークする。
+    /// window_id is the primary key. Name matching is the fallback — if a window can't be
+    /// rediscovered after a Bridge restart forgot its id, every attempt respawns and old agents leak.
     pub fn pid_of(&self, window_id: Option<&str>, name: &str) -> Option<Pid> {
         let rows = self.rows();
         rows.iter()
@@ -299,25 +301,25 @@ impl Tmux {
     }
 }
 
-/// 棚卸しで見えた窓1つ。
+/// One window seen in the inventory.
 #[derive(Clone)]
 pub struct WindowRow {
     pub id: String,
     pub pid: Pid,
-    /// pane で**いま**走っているコマンド(`claude` / `zsh` …)。
+    /// The command running in the pane **right now** (`claude` / `zsh` …).
     pub command: String,
     pub name: String,
 }
 
 impl WindowRow {
-    /// この窓が抱えているワーカーの session_id(`w-<sid>`)。
-    /// `None` = ワーカーの窓ではない(アンカー窓・人が開いた窓) → **触らない**。
+    /// The session_id of the agent this window holds (`w-<sid>`).
+    /// `None` = not an agent window (the anchor window, a window a person opened) → **don't touch it**.
     pub fn session_id(&self) -> Option<&str> {
         self.name.strip_prefix("w-").filter(|s| !s.is_empty())
     }
 
-    /// claude が居なくなって shell だけが残った殻か(判定)。
-    /// ログインシェルは `-zsh` のように頭に `-` が付く。
+    /// Whether this is a husk where claude is gone and only the shell is left.
+    /// Login shells carry a leading `-`, like `-zsh`.
     pub fn is_empty_shell(&self) -> bool {
         matches!(
             self.command.trim().trim_start_matches('-'),
@@ -350,7 +352,7 @@ mod tests {
         tmux.deliver(&Window::of("1-1"), "hello").unwrap();
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 2, "type then Enter: {calls:?}");
-        // 先頭が `-` のテキストでも引数として渡るよう `--` を置く
+        // Put `--` so text starting with `-` still passes as an argument
         assert_eq!(
             calls[0],
             [
@@ -379,7 +381,7 @@ mod tests {
         );
     }
 
-    /// list-windows の出力を返すだけの fake。
+    /// A fake that just returns list-windows output.
     fn listing_tmux(out: &'static str) -> Tmux {
         Tmux {
             run: Box::new(move |_| Ok(out.to_string())),
@@ -388,15 +390,15 @@ mod tests {
 
     #[test]
     fn finds_the_worker_by_window_id_after_tmux_renames_the_window() {
-        // 窓名は claude の画面タイトルに改名済み(空白入り)。名前照合はもう当たらない。
+        // The window name was renamed to claude's screen title (with spaces). Name matching no longer hits.
         let tmux = listing_tmux(
             "@22 3493 claude ✳ building the thing\n@23 5773 claude 1785161156-915759\n",
         );
         assert_eq!(tmux.pid_of(Some("@22"), "2-1-220"), Some(Pid(3493)));
     }
 
-    /// 棚卸しは「窓名に空白が入っていても最後まで名前」と読めること。ここがずれると
-    /// 改名された窓の session_id を取り違えて、**生きている窓を掃除**しかねない。
+    /// The inventory must read "everything to the end is the name, even with spaces". If this
+    /// drifts, a renamed window's session_id gets mixed up and a **live window may be cleaned up**.
     #[test]
     fn the_window_listing_keeps_a_renamed_name_whole() {
         let tmux = listing_tmux(
@@ -408,11 +410,11 @@ mod tests {
         let rows = tmux.rows();
         assert_eq!(rows.len(), 4);
 
-        // ワーカーの窓 = 名前が `w-` で始まるものだけ
+        // Agent windows = only names starting with `w-`
         let ids: Vec<Option<&str>> = rows.iter().map(|r| r.session_id()).collect();
         assert_eq!(ids, [Some("abc-123"), Some("dead-9"), None, None]);
 
-        // claude が居るか、shell だけの殻か
+        // Is claude there, or is it a shell-only husk
         let shells: Vec<bool> = rows.iter().map(|r| r.is_empty_shell()).collect();
         assert_eq!(
             shells,
@@ -426,7 +428,7 @@ mod tests {
 
     #[test]
     fn falls_back_to_the_window_name_when_the_id_is_unknown() {
-        // Bridge 再起動後: id を忘れていても窓を再発見できないと respawn でリークする
+        // After a Bridge restart: if the window can't be found without its id, respawn leaks
         let tmux = listing_tmux("@22 3493 claude 2-1-220\n@23 5773 claude other\n");
         assert_eq!(tmux.pid_of(None, "2-1-220"), Some(Pid(3493)));
         assert_eq!(tmux.pid_of(Some("@99"), "nope"), None);
@@ -467,7 +469,7 @@ mod tests {
 
     #[tokio::test]
     async fn kill_pid_graceful_returns_false_for_dead_pid() {
-        // 元から居ない pid は「落とした」ではない
+        // A pid that was never there is not "taken down"
         assert!(!Pid(4_000_000).kill_graceful(100).await);
     }
 
@@ -478,8 +480,8 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = Pid(child.id());
-        // 死んだ子は wait するまでゾンビとして pid 表に残り `kill -0` に応える。実弾で殺す
-        // claude は tmux の子(こちらの子ではない)なので出ない現象 — テスト側で刈り取る。
+        // A dead child stays in the pid table as a zombie until waited on and answers `kill -0`. In real runs
+        // claude is tmux's child (not ours), so this doesn't happen — the test reaps it itself.
         let reaper = std::thread::spawn(move || child.wait().unwrap());
         assert!(pid.kill_graceful(KILL_GRACE_MS).await);
         reaper.join().unwrap();

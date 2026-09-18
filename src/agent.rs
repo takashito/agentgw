@@ -1,4 +1,4 @@
-//! エージェント抽象化レイヤー。Bridge はここから下を直接知らない。
+//! The agent abstraction layer. The Bridge knows nothing below this directly.
 //!
 //! Bridge talks to the agent through `crate::agent::Agent`; the only implementation is
 //! [`claude::Claude`]. This module keeps the types that cross that edge.
@@ -15,15 +15,15 @@ use crate::bridge::state::{LogCtx, ThreadKey};
 use screen::SpawnOutcome;
 use tmux::{Pid, Window, WindowRow};
 
-/// ワーカー1本のセッション識別子。
+/// The session identifier of one agent.
 ///
-/// **使い捨て** — 使用済み ID で起動すると claude は即死する。
-/// spawn は毎回新規、継続は実体側の再開機構に任せる。
+/// **Single-use** — claude dies at once when started with an already-used ID.
+/// Every spawn is new; continuing is left to the implementation's resume mechanism.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SessionId(String);
 
 impl SessionId {
-    /// spawn ごとに新しい ID。使用済み ID での起動は claude に拒否される(スパイク実測)。
+    /// A new ID per spawn. claude refuses to start with a used ID (measured in the spike).
     pub fn new() -> Self {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -45,9 +45,9 @@ impl SessionId {
         &self.0
     }
 
-    /// ワーカーの tmux 窓名。**プールも割当済みも同じ1つの規則**。
-    /// 窓名が session_id だけで決まるから、window_id を忘れた Bridge 再起動後でも名前で引き直せる
-    /// (プール専用名は作らない — 引き当て時に改名しないのが現行の形)。
+    /// The agent's tmux window name. **One rule for pooled and assigned agents alike**.
+    /// Since the name depends only on session_id, it can be looked up by name after a Bridge restart that forgot the window_id
+    /// (no pool-only names — the window is not renamed when taken from the pool).
     pub fn window_name(&self) -> String {
         let mut name = String::from("w-");
         name.extend(self.0.chars().map(|c| match c {
@@ -70,17 +70,17 @@ impl From<&str> for SessionId {
     }
 }
 
-/// `new()` は毎回**新しい**値を発行する — `Default` が同じ意味を持つのはそのため
-/// (使い捨て ID なので「既定値」という概念が無く、既定 = 新規発行が唯一の解釈)。
+/// `new()` issues a **new** value every time — that is why `Default` means the same
+/// (a single-use ID has no notion of a "default value"; default = issue a new one is the only reading).
 impl Default for SessionId {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// ワーカーの生存。Bridge の `Workers`(`bridge/worker.rs`)が facts から導く。
+/// Whether an agent is alive. Derived from facts by the Bridge's `Workers` (`bridge/worker.rs`).
 ///
-/// [`SpawnReq::state`] で実体に渡り、座席の確認(`Absent` 以外への spawn を断る)に使われる。
+/// Handed to the implementation via [`SpawnReq::state`] to check the seat (spawn into anything but `Absent` is refused).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WorkerState {
     Absent,
@@ -88,30 +88,30 @@ pub enum WorkerState {
     Ready,
 }
 
-/// ワーカーを1本起こす要求。
+/// A request to start one agent.
 #[derive(Clone)]
 pub struct SpawnReq {
     pub session_id: SessionId,
     pub cwd: String,
-    /// 最初に流し込む本文。`None` なら実体側の待機プロンプト(プールの空焚き)。
-    /// 実体が向き付けの前口上を付けるので、ここには**素の封筒**を入れる。
+    /// The first text to feed in. `None` means the implementation's idle prompt (warming the pool).
+    /// The implementation adds its own orienting preamble, so put the **bare envelope** here.
     pub prompt: Option<String>,
-    /// 継続なら直前の session id。
+    /// The previous session id when continuing.
     pub resume_from: Option<SessionId>,
-    /// 座席の窓名([`SessionId::window_name`] の規則)。改名されるので追跡には使わない。
+    /// The seat's window name (rule of [`SessionId::window_name`]). It gets renamed, so not used for tracking.
     pub window: String,
-    /// 座席の現状。`Absent` 以外への spawn は実体が拒否する(spawn を kill にしない)。
+    /// The seat's current state. The implementation refuses spawn into anything but `Absent` (spawn never kills).
     pub state: WorkerState,
-    /// 実体に渡す hook 設定ファイルの絶対パス。
+    /// Absolute path of the hook settings file handed to the implementation.
     pub hooks_file: String,
-    /// このセッション用に書き出した MCP 設定ファイルの絶対パス。
+    /// Absolute path of the MCP config file written for this session.
     pub mcp_config: String,
 }
 
-/// ワーカーに渡す封筒 — 1通の受信メッセージを、そのまま prompt に流せる形にしたもの。
+/// The envelope handed to an agent — one inbound message, in a form that can go straight into the prompt.
 ///
-/// 属性の並びは現行の meta 構築順。
-/// `message_id` は**受信メッセージの ts**、`ts` は配達時点の now(呼び手が入れる)。
+/// Attribute order follows the meta build order.
+/// `message_id` is **the inbound message's ts**; `ts` is the now at delivery (filled in by the caller).
 pub struct Envelope {
     pub channel_id: String,
     pub message_id: String,
@@ -119,34 +119,34 @@ pub struct Envelope {
     pub ts: String,
     pub thread_ts: Option<String>,
     pub text: String,
-    /// 先読みダウンロード済みの添付のローカルパス。`file_count` はこの数(現行)。
+    /// Local paths of attachments downloaded ahead. `file_count` is their count.
     pub file_paths: Vec<String>,
-    /// 落とせなかった添付の劣化ノート。黙って捨てず、ワーカーに見せて人に伝えさせる。
+    /// Degradation notes for attachments that couldn't be downloaded. Not dropped silently: shown to the agent so it tells the person.
     pub file_errors: Vec<String>,
-    /// ループ遮断が働いた配達(`loop_guard="true"`)。載っていたら、その bot には返さず
-    /// **人に判断を仰げ**という合図。`loop_notify` は呼ぶ相手(Owner の mention)。
+    /// A delivery the loop guard tripped on (`loop_guard="true"`). When present, it signals: don't answer
+    /// that bot, **ask a person to decide**. `loop_notify` is who to call (the Owner's mention).
     pub loop_guard: Option<String>,
 }
 
-/// Claude Code が push 通知を描くときの source。同じ値にして、注入した1通目を
-/// push された1通と同じバイト形にする。
+/// The source Claude Code uses when drawing a push notification. Using the same value makes
+/// the injected first message byte-identical to a pushed one.
 ///
-/// **読み手はプラグイン側の名前。** 2026-09-18 時点で `~/.claude/plugins` に
-/// 相当するプラグインは無いので、バイナリ名に揃えてある。将来プラグインを作るときは
-/// その名前とここを一致させる。
+/// **The reader is the plugin's name.** As of 2026-09-18 there is no matching plugin in
+/// `~/.claude/plugins`, so it matches the binary name. If a plugin is made later, keep
+/// its name and this in sync.
 const CHANNEL_SOURCE: &str = "plugin:agentgw:agentgw";
 
 impl Envelope {
-    /// 移植 — cold start のワーカーに、押し込みと同じ形で1通目を渡す。
+    /// Hands a cold-start agent its first message in the same form as a push-in.
     pub fn render(&self) -> String {
         let e = self;
-        // 現行は `if (threadTs) meta.thread_ts = threadTs` — 無ければ属性ごと出さない
+        // No thread_ts means no attribute at all
         let thread_ts = e
             .thread_ts
             .as_deref()
             .map_or(String::new(), |t| format!(" thread_ts=\"{t}\""));
-        // 添付は受信時に落とし済み。成功があれば
-        // file_count/file_paths、失敗があれば file_errors。無いものは属性ごと出さない
+        // Attachments were downloaded on receipt. Successes give
+        // file_count/file_paths, failures give file_errors. Missing ones leave the attribute out entirely
         let files = if e.file_paths.is_empty() {
             String::new()
         } else {
@@ -161,7 +161,7 @@ impl Envelope {
         } else {
             format!(" file_errors=\"{}\"", e.file_errors.join("\n"))
         };
-        // ループ遮断— 立った配達にだけ属性が付く
+        // Loop guard — the attribute is only on deliveries where it tripped
         let loop_guard = match e.loop_guard.as_deref() {
             None => String::new(),
             Some("") => " loop_guard=\"true\"".to_string(),
@@ -175,11 +175,11 @@ impl Envelope {
     }
 }
 
-/// 実体から上がってきた出来事1件。
+/// One event reported by the implementation.
 ///
-/// claude は hook から作り、別の実体は別の方法で作る — Bridge から見ればどちらも同じ型。
-/// `respond` は答えを待っている hook(stop)だけに載る — 受け手が送るか落とすかで決まる
-/// (落とせば `{}` = 辞退)。Sender は複製できないので Clone は付けない。
+/// claude builds it from hooks, another implementation some other way — to the Bridge it's the same type.
+/// `respond` is only on hooks waiting for an answer (stop) — the receiver decides by sending or dropping it
+/// (dropping = `{}` = decline). Sender can't be cloned, so no Clone.
 #[derive(Debug)]
 pub struct HookEvent {
     pub kind: String,
@@ -188,58 +188,58 @@ pub struct HookEvent {
     pub respond: Option<tokio::sync::oneshot::Sender<serde_json::Value>>,
 }
 
-/// 表の1行。`(名前, トークン, %)` — すべて**印字されたまま**の文字列。
+/// One table row. `(name, tokens, %)` — all strings **exactly as printed**.
 pub type ContextCategory = (String, String, String);
 
-/// パース済みの `/context`。
+/// Parsed `/context`.
 ///
-/// 数値化はしない(描画に必要な桁は現物の印字が持っている)。
+/// Not converted to numbers (the printed text already has the digits needed for drawing).
 #[derive(Debug)]
 pub struct ContextReport {
-    /// 例 `claude-opus-4-8[1m]`
+    /// e.g. `claude-opus-4-8[1m]`
     pub model: String,
-    /// 使用トークン(印字のまま。例 `43.8k`)
+    /// Tokens used (as printed, e.g. `43.8k`)
     pub used: String,
-    /// 窓の大きさ(印字のまま。例 `1m`)
+    /// Window size (as printed, e.g. `1m`)
     pub total: String,
-    /// 使用率(印字のまま。例 `4%`)
+    /// Usage percentage (as printed, e.g. `4%`)
     pub pct: String,
     pub categories: Vec<ContextCategory>,
 }
 
-/// Claude Code 自身が「上限に当たった」と書いた記録。
+/// A record in which Claude Code itself wrote "hit the limit".
 #[derive(Debug, PartialEq, Eq)]
 pub struct LimitHit {
-    /// 記録の本文(ログにそのまま出す — 何を読んで判断したかが残る)。
+    /// The record's text (logged as is — keeps what the decision was based on).
     pub detail: String,
-    /// 壁が解ける時刻(epoch ms)。
+    /// When the wall lifts (epoch ms).
     pub reset_ms: u64,
 }
 
-/// `/usage` の上限行1本(例 `Current week (all models): 66% used · resets Jul 1 at 5pm`)。
+/// One limit line of `/usage` (e.g. `Current week (all models): 66% used · resets Jul 1 at 5pm`).
 #[derive(Debug)]
 pub struct UsageRow {
     pub label: String,
     pub pct: String,
-    /// `· resets <when>` の中身。0% の行にはこの節が無く、空文字になる
+    /// The content of `· resets <when>`. A 0% line has no such clause and this is empty
     pub reset: String,
 }
 
-/// 生きた圧縮スピナーから読めるもの。数値化するのは秒と % だけで、トークン数は**印字のまま**。
+/// What can be read from the live compaction spinner. Only seconds and % become numbers; tokens stay **as printed**.
 #[derive(Debug, Default, PartialEq)]
 pub struct CompactProgress {
     pub active: bool,
-    /// 経過秒(`(1m 4s)` → 64)。まだタイマーが出ていなければ None
+    /// Elapsed seconds (`(1m 4s)` → 64). None while the timer isn't shown yet
     pub seconds: Option<u32>,
-    /// 印字のままのトークン数(例 `876` / `1.6k`)
+    /// Token count as printed (e.g. `876` / `1.6k`)
     pub tokens: Option<String>,
-    /// トークン数の矢印(`↑` / `↓`)
+    /// Token count arrow (`↑` / `↓`)
     pub tokens_dir: Option<char>,
-    /// スピナー直下のバー行から読んだ完了率(0–100)
+    /// Completion percentage (0–100) read from the bar line right below the spinner
     pub percent: Option<u8>,
 }
 
-/// コードを投げた**後**の pane の判定。
+/// Reading of the pane **after** the code was sent.
 #[derive(Debug, PartialEq, Eq)]
 pub enum LoginOutcome {
     Success,
@@ -247,24 +247,23 @@ pub enum LoginOutcome {
     Pending,
 }
 
-/// 圧縮の結末。**文面は持たない** — 何と言うかは Bridge が決める。
+/// How a compaction ended. **Holds no wording** — what to say is up to the Bridge.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CompactOutcome {
     Done,
-    /// 履歴が短くて圧縮するものが無かった。
+    /// The history was too short to have anything to compact.
     Nothing,
     Failed,
 }
 
-/// headless probe の失敗2種。**Owner に返す文言が変わる**ので型で分ける。
+/// The two ways a headless probe fails. **The wording returned to the Owner differs**, so they are separate types.
 ///
-/// 現行は「走ったが答えなかった」を `{kind:'failed'}` で、「そもそも
-/// 起動できなかった」を外側の catch で受け、Owner に返す文言を分ける
-/// 再試行を勧めてよいのは前者だけ。
+/// "Ran but didn't answer" and "couldn't start at all" get different wording for the Owner;
+/// only the former may suggest a retry.
 pub enum ProbeErr {
-    /// 非0 終了 / 60秒タイムアウト
+    /// Non-zero exit / 60-second timeout
     Failed(String),
-    /// spawn できない(実体が PATH に無い等)
+    /// Couldn't spawn (the implementation isn't on PATH, etc.)
     Errored(String),
 }
 
@@ -575,12 +574,12 @@ mod tests {
 
     #[test]
     fn worker_window_name_is_w_plus_the_sanitized_session_id() {
-        // 普通の session_id(英数と `-`)はそのまま頭に `w-` が付くだけ
+        // An ordinary session_id (alphanumerics and `-`) just gets `w-` prefixed
         assert_eq!(
             SessionId::from("18c6a2a8-be4e-4a80-8000-8b08be4e7a80").window_name(),
             "w-18c6a2a8-be4e-4a80-8000-8b08be4e7a80"
         );
-        // `[^A-Za-z0-9_-]` は1文字ずつ `-` に
+        // Each `[^A-Za-z0-9_-]` character becomes `-`
         assert_eq!(
             SessionId::from("a:b.c/d e_f").window_name(),
             "w-a-b-c-d-e_f"
@@ -622,13 +621,13 @@ mod tests {
              message_id=\"171.002\" user=\"U1\" user_id=\"U1\" ts=\"2026-07-28T00:00:00.000Z\" \
              thread_ts=\"171.001\">\nhello\nworld\n</channel>"
         );
-        // 現行 `if (threadTs) meta.thread_ts = threadTs` — 無いときは属性ごと出さない
+        // No thread_ts means no attribute at all
         let bare = Envelope {
             thread_ts: None,
             ..e
         };
         assert!(!bare.render().contains("thread_ts"));
-        // 添付が無ければ file_* も属性ごと出さない
+        // Without attachments, the file_* attributes are left out entirely
         assert!(!bare.render().contains("file_"));
     }
 
@@ -647,7 +646,7 @@ mod tests {
         .render()
     }
 
-    /// ループ遮断が立った配達にだけ属性が付く。呼ぶ相手が居なければ印だけ。
+    /// The attribute is only on deliveries where the loop guard tripped. With nobody to call, just the mark.
     #[test]
     fn the_loop_guard_rides_the_envelope_only_when_it_tripped() {
         let env = |guard: Option<&str>| {
@@ -673,7 +672,7 @@ mod tests {
 
     #[test]
     fn envelope_carries_downloaded_attachments() {
-        // file_count は**成功した**ダウンロード数、file_paths はカンマ結合
+        // file_count is the number of **successful** downloads, file_paths is comma-joined
         let out = envelope_with(vec!["/i/a.png".into(), "/i/b.png".into()], Vec::new());
         assert!(
             out.contains(
@@ -686,7 +685,7 @@ mod tests {
 
     #[test]
     fn envelope_carries_failure_notes_without_paths() {
-        // 1つも落とせなくても本文は配る — 劣化ノートだけが載る
+        // Even when nothing could be downloaded the text is delivered — only the degradation note is attached
         let note = "[attachment shot.png not downloaded: file too large]".to_string();
         let out = envelope_with(Vec::new(), vec![note.clone()]);
         assert!(out.contains(&format!(" file_errors=\"{note}\">")), "{out}");
@@ -695,7 +694,7 @@ mod tests {
 
     #[test]
     fn envelope_mixes_successes_and_failures() {
-        // 属性の並びは現行の meta 挿入順 — file_count, file_paths, file_errors
+        // Attribute order is the meta insertion order — file_count, file_paths, file_errors
         let out = envelope_with(
             vec!["/i/a.png".into()],
             vec!["[attachment b.png not downloaded: boom]".into()],
@@ -707,7 +706,7 @@ mod tests {
             ),
             "{out}"
         );
-        // 複数ノートは改行結合(meta.file_errors = fileErrors.join('\n'))
+        // Multiple notes are joined with newlines
         let two = envelope_with(Vec::new(), vec!["[a]".into(), "[b]".into()]);
         assert!(two.contains("file_errors=\"[a]\n[b]\">"), "{two}");
     }

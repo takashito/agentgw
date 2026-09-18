@@ -1,12 +1,12 @@
-//! Bridge — Slack とエージェントの間に座る本体。このファイルは**組み立ての起点**だけを持つ:
-//! `Bridge` の構造体、外の世界を受け取る [`Deps`](Slack・エージェント・時計 — [`crate::chat::Chat`]・[`crate::agent::Agent`]・[`state::Clock`])、
-//! `run()`(配線と select ループ)、起動・停止・再起動。
+//! Bridge — the core that sits between Slack and the agent. This file holds only **the starting point of the assembly**:
+//! the `Bridge` struct, [`Deps`] for receiving the outside world (Slack, the agent, the clock — [`crate::chat::Chat`], [`crate::agent::Agent`], [`state::Clock`]),
+//! `run()` (wiring and the select loop), and start-up, shutdown and restart.
 //!
-//! 機能ごとの `impl Bridge` は子モジュールに1つずつ:
-//! [`inbound`](crate::bridge::inbound)(受信と門)/ [`turn`](crate::bridge::turn)(hook・ターン・許可・沈黙の見張り・進捗)/
-//! [`worker`](crate::bridge::worker)(エージェントの起動・在庫・回収)/ [`command`](crate::bridge::command)(コマンドの解釈と実行)。
-//! ディスクに残る状態とログは [`state`]、
-//! ゲートウェイ側は [`gateway`]、マシン側の接続は [`machine`]。
+//! Each feature's `impl Bridge` lives in its own child module:
+//! [`inbound`](crate::bridge::inbound) (receiving and gates) / [`turn`](crate::bridge::turn) (hooks, turns, permissions, the silence watch, progress) /
+//! [`worker`](crate::bridge::worker) (starting agents, the pool, recovery) / [`command`](crate::bridge::command) (parsing and running commands).
+//! State and logs kept on disk are in [`state`],
+//! the gateway side in [`gateway`], and the machine side of the connection in [`machine`].
 
 pub mod command;
 pub mod machine;
@@ -31,15 +31,15 @@ use std::time::Duration;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
-/// 付箋を Slack に反映する間隔。board 側が別途スレッド単位で1秒スロットルする。
+/// How often progress messages are pushed to Slack. The board also throttles to once a second per thread on its own.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 
-/// 未応答を抱えたスレッドに残す一言。
+/// The note left in threads with unanswered messages.
 ///
-/// **Bun 原文から意図的に逸脱**: 原文は「再起動後に残りの処理を自動で
-/// 再開します」だが、Rust の restart が降ろすのは Bridge だけで、ワーカーも在庫も畳まない
-/// (後継が継承する)。止めていないものを「再開する」と言うのは二重に嘘 — 自動再開の仕組みも
-/// まだ無い(`maintenance_restart` の ponytail 注記)。事実だけを言う。
+/// **Deliberately differs from the original wording**, which said "the remaining work resumes automatically
+/// after the restart". A restart only takes down the Bridge; agents and the pool are not torn down
+/// (the successor inherits them). Saying "resume" for something never stopped is doubly false — and there's
+/// no auto-resume mechanism yet either (see the ponytail note on `maintenance_restart`). State only the facts.
 fn restart_notice() -> String {
     crate::t!(
         "🙏 agentgw is restarting for a few seconds. Running agents aren't stopped, so their work continues.",
@@ -47,56 +47,56 @@ fn restart_notice() -> String {
     )
 }
 
-/// main ループが握る可変状態ひとまとめ。select の各腕はここのメソッドを呼ぶだけ。
+/// All the mutable state the main loop holds. Each select arm just calls a method here.
 pub struct Bridge {
     /// The outside world: Slack, the agent, the clock and the state directory.
     deps: Deps,
     access: bridge::Access,
     threads: bridge::Threads,
-    /// cwd → 在庫に指名したセッション(pools.json)。**実体ではなく指名**なので Bridge を
-    /// またいで残る。在庫を起こすときはここを見て `--resume` / 新規を決める。
+    /// cwd → the session nominated for the pool (pools.json). **A nomination, not the process itself**, so it
+    /// survives across Bridges. When starting a pool agent, this decides `--resume` or new.
     pools: bridge::Pools,
     dedup: inbound::RecentDeliveries,
-    /// 生きているワーカーと在庫の台帳。
+    /// Ledger of live agents and the pool.
     workers: worker::Workers,
-    /// 配達待ち(まだワーカーが暖まっていないスレッドの queue)。台帳ではないので Bridge 側。
-    /// **root_ts** → 配達待ちの本文。スレッド鍵ではない(ワーカーがまだ暖まっていない
-    /// 間に溜める queue で、引くのは常に同じチャンネルの中)。
+    /// Waiting for delivery (the queue of threads whose agent isn't warm yet). Not a ledger, so it lives in the Bridge.
+    /// **root_ts** → the texts waiting for delivery. Not a thread key (it's the queue that fills while the agent
+    /// isn't warm yet, and lookups always happen within the same channel).
     pending: HashMap<String, Vec<InboundMsg>>,
     lifecycle: bridge::Lifecycle,
     ledger: bridge::Ledger,
     sticky: slack::StickyBoard,
-    /// 人のクリック待ちのツール許可。reqId → 待っているワーカーと、消すべきプロンプト。
+    /// Tool permissions waiting for a person's click. reqId → the waiting agent and the prompt to delete.
     perm_pending: HashMap<String, PermPending>,
-    /// `thread_key\0message_id` → まだ final が来ていない narration の断片。
+    /// `thread_key\0message_id` → narration fragments whose final hasn't arrived yet.
     narration: HashMap<String, String>,
     hooks_file: String,
     mcp_port: u16,
     mcp_token: String,
-    /// 自分の Slack user id。本文コマンドは自 mention を剥がしてから判定する。
-    /// auth.test が落ちた起動では None(mention 付きのコマンドが素通しになるだけ)。
+    /// Our own Slack user id. Text commands are checked after stripping our own mention.
+    /// None on a start where auth.test failed (commands with a mention just pass through).
     bot_user_id: Option<String>,
-    /// この Bridge が聞き始めた時刻。これより前に投稿されたコマンドは手遅れ。
+    /// When this Bridge started listening. Commands posted before then are too late.
     started_at_ms: u64,
-    /// spawn したサインイン・サインアウトが状態変更を戻してくる口。
+    /// Where spawned sign-in / sign-out tasks send back their state changes.
     cmd_tx: mpsc::Sender<CmdFx>,
-    /// 進行中のサインイン・サインアウト([`command::SignIn`])。
+    /// The sign-in / sign-out in progress ([`command::SignIn`]).
     sign_in: command::SignIn,
-    /// 再起動を始めたか。exit(0) までの数百 ms を二重に走らせないための札
+    /// Whether a restart has begun. A flag so the few hundred ms until exit(0) don't run twice
     restarting: bool,
-    /// usage 上限のリセット時刻(epoch ms)。いまの時刻がこれを下回る間は新規配達を遮断する。
-    /// 0 = ゲート開放。実際に埋めるのは定期ポーリング。
+    /// Reset time of the usage limit (epoch ms). While now is below it, new deliveries are blocked.
+    /// 0 = gate open. The periodic polling is what actually fills it.
     limited_until_ms: u64,
-    /// 上限の見張り。最後に `/usage` を読んだ時刻・上限が見込まれるか・
-    /// どこまで警告したか。
+    /// The usage-limit watch: when `/usage` was last read, whether the limit is expected,
+    /// and how far warnings have gone.
     usage_polled_at_ms: u64,
     usage_at_risk: bool,
     usage_warned_pct: u32,
-    /// 沈黙見張り(現行の `armWatchdog` / `showStall`)。`thread_key` → [`Stall`]。
+    /// The silence watch (`armWatchdog` / `showStall`). `thread_key` → [`Stall`].
     stall: HashMap<ThreadKey, Stall>,
-    /// 子を迎える口を持っているか。`help` に `route` の節を出すかだけに使う
-    /// (実行するのは `relay::CommandCtx::route`。持っていないマシンで一覧に出しても
-    /// 振り分ける相手が居ない)。
+    /// Whether this has a port for machines to connect to. Only used to decide whether `help` shows the `route` section
+    /// (running it is `relay::CommandCtx::route`. Listing it on a machine without one leaves
+    /// nobody to route to).
     fleet: bool,
     /// This machine's name as the gateway knows it (`route <name>`); the hostname if unset.
     machine_name: String,
@@ -128,7 +128,7 @@ struct Config {
 impl Bridge {
     /// Loads the state files from `deps.dir`; everything else starts empty.
     fn new(deps: Deps, config: Config) -> Bridge {
-        // 台帳は threads.json の中(entry の `inflight`)なので、読んだ後に組み立てる
+        // The ledger lives inside threads.json (the entry's `inflight`), so build it after reading
         let threads = bridge::Threads::load(&deps.dir);
         Bridge {
             ledger: bridge::Ledger::load(&threads),
@@ -177,15 +177,15 @@ impl Bridge {
         (Bridge::new(deps, config), cmd_rx)
     }
 
-    /// 起動/終了の home 通知を1回投げる。**失敗はログだけ**
-    /// 起動シーケンスも restart も止めない。DM フォールバックは未実装(沈黙はしない)。
-    /// home に「online」を出す。**起動のときと、親との link を張り直したとき**の両方で使う
-    /// (子にとって「繋がった」を人に知らせるのはこの1行だけ — 親側の presence は 🔴 だけを言う)。
+    /// Posts one start / stop notice to home. **Failures are only logged**;
+    /// they stop neither start-up nor restart. No DM fallback yet (but no silence either).
+    /// Posts "online" to home. Used both **at start-up and when the link to the gateway is re-established**
+    /// (for a machine this one line is the only way to tell a person "connected" — the gateway's presence only reports 🔴).
     async fn announce_online(&mut self, connected_as: &str) {
         let pools: Vec<String> = self.access.pool_targets(&Host::home());
         let text = online_notice(
             &Host::name().await,
-            // 人が読む通知なので**名前**を出す(現行と同じ)
+            // A notice for people to read, so show the **name**
             connected_as,
             env!("CARGO_PKG_VERSION"),
             &pools,
@@ -204,8 +204,8 @@ impl Bridge {
                 )
                 .await;
             }
-            // home チャンネルが無ければ Owner の DM に落とす。
-            // DM は開き直しても同じ id が返るので、その場で開いて投げる
+            // Without a home channel, fall back to the Owner's DM.
+            // Reopening a DM returns the same id, so open it on the spot and post
             bridge::NoticeTarget::OwnerDm(owner) => match self.deps.slack.open_dm(&owner).await {
                 Ok(ch) => {
                     slack::Api::brief_call(
@@ -227,17 +227,17 @@ impl Bridge {
         }
     }
 
-    /// `restart`(簡約)。この Bridge を
-    /// **降ろす**のが仕事 — 起こし直すのは supervisor で、チェックリストは後継が閉じる。
+    /// `restart` (simplified). The job is to **take down** this
+    /// Bridge — the supervisor starts it again, and the successor closes the checklist.
     ///
-    /// `req` = 要求者スレッド `(channel, root_ts)`。Slack の `restart` は Some、運用者の
-    /// SIGUSR1 は None(答える相手が居ないので、チェックリストも thinking status も marker も
-    /// 出さない — の `req ? … : undefined` と同じ分岐)。
+    /// `req` = the requester's thread `(channel, root_ts)`. Some for Slack's `restart`, None for an operator's
+    /// SIGUSR1 (there's nobody to answer, so no checklist, no thinking status, no marker
+    /// — the same branch as `req ? … : undefined`).
     ///
-    /// ponytail: プラグイン更新は持たない(Rust はバイナリ1個 — 差し替えは install script の仕事)。
-    /// 未応答は「予告を出して置いていく」— 自動再開はまだ無いので、続きは Owner が押し直す
+    /// ponytail: no plugin updating (Rust is a single binary — replacing it is the install script's job).
+    /// Unanswered messages are "announced and left behind" — there's no auto-resume yet, so the Owner re-sends to continue
     async fn maintenance_restart(&mut self, source: &str, req: Option<(&str, &str)>, ctx: &LogCtx) {
-        // select の1腕は最後まで走るので今の実装で2本目は入らないが、順序の約束として置く
+        // A select arm runs to completion, so a second one can't get in with the current code, but keep this as an ordering promise
         if self.restarting {
             ctx.info(
                 "bridge",
@@ -246,8 +246,8 @@ impl Bridge {
             return;
         }
         self.restarting = true;
-        // exit(0) は Drop を走らせない — restart だけは slack::Thinking guard を使わず、
-        // set も clear も**その場で await** する(投げっぱなしだと exitがタスクごと殺す)
+        // exit(0) doesn't run Drop — restart alone skips the slack::Thinking guard and
+        // **awaits** both set and clear on the spot (fire-and-forget would be killed along with its task by exit)
         if let Some((channel, root_ts)) = req {
             slack::Api::brief_call(
                 "restart: thinking status set failed",
@@ -257,8 +257,8 @@ impl Bridge {
             )
             .await;
         }
-        // (a) 進捗チェックリストを1本投稿して ts を控える(以後これを編集し続ける)。**投稿に
-        // 失敗しても再起動は止めない** — 表は飾り
+        // (a) Post one progress checklist and note its ts (it's edited from then on). **A failed post
+        // doesn't stop the restart** — the list is decoration
         let progress_ts = match req {
             Some((channel, root_ts)) => {
                 let first = RestartPhase::Received.render(None);
@@ -276,7 +276,7 @@ impl Bridge {
             "bridge",
             &format!("maintenance restart triggered ({source})"),
         );
-        // (b) まだ返事を借りているスレッドには断りを入れる
+        // (b) Tell threads still owed a reply
         for key in self.ledger.pending_keys() {
             let (channel, thread) = key.split();
             slack::Api::brief_call(
@@ -287,9 +287,9 @@ impl Bridge {
             )
             .await;
         }
-        // (c) 後継への引き継ぎ。これが無いとチェックリストは「◌ …」のまま凍る。
-        //     要求者が居ないときは書かない — ✅ を返す宛先が無いのに marker を残すと、
-        // 後の無関係な起動が拾って的外れな「完了」を出す(不変条件)
+        // (c) The handoff to the successor. Without it the checklist freezes at "◌ …".
+        //     Not written when there's no requester — leaving a marker with nowhere to send ✅
+        // makes a later, unrelated start pick it up and post a bogus "done" (invariant)
         if let Some((channel, root_ts)) = req {
             let marker = serde_json::json!({
                 "channel": channel,
@@ -306,10 +306,10 @@ impl Bridge {
                     )),
             }
         }
-        // (d) 降りることを home に1回知らせる(後継が online 通知を出す)
+        // (d) Tell home once that we're going down (the successor posts the online notice)
         let offline = offline_notice(&Host::name().await, env!("CARGO_PKG_VERSION"), "restart");
         self.post_notice(&offline, ctx).await;
-        // (e) 「Bridge を停止」まで done にしてから降りる。後継が繋がるまでの数秒、表は凍る
+        // (e) Mark up to "stop the Bridge" as done before going down. The list freezes for the few seconds until the successor connects
         if let (Some((channel, _)), Some(ts)) = (req, &progress_ts) {
             let switching = RestartPhase::Switching.render(None);
             slack::Api::brief_call(
@@ -319,12 +319,12 @@ impl Bridge {
             )
             .await;
         }
-        // (f) 在庫は**畳まない**。畳むと後継が新しいセッションを切り直すことになり、
-        //     再起動のたびに使い捨ての在庫セッションが claude の履歴に積まれる。
-        //     後継は pools.json の指名を頼りに、生き残りを `restore_pools` で拾い直す
-        //     (死んでいた枠だけ同じ session_id を `--resume` で起こす)
-        // 降りる前に必ず消す。残すとこのスレッドの shimmer は誰にも消されず居座る
-        // (後継は自分が張っていない status を知らない)
+        // (f) The pool is **not torn down**. Tearing it down makes the successor start fresh sessions,
+        //     piling a throwaway pool session into claude's history on every restart.
+        //     The successor relies on the pools.json nominations to pick up survivors with `restore_pools`
+        //     (only dead slots are started with the same session_id via `--resume`)
+        // Always clear before going down. Left in place, this thread's shimmer lingers with nobody to clear it
+        // (the successor doesn't know about a status it didn't set)
         if let Some((channel, root_ts)) = req {
             slack::Api::brief_call(
                 "restart: thinking status clear failed",
@@ -337,26 +337,26 @@ impl Bridge {
             "bridge",
             "maintenance restart: stepping down now (the supervisor brings the successor up)",
         );
-        // 最後の tick 以降の変化を落としてから降りる — ワーカーは生き残るので、後継が
-        // 未応答を拾い直せないと、そのスレッドは見張りの外に落ちる
+        // Save changes since the last tick before going down — agents survive, so if the successor
+        // can't pick up the unanswered messages, those threads fall outside the watch
         self.save_ledger();
         self.flush_pending_to_disk(ctx);
         std::process::exit(0);
     }
 
-    /// 変異後の access を採用して落とす。以後の gate / resolve_repo_path はこれを読む
-    /// (保存に失敗しても採用はする — 今の答えと食い違う方が混乱する)。
+    /// Adopts the mutated access and saves it. From then on gate / resolve_repo_path read this
+    /// (adopted even if saving fails — disagreeing with the current answer would be more confusing).
     fn adopt_access(&mut self, access: bridge::Access, ctx: &LogCtx) {
         if let Err(e) = access.save(&self.deps.dir) {
             ctx.error("bridge", &format!("access.json save failed: {e}"));
         }
         self.access = access;
-        // 設定が変わったら在庫を**その場で**合わせる。次の死亡や再起動を待つと
-        // `warm off` が何も解放しないまま居座る
+        // When settings change, adjust the pool **right away**. Waiting for the next death or restart
+        // leaves `warm off` sitting there without releasing anything
         self.start_missing_pool_workers(ctx);
     }
 
-    /// Bridge 直答の1本。呼び手は待たない — Slack の返事は台帳の外の出来事。
+    /// One direct reply from the Bridge. The caller doesn't wait — Slack's answer happens outside the ledger.
     fn post(&self, channel: &str, thread_ts: &str, text: String, key: &ThreadKey) {
         let (api, channel, thread_ts, key) = (
             self.deps.slack.clone(),
@@ -369,13 +369,13 @@ impl Bridge {
         });
     }
 
-    /// SIGTERM / SIGINT — **本当に止める**。後継は来ない。
-    /// restart(SIGUSR1 / Slack の `restart`)と違い、ワーカーは1本も残さない:
-    /// Bridge の居ない claude + tmux 窓は誰にも掃除されない孤児になる。
+    /// SIGTERM / SIGINT — **really stop**. No successor comes.
+    /// Unlike restart (SIGUSR1 / Slack's `restart`), no agent is left running:
+    /// a claude + tmux window with no Bridge becomes an orphan nobody cleans up.
     ///
-    /// なお slack-morphism は Socket Mode を張ると自前で TERM_SIGNALS を握る
-    /// (tokio_clients_manager.rs:151-161 — debug ログを出すだけでプロセスを終わらせない)。
-    /// signal-hook のレジストリは1シグナルに複数の受け手を許すので、この腕とは共存する。
+    /// Note that slack-morphism grabs TERM_SIGNALS itself once Socket Mode is up
+    /// (tokio_clients_manager.rs:151-161 — it just logs at debug and doesn't end the process).
+    /// signal-hook's registry allows several receivers per signal, so it coexists with this arm.
     async fn shutdown(&mut self, reason: &str) -> ! {
         let ctx = LogCtx::default();
         ctx.info(
@@ -383,17 +383,17 @@ impl Bridge {
             &format!("shutting down ({reason}) pid={}", std::process::id()),
         );
         eprintln!("slack bridge: shutting down ({reason})");
-        // 下のどれかが詰まっても必ず降りる(5秒)。
-        // teardown 側は tmux の SIGTERM 猶予を待つので、これが唯一の上限
+        // Always go down (5 seconds), even if something below gets stuck.
+        // Teardown waits out tmux's SIGTERM grace, so this is the only upper bound
         tokio::spawn(async {
             tokio::time::sleep(Duration::from_secs(5)).await;
             std::process::exit(0);
         });
-        // offline を**先に**出す。teardown は数秒かかるので、後回しにすると
-        // 上のハード exit に食われて通知が落ちる(同じ事故を書いている)
+        // Post offline **first**. Teardown takes seconds, so leaving it for later
+        // gets the notice eaten by the hard exit above (the same accident is noted there)
         let offline = offline_notice(&Host::name().await, env!("CARGO_PKG_VERSION"), reason);
         self.post_notice(&offline, &ctx).await;
-        // 畳む前に逃がす — ワーカーごと落とすので、queue に残った依頼はここでしか救えない
+        // Save them before tearing down — agents go down with it, so requests left in the queue can only be rescued here
         self.flush_pending_to_disk(&ctx);
         self.save_ledger();
         self.teardown_all_workers("shutdown", "", &ctx).await;
@@ -401,8 +401,8 @@ impl Bridge {
         std::process::exit(0);
     }
 
-    /// SIGHUP。access.json / threads.json は**メモリ側が正**なので、
-    /// 手で編集したものを取り込む口はここだけ。
+    /// SIGHUP. access.json / threads.json are **authoritative in memory**, so
+    /// this is the only way to take in hand edits.
     fn reload_from_disk(&mut self) {
         let ctx = LogCtx::default();
         let access = bridge::Access::load(&self.deps.dir);
@@ -414,16 +414,16 @@ impl Bridge {
         );
     }
 
-    /// 配線して select ループを回す。シグナル契約は
-    /// SIGTERM/SIGINT=graceful shutdown / SIGUSR1=maintenance restart / SIGHUP=再読込。
+    /// Wires things up and runs the select loop. The signal contract is
+    /// SIGTERM/SIGINT=graceful shutdown / SIGUSR1=maintenance restart / SIGHUP=reload.
     pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let dir = bridge::StateDir::resolve();
         for (k, v) in dir.load_env()? {
-            // 起動時・spawn 前の単スレッド区間なので安全
+            // Safe: single-threaded section at start-up, before any spawn
             unsafe { std::env::set_var(k, v) };
         }
-        // 上流(直結か親経由か)と下流(子を迎えるか)。**両方揃った設定は起動しない**
-        // (黙って両方繋ぐと Slack が負荷分散を始め、split-brain がそのまま戻る)
+        // Upstream (direct or via the gateway) and downstream (accepting machines). **A config with both doesn't start**
+        // (silently connecting both makes Slack start load-balancing, bringing split-brain straight back)
         let wiring = machine::Wiring::resolve(|k| std::env::var(k).ok())?;
         let mode = wiring.upstream.clone();
         LogCtx::default().info(
@@ -433,12 +433,12 @@ impl Bridge {
 
         let (msg_tx, mut msg_rx) = mpsc::channel(64);
         let (click_tx, mut click_rx) = mpsc::channel(16);
-        // 聞き始める**前**に打つ。この後ろで取ると、接続と
-        // auth.test にかかった数百 ms の間に届いた生きたコマンドが「起動前の投稿」に見えて黙って落ちる
+        // Take it **before** starting to listen. Taken after, live commands that arrived during the few hundred ms of
+        // connecting and auth.test look like "posted before start-up" and are silently dropped
         let started_at_ms = Host::now_ms();
 
-        // Relay 経由では bot トークンが**握手で来る**ので、Api はその後にしか作れない。
-        // ここが直結との唯一の順序の違い。
+        // Via Relay the bot token **comes in the handshake**, so the Api can only be built after it.
+        // This is the only ordering difference from a direct connection.
         let (bot_token, link_home, relay_rx) = match &mode {
             machine::Mode::Direct { bot_token, .. } => (bot_token.clone(), None, None),
             machine::Mode::Relay {
@@ -452,17 +452,17 @@ impl Bridge {
                     let l = l.clone();
                     async move { l.run(tx).await }
                 });
-                // 最初の Ready が来るまでは Slack に何も書けない。**待つ**
+                // Nothing can be written to Slack until the first Ready. **Wait**
                 let (token, home) = loop {
                     match rx.recv().await {
                         Some(machine::FromRelay::Ready { bot_token, home }) => {
                             break (bot_token, home);
                         }
-                        // **握手を断られても落ちない。** 落ちると supervisor がすぐ起こし直し、
-                        // その連打が systemd の起動レート制限(既定 10秒に5回)を踏んで
-                        // unit を `failed` のまま置き去りにする — デプロイ中の一瞬の 401 で
-                        // 子が恒久的に上がってこなくなる(2026-08-03、子が5時間15分停止)。
-                        // `RelayLink::run` は間を空けて繋ぎ直し続けるので、ここでは待つ
+                        // **Don't exit when the handshake is refused.** Exiting makes the supervisor restart at once,
+                        // and that hammering trips systemd's start rate limit (default 5 in 10 seconds),
+                        // leaving the unit `failed` — a momentary 401 during a deploy
+                        // keeps a machine down for good (2026-08-03, a machine stopped for 5 hours 15 minutes).
+                        // `RelayLink::run` keeps reconnecting with pauses in between, so just wait here
                         Some(machine::FromRelay::Fatal(f)) => {
                             LogCtx::default().error(
                                 "bridge",
@@ -470,13 +470,13 @@ impl Bridge {
                             );
                             continue;
                         }
-                        Some(_) => continue, // 受理前に何か来ても捨てる
+                        Some(_) => continue, // anything arriving before acceptance is dropped
                         None => return Err("relay link ended before the handshake".into()),
                     }
                 };
                 (token, home, Some(rx))
             }
-            // 親が迎えに来る。**待つのは同じ** — 最初の Ready まで Slack には何も書けない
+            // The gateway comes to us. **Waiting is the same** — nothing can be written to Slack until the first Ready
             machine::Mode::AwaitParent => {
                 let Some(listen) = wiring.inlet.clone() else {
                     return Err("AGENTGW_LINK_LISTEN is not set, so the gateway has nowhere to connect".into());
@@ -499,8 +499,8 @@ impl Bridge {
                 (token, home, Some(rx))
             }
         };
-        // 握手の1本目に載っている home をここで反映する。この後 `Access::load` で読み直すので、
-        // 起動通知(online)は最初から親と同じチャンネルに出る
+        // Apply the home carried in the first handshake here. `Access::load` rereads it after this,
+        // so the start-up notice (online) goes to the same channel as the gateway's from the start
         adopt_home(&dir, link_home);
 
         let api: crate::chat::ChatRef = Arc::new(slack::Api::new(&bot_token)?);
@@ -521,15 +521,15 @@ impl Bridge {
         let hooks_file = hooks_file.to_string_lossy().to_string();
         let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
         let (reload_tx, mut reload_rx) = mpsc::channel(4);
-        // 親との link を張り直したときの合図(子だけが使う)
+        // The signal that the link to the gateway was re-established (only machines use it)
         let (relink_tx, mut relink_rx) = mpsc::channel(4);
         consume_restart_marker(&dir, api.as_ref()).await;
 
-        // 子を迎えるなら、Slack のイベントは**畳む前に**こちらへ回す。誰の担当かを決めてから、
-        // 自分の分だけ msg_tx / click_tx に戻る(= ローカル配達は直結と同じ変換を通る)
+        // When accepting machines, Slack events go here **before being folded**. Once it's decided whose they are,
+        // only our own share goes back to msg_tx / click_tx (= local delivery goes through the same conversion as a direct connection)
         let fleet = wiring.children.map(|listen| {
-            // loopback の外に出したなら1行残す。**拒否はしない**(2026-08-02 の判断)が、
-            // 前段の TLS を忘れたまま動いている Bridge は、ログにも痕跡が無いと気づけない
+            // If exposed beyond loopback, leave one line. **Not refused** (decided 2026-08-02), but
+            // a Bridge running without the TLS in front can't be noticed if the log shows no trace either
             if listen.is_exposed() {
                 LogCtx::default().info(
                     "bridge",
@@ -564,7 +564,7 @@ impl Bridge {
             tokio::spawn(fleet.clone().watch_presence());
             fleet
         });
-        // 親が NAT の内側にいる構成でだけ、こちらから子へ迎えに行く
+        // Only when the gateway is behind NAT do we go out to fetch the machine
         if let Some(fleet) = &fleet
             && let Ok(raw) = std::env::var("AGENTGW_CHILD_URLS")
         {
@@ -585,12 +585,12 @@ impl Bridge {
                 fleet.dial_children(targets);
             }
         }
-        // 直結で届かない子には、親が ssh トンネルを張る(`add-child` が書く一覧)。
-        // **agentgw の子プロセスとして持つ** — 動いている間だけ繋がっていればよい
+        // For machines a direct connection can't reach, the gateway opens an ssh tunnel (the list `add-child` writes).
+        // **Held as a child process of agentgw** — it only needs to be connected while running
         if let Some(fleet) = &fleet
             && let Ok(raw) = std::env::var("AGENTGW_TUNNELS")
         {
-            // 出口は親の口。0.0.0.0 で待っていても、トンネルの出口は loopback で足りる
+            // The exit is the gateway's port. Even listening on 0.0.0.0, loopback is enough for the tunnel's exit
             let port = std::env::var("AGENTGW_LINK_LISTEN")
                 .ok()
                 .and_then(|l| l.rsplit(':').next().map(str::to_string))
@@ -624,8 +624,8 @@ impl Bridge {
                     }
                 });
             }
-            // 親経由(こちらから dial / 迎えに来てもらう のどちらでも)。**同じ2本に
-            // 流し込む**ので、この下流は1行も変わらない
+            // Via the gateway (whether we dial or it comes to fetch us). **Fed into the same two
+            // channels**, so not one line downstream changes
             (machine::Mode::Relay { .. } | machine::Mode::AwaitParent, Some(mut rx)) => {
                 let dir2 = dir.clone();
                 let reload = reload_tx.clone();
@@ -644,7 +644,7 @@ impl Bridge {
         if bridge::Access::load(&dir).owner.is_empty() {
             LogCtx::default().info("bridge", "no owner in access.json — serving nobody");
         }
-        // 起動時に1回だけ訊く。落ちても起動は止めない — コマンド判定が mention 抜きの形だけになる
+        // Asked once at start-up. A failure doesn't stop start-up — command checks just only match the form without a mention
         let (bot_user_id, bot_name) = match api.auth_test().await {
             Ok((id, name)) => {
                 LogCtx::default().info(
@@ -660,7 +660,7 @@ impl Bridge {
                 (None, None)
             }
         };
-        // フリートのコマンド判定にも同じ id が要る(`@ボット route …`)
+        // Fleet command checks need the same id (`@bot route …`)
         if let Some(fleet) = &fleet {
             *fleet.bot_user_id.lock().await = bot_user_id.clone();
         }
@@ -685,27 +685,27 @@ impl Bridge {
                 cmd_tx,
             },
         );
-        // 前の Bridge が落ちる前に残した login セッションを掃く
+        // Sweep login sessions the previous Bridge left before going down
         b.deps.agent.login_kill();
-        // 再起動でも Owner は access.json に残る。restart は在庫を畳まずに降りるので、
-        // まず生き残りを拾い直し(restore_pools)、欠けた枠だけを起こす。指名済みの
-        // セッションがある枠は新規 ID ではなく `--resume` で立ち上がる
+        // The Owner stays in access.json across restarts. restart goes down without tearing down the pool,
+        // so first pick up survivors (restore_pools) and start only the missing slots. Slots with a nominated
+        // session come up with `--resume`, not a new ID
         if !b.access.owner.is_empty() {
             b.restore_pools(&LogCtx::default()).await;
             b.start_missing_pool_workers(&LogCtx::default());
         }
-        // 前プロセスが答えを待っていたスレッドを拾い直す(生きているワーカーの分だけ)
+        // Pick up threads the previous process was waiting to answer (only those with live agents)
         b.restore_pending(&LogCtx::default());
-        // 渡しそびれた依頼を配り直す(ワーカーが居なければ起こして渡す)
+        // Re-deliver requests that never got handed over (start an agent to hand them to if there is none)
         b.resume_pending_from_disk().await;
-        // 起動を home に1回知らせる。pending は常に 0 — Rust 版は未完スレッドの自動再開を持たない
+        // Tell home once about the start. pending is always 0 — the Rust version has no auto-resume of unfinished threads
         let online_as = bot_name
             .or_else(|| b.bot_user_id.clone())
             .unwrap_or_else(|| "?".to_string());
         b.announce_online(&online_as).await;
-        // tokio の signal は features = ["full"] に含まれる(依存は増えない)。
-        // slack-morphism が signal-hook で TERM_SIGNALS を先に握っているが、レジストリは
-        // 1シグナルに複数の受け手を許すので両方に配送される
+        // tokio's signal is in features = ["full"] (no new dependency).
+        // slack-morphism grabs TERM_SIGNALS first via signal-hook, but the registry
+        // allows several receivers per signal, so both get it
         let mut sigterm = signal(SignalKind::terminate())?;
         let mut sigint = signal(SignalKind::interrupt())?;
         let mut sighup = signal(SignalKind::hangup())?;
@@ -716,7 +716,7 @@ impl Bridge {
             tokio::select! {
                 Some(msg) = msg_rx.recv() => b.on_inbound(&msg).await,
                 Some(ev) = hook_rx.recv() => b.on_hook(ev).await,
-                // 詰まると MCP ツール呼び出しごとワーカーが固まる — 必ず引き取る
+                // If this clogs, agents freeze on every MCP tool call — always take it
                 Some(d) = dispo_rx.recv() => b.on_disposition(d).await,
                 Some(fx) = cmd_rx.recv() => b.on_cmd_fx(fx).await,
                 Some(c) = click_rx.recv() => b.on_perm_click(c).await,
@@ -736,14 +736,14 @@ impl Bridge {
                 _ = sigterm.recv() => b.shutdown("signal:SIGTERM").await,
                 _ = sigint.recv() => b.shutdown("signal:SIGINT").await,
                 _ = sighup.recv() => b.reload_from_disk(),
-                // フリート側が access.json を書いた(route / set-home / owner)。SIGHUP と同じ
+                // The fleet side wrote access.json (route / set-home / owner). Same as SIGHUP
                 Some(()) = reload_rx.recv() => b.reload_from_disk(),
-                // 親との link を張り直した。**もう一度 online を出す** — 子にとって
-                // 「繋がった」を人に知らせるのはこの1行しかない(親側の presence は
-                // 🔴 だけを言う。2か所で同じことを言わない)
+                // The link to the gateway was re-established. **Post online again** — for a machine
+                // this one line is the only way to tell a person "connected" (the gateway's presence
+                // only reports 🔴. Don't say the same thing in two places)
                 Some(()) = relink_rx.recv() => b.announce_online(&online_as).await,
-                // 運用者からの再起動要求。Slack の `restart` と同じ経路に合流し、
-                // 要求者スレッドが無いぶんだけチェックリスト・status・marker を省く
+                // A restart request from the operator. Joins the same path as Slack's `restart`,
+                // skipping the checklist, status and marker since there's no requester thread
                 _ = sigusr1.recv() => b.maintenance_restart("SIGUSR1", None, &LogCtx::default()).await,
                 else => break,
             }
@@ -752,9 +752,9 @@ impl Bridge {
     }
 }
 
-/// 前のプロセスが `restart` で降りるときに残したマーカーを**消費**する(読んで消す)。
-/// 残すと、次の起動が身に覚えの無い「✅ 再起動が完了しました」を出す。
-/// 中断スレッドの自動再開はこの実装に無いので、再開の行は 0 件で閉じる。
+/// **Consumes** the marker the previous process left when going down with `restart` (read, then delete).
+/// Left in place, the next start would post an unexplained "✅ restart complete".
+/// This implementation has no auto-resume of interrupted threads, so the resume line closes with 0 entries.
 async fn consume_restart_marker(dir: &bridge::StateDir, api: &dyn crate::chat::Chat) {
     let ctx = LogCtx::default();
     let path = dir.restart_marker();
@@ -790,12 +790,12 @@ async fn consume_restart_marker(dir: &bridge::StateDir, api: &dyn crate::chat::C
     }
 }
 
-/// このマシンについて外のコマンドに訊くこと。
+/// What to ask outside commands about this machine.
 pub struct Host;
 
 impl Host {
-    /// home 通知に出すホスト名を `hostname` 1回で取る(`now_wallclock` と同じ流儀)。
-    /// 飾りなので失敗しても落とさない — `unknown` で通す。
+    /// Gets the host name for home notices with a single `hostname` (same approach as `now_wallclock`).
+    /// It's decoration, so failures don't bring anything down — `unknown` is used.
     pub async fn name() -> String {
         let out = tokio::process::Command::new("hostname").output().await;
         match out {
@@ -811,13 +811,13 @@ impl Host {
         }
     }
 
-    /// ルート未設定のチャンネル / DM のワーカーが立つ場所。**pwd と spawn は同じこれを読む**
-    /// (usage の probe・context/resume の cwd フォールバック・login セッションの `-c` も全部ここ)。
-    /// 現行の`workerHomeOf` = `access.workerHome ?? homedir()` — Bridge を
-    /// どこから起動したかで変わってはいけない。カレントに落ちるのは HOME が読めない時だけ。
+    /// Where agents for channels / DMs with no route stand. **pwd and spawn read this same value**
+    /// (usage probes, the cwd fallback for context/resume, and the login session's `-c` all come here too).
+    /// `workerHomeOf` = `access.workerHome ?? homedir()` — it must not change with where the Bridge
+    /// was started from. Falls back to the current directory only when HOME can't be read.
     ///
-    /// ponytail: `access.workerHome` の型付けはまだ無い(未知フィールドとして往復保存はされている)。
-    /// setup がそれを書き始めたら、ここで先に読む
+    /// ponytail: `access.workerHome` isn't typed yet (it's round-tripped as an unknown field).
+    /// Once setup starts writing it, read it here first
     pub fn home() -> String {
         match std::env::var("HOME") {
             Ok(h) if !h.is_empty() => h,
@@ -833,25 +833,25 @@ impl Host {
     }
 }
 
-/// Relay から来たものを、直結モードと**同じ2本の口**に流し込む。
+/// Feeds what comes from Relay into **the same two channels** as direct mode.
 ///
-/// ここが「Relay 経由」と「直結」の合流点。イベントは slack-morphism の型に戻してから
-/// `InboundMsg` にする — **変換ロジックを複製しない**のが要で、2本目を書くと、直結と
-/// Relay 経由で門番の判断がいつか食い違う。
+/// This is where "via Relay" and "direct" meet. Events are turned back into slack-morphism types and then
+/// into `InboundMsg` — the point is **not duplicating the conversion logic**: a second copy would sooner or later
+/// make the gates decide differently for direct and Relay.
 ///
-/// `reload` は「access.json を書いたから読み直せ」の合図。**書きっぱなしにすると、動いている
-/// Bridge は古い値(Owner 空)を見続けて、届いたものを全部 `no-owner` で捨てる** — 入口で
-/// 捨てるので Owner を直すコマンドも入らず、再起動するまで抜けられない(2026-08-02 実機で発生)。
+/// `reload` is the "access.json was written, reread it" signal. **Writing without it leaves a running
+/// Bridge looking at the old value (no Owner), dropping everything that arrives as `no-owner`** — since it's dropped
+/// at the door, even the command that fixes the Owner can't get in, and only a restart gets out (happened on a real machine 2026-08-02).
 ///
-/// ponytail: 合図と本文は別の channel なので、同じ瞬間に両方届いた1回分だけ順序が入れ替わりうる
-/// (握手と本文が同時に来たときだけ)。気になったら oneshot で ack を待つ
-/// 握手で来た home を、こちらの現在値に反映する。**変わったら true**(呼ぶ側が読み直しの
-/// 合図を出す)。
+/// ponytail: the signal and the payload are separate channels, so for one round where both arrive at the same moment
+/// the order can flip (only when the handshake and the payload arrive together). If it matters, wait for an ack over a oneshot
+/// Applies the home carried in the handshake to our current value. **true if it changed** (the caller sends the
+/// reread signal).
 ///
-/// **起動時の「最初の `Ready` 待ち」もここを通す。** 待ちループは bot トークンだけ取って
-/// home を捨てていたので、親が `attach()` で1回だけ載せてくる home が誰にも読まれず、
-/// 起動したての子は自分の古い home(または未設定 → Owner DM)に通知を出していた
-/// (2026-08-02 実機: 子の online 通知が親の home と違うチャンネルに出た)。
+/// **The start-up "wait for the first `Ready`" goes through here too.** The wait loop took only the bot token and
+/// dropped home, so the home the gateway sends once in `attach()` was read by nobody, and a
+/// freshly started machine posted its notices to its own old home (or, unset → the Owner's DM)
+/// (2026-08-02 on a real machine: a machine's online notice went to a different channel than the gateway's home).
 fn adopt_home(dir: &bridge::StateDir, home: Option<String>) -> bool {
     let Some(home) = home else { return false };
     let mut access = bridge::Access::load(dir);
@@ -893,18 +893,18 @@ async fn pump_relay(
                 return;
             }
         }
-        // 握手のたびに来る。Relay が持っている home を、こちらの現在値に反映する
-        // (`set-home` を聞き逃していたマシンが、繋ぎ直しで追いつく)
+        // Comes with every handshake. Apply the home Relay holds to our current value
+        // (a machine that missed a `set-home` catches up on reconnect)
         machine::FromRelay::Ready { home, .. } => {
             if adopt_home(dir, home) {
                 let _ = reload.send(()).await;
             }
-            // **起動時の1本目はここを通らない**(構築前の待ちループが食う)。ここに来るのは
-            // 張り直しだけなので、そのたびに online を出す
+            // **The first one at start-up doesn't come through here** (the wait loop before construction eats it). Only
+            // reconnects get here, so post online each time
             let _ = relink.send(()).await;
         }
-        // Owner がこのマシンを担当に決めた。**Owner を記録する** — Relay 経由の Bridge は
-        // これが来るまで Slack 上の自分の身元を何も知らない
+        // The Owner assigned this machine. **Record the Owner** — a Bridge via Relay
+        // knows nothing of its own identity on Slack until this arrives
         machine::FromRelay::Linked {
             owner_user_id,
             channel,
@@ -924,8 +924,8 @@ async fn pump_relay(
                 }
             }
         }
-        // ここまで来たらリンクは諦めている。**ワーカーには触らない** — 走っているものは
-        // 走り続ける。人が設定を直して再起動するまで、新しい Slack メッセージが来ないだけ
+        // Getting here means the link has been given up. **Don't touch the agents** — running ones
+        // keep running. New Slack messages just stop coming until a person fixes the config and restarts
         machine::FromRelay::Fatal(f) => {
             LogCtx::default().error("bridge", &format!("remote link: {} — no new messages will arrive (running workers keep going)", f.message()));
         }
@@ -933,33 +933,33 @@ async fn pump_relay(
 }
 
 
-// ── `restart` の進捗チェックリスト ────────────────────
-// Owner のスレッドに**1本**投稿し、再起動が進むごとにその場で編集する。
-// 形を決めている制約: 再起動は2つの Bridge プロセスをまたぐ。古い方が最初の数段を進めて
-// 降り(Slack に何も繋がっていない数秒間があり、launchd が最新コードで起こし直す)、
-// **後継**が残りを終える(どのメッセージを編集するかは restart マーカーから知る)。だから
-// 両者が「どこまで進んだか」という1つの値から同じ固定チェックリストを描く — 表示は跳ねない。
+// ── The `restart` progress checklist ────────────────────
+// Posted **once** in the Owner's thread and edited in place as the restart advances.
+// The constraint shaping it: a restart spans two Bridge processes. The old one advances the first few steps and
+// goes down (there are a few seconds with nothing connected to Slack, and launchd restarts it with the latest code),
+// then the **successor** finishes the rest (it learns which message to edit from the restart marker). So
+// both draw the same fixed checklist from one value, "how far it got" — the display doesn't jump.
 //
-// 現行との**意図的な差**: 版注記(`Bridge を停止 (vX)` / `…復帰(vX)`)は落とす —
-// この実装には版報告の機構が部品ごと無い。
+// **Deliberate difference**: the version notes (`stop Bridge (vX)` / `…back (vX)`) are dropped —
+// this implementation has no version-reporting machinery at all.
 
-/// 再起動の段。`Done`/`Failed` は終端で、行ではない。
+/// A restart phase. `Done`/`Failed` are terminal, not lines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartPhase {
-    /// Owner の restart を受理した(最初の投稿)
+    /// Accepted the Owner's restart (the first post)
     Received,
-    /// **古い** Bridge が止まる(launchd が起こし直す)
+    /// The **old** Bridge stops (launchd starts it again)
     Switching,
-    /// **後継** Bridge が Slack に繋ぎ直した
+    /// The **successor** Bridge reconnected to Slack
     Online,
-    /// 再起動完了(全行 done)
+    /// Restart complete (all lines done)
     Done,
-    /// 再起動が中断(進行中の行を failed に)
+    /// Restart aborted (the line in progress becomes failed)
     Failed,
 }
 
 impl RestartPhase {
-    /// チェックリストの1行の文言。
+    /// The wording of one checklist line.
     fn step_label(self) -> String {
         match self {
             RestartPhase::Received => crate::t!("Restart requested", "再起動を受け付けました"),
@@ -969,18 +969,18 @@ impl RestartPhase {
         }
     }
 
-    /// 与えられた進捗点でチェックリスト全体を描く:
-    ///   - `completed_through` までの行 → `•`(done)
-    ///   - その次の1行 → `◌ …`(進行中)、`failed_reason` があれば `💥`
-    ///   - それ以降 → `◌`(未着手)
-    ///   - done なら末尾に `✅ 再起動が完了しました`、失敗なら `💥 再起動に失敗しました — <理由>`
+    /// Draws the whole checklist at a given progress point:
+    ///   - lines up to `completed_through` → `•` (done)
+    ///   - the next line → `◌ …` (in progress), or `💥` if there's a `failed_reason`
+    ///   - after that → `◌` (not started)
+    ///   - when done, `✅ restart complete` at the end; on failure `💥 restart failed — <reason>`
     ///
-    /// `RestartPhase::Done` は全行 done、`Failed` は**最初の行**を failed に。
+    /// `RestartPhase::Done` makes every line done; `Failed` makes **the first line** failed.
     pub fn render(&self, failed_reason: Option<&str>) -> String {
         let completed_through = *self;
         let failed = completed_through == RestartPhase::Failed || failed_reason.is_some();
-        // done な行の**本数**。途中での失敗は「最後に done だった段 + failed_reason」で表され
-        // (その次の行が 💥 になる)、`Failed` そのものは何もしないうちに落ちた退化ケース。
+        // The **number** of done lines. A mid-way failure is expressed as "the last done phase + failed_reason"
+        // (the line after it becomes 💥); `Failed` itself is the degenerate case of failing before doing anything.
         let done_count = match completed_through {
             RestartPhase::Done => RESTART_STEPS.len(),
             RestartPhase::Failed => 0,
@@ -991,7 +991,7 @@ impl RestartPhase {
         };
         let active = (completed_through != RestartPhase::Done).then_some(done_count);
 
-        // 1行は `<glyph> <label>` — 字下げはしない
+        // One line is `<glyph> <label>` — no indent
         let mut lines: Vec<String> = RESTART_STEPS
             .iter()
             .enumerate()
@@ -1020,18 +1020,18 @@ impl RestartPhase {
     }
 }
 
-/// 固定の行の集合、順番どおり。`completed_through` は**完全に done な最後の行**を指し、
-/// その次の行が進行中。両 Bridge がこの表を共有するのでメッセージは跳ねない。
-/// Bun の表にあった「Bridge を更新」と「中断していたスレッドの処理を再開」は**持たない**:
-/// Rust はバイナリ1個で更新機能が無く(差し替えは install script の仕事)、自動再開も無いので、
-/// どちらも毎回「何もせず done」になる飾りだった。
+/// The fixed set of lines, in order. `completed_through` points to **the last fully done line**,
+/// and the one after it is in progress. Both Bridges share this table, so the message doesn't jump.
+/// "Update the Bridge" and "Resume interrupted threads" from the original table are **left out**:
+/// Rust is a single binary with no update feature (replacing it is the install script's job) and no auto-resume,
+/// so both were decoration that went "done without doing anything" every time.
 const RESTART_STEPS: [RestartPhase; 3] = [
     RestartPhase::Received,
     RestartPhase::Switching,
     RestartPhase::Online,
 ];
 
-/// home への起動通知に付く要約。
+/// The summary attached to the start-up notice in home.
 fn startup_notice(pools: &[String], pending_count: u32) -> String {
     let n = pools.len();
     let mut lines = vec![crate::t!("• Started {n} warm agent(s)", "• 待機用のエージェントを {n} 個起動")];
@@ -1045,7 +1045,7 @@ fn startup_notice(pools: &[String], pending_count: u32) -> String {
     lines.join("\n")
 }
 
-/// home への起動通知。
+/// The start-up notice in home.
 fn online_notice(
     label: &str,
     connected_as: &str,
@@ -1060,7 +1060,7 @@ fn online_notice(
     )
 }
 
-/// home への終了通知。`reason` は止まった理由の内部の名前なので、人の言葉にしてから出す。
+/// The stop notice in home. `reason` is the internal name for why it stopped, so turn it into human words before showing.
 fn offline_notice(label: &str, version: &str, reason: &str) -> String {
     let why = if reason.starts_with("signal:") {
         crate::t!("stopped by the system", "システムに止められたため")
@@ -1085,8 +1085,8 @@ mod tests {
     use std::collections::HashSet;
     use crate::bridge::inbound::{ForeignReaction, dedup_key, foreign_reaction, is_own_reaction};
 
-    /// 削除の鍵が元メッセージの配達とぶつかると、取り消しが**一度も**通らない
-    /// (実機で 100% 落ちていた)。種別ごとに別の鍵になることだけ確かめる。
+    /// If the deletion key collides with the delivery of the original message, the cancel **never** goes through
+    /// (it failed 100% of the time on a real machine). Just check that each kind gets its own key.
     #[test]
     fn dedup_key_separates_a_deletion_from_the_message_it_removes() {
         let base = InboundMsg {
@@ -1112,7 +1112,7 @@ mod tests {
         assert_eq!(dedup_key(&base), "1.1");
         assert_ne!(dedup_key(&deleted), dedup_key(&base));
 
-        // 自分が付けた印だけ捨てる。人が付けたものは今までどおり通す(stop の ✋ が死ぬ)
+        // Drop only marks we added. Ones people add pass as before (otherwise stop's ✋ dies)
         let react = |by: &str| InboundMsg {
             user: Some(by.into()),
             reaction: Some(crate::chat::Reaction {
@@ -1124,12 +1124,12 @@ mod tests {
         };
         assert!(is_own_reaction(&react("UBOT"), Some("UBOT")));
         assert!(!is_own_reaction(&react("U1"), Some("UBOT")));
-        // 自分の id をまだ知らない起動直後に、人のリアクションを巻き込まない
+        // Right after start-up, before we know our own id, don't catch people's reactions
         assert!(!is_own_reaction(&react("UBOT"), None));
         assert!(!is_own_reaction(&base, Some("UBOT")), "本文は素通し");
     }
 
-    /// 自分が書いたのではない投稿への stop は、**Owner が自分の依頼に付けたときだけ**通す。
+    /// A stop on a post we didn't write passes **only when the Owner put it on their own request**.
     #[test]
     fn only_the_owner_stopping_their_own_request_counts() {
         let r = |emoji: &str| crate::chat::Reaction {
@@ -1163,7 +1163,7 @@ mod tests {
             ForeignReaction::Drop,
             "Owner がまだ居ない"
         );
-        // 外したときは止めない(`is_stop` は added のときだけ真)
+        // Removing it doesn't stop anything (`is_stop` is true only when added)
         let removed = crate::chat::Reaction {
             added: false,
             ..r("raised_hand")
@@ -1175,9 +1175,9 @@ mod tests {
         );
     }
 
-    /// 親から「君が担当」と言われた子は、access.json に書くだけでなく**読み直しの合図まで出す**。
-    /// 出さないと動いている門番は Owner 空のままで、以後の配達を全部 `no-owner` で捨てる
-    /// (2026-08-02 実機。入口で捨てるので直すコマンドも入らず再起動でしか抜けられなかった)。
+    /// A machine told "you're in charge" by the gateway not only writes access.json but **also sends the reread signal**.
+    /// Without it the running gate keeps an empty Owner and drops every later delivery as `no-owner`
+    /// (2026-08-02 on a real machine. Dropped at the door, so even the fixing command couldn't get in; only a restart got out).
     #[tokio::test]
     async fn being_put_in_charge_asks_the_running_bridge_to_reread_access() {
         let dir = bridge::StateDir::at(
@@ -1212,8 +1212,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir.path());
     }
 
-    /// 握手で来た home はディスクに残る。**同じ値なら false** — 変わっていないのに
-    /// 読み直しの合図を出すと、繋ぎ直すたびに門番が access.json を読み直すことになる。
+    /// The home from the handshake stays on disk. **false for the same value** — sending the reread
+    /// signal when nothing changed would make the gate reread access.json on every reconnect.
     #[test]
     fn a_home_from_the_handshake_is_kept_on_disk() {
         let dir = bridge::StateDir::at(
@@ -1235,8 +1235,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir.path());
     }
 
-    /// 2026-08-03 の事故そのもの: 担当表が空のまま掃除役が回ると、**動いているワーカーの窓が
-    /// 全部「持ち主不明」に見えて閉じられる**。持ち主ゼロ + ワーカーの窓あり、の回は触らない。
+    /// The 2026-08-03 accident itself: when the cleaner runs with an empty assignment table, **every running agent's
+    /// window looks "ownerless" and gets closed**. A round with zero owners + agent windows is left untouched.
     #[test]
     fn the_sweeper_does_not_run_when_it_knows_no_owner_but_worker_windows_exist() {
         let row = |name: &str| tmux_mod::WindowRow {
