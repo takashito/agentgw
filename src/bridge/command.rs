@@ -14,11 +14,10 @@
 //! Sections, in order of role:
 //!
 //! 1. Reading the body   `Message` (the only place mentions and invisible characters are removed)
-//! 2. Slack ids          `SlackId`
-//! 3. Command detection  `Cmd` / `PwdMode` / `OwnerCmd` — the bare-word vocabulary is the single table `Cmd::WORDS`
-//! 4. Usage-limit watch  `UsageWatch` (reading and writing times is `state::WallClock`)
-//! 5. Tool permission    `ToolPermission`
-//! 6. Execution          `SignIn` and the entry point `handle_command`. The bodies split into those acting on
+//! 2. Command detection  `Cmd` / `PwdMode` / `OwnerCmd` — the bare-word vocabulary is the single table `Cmd::WORDS`
+//! 3. Usage-limit watch  `UsageWatch` (reading and writing times is `clock::WallClock`)
+//! 4. Tool permission    `ToolPermission`
+//! 5. Execution          `SignIn` and the entry point `handle_command`. The bodies split into those acting on
 //!    the thread's agent (`command/agent.rs`) and those about the Bridge itself (`command/bridge.rs`)
 
 mod agent;
@@ -34,6 +33,7 @@ use super::Bridge;
 use crate::chat::InboundMsg;
 use crate::log::LogCtx;
 use crate::chat::ThreadKey;
+use crate::chat::slack::SlackId;
 use crate::agent::screen::SpawnOutcome;
 use std::collections::HashMap;
 
@@ -138,67 +138,7 @@ impl<'a> Message<'a> {
     }
 }
 
-// ── Section 2: Slack id shapes and mentions ──────────────────────────────────
-// Both users and bots render as `<@…>`. A bot is identified by its `B…` id.
-
-/// A Slack id. The kind is known **from its shape alone** (no lookup).
-pub struct SlackId;
-
-impl SlackId {
-    fn shaped(id: &str, first: &[char]) -> bool {
-        let mut cs = id.chars();
-        cs.next().is_some_and(|c| first.contains(&c))
-            && id.len() > 1
-            && cs.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
-    }
-
-    pub fn is_user(id: &str) -> bool {
-        Self::shaped(id, &['U'])
-    }
-
-    pub fn is_bot(id: &str) -> bool {
-        Self::shaped(id, &['B'])
-    }
-
-    pub fn is_channel(id: &str) -> bool {
-        Self::shaped(id, &['C', 'G'])
-    }
-
-    /// A DM channel (`D…`) — a room with only the bot and the other party.
-    pub fn is_dm(id: &str) -> bool {
-        Self::shaped(id, &['D'])
-    }
-
-    pub fn from_user_mention(token: &str) -> Option<String> {
-        Self::parse_mention(token, '@', Self::is_user)
-    }
-
-    pub fn from_channel_mention(token: &str) -> Option<String> {
-        Self::parse_mention(token, '#', Self::is_channel)
-    }
-
-    /// The id inside a mention token — `<@U…>` / `<@U…|label>` for a user, `<#C…>` / `<#C…|label>` for
-    /// a channel — or a bare id written on its own. None if it is not such a reference.
-    fn parse_mention(token: &str, sigil: char, shape: fn(&str) -> bool) -> Option<String> {
-        let t = token.trim();
-        let inner = t
-            .strip_prefix('<')
-            .and_then(|s| s.strip_prefix(sigil))
-            .and_then(|s| s.strip_suffix('>'));
-        let id = match inner {
-            // A broken token whose label contains `>` is not treated as a mention (equivalent to `[^>]*`)
-            Some(i) => match i.split_once('|') {
-                Some((id, label)) if !label.contains('>') => id,
-                Some(_) => t,
-                None => i,
-            },
-            None => t,
-        };
-        shape(id).then(|| id.to_string())
-    }
-}
-
-// ── Section 3: command detection ─────────────────────────────────────────────
+// ── Section 2: command detection ─────────────────────────────────────────────
 // The five that take arguments (`model` / `effort` / `mode` / `pwd` / access verbs) are detected by **shape**:
 // only known model names count as arguments, so "explain model to me" is a sentence and goes to the agent as-is.
 
@@ -434,7 +374,7 @@ pub struct OwnerCmd {
     pub args: Vec<String>,
 }
 
-// ── Section 4: usage-limit watch ─────────────────────────────────────────────
+// ── Section 3: usage-limit watch ─────────────────────────────────────────────
 
 /// The decisions for reading `/usage` periodically and noticing that a limit is near or hit.
 ///
@@ -473,7 +413,7 @@ impl UsageWatch {
 }
 
 
-// ── Section 5: tool permission — standing rules applied before asking a human ─
+// ── Section 4: tool permission — standing rules applied before asking a human ─
 // The gatekeeper that makes sure only tools worth asking about are asked about. **Without it** the agent asks a
 // human for permission to use its own reply tool (`reply`) = asking on Slack "may I answer on Slack?",
 // and it stalls with nobody pressing the button.

@@ -650,7 +650,7 @@ impl Access {
         let mut warnings = Vec::new();
         let message = match op {
             AccessOp::BotAllow(id) => {
-                if !crate::bridge::command::SlackId::is_bot(&id) {
+                if !crate::chat::slack::SlackId::is_bot(&id) {
                     return Err(format!("bot_allow expects a bot id (B…), got \"{id}\""));
                 }
                 if !access.allowed_bots.contains(&id) {
@@ -659,7 +659,7 @@ impl Access {
                 crate::t!("Added {id} to the allowed bots.", "{id} を許可 bot に追加しました。")
             }
             AccessOp::BotRemove(id) => {
-                if !crate::bridge::command::SlackId::is_bot(&id) {
+                if !crate::chat::slack::SlackId::is_bot(&id) {
                     return Err(format!("bot_remove expects a bot id (B…), got \"{id}\""));
                 }
                 let had = access.allowed_bots.contains(&id);
@@ -671,7 +671,7 @@ impl Access {
                 }
             }
             AccessOp::SetRepo { channel, path } => {
-                if !crate::bridge::command::SlackId::is_channel(&channel) {
+                if !crate::chat::slack::SlackId::is_channel(&channel) {
                     return Err(format!(
                         "set_repo expects a channel id (C…/G…), got \"{channel}\""
                     ));
@@ -690,7 +690,7 @@ impl Access {
             AccessOp::SetWarm { channel, on } => {
                 // Warm pool keys are cwds, so this only means something for channels with a repo
                 // (channels without one are served by the resident Home pool). Keep the flag, but say so.
-                if !crate::bridge::command::SlackId::is_channel(&channel) {
+                if !crate::chat::slack::SlackId::is_channel(&channel) {
                     return Err(format!(
                         "set_warm expects a channel id (C…/G…), got \"{channel}\""
                     ));
@@ -719,7 +719,7 @@ impl Access {
                     access.home_channel = None;
                     crate::t!("The home channel is no longer set.", "Home チャンネルの設定を解除しました。")
                 } else {
-                    if !crate::bridge::command::SlackId::is_channel(ch) {
+                    if !crate::chat::slack::SlackId::is_channel(ch) {
                         return Err(format!(
                             "set_home_channel expects a channel id (C…/G…), got \"{ch}\""
                         ));

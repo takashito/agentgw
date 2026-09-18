@@ -2048,6 +2048,66 @@ pub async fn execute_tool(
     }
 }
 
+// ─── Slack id shapes and mentions ──────────────────────────────────────────────
+// Both users and bots render as `<@…>`. A bot is identified by its `B…` id.
+
+/// A Slack id. The kind is known **from its shape alone** (no lookup).
+pub struct SlackId;
+
+impl SlackId {
+    fn shaped(id: &str, first: &[char]) -> bool {
+        let mut cs = id.chars();
+        cs.next().is_some_and(|c| first.contains(&c))
+            && id.len() > 1
+            && cs.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    }
+
+    pub fn is_user(id: &str) -> bool {
+        Self::shaped(id, &['U'])
+    }
+
+    pub fn is_bot(id: &str) -> bool {
+        Self::shaped(id, &['B'])
+    }
+
+    pub fn is_channel(id: &str) -> bool {
+        Self::shaped(id, &['C', 'G'])
+    }
+
+    /// A DM channel (`D…`) — a room with only the bot and the other party.
+    pub fn is_dm(id: &str) -> bool {
+        Self::shaped(id, &['D'])
+    }
+
+    pub fn from_user_mention(token: &str) -> Option<String> {
+        Self::parse_mention(token, '@', Self::is_user)
+    }
+
+    pub fn from_channel_mention(token: &str) -> Option<String> {
+        Self::parse_mention(token, '#', Self::is_channel)
+    }
+
+    /// The id inside a mention token — `<@U…>` / `<@U…|label>` for a user, `<#C…>` / `<#C…|label>` for
+    /// a channel — or a bare id written on its own. None if it is not such a reference.
+    fn parse_mention(token: &str, sigil: char, shape: fn(&str) -> bool) -> Option<String> {
+        let t = token.trim();
+        let inner = t
+            .strip_prefix('<')
+            .and_then(|s| s.strip_prefix(sigil))
+            .and_then(|s| s.strip_suffix('>'));
+        let id = match inner {
+            // A broken token whose label contains `>` is not treated as a mention (equivalent to `[^>]*`)
+            Some(i) => match i.split_once('|') {
+                Some((id, label)) if !label.contains('>') => id,
+                Some(_) => t,
+                None => i,
+            },
+            None => t,
+        };
+        shape(id).then(|| id.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// **Up to two of our own is normal** (slack-morphism's default; confirmed in the startup log on a real machine).

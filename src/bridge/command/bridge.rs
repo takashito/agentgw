@@ -157,7 +157,7 @@ impl Bridge {
             }
             // A DM has no route (its agent always starts at Home), so say so
             // instead of silently recording it
-            PwdMode::Set(_) if dm || !crate::bridge::command::SlackId::is_channel(&msg.channel) => {
+            PwdMode::Set(_) if dm || !crate::chat::slack::SlackId::is_channel(&msg.channel) => {
                 ctx.info(
                     "bridge",
                     &format!(
@@ -221,7 +221,7 @@ impl Bridge {
                     .first()
                     .is_some_and(|a| a.eq_ignore_ascii_case("on"));
                 let ch = match oc.args.get(1) {
-                    Some(tok) => crate::bridge::command::SlackId::from_channel_mention(tok),
+                    Some(tok) => crate::chat::slack::SlackId::from_channel_mention(tok),
                     None if !dm => Some(msg.channel.clone()),
                     None => None,
                 };
@@ -241,7 +241,7 @@ impl Bridge {
             }
             // Home must be a real channel — the place where it was typed becomes Home
             "set-home" => {
-                if dm || !crate::bridge::command::SlackId::is_channel(&msg.channel) {
+                if dm || !crate::chat::slack::SlackId::is_channel(&msg.channel) {
                     let refusal = crate::t!(
                         "Run `set-home` in the *channel* you want notices in. A DM can't be the notice channel.",
                         "`set-home` は、通知を出したい *チャンネル* で実行してください。DM は通知先にできません。"
@@ -253,11 +253,11 @@ impl Bridge {
             }
             verb @ ("allow-bot" | "remove-bot") => {
                 let raw = oc.args.first().map(String::as_str).unwrap_or("");
-                let bot_id = if crate::bridge::command::SlackId::is_bot(raw) {
+                let bot_id = if crate::chat::slack::SlackId::is_bot(raw) {
                     raw.to_string() // A bare B… id is taken as-is
                 } else {
                     // A bot is mentioned by its USER id (`<@U…>`), but the allowlist is keyed by bot_id (B…)
-                    let Some(uid) = crate::bridge::command::SlackId::from_user_mention(raw) else {
+                    let Some(uid) = crate::chat::slack::SlackId::from_user_mention(raw) else {
                         self.post(
                             &msg.channel,
                             root_ts,

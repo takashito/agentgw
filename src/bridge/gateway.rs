@@ -780,7 +780,7 @@ impl<'a> Event<'a> {
         if self.name != "message" || self.from_a_bot() || self.is_retraction() {
             return false;
         }
-        crate::bridge::command::SlackId::is_dm(channel)
+        crate::chat::slack::SlackId::is_dm(channel)
             || crate::bridge::command::Message::new(self.text().unwrap_or(""), bot_user_id)
                 .mentions_bot()
     }
@@ -917,7 +917,7 @@ pub struct CommandCtx<'a> {
 
 impl CommandCtx<'_> {
     fn is_dm(&self) -> bool {
-        crate::bridge::command::SlackId::is_dm(self.channel_id)
+        crate::chat::slack::SlackId::is_dm(self.channel_id)
     }
 
     fn msg(&self) -> crate::bridge::command::Message<'_> {
@@ -1759,7 +1759,7 @@ impl Fleet {
         let machines = self.machines();
 
         // ── DM name-claim. Before `route` (route assumes there's already an Owner)
-        if crate::bridge::command::SlackId::is_dm(channel) {
+        if crate::chat::slack::SlackId::is_dm(channel) {
             let awaiting = self.pending_selection.lock().await.is_some();
             let outcome = DmOnboardingCtx {
                 text,
@@ -3218,10 +3218,10 @@ mod tests {
 
     #[test]
     fn a_dm_channel_is_recognised_by_its_shape() {
-        assert!(crate::bridge::command::SlackId::is_dm("D0123"));
-        assert!(!crate::bridge::command::SlackId::is_dm("C0123"));
-        assert!(!crate::bridge::command::SlackId::is_dm("G0123"));
-        assert!(!crate::bridge::command::SlackId::is_dm(""));
+        assert!(crate::chat::slack::SlackId::is_dm("D0123"));
+        assert!(!crate::chat::slack::SlackId::is_dm("C0123"));
+        assert!(!crate::chat::slack::SlackId::is_dm("G0123"));
+        assert!(!crate::chat::slack::SlackId::is_dm(""));
     }
 
     // ── route / set-home ────────────────────────────────────────────────────
