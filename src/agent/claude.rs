@@ -145,7 +145,75 @@ impl Claude {
             None => self.pool_prompt().to_string(),
         };
         let line = self.launch_line(&mode, &req.hooks_file, &req.mcp_config, &prompt);
+        // 信頼の確認を画面で答えずに済ませる(公式の方法)。書けなくても起動は止めない —
+        // 確認が出れば起動画面の見張りが答える
+        match Self::pre_trust(&req.cwd) {
+            Ok(Some(key)) => LogCtx::default().info(
+                "spawn",
+                &format!("pre-trusted {} in ~/.claude.json (no trust dialog)", key.display()),
+            ),
+            Ok(None) => {}
+            Err(e) => LogCtx::default().error("spawn", &format!("could not pre-trust {}: {e}", req.cwd)),
+        }
         self.tmux.spawn(&req.window, &req.cwd, &line)
+    }
+
+    /// Marks `cwd` as trusted in `~/.claude.json` so the workspace-trust dialog never shows.
+    /// This is the documented way (Claude Code permissions docs: set
+    /// `projects["<path>"].hasTrustDialogAccepted` to `true`, keyed on the repository root).
+    /// Returns the key it wrote, or `None` when nothing needed writing (already trusted, or
+    /// the home directory, whose trust Claude Code never persists).
+    fn pre_trust(cwd: &str) -> Result<Option<std::path::PathBuf>, String> {
+        // Tests spawn with made-up folders: never touch the real user's config from a test
+        if cfg!(test) {
+            return Ok(None);
+        }
+        let home = std::env::var("HOME").map_err(|e| format!("HOME: {e}"))?;
+        let Some(key) = Self::trust_key(std::path::Path::new(cwd), std::path::Path::new(&home)) else {
+            return Ok(None);
+        };
+        let path = std::path::Path::new(&home).join(".claude.json");
+        let config: serde_json::Value = match std::fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
+        let Some(updated) = Self::with_trust(&config, &key.to_string_lossy()) else {
+            return Ok(None);
+        };
+        // Claude Code rewrites this file too: write a sibling and rename, so a reader never
+        // sees half a file. Keep the original's permissions (it is private to the user).
+        let tmp = path.with_extension("json.agentgw-tmp");
+        let body = serde_json::to_string_pretty(&updated).map_err(|e| e.to_string())?;
+        std::fs::write(&tmp, body).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        if let Ok(meta) = std::fs::metadata(&path) {
+            let _ = std::fs::set_permissions(&tmp, meta.permissions());
+        }
+        std::fs::rename(&tmp, &path).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(Some(key))
+    }
+
+    /// Where Claude Code keys the trust for `cwd`: the git repository root when `cwd` is inside
+    /// one, else `cwd` itself. `None` for the home directory (never persisted).
+    pub fn trust_key(cwd: &std::path::Path, home: &std::path::Path) -> Option<std::path::PathBuf> {
+        if cwd == home {
+            return None;
+        }
+        let root = cwd.ancestors().find(|dir| dir.join(".git").exists()).unwrap_or(cwd);
+        (root != home).then(|| root.to_path_buf())
+    }
+
+    /// `config` with `projects[key].hasTrustDialogAccepted = true`, or `None` if already so.
+    pub fn with_trust(config: &serde_json::Value, key: &str) -> Option<serde_json::Value> {
+        if config["projects"][key]["hasTrustDialogAccepted"] == serde_json::Value::Bool(true) {
+            return None;
+        }
+        let mut updated = config.clone();
+        let root = updated.as_object_mut()?;
+        let projects = root.entry("projects").or_insert_with(|| serde_json::json!({}));
+        let project = projects.as_object_mut()?.entry(key).or_insert_with(|| serde_json::json!({}));
+        project.as_object_mut()?.insert("hasTrustDialogAccepted".into(), serde_json::Value::Bool(true));
+        Some(updated)
     }
 
     /// 押し込むのは tmux の仕事。**送信されたことを確かめるのはこちら** — 入力欄(`❯`)を
@@ -2172,6 +2240,40 @@ mod tests {
     }
 
     /// Claude Code 2.1.276 selects "No, exit" first. Enter alone would quit; move to Yes first.
+    /// Trust is keyed on the repository root inside a git repository and on the folder itself
+    /// outside one; the home directory is never persisted (Claude Code's permissions docs).
+    #[test]
+    fn the_trust_key_is_the_repo_root_or_the_folder_but_never_home() {
+        let base = std::env::temp_dir().join(format!("agentgw-trust-key-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join("home");
+        let repo = home.join("repo");
+        let plain = home.join("notes");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("src/deep")).unwrap();
+        std::fs::create_dir_all(&plain).unwrap();
+        assert_eq!(Claude::trust_key(&home, &home), None, "home is never persisted");
+        assert_eq!(Claude::trust_key(&repo.join("src/deep"), &home), Some(repo.clone()));
+        assert_eq!(Claude::trust_key(&repo, &home), Some(repo.clone()));
+        assert_eq!(Claude::trust_key(&plain, &home), Some(plain.clone()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn trusting_a_folder_sets_only_its_flag_and_skips_when_already_set() {
+        let config = serde_json::json!({
+            "userID": "u",
+            "projects": { "/srv/app": { "allowedTools": ["Read"] } }
+        });
+        let updated = Claude::with_trust(&config, "/srv/app").expect("needs writing");
+        assert_eq!(updated["projects"]["/srv/app"]["hasTrustDialogAccepted"], true);
+        assert_eq!(updated["projects"]["/srv/app"]["allowedTools"][0], "Read", "other fields kept");
+        assert_eq!(updated["userID"], "u");
+        assert_eq!(Claude::with_trust(&updated, "/srv/app"), None, "already trusted: no write");
+        let fresh = Claude::with_trust(&serde_json::json!({}), "/x").unwrap();
+        assert_eq!(fresh["projects"]["/x"]["hasTrustDialogAccepted"], true);
+    }
+
     #[tokio::test]
     async fn a_trust_dialog_with_no_selected_is_moved_to_yes_before_enter() {
         use crate::agent::screen::tests::{TRUST_PANE_NO_FIRST, TRUST_PANE_YES_SECOND};
