@@ -2,7 +2,7 @@
 //!
 //! The core (`bridge`) talks to Slack, to the coding agent and to the clock only through
 //! these traits. `Bridge::run()` wires the real implementations; tests wire the fakes in
-//! [`fake`] and drive the same code.
+//! `fake` and drive the same code.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -180,7 +180,7 @@ pub trait AgentPort: Send + Sync + 'static {
     async fn logout(&self) -> Result<(), ProbeErr>;
 }
 
-/// The time. Implemented by [`SystemClock`]; tests move a [`fake::FakeClock`] by hand.
+/// The time. Implemented by [`SystemClock`]; tests move a `fake::FakeClock` by hand.
 pub trait Clock: Send + Sync + 'static {
     fn now_ms(&self) -> u64;
 }

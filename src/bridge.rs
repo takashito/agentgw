@@ -1,9 +1,12 @@
-//! Bridge — Slack と エージェントの間に座る本体。
+//! Bridge — Slack とエージェントの間に座る本体。このファイルは**組み立ての起点**だけを持つ:
+//! `Bridge` の構造体、外の世界を受け取る [`Deps`](Slack・エージェント・時計 — [`crate::ports`])、
+//! `run()`(配線と select ループ)、起動・停止・再起動。
 //!
-//! 実行時状態(起動/再起動/終了・受信配達・コマンド応答)はここ。
-//! ディスクに残る状態(access.json / threads.json / ポート・トークンの記憶)と
-//! ログは [`state`] に、ワーカーの台帳は [`worker`] に、コマンドの検出と文面は
-//! [`command`] に居る。
+//! 機能ごとの `impl Bridge` は子モジュールに1つずつ:
+//! [`inbound`](crate::bridge::inbound)(受信と門)/ [`turn`](crate::bridge::turn)(hook・ターン・許可・沈黙の見張り・進捗)/
+//! [`worker`](crate::bridge::worker)(エージェントの起動・在庫・回収)/ [`command`](crate::bridge::command)(コマンドの解釈と実行)。
+//! Slack に出す文面は [`render`]、ディスクに残る状態とログは [`state`]、
+//! ゲートウェイ側は [`gateway`]、マシン側の接続は [`link`]。
 
 pub mod command;
 pub mod link;
@@ -16,7 +19,6 @@ pub mod worker;
 
 use crate::agent::claude::HookIntake;
 use crate::agent::claude::Claude;
-use crate::agent::Envelope;
 use crate::bridge::command::CmdFx;
 use crate::bridge::render::RestartPhase;
 use crate::bridge::state as bridge;
@@ -30,51 +32,8 @@ use std::time::Duration;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
-const NARRATION_CAP: usize = 600;
-
-/// ドレインを諦めてでも殺す上限。現行は受信確認のタイムアウトを流用する
-/// (RECEIPT_TIMEOUT_MS = 30s)— 新しいつまみを増やさないため。
-const DRAIN_TIMEOUT_MS: u64 = 30_000;
-
 /// 付箋を Slack に反映する間隔。board 側が別途スレッド単位で1秒スロットルする。
 const FLUSH_INTERVAL: Duration = Duration::from_millis(500);
-
-/// 冷えたワーカーを畳む規則(2026-08-02 ユーザー決裁の4つの数字)。
-/// 現行 Bun は環境変数で動かせるが、こちらは決め打ち — 動かしたくなったら足す。
-const CLEANUP: worker::CleanupPolicy = worker::CleanupPolicy {
-    idle_ttl_ms: 30 * 60_000,
-    idle_slots: 5,
-    idle_max_ms: 60 * 60_000,
-    max_concurrent: 10,
-};
-
-/// Slack が再配達に刻む試行回数。slack-morphism 2.24.0 の Socket Mode envelope は
-/// `envelope_id` と `accepts_response_payload` しか持たず、Slack が載せる `retry_attempt` は
-/// push イベントのコールバックに渡る前に捨てられる(models/socket_mode/mod.rs:59-64)ので
-/// 0 固定。同じ (channel, ts) の再到着は dedup が落とすため、stale の判定に残るのは
-/// 「この Bridge が聞き始める前に投稿されたか」だけになる。
-const RETRY_NUM: u32 = 0;
-
-/// ターン失敗で1つのメッセージを再送してよい回数(現行 `TURN_FAILURE_RETRY_CAP`)。
-/// **1回は意図** — 再送で直る失敗(混雑・API の瞬断・型無しの一発)は次の試行で晴れる。
-/// 同じ失敗が2度出るなら本物なので、ループを見せるより人に伝える。
-const TURN_FAILURE_RETRY_CAP: u32 = 1;
-
-/// 上限の見張りを始めるまでの猶予(立ち上がりに probe をぶつけない)。
-const USAGE_MONITOR_STARTUP_DELAY_MS: u64 = 60_000;
-
-/// 起動画面を見張る時間。現行の 30秒(同期)+ 120秒(linger)= 150秒に合わせた。
-/// 現行の linger は `FIRST_PROMPT_TIMEOUT_MS`(60s、p99 45.6s)の2倍。
-const SPAWN_SCREEN_BUDGET_MS: u64 = 150_000;
-const SPAWN_SCREEN_POLL_MS: u64 = 1_000;
-
-/// 人を待つ上限。hook の宣言(125s)と Bridge の待ち(120s)より内側で畳む。
-const PERM_WAIT_MS: u64 = 115_000;
-
-/// サインインのポーリング(定数どおり)。URL は普通 1〜3 秒で出る。
-const LOGIN_POLL: Duration = Duration::from_secs(1);
-const URL_POLL_MAX: u32 = 20;
-const CODE_POLL_MAX: u32 = 30;
 
 /// 未応答を抱えたスレッドに残す一言。
 ///
@@ -88,10 +47,6 @@ fn restart_notice() -> String {
         "🙏 agentgw を数秒だけ再起動します。動いているエージェントは止めないので、作業はそのまま続きます。"
     )
 }
-
-/// プール worker が MCP を上げるまでの猶予(worker.ts の `MCP_INIT_TIMEOUT_MS` と同値)。
-/// これを超えたら諦める(= 実体ごと畳んで在庫から消す)。
-const POOL_MCP_INIT_TIMEOUT_MS: u64 = 50_000;
 
 /// main ループが握る可変状態ひとまとめ。select の各腕はここのメソッドを呼ぶだけ。
 pub struct Bridge {
@@ -222,9 +177,6 @@ impl Bridge {
         };
         (Bridge::new(deps, config), cmd_rx)
     }
-}
-
-impl Bridge {
 
     /// 起動/終了の home 通知を1回投げる。**失敗はログだけ**
     /// 起動シーケンスも restart も止めない。DM フォールバックは未実装(沈黙はしない)。
@@ -477,189 +429,6 @@ impl Bridge {
         );
     }
 
-}
-
-/// 前のプロセスが `restart` で降りるときに残したマーカーを**消費**する(読んで消す)。
-/// 残すと、次の起動が身に覚えの無い「✅ 再起動が完了しました」を出す。
-/// 中断スレッドの自動再開はこの実装に無いので、再開の行は 0 件で閉じる。
-async fn consume_restart_marker(dir: &bridge::StateDir, api: &dyn ports::SlackPort) {
-    let ctx = LogCtx::default();
-    let path = dir.restart_marker();
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return;
-    };
-    if let Err(e) = std::fs::remove_file(&path) {
-        ctx.error(
-            "bridge",
-            &format!(
-                "could not remove the restart marker (a later start may post a false ✅): {e}"
-            ),
-        );
-    }
-    let m: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
-    let (Some(channel), Some(ts)) = (m["channel"].as_str(), m["progress_ts"].as_str()) else {
-        ctx.info(
-            "bridge",
-            "restart marker consumed — no progress checklist to finish",
-        );
-        return;
-    };
-    let done = RestartPhase::Done.render(None);
-    match api.update_message(channel, ts, &done).await {
-        Ok(()) => ctx.info(
-            "bridge",
-            &format!("restart: checklist completed for {channel}:{ts} (marker consumed)"),
-        ),
-        Err(e) => ctx.error(
-            "bridge",
-            &format!("restart: could not finish the progress checklist for {channel}:{ts}: {e}"),
-        ),
-    }
-}
-
-/// このマシンについて外のコマンドに訊くこと。
-pub struct Host;
-
-impl Host {
-    /// home 通知に出すホスト名を `hostname` 1回で取る(`now_wallclock` と同じ流儀)。
-    /// 飾りなので失敗しても落とさない — `unknown` で通す。
-    pub async fn name() -> String {
-        let out = tokio::process::Command::new("hostname").output().await;
-        match out {
-            Ok(o) if o.status.success() => {
-                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                if s.is_empty() {
-                    "unknown".to_string()
-                } else {
-                    s
-                }
-            }
-            _ => "unknown".to_string(),
-        }
-    }
-
-    /// ルート未設定のチャンネル / DM のワーカーが立つ場所。**pwd と spawn は同じこれを読む**
-    /// (usage の probe・context/resume の cwd フォールバック・login セッションの `-c` も全部ここ)。
-    /// 現行の`workerHomeOf` = `access.workerHome ?? homedir()` — Bridge を
-    /// どこから起動したかで変わってはいけない。カレントに落ちるのは HOME が読めない時だけ。
-    ///
-    /// ponytail: `access.workerHome` の型付けはまだ無い(未知フィールドとして往復保存はされている)。
-    /// setup がそれを書き始めたら、ここで先に読む
-    pub fn home() -> String {
-        match std::env::var("HOME") {
-            Ok(h) if !h.is_empty() => h,
-            _ => std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| ".".to_string()),
-        }
-    }
-
-    /// Wall-clock epoch ms for the wiring in `run()`. Bridge methods read `deps.clock` instead.
-    pub fn now_ms() -> u64 {
-        bridge::now_ms()
-    }
-}
-
-/// Relay から来たものを、直結モードと**同じ2本の口**に流し込む。
-///
-/// ここが「Relay 経由」と「直結」の合流点。イベントは slack-morphism の型に戻してから
-/// `InboundMsg` にする — **変換ロジックを複製しない**のが要で、2本目を書くと、直結と
-/// Relay 経由で門番の判断がいつか食い違う。
-///
-/// `reload` は「access.json を書いたから読み直せ」の合図。**書きっぱなしにすると、動いている
-/// Bridge は古い値(Owner 空)を見続けて、届いたものを全部 `no-owner` で捨てる** — 入口で
-/// 捨てるので Owner を直すコマンドも入らず、再起動するまで抜けられない(2026-08-02 実機で発生)。
-///
-/// ponytail: 合図と本文は別の channel なので、同じ瞬間に両方届いた1回分だけ順序が入れ替わりうる
-/// (握手と本文が同時に来たときだけ)。気になったら oneshot で ack を待つ
-/// 握手で来た home を、こちらの現在値に反映する。**変わったら true**(呼ぶ側が読み直しの
-/// 合図を出す)。
-///
-/// **起動時の「最初の `Ready` 待ち」もここを通す。** 待ちループは bot トークンだけ取って
-/// home を捨てていたので、親が `attach()` で1回だけ載せてくる home が誰にも読まれず、
-/// 起動したての子は自分の古い home(または未設定 → Owner DM)に通知を出していた
-/// (2026-08-02 実機: 子の online 通知が親の home と違うチャンネルに出た)。
-fn adopt_home(dir: &bridge::StateDir, home: Option<String>) -> bool {
-    let Some(home) = home else { return false };
-    let mut access = bridge::Access::load(dir);
-    if access.home_channel.as_deref() == Some(home.as_str()) {
-        return false;
-    }
-    access.home_channel = Some(home.clone());
-    if let Err(e) = access.save(dir) {
-        LogCtx::default().error("bridge", &format!("could not save the home channel: {e}"));
-        return false;
-    }
-    LogCtx::default().info(
-        "bridge",
-        &format!("remote link: home channel is now {home}"),
-    );
-    true
-}
-
-async fn pump_relay(
-    item: link::FromRelay,
-    msg_tx: &mpsc::Sender<InboundMsg>,
-    click_tx: &mpsc::Sender<slack::PermClick>,
-    dir: &bridge::StateDir,
-    reload: &mpsc::Sender<()>,
-    relink: &mpsc::Sender<()>,
-) {
-    match item {
-        link::FromRelay::Event { name, event } => {
-            if let Some(msg) = slack::inbound_from_relay(&name, &event)
-                && msg_tx.send(msg).await.is_err()
-            {
-                return;
-            }
-        }
-        link::FromRelay::Action { action, body } => {
-            if let Some(click) = slack::perm_click_from_relay(&action, &body)
-                && click_tx.send(click).await.is_err()
-            {
-                return;
-            }
-        }
-        // 握手のたびに来る。Relay が持っている home を、こちらの現在値に反映する
-        // (`set-home` を聞き逃していたマシンが、繋ぎ直しで追いつく)
-        link::FromRelay::Ready { home, .. } => {
-            if adopt_home(dir, home) {
-                let _ = reload.send(()).await;
-            }
-            // **起動時の1本目はここを通らない**(構築前の待ちループが食う)。ここに来るのは
-            // 張り直しだけなので、そのたびに online を出す
-            let _ = relink.send(()).await;
-        }
-        // Owner がこのマシンを担当に決めた。**Owner を記録する** — Relay 経由の Bridge は
-        // これが来るまで Slack 上の自分の身元を何も知らない
-        link::FromRelay::Linked {
-            owner_user_id,
-            channel,
-            ..
-        } => {
-            let mut access = bridge::Access::load(dir);
-            if access.owner != owner_user_id {
-                access.owner = owner_user_id.clone();
-                if let Err(e) = access.save(dir) {
-                    LogCtx::default().error("bridge", &format!("could not save the owner: {e}"));
-                } else {
-                    LogCtx::default().info(
-                        "bridge",
-                        &format!("remote link: owner is {owner_user_id} (in charge of {channel})"),
-                    );
-                    let _ = reload.send(()).await;
-                }
-            }
-        }
-        // ここまで来たらリンクは諦めている。**ワーカーには触らない** — 走っているものは
-        // 走り続ける。人が設定を直して再起動するまで、新しい Slack メッセージが来ないだけ
-        link::FromRelay::Fatal(f) => {
-            LogCtx::default().error("bridge", &format!("remote link: {} — no new messages will arrive (running workers keep going)", f.message()));
-        }
-    }
-}
-
-impl Bridge {
     /// 配線して select ループを回す。シグナル契約は
     /// SIGTERM/SIGINT=graceful shutdown / SIGUSR1=maintenance restart / SIGHUP=再読込。
     pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -991,38 +760,188 @@ impl Bridge {
         }
         Ok(())
     }
-
 }
 
-impl Envelope {
-    /// 受信メッセージ → 封筒テキスト。`ts` は**配達時点**の now(`now_ms`)、`thread_ts` は解決済みの根
-    /// (現行`threadTs || msg.ts` を渡す)。
-    pub fn of(msg: &InboundMsg, root_ts: &str, now_ms: u64) -> String {
-        Self::of_guarded(msg, root_ts, None, now_ms)
+/// 前のプロセスが `restart` で降りるときに残したマーカーを**消費**する(読んで消す)。
+/// 残すと、次の起動が身に覚えの無い「✅ 再起動が完了しました」を出す。
+/// 中断スレッドの自動再開はこの実装に無いので、再開の行は 0 件で閉じる。
+async fn consume_restart_marker(dir: &bridge::StateDir, api: &dyn ports::SlackPort) {
+    let ctx = LogCtx::default();
+    let path = dir.restart_marker();
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    if let Err(e) = std::fs::remove_file(&path) {
+        ctx.error(
+            "bridge",
+            &format!(
+                "could not remove the restart marker (a later start may post a false ✅): {e}"
+            ),
+        );
     }
+    let m: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+    let (Some(channel), Some(ts)) = (m["channel"].as_str(), m["progress_ts"].as_str()) else {
+        ctx.info(
+            "bridge",
+            "restart marker consumed — no progress checklist to finish",
+        );
+        return;
+    };
+    let done = RestartPhase::Done.render(None);
+    match api.update_message(channel, ts, &done).await {
+        Ok(()) => ctx.info(
+            "bridge",
+            &format!("restart: checklist completed for {channel}:{ts} (marker consumed)"),
+        ),
+        Err(e) => ctx.error(
+            "bridge",
+            &format!("restart: could not finish the progress checklist for {channel}:{ts}: {e}"),
+        ),
+    }
+}
 
-    /// ループ遮断が立った配達だけ `loop_guard` を載せる(空文字 = 呼ぶ相手が居ない)。
-    pub fn of_guarded(
-        msg: &InboundMsg,
-        root_ts: &str,
-        loop_guard: Option<String>,
-        now_ms: u64,
-    ) -> String {
-        Envelope {
-            loop_guard,
-            channel_id: msg.channel.clone(),
-            message_id: msg.ts.clone(),
-            user: msg.user.clone().unwrap_or_else(|| "unknown".to_string()),
-            ts: bridge::iso8601(now_ms),
-            thread_ts: Some(root_ts.to_string()),
-            text: msg.text.clone(),
-            // 先読みダウンロードの結果はメッセージが持っている(queue 経由でも持ち越す)
-            file_paths: msg.file_paths.clone(),
-            file_errors: msg.file_errors.clone(),
+/// このマシンについて外のコマンドに訊くこと。
+pub struct Host;
+
+impl Host {
+    /// home 通知に出すホスト名を `hostname` 1回で取る(`now_wallclock` と同じ流儀)。
+    /// 飾りなので失敗しても落とさない — `unknown` で通す。
+    pub async fn name() -> String {
+        let out = tokio::process::Command::new("hostname").output().await;
+        match out {
+            Ok(o) if o.status.success() => {
+                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if s.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    s
+                }
+            }
+            _ => "unknown".to_string(),
         }
-        .render()
+    }
+
+    /// ルート未設定のチャンネル / DM のワーカーが立つ場所。**pwd と spawn は同じこれを読む**
+    /// (usage の probe・context/resume の cwd フォールバック・login セッションの `-c` も全部ここ)。
+    /// 現行の`workerHomeOf` = `access.workerHome ?? homedir()` — Bridge を
+    /// どこから起動したかで変わってはいけない。カレントに落ちるのは HOME が読めない時だけ。
+    ///
+    /// ponytail: `access.workerHome` の型付けはまだ無い(未知フィールドとして往復保存はされている)。
+    /// setup がそれを書き始めたら、ここで先に読む
+    pub fn home() -> String {
+        match std::env::var("HOME") {
+            Ok(h) if !h.is_empty() => h,
+            _ => std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| ".".to_string()),
+        }
+    }
+
+    /// Wall-clock epoch ms for the wiring in `run()`. Bridge methods read `deps.clock` instead.
+    pub fn now_ms() -> u64 {
+        bridge::now_ms()
     }
 }
+
+/// Relay から来たものを、直結モードと**同じ2本の口**に流し込む。
+///
+/// ここが「Relay 経由」と「直結」の合流点。イベントは slack-morphism の型に戻してから
+/// `InboundMsg` にする — **変換ロジックを複製しない**のが要で、2本目を書くと、直結と
+/// Relay 経由で門番の判断がいつか食い違う。
+///
+/// `reload` は「access.json を書いたから読み直せ」の合図。**書きっぱなしにすると、動いている
+/// Bridge は古い値(Owner 空)を見続けて、届いたものを全部 `no-owner` で捨てる** — 入口で
+/// 捨てるので Owner を直すコマンドも入らず、再起動するまで抜けられない(2026-08-02 実機で発生)。
+///
+/// ponytail: 合図と本文は別の channel なので、同じ瞬間に両方届いた1回分だけ順序が入れ替わりうる
+/// (握手と本文が同時に来たときだけ)。気になったら oneshot で ack を待つ
+/// 握手で来た home を、こちらの現在値に反映する。**変わったら true**(呼ぶ側が読み直しの
+/// 合図を出す)。
+///
+/// **起動時の「最初の `Ready` 待ち」もここを通す。** 待ちループは bot トークンだけ取って
+/// home を捨てていたので、親が `attach()` で1回だけ載せてくる home が誰にも読まれず、
+/// 起動したての子は自分の古い home(または未設定 → Owner DM)に通知を出していた
+/// (2026-08-02 実機: 子の online 通知が親の home と違うチャンネルに出た)。
+fn adopt_home(dir: &bridge::StateDir, home: Option<String>) -> bool {
+    let Some(home) = home else { return false };
+    let mut access = bridge::Access::load(dir);
+    if access.home_channel.as_deref() == Some(home.as_str()) {
+        return false;
+    }
+    access.home_channel = Some(home.clone());
+    if let Err(e) = access.save(dir) {
+        LogCtx::default().error("bridge", &format!("could not save the home channel: {e}"));
+        return false;
+    }
+    LogCtx::default().info(
+        "bridge",
+        &format!("remote link: home channel is now {home}"),
+    );
+    true
+}
+
+async fn pump_relay(
+    item: link::FromRelay,
+    msg_tx: &mpsc::Sender<InboundMsg>,
+    click_tx: &mpsc::Sender<slack::PermClick>,
+    dir: &bridge::StateDir,
+    reload: &mpsc::Sender<()>,
+    relink: &mpsc::Sender<()>,
+) {
+    match item {
+        link::FromRelay::Event { name, event } => {
+            if let Some(msg) = slack::inbound_from_relay(&name, &event)
+                && msg_tx.send(msg).await.is_err()
+            {
+                return;
+            }
+        }
+        link::FromRelay::Action { action, body } => {
+            if let Some(click) = slack::perm_click_from_relay(&action, &body)
+                && click_tx.send(click).await.is_err()
+            {
+                return;
+            }
+        }
+        // 握手のたびに来る。Relay が持っている home を、こちらの現在値に反映する
+        // (`set-home` を聞き逃していたマシンが、繋ぎ直しで追いつく)
+        link::FromRelay::Ready { home, .. } => {
+            if adopt_home(dir, home) {
+                let _ = reload.send(()).await;
+            }
+            // **起動時の1本目はここを通らない**(構築前の待ちループが食う)。ここに来るのは
+            // 張り直しだけなので、そのたびに online を出す
+            let _ = relink.send(()).await;
+        }
+        // Owner がこのマシンを担当に決めた。**Owner を記録する** — Relay 経由の Bridge は
+        // これが来るまで Slack 上の自分の身元を何も知らない
+        link::FromRelay::Linked {
+            owner_user_id,
+            channel,
+            ..
+        } => {
+            let mut access = bridge::Access::load(dir);
+            if access.owner != owner_user_id {
+                access.owner = owner_user_id.clone();
+                if let Err(e) = access.save(dir) {
+                    LogCtx::default().error("bridge", &format!("could not save the owner: {e}"));
+                } else {
+                    LogCtx::default().info(
+                        "bridge",
+                        &format!("remote link: owner is {owner_user_id} (in charge of {channel})"),
+                    );
+                    let _ = reload.send(()).await;
+                }
+            }
+        }
+        // ここまで来たらリンクは諦めている。**ワーカーには触らない** — 走っているものは
+        // 走り続ける。人が設定を直して再起動するまで、新しい Slack メッセージが来ないだけ
+        link::FromRelay::Fatal(f) => {
+            LogCtx::default().error("bridge", &format!("remote link: {} — no new messages will arrive (running workers keep going)", f.message()));
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

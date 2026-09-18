@@ -29,7 +29,7 @@ use std::path::Path;
 
 use super::inbound::InboundMsg;
 use super::state::{self as bridge, LogCtx, ThreadKey};
-use super::{Bridge, CODE_POLL_MAX, Host, LOGIN_POLL, URL_POLL_MAX};
+use super::{Bridge, Host};
 use crate::agent::screen::SpawnOutcome;
 use crate::agent::tmux::Window;
 use crate::agent::{CompactOutcome, CompactProgress, LoginOutcome, ProbeErr, SessionId};
@@ -37,6 +37,13 @@ use crate::bridge::inbound;
 use crate::{ports, slack};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
+
+/// サインインのポーリング(定数どおり)。URL は普通 1〜3 秒で出る。
+const LOGIN_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+const URL_POLL_MAX: u32 = 20;
+
+const CODE_POLL_MAX: u32 = 30;
 
 // ── 節1: 本文の読み方 ────────────────────────────────────────────────────────
 

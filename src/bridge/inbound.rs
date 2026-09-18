@@ -4,7 +4,7 @@
 //! `impl Access` here holds only the gate (`gate`, per-channel tool grants); `Access`
 //! itself is persisted state and lives in `state.rs`.
 
-use super::{Bridge, DRAIN_TIMEOUT_MS, Host, RETRY_NUM};
+use super::{Bridge, Host};
 use crate::bridge::turn::Stall;
 use crate::agent::tmux::Window;
 use crate::agent::{Envelope, SessionId, SpawnReq};
@@ -13,6 +13,17 @@ use crate::bridge::state::{Access, LogCtx, ThreadEntry, ThreadKey};
 use crate::bridge::{inbound, worker};
 use crate::slack;
 use slack_morphism::prelude::*;
+
+/// ドレインを諦めてでも殺す上限。現行は受信確認のタイムアウトを流用する
+/// (RECEIPT_TIMEOUT_MS = 30s)— 新しいつまみを増やさないため。
+const DRAIN_TIMEOUT_MS: u64 = 30_000;
+
+/// Slack が再配達に刻む試行回数。slack-morphism 2.24.0 の Socket Mode envelope は
+/// `envelope_id` と `accepts_response_payload` しか持たず、Slack が載せる `retry_attempt` は
+/// push イベントのコールバックに渡る前に捨てられる(models/socket_mode/mod.rs:59-64)ので
+/// 0 固定。同じ (channel, ts) の再到着は dedup が落とすため、stale の判定に残るのは
+/// 「この Bridge が聞き始める前に投稿されたか」だけになる。
+const RETRY_NUM: u32 = 0;
 
 /// 受信メッセージの出どころ。
 ///
@@ -442,7 +453,7 @@ pub enum WorkerState {
 
 /// 門を通った1通をどう捌くか — 「起こす / 再開する / 渡す / 溜める」の4通りしかない。
 ///
-/// スレッドの記録とワーカーの生死だけで決まる([`Action::decide`])。
+/// スレッドの記録とワーカーの生死だけで決まる([`Dispatch::decide`])。
 #[derive(PartialEq, Eq, Debug)]
 pub enum Dispatch {
     SpawnNew,

@@ -154,7 +154,7 @@ pub mod wire {
     /// 接頭辞が版。将来フォーマットを変えたら「読み違い」でなく「はっきりした拒否」になる。
     const PREFIX: &str = "SCLINK1-";
 
-    /// 相手に貼らせる1本の中身 — dial 先と鍵。**接続簿の [`Conn`] とは別物**
+    /// 相手に貼らせる1本の中身 — dial 先と鍵。**接続簿の [`Conn`](super::Conn) とは別物**
     /// (あちらは繋がった link の書き手側)。
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct Invite {

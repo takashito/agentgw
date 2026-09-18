@@ -2,15 +2,25 @@
 //! failure of a turn, the usage-limit watch, the silence watch, tool permission prompts,
 //! and writing the progress message.
 
-use super::{
-    Bridge, Host, NARRATION_CAP, PERM_WAIT_MS, TURN_FAILURE_RETRY_CAP, USAGE_MONITOR_STARTUP_DELAY_MS,
-    inbound,
-};
+use super::{Bridge, Host, inbound};
 use crate::agent::tmux::Window;
 use crate::agent::{HookEvent, ProbeErr, SessionId};
 use crate::bridge::state as bridge;
 use crate::bridge::state::{Disposition, LogCtx, ThreadKey};
 use crate::slack;
+
+const NARRATION_CAP: usize = 600;
+
+/// ターン失敗で1つのメッセージを再送してよい回数(現行 `TURN_FAILURE_RETRY_CAP`)。
+/// **1回は意図** — 再送で直る失敗(混雑・API の瞬断・型無しの一発)は次の試行で晴れる。
+/// 同じ失敗が2度出るなら本物なので、ループを見せるより人に伝える。
+const TURN_FAILURE_RETRY_CAP: u32 = 1;
+
+/// 上限の見張りを始めるまでの猶予(立ち上がりに probe をぶつけない)。
+const USAGE_MONITOR_STARTUP_DELAY_MS: u64 = 60_000;
+
+/// 人を待つ上限。hook の宣言(125s)と Bridge の待ち(120s)より内側で畳む。
+const PERM_WAIT_MS: u64 = 115_000;
 
 /// 人のクリックを待っているツール許可1件。
 ///

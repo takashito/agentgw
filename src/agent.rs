@@ -158,6 +158,34 @@ impl Envelope {
             e.channel_id, e.message_id, e.user, e.user, e.ts, e.text
         )
     }
+
+    /// 受信メッセージ → 封筒テキスト。`ts` は**配達時点**の now(`now_ms`)、`thread_ts` は解決済みの根
+    /// (現行`threadTs || msg.ts` を渡す)。
+    pub fn of(msg: &crate::bridge::inbound::InboundMsg, root_ts: &str, now_ms: u64) -> String {
+        Self::of_guarded(msg, root_ts, None, now_ms)
+    }
+
+    /// ループ遮断が立った配達だけ `loop_guard` を載せる(空文字 = 呼ぶ相手が居ない)。
+    pub fn of_guarded(
+        msg: &crate::bridge::inbound::InboundMsg,
+        root_ts: &str,
+        loop_guard: Option<String>,
+        now_ms: u64,
+    ) -> String {
+        Envelope {
+            loop_guard,
+            channel_id: msg.channel.clone(),
+            message_id: msg.ts.clone(),
+            user: msg.user.clone().unwrap_or_else(|| "unknown".to_string()),
+            ts: crate::bridge::state::iso8601(now_ms),
+            thread_ts: Some(root_ts.to_string()),
+            text: msg.text.clone(),
+            // 先読みダウンロードの結果はメッセージが持っている(queue 経由でも持ち越す)
+            file_paths: msg.file_paths.clone(),
+            file_errors: msg.file_errors.clone(),
+        }
+        .render()
+    }
 }
 
 /// 実体から上がってきた出来事1件。

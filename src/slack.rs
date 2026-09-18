@@ -1066,6 +1066,45 @@ impl Api {
             );
         }
     }
+
+    /// 再起動の道中の Slack 1本を5秒で見切る。ここで投げるものはどれも「出れば嬉しい」飾りで、
+    /// 1本の hang が marker 書きと exit(0) を止めてはならない(現行が allSettled で束ねているのと
+    /// 同じ趣旨)。失敗も時間切れもログして続ける。
+    pub async fn brief_call<T>(
+        label: &str,
+        call: impl std::future::Future<Output = Result<T, String>>,
+        ctx: &LogCtx,
+    ) -> Option<T> {
+        const CAP: std::time::Duration = std::time::Duration::from_secs(5);
+        match tokio::time::timeout(CAP, call).await {
+            Ok(Ok(v)) => Some(v),
+            Ok(Err(e)) => {
+                ctx.error("bridge", &format!("{label}: {e}"));
+                None
+            }
+            Err(_) => {
+                ctx.error(
+                    "bridge",
+                    &format!("{label}: timed out after {}s — carrying on", CAP.as_secs()),
+                );
+                None
+            }
+        }
+    }
+
+    fn fetched(m: &SlackHistoryMessage) -> FetchedMsg {
+        FetchedMsg {
+            ts: m.origin.ts.to_string(),
+            user: m
+                .sender
+                .user
+                .as_ref()
+                .map(|u| u.to_string())
+                .unwrap_or_else(|| "bot".to_string()),
+            text: m.content.text.clone().unwrap_or_default(),
+            thread_ts: m.origin.thread_ts.as_ref().map(|t| t.to_string()),
+        }
+    }
 }
 
 /// Helpers every Slack port gets, real or fake.
@@ -1103,47 +1142,6 @@ impl dyn SlackPort {
                 "bridge",
                 &format!("command post failed for {channel}:{thread_ts}: {e}"),
             );
-        }
-    }
-}
-
-impl Api {
-    /// 再起動の道中の Slack 1本を5秒で見切る。ここで投げるものはどれも「出れば嬉しい」飾りで、
-    /// 1本の hang が marker 書きと exit(0) を止めてはならない(現行が allSettled で束ねているのと
-    /// 同じ趣旨)。失敗も時間切れもログして続ける。
-    pub async fn brief_call<T>(
-        label: &str,
-        call: impl std::future::Future<Output = Result<T, String>>,
-        ctx: &LogCtx,
-    ) -> Option<T> {
-        const CAP: std::time::Duration = std::time::Duration::from_secs(5);
-        match tokio::time::timeout(CAP, call).await {
-            Ok(Ok(v)) => Some(v),
-            Ok(Err(e)) => {
-                ctx.error("bridge", &format!("{label}: {e}"));
-                None
-            }
-            Err(_) => {
-                ctx.error(
-                    "bridge",
-                    &format!("{label}: timed out after {}s — carrying on", CAP.as_secs()),
-                );
-                None
-            }
-        }
-    }
-
-    fn fetched(m: &SlackHistoryMessage) -> FetchedMsg {
-        FetchedMsg {
-            ts: m.origin.ts.to_string(),
-            user: m
-                .sender
-                .user
-                .as_ref()
-                .map(|u| u.to_string())
-                .unwrap_or_else(|| "bot".to_string()),
-            text: m.content.text.clone().unwrap_or_default(),
-            thread_ts: m.origin.thread_ts.as_ref().map(|t| t.to_string()),
         }
     }
 }

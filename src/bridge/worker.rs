@@ -12,15 +12,31 @@ use crate::agent::{SessionId, SpawnReq};
 use crate::bridge::{inbound, worker};
 use crate::bridge::state as bridge;
 use crate::bridge::state::LogCtx;
-use crate::bridge::{
-    Bridge, CLEANUP, CmdFx, Host, POOL_MCP_INIT_TIMEOUT_MS, SPAWN_SCREEN_BUDGET_MS,
-    SPAWN_SCREEN_POLL_MS,
-};
+use crate::bridge::{Bridge, CmdFx, Host};
 use crate::{mcp, slack};
 use crate::ports::AgentPort;
 use crate::bridge::inbound::WorkerState;
 use crate::bridge::state::{PoolKey, ThreadEntry, ThreadKey};
 use std::collections::{HashMap, HashSet};
+
+/// 冷えたワーカーを畳む規則(2026-08-02 ユーザー決裁の4つの数字)。
+/// 現行 Bun は環境変数で動かせるが、こちらは決め打ち — 動かしたくなったら足す。
+const CLEANUP: CleanupPolicy = CleanupPolicy {
+    idle_ttl_ms: 30 * 60_000,
+    idle_slots: 5,
+    idle_max_ms: 60 * 60_000,
+    max_concurrent: 10,
+};
+
+/// 起動画面を見張る時間。現行の 30秒(同期)+ 120秒(linger)= 150秒に合わせた。
+/// 現行の linger は `FIRST_PROMPT_TIMEOUT_MS`(60s、p99 45.6s)の2倍。
+const SPAWN_SCREEN_BUDGET_MS: u64 = 150_000;
+
+const SPAWN_SCREEN_POLL_MS: u64 = 1_000;
+
+/// プール worker が MCP を上げるまでの猶予(worker.ts の `MCP_INIT_TIMEOUT_MS` と同値)。
+/// これを超えたら諦める(= 実体ごと畳んで在庫から消す)。
+const POOL_MCP_INIT_TIMEOUT_MS: u64 = 50_000;
 
 /// 在庫を数え直す間隔。tick は 500ms 刻みなので、ここでスイープを間引く。
 pub const POOL_SWEEP_INTERVAL_MS: u64 = 5_000;
