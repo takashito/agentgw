@@ -14,7 +14,7 @@ const NARRATION_CAP: usize = 600;
 /// How many times one message may be re-sent after turn failures (`TURN_FAILURE_RETRY_CAP`).
 /// **Once is deliberate** — failures a re-send fixes (congestion, an API blip, a one-off without a type) clear on the next try.
 /// The same failure twice is real, so tell a person rather than show a loop.
-const TURN_FAILURE_RETRY_CAP: u32 = 1;
+pub(super) const TURN_FAILURE_RETRY_CAP: u32 = 1;
 
 /// Grace period before the usage-limit watch starts (don't hit start-up with a probe).
 const USAGE_MONITOR_STARTUP_DELAY_MS: u64 = 60_000;
@@ -213,7 +213,10 @@ impl Bridge {
         {
             return;
         }
-        self.settle_told(key);
+        // A retry-class message the worker couldn't take yet still belongs to the recovery paths
+        if klass != TurnFailureClass::Retry {
+            self.settle_told(key);
+        }
         self.post_error_frame(channel, thread_ts, text);
     }
 
@@ -333,6 +336,7 @@ impl Bridge {
                     ids.join(",")
                 ),
             );
+            self.settle_told(key);
             return false;
         }
         // Prefer window_id for the target (window names can be renamed) — same lookup as Dispatch::Deliver

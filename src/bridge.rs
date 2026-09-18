@@ -1649,6 +1649,45 @@ mod tests {
         assert_eq!(last_status, Some(format!("status C1 {ROOT} ")), "{:?}", slack.calls());
     }
 
+    /// A failure that re-sending can fix, on an agent that isn't ready yet: the message stays
+    /// unanswered so the recovery paths can still deliver it.
+    #[tokio::test]
+    async fn a_retryable_failure_on_a_starting_agent_keeps_the_message() {
+        let (d, _slack, agent, _clock) = flow_deps("retry-starting");
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.on_inbound(&channel_msg(ROOT, "U_OWNER", "<@U_BOT> fix the tests")).await;
+        let sid = agent.spawned.lock().unwrap()[0].session_id.as_str().to_string();
+        b.on_hook(HookEvent {
+            kind: "error".into(),
+            session_id: sid,
+            payload: serde_json::json!({ "hook_event_name": "StopFailure", "error_type": "server_error" }),
+            respond: None,
+        })
+        .await;
+        settle().await;
+        assert!(!b.ledger.pending(&ThreadKey::new("C1", ROOT)).is_empty());
+    }
+
+    /// Once the re-sends are spent the person is told, and the thread settles like any other
+    /// reported failure.
+    #[tokio::test]
+    async fn a_failure_past_the_retry_budget_settles_the_thread() {
+        let (d, _slack, agent, _clock) = flow_deps("retry-spent");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let sid = running_thread(&mut b, &agent).await;
+        for _ in 0..=crate::bridge::turn::TURN_FAILURE_RETRY_CAP {
+            b.on_hook(HookEvent {
+                kind: "error".into(),
+                session_id: sid.clone(),
+                payload: serde_json::json!({ "hook_event_name": "StopFailure", "error_type": "server_error" }),
+                respond: None,
+            })
+            .await;
+        }
+        settle().await;
+        assert!(b.ledger.pending(&ThreadKey::new("C1", ROOT)).is_empty());
+    }
+
     #[tokio::test]
     async fn login_on_a_signed_out_machine_starts_the_sign_in_here() {
         let (d, slack, agent, _clock) = flow_deps("login-signed-out");
