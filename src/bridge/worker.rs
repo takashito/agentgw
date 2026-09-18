@@ -1170,7 +1170,7 @@ impl Bridge {
             .workers
             .window_of(&sid)
             .unwrap_or_else(|| SessionId::from(sid.clone()).window_name());
-        match self.deps.agent.send_text(&Window::of(&target), envelope) {
+        match self.deps.agent.deliver(&Window::of(&target), envelope) {
             // Dispatch::Deliver と同型の配達記録。
             // このパスは新規スレッドの割当てなので new は常に true
             Ok(()) => {

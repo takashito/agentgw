@@ -313,7 +313,7 @@ impl Bridge {
             .and_then(|h| h.window_id.clone())
             .unwrap_or(window);
         for (id, envelope) in &undisposed {
-            if let Err(e) = self.deps.agent.send_text(&Window::of(&target), envelope) {
+            if let Err(e) = self.deps.agent.deliver(&Window::of(&target), envelope) {
                 ctx.error(
                     "bridge",
                     &format!("turn-failure re-send failed for {id}: {e} — telling the user"),

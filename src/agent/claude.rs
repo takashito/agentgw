@@ -896,8 +896,10 @@ impl crate::ports::AgentPort for Claude {
         Claude::spawn(self, req)
     }
 
-    fn send_text(&self, w: &Window, text: &str) -> Result<(), String> {
-        self.tmux.deliver(w, text)
+    fn deliver(&self, w: &Window, text: &str) -> Result<(), String> {
+        // The inherent `Claude::deliver`: checks for a dialog, then presses Enter again until
+        // the input box is empty.
+        Claude::deliver(self, w, text)
     }
 
     async fn watch_spawn_screens(

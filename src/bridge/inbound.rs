@@ -1090,7 +1090,7 @@ impl Bridge {
             Dispatch::Deliver => {
                 let sid = entry.as_ref().and_then(|e| e.agent_id.clone());
                 // 暖まっているワーカーには prefix 抜きの素の封筒(push と同じ形)
-                match self.deps.agent.send_text(&Window::of(&target), &envelope) {
+                match self.deps.agent.deliver(&Window::of(&target), &envelope) {
                     // 1メッセージ1行の配達記録(現行)
                     Ok(()) => {
                         ctx(sid.as_deref()).info(
@@ -1216,7 +1216,7 @@ impl Bridge {
             ),
         );
         let envelope = Envelope::of(&notice, root_ts, self.deps.clock.now_ms());
-        if let Err(e) = self.deps.agent.send_text(&Window::of(&target), &envelope) {
+        if let Err(e) = self.deps.agent.deliver(&Window::of(&target), &envelope) {
             ctx.error("bridge", &format!("message_changed delivery failed: {e}"));
             return;
         }
@@ -1330,7 +1330,7 @@ impl Bridge {
         match target {
             Some(w) => {
                 let envelope = Envelope::of(msg, root_ts, self.deps.clock.now_ms());
-                match self.deps.agent.send_text(&Window::of(&w), &envelope) {
+                match self.deps.agent.deliver(&Window::of(&w), &envelope) {
                     Ok(()) => ctx.info(
                         "bridge",
                         &format!(
@@ -1610,7 +1610,7 @@ impl Bridge {
         let mut i = 0;
         while i < queued.len() {
             let text = Envelope::of(&queued[i], &root_ts, self.deps.clock.now_ms());
-            match self.deps.agent.send_text(&Window::of(&window), &text) {
+            match self.deps.agent.deliver(&Window::of(&window), &text) {
                 Ok(()) => {
                     ctx.info("bridge", "flushed queued message");
                     delivered = true;

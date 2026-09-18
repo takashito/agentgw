@@ -98,8 +98,10 @@ pub trait SlackPort: Send + Sync + 'static {
 #[async_trait]
 pub trait AgentPort: Send + Sync + 'static {
     fn spawn(&self, req: &SpawnReq) -> Result<Window, String>;
-    /// Types `text` into the window and presses Enter.
-    fn send_text(&self, w: &Window, text: &str) -> Result<(), String>;
+    /// Hands `text` to the agent as its next message and confirms it was submitted.
+    /// Errs when the window can't take keys (a dialog is open) or the text never left the
+    /// input box — the caller keeps the message instead of assuming it arrived.
+    fn deliver(&self, w: &Window, text: &str) -> Result<(), String>;
     /// Answers the start-up screens of a freshly spawned window until `budget_ms` runs out.
     async fn watch_spawn_screens(
         &self,
@@ -372,7 +374,7 @@ pub mod fake {
             });
             Ok(Window::of(&id))
         }
-        fn send_text(&self, w: &Window, text: &str) -> Result<(), String> {
+        fn deliver(&self, w: &Window, text: &str) -> Result<(), String> {
             self.delivered
                 .lock()
                 .unwrap()
