@@ -555,6 +555,10 @@ pub(super) struct SignIn {
     /// サインアウトが走っているか。`logout` の2連打で `claude auth logout` が2回走り、
     /// 2本目の teardown が1本目の後始末と噛み合わなくなるのを防ぐ
     signing_out: bool,
+    /// サインイン切れの見張り: 最後に確かめた時刻(0 = まだ)と、最後に分かった状態
+    /// (`None` = まだ分からない。切れたと分かった時点で1回だけ知らせる)
+    checked_at_ms: u64,
+    last_known: Option<bool>,
 }
 
 // ── running commands ─────────────────────────────────────────────────────────

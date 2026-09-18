@@ -1073,6 +1073,35 @@ impl Bridge {
         });
     }
 
+    /// このマシンの Claude Code のサインインを見張る。起動時と12時間ごと(ユーザー判断)に確かめ、
+    /// **切れたと分かった時点で1回だけ**通知先に知らせる。戻っても何も言わない。確かめられなかった
+    /// (`None`)ときは状態を変えない。Owner がまだ居ない(最初のセットアップ前)ときは見ない —
+    /// 切れているのが当たり前で、知らせる相手も居ない
+    pub(in crate::bridge) async fn sign_in_tick(&mut self) {
+        const EVERY_MS: u64 = 12 * 60 * 60 * 1000;
+        let now = self.deps.clock.now_ms();
+        let due = self.sign_in.checked_at_ms == 0 || now >= self.sign_in.checked_at_ms + EVERY_MS;
+        if !due || self.access.owner.is_empty() {
+            return;
+        }
+        self.sign_in.checked_at_ms = now;
+        let Some(signed_in) = self.deps.agent.signed_in().await else {
+            return;
+        };
+        let was = self.sign_in.last_known.replace(signed_in);
+        if signed_in || was == Some(false) {
+            return;
+        }
+        let ctx = LogCtx::default();
+        ctx.info("bridge", "sign-in watch: this machine's agent is signed out — telling the owner");
+        let machine = &self.machine_name;
+        let text = crate::t!(
+            "🔑 Claude Code on *{machine}* is signed out. Send `login` in a channel {machine} handles to sign in again.",
+            "🔑 *{machine}* の Claude Code のサインインが切れています。{machine} が受け持つチャンネルで `login` と送ると、サインインし直せます。"
+        );
+        self.post_notice(&text, &ctx).await;
+    }
+
     /// spawn したサインイン・サインアウトが戻してきた状態変更を、main の側で1つずつ適用する。
     pub(in crate::bridge) async fn on_cmd_fx(&mut self, fx: CmdFx) {
         let ctx = LogCtx::default();

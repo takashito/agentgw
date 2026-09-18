@@ -731,6 +731,7 @@ impl Bridge {
                     b.sweep_pools(&LogCtx::default());
                     b.cleanup_workers().await;
                     b.usage_tick().await;
+                    b.sign_in_tick().await;
                 }
                 _ = sigterm.recv() => b.shutdown("signal:SIGTERM").await,
                 _ = sigint.recv() => b.shutdown("signal:SIGINT").await,
@@ -1666,5 +1667,45 @@ mod tests {
         b.on_cmd_fx(CmdFx::LoginFinished { channel: "C1".into(), bound: Some("U_SOMEONE".into()) })
             .await;
         assert_eq!(b.access.owner, "U_OWNER");
+    }
+
+    /// Each machine checks its own Claude Code sign-in at start and every 12 hours, and says so
+    /// once in the notice channel when it finds it signed out. Seen: a machine signed out for
+    /// days while its gateway (and so its owner) was fine.
+    #[tokio::test]
+    async fn a_signed_out_machine_is_announced_once_until_it_signs_in_again() {
+        const HOURS_12: u64 = 12 * 60 * 60 * 1000;
+        let (d, slack, agent, clock) = flow_deps("sign-in-watch");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let said = |slack: &FakeChat| slack.calls().iter().filter(|c| c.contains("is signed out")).count();
+        let set = |v: Option<bool>| *agent.signed_in.lock().unwrap() = Some(v);
+
+        set(Some(false));
+        b.sign_in_tick().await; // the first check runs at start
+        settle().await;
+        assert_eq!(said(&slack), 1, "{:?}", slack.calls());
+        assert!(slack.calls().iter().any(|c| c.contains("*test-machine*")), "names the machine");
+
+        clock.advance(60 * 60 * 1000);
+        b.sign_in_tick().await; // not due yet
+        clock.advance(HOURS_12);
+        b.sign_in_tick().await; // due, still signed out: no second notice
+        settle().await;
+        assert_eq!(said(&slack), 1);
+
+        set(Some(true));
+        clock.advance(HOURS_12);
+        b.sign_in_tick().await; // signed in again: nothing to say
+        set(None);
+        clock.advance(HOURS_12);
+        b.sign_in_tick().await; // couldn't tell: nothing changes
+        settle().await;
+        assert_eq!(said(&slack), 1);
+
+        set(Some(false));
+        clock.advance(HOURS_12);
+        b.sign_in_tick().await; // signed out again: say it again
+        settle().await;
+        assert_eq!(said(&slack), 2);
     }
 }
