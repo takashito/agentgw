@@ -83,7 +83,7 @@ pub fn choose_source(has_gh: bool, dist: Option<PathBuf>, version: &str) -> Resu
 // ── 通り道 ───────────────────────────────────────────────────────────────────
 
 /// マシンがゲートウェイにつなぐ通り道。**検出ではなく実測で決める** — マシンを起こして、ゲートウェイの
-/// `ask_connected` に名前が出たかで判定する(`relay.rs:2488`)。
+/// `ask_connected`(`bridge::gateway::Cli`)に名前が出たかで判定する。
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Transport {
     /// マシンがゲートウェイの公開名に直接 dial する(tailnet など)
