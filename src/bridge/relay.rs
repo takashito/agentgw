@@ -499,9 +499,7 @@ impl Admit {
             Admit::BadPath => "the path carries no usable Bridge ID",
         }
     }
-}
 
-impl Admit {
     /// upgrade の3点(パス / `Authorization` / `Sec-WebSocket-Protocol`)を見て決める。
     ///
     /// **順序が仕様**: ①同じ言葉を喋るか → ②api トークン → ③**はじめて**名乗りを信じる。
@@ -952,27 +950,12 @@ impl CommandCtx<'_> {
             )),
         }
     }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum RouteOutcome {
-    NotACommand,
-    Refused(String),
-    List(String),
-    /// 担当が決まった。`reply` を返し、`bridge_id` をこのチャンネルに紐づける。
-    Set {
-        bridge_id: String,
-        reply: String,
-    },
-    UnknownBridge(String),
-}
 
 /// `route` — Owner がこのチャンネルの担当マシンを決める。
 ///
 /// **Owner だけ**。これが無いと、共有チャンネルに居る他人が `route 自分のマシン` と打つだけで
 /// そのチャンネルを乗っ取れ、以後のメッセージがその人のマシン(その人の権限)へ流れる。
 /// 飾りの検査ではない。
-impl CommandCtx<'_> {
     /// `route` — Owner がこのチャンネルの担当マシンを決める。
     /// `self_id` は親の名前 — **担当の決まっていないチャンネルは親が受ける**ので、一覧で言う。
     pub fn route(&self, routes: &Routes, connected: &[String], self_id: &str) -> RouteOutcome {
@@ -1031,6 +1014,42 @@ impl CommandCtx<'_> {
             reply: lines.join("\n"),
         }
     }
+
+    /// `set-home` — 打ったチャンネルがフリート共通の home になる。引数の形は持たない。
+    pub fn set_home(&self) -> SetHomeOutcome {
+        let ctx = self;
+        match ctx.verb_args("set-home") {
+            Some(args) if args.is_empty() => {}
+            _ => return SetHomeOutcome::NotACommand,
+        }
+        if let Some(reply) = ctx.refuse_if_not_owner("set-home") {
+            return SetHomeOutcome::Refused(reply);
+        }
+        if ctx.is_dm() {
+            return SetHomeOutcome::NeedsChannel(crate::t!(
+                "Run `set-home` in the *channel* you want notices in. A DM can't be the notice channel.",
+                "`set-home` は、通知を出したい *チャンネル* で実行してください。DM は通知先にできません。"
+            ));
+        }
+        let ch = ctx.channel_id;
+        SetHomeOutcome::Set(crate::t!(
+            "Notices from every machine will now go to <#{ch}>.",
+            "これからは、すべてのマシンの通知を <#{ch}> に出します。"
+        ))
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum RouteOutcome {
+    NotACommand,
+    Refused(String),
+    List(String),
+    /// 担当が決まった。`reply` を返し、`bridge_id` をこのチャンネルに紐づける。
+    Set {
+        bridge_id: String,
+        reply: String,
+    },
+    UnknownBridge(String),
 }
 
 /// 引数なしの `route` の答え。**打ったチャンネルがどうなっているか**を先に言い、
@@ -1117,31 +1136,6 @@ pub enum SetHomeOutcome {
     /// DM で打たれた。home は**チャンネル**でなければならない。
     NeedsChannel(String),
     Set(String),
-}
-
-impl CommandCtx<'_> {
-    /// `set-home` — 打ったチャンネルがフリート共通の home になる。引数の形は持たない。
-    pub fn set_home(&self) -> SetHomeOutcome {
-        let ctx = self;
-        match ctx.verb_args("set-home") {
-            Some(args) if args.is_empty() => {}
-            _ => return SetHomeOutcome::NotACommand,
-        }
-        if let Some(reply) = ctx.refuse_if_not_owner("set-home") {
-            return SetHomeOutcome::Refused(reply);
-        }
-        if ctx.is_dm() {
-            return SetHomeOutcome::NeedsChannel(crate::t!(
-                "Run `set-home` in the *channel* you want notices in. A DM can't be the notice channel.",
-                "`set-home` は、通知を出したい *チャンネル* で実行してください。DM は通知先にできません。"
-            ));
-        }
-        let ch = ctx.channel_id;
-        SetHomeOutcome::Set(crate::t!(
-            "Notices from every machine will now go to <#{ch}>.",
-            "これからは、すべてのマシンの通知を <#{ch}> に出します。"
-        ))
-    }
 }
 
 // ── DM の名乗り — Owner が生まれる瞬間 ───────────────────────────
@@ -1604,192 +1598,9 @@ impl Fleet {
             rlog("error", &format!("could not post to {channel}: {e}"));
         }
     }
-}
-
-// ── HTTP / WebSocket の口 ──────────────────────────────────
-
-/// upgrade を通してよいか。**通すなら名乗り**、通さない/到達確認なら**返す応答**。
-///
-/// 親(子を迎える口)と子(親を迎える口)で、判断も断り方も同じ — 違うのは通ったあとだけ。
-fn admit_upgrade(
-    headers: &HeaderMap,
-    uri: &axum::http::Uri,
-    token: &str,
-    who: &str,
-    ws: WebSocketUpgrade,
-) -> Result<(String, WebSocketUpgrade), axum::response::Response> {
-    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-    match Admit::of(
-        uri.path(),
-        header("authorization"),
-        header("sec-websocket-protocol"),
-        token,
-    ) {
-        Admit::Ok(id) => Ok((id, ws)),
-        // 到達確認 — upgrade は通すが、接続簿には載せない
-        Admit::Probe => {
-            rlog("debug", "answered a reachability probe — not recorded");
-            Err(ws
-                .protocols([LINK_SUBPROTOCOL])
-                .on_upgrade(|_socket| async {}))
-        }
-        decision => {
-            // **黙って断らない。** 何が駄目だったのかを、こちらのログにも1行残す
-            rlog(
-                "info",
-                &format!("refused {who} on {}: {}", uri.path(), decision.why()),
-            );
-            let code = decision.status().unwrap_or(400);
-            Err((
-                StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST),
-                decision.why(),
-            )
-                .into_response())
-        }
-    }
-}
-
-/// 子が dial してくる口。`/bridge/{id}`。
-async fn on_upgrade(
-    State(fleet): State<Arc<Fleet>>,
-    headers: HeaderMap,
-    uri: axum::http::Uri,
-    ws: WebSocketUpgrade,
-) -> axum::response::Response {
-    let (bridge_id, ws) = match admit_upgrade(&headers, &uri, &fleet.token, "a link", ws) {
-        Ok(ok) => ok,
-        Err(response) => return response,
-    };
-    // 自分と同じ名前は通さない。通すと `route <自分の id>` の行き先が2つになる
-    if bridge_id == fleet.self_id {
-        rlog(
-            "info",
-            &format!("refused a link named \"{bridge_id}\" — that is this machine's own name"),
-        );
-        return (StatusCode::CONFLICT, "that name is taken by the parent").into_response();
-    }
-    // upgrade の応答に subprotocol を返すのが作法(返さないと厳しいクライアントは切る)
-    ws.protocols([LINK_SUBPROTOCOL])
-        .on_upgrade(move |socket| on_socket(fleet, bridge_id, socket))
-}
-
-/// axum 側の読み口。差を埋めるだけ — 見張りの時計と状態機械は `link::beat` に1つしか無い。
-impl link_watch::LinkRead for WebSocket {
-    async fn read_frame(&mut self) -> link_watch::Frame {
-        match self.recv().await {
-            Some(Ok(Message::Text(t))) => link_watch::Frame::Text(t.to_string()),
-            Some(Ok(Message::Close(_))) | None => {
-                link_watch::Frame::Closed("closed by the other side".to_string())
-            }
-            Some(Ok(_)) => link_watch::Frame::Other,
-            Some(Err(e)) => link_watch::Frame::Closed(e.to_string()),
-        }
-    }
-}
-
-/// 1本の link の一生(**子が dial してきた側**)。
-async fn on_socket(fleet: Arc<Fleet>, bridge_id: String, mut socket: WebSocket) {
-    let (conn, mut rx) = fleet.attach(&bridge_id).await;
-
-    // ソケットを分割しない(futures_util の Sink 側を使わない)。**握手のあと子は何も送って
-    // こない**ので、この1本のループで「送る」と「閉じるのを待つ」を兼ねられる。
-    //
-    // **黙って消えた子を掴んだままにしない。** 握手のあと子は何も送ってこないので、この口は
-    // 無通信が正常。だから Ping で叩かないと half-open と区別がつかず、居ない子が
-    // `status` に「つながっています」と出続け、その子宛の配達が宙に消える
-    let mut watch = link_watch::IdleWatch::default();
-    loop {
-        tokio::select! {
-            outgoing = rx.recv() => match outgoing {
-                Some(text) => {
-                    watch.on_traffic();
-                    if socket.send(Message::Text(text.into())).await.is_err() {
-                        break;
-                    }
-                }
-                None => break,
-            },
-            // **受信は `beat` 経由だけ。** 直に `recv()` を待つと half-open で永久に止まる
-            incoming = link_watch::beat(&mut socket, &mut watch) => match incoming {
-                link_watch::Beat::Text(_) | link_watch::Beat::Alive => {} // 送ってくるものは無いはず
-                link_watch::Beat::Ping => {
-                    if socket.send(Message::Ping(Default::default())).await.is_err() {
-                        break;
-                    }
-                }
-                link_watch::Beat::Gone(why) => {
-                    rlog("info", &format!("{bridge_id}: link closed ({why})"));
-                    break;
-                }
-            },
-        }
-    }
-    // axum の WebSocket は drop で閉じる
-    fleet.detach(&bridge_id, &conn).await;
-}
-
-/// 走っている親に「いま誰が繋がっているか」を聞く口。**生きているプロセスしか知らない。**
-/// loopback にしか bind しないが、前段の proxy が全パスを転送する構成もありうるので鍵で守る。
-async fn on_status(
-    State(fleet): State<Arc<Fleet>>,
-    headers: HeaderMap,
-) -> axum::response::Response {
-    let presented = headers
-        .get("x-api-token")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if !secret_eq(presented, &fleet.token) {
-        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
-    }
-    let tunnels = fleet.tunnels.lock().unwrap().clone();
-    axum::Json(serde_json::json!({ "connected": fleet.links.connected(), "tunnels": tunnels }))
-        .into_response()
-}
-
-/// 子を迎える口を開ける。**戻ってこない。**
-///
-/// bind に失敗しても Bridge は止めない — 自分のワーカーは動き続ける。ただし子は1台も
-/// 繋がらないので、error で大きく残す(黙ると「繋がらない」の原因がどこにも出ない)。
-pub async fn serve_children(fleet: Arc<Fleet>, addr: std::net::SocketAddr) {
-    let Some(listener) = bind_link_port(addr, "children").await else {
-        return;
-    };
-    rlog("info", &format!("listening on {addr}/bridge/<id>"));
-    serve_children_on(fleet, listener).await;
-}
-
-/// link の口を開ける。**開けなくても Bridge は止めない** — 自分のワーカーは動き続ける。
-/// ただし相手は1台も繋がらないので、error で大きく残す(黙ると原因がどこにも出ない)。
-async fn bind_link_port(addr: std::net::SocketAddr, what: &str) -> Option<tokio::net::TcpListener> {
-    match tokio::net::TcpListener::bind(addr).await {
-        Ok(l) => Some(l),
-        Err(e) => {
-            rlog(
-                "error",
-                &format!("cannot listen on {addr} for the {what} ({e}) — nothing can connect"),
-            );
-            None
-        }
-    }
-}
-
-/// **この口に載っているのは link の3本だけ。** hook intake(`bridge.rs`)と MCP は
-/// **別の口**で、あちらは loopback + トークンで守られている。こちらは前段の proxy 経由で
-/// 公開されるので、同じ口に載せると hook と MCP が外から叩けるようになる。
-async fn serve_children_on(fleet: Arc<Fleet>, listener: tokio::net::TcpListener) {
-    let app = Router::new()
-        .route("/status", get(on_status))
-        .route(wire::PROBE_PATH, get(on_upgrade))
-        .route("/bridge/{id}", get(on_upgrade))
-        .with_state(fleet);
-    if let Err(e) = axum::serve(listener, app).await {
-        rlog("error", &format!("the link server stopped: {e}"));
-    }
-}
 
 // ── Slack から来たものを、どこへ渡すか ───────────────────────────
 
-impl Fleet {
     /// presence の猶予切れを拾う番人。タイマーを持たない設計なので、ここが唯一の時計。
     pub async fn watch_presence(self: Arc<Self>) {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -2152,7 +1963,6 @@ impl Fleet {
             }
         }
     }
-}
 
 // ── 親→子 dial(親が NAT の内側にいるときだけ) ────────────────────────
 //
@@ -2164,7 +1974,6 @@ impl Fleet {
 ///
 /// 繋がったら [`LinkServer`] に登録するので、配達も presence も set-home の一斉配りも
 /// 子から dial された link と1行も変わらない扱いになる。
-impl Fleet {
     /// `AGENTGW_CHILD_URLS` に書かれた子へ、1台につき1本ずつ繋ぎに行く。
     pub fn dial_children(self: &Arc<Self>, targets: Vec<(String, String)>) {
         for (bridge_id, url) in targets {
@@ -2269,6 +2078,188 @@ impl Fleet {
         Ok(true)
     }
 }
+
+// ── HTTP handlers ──────────────────────────────────────
+
+/// upgrade を通してよいか。**通すなら名乗り**、通さない/到達確認なら**返す応答**。
+///
+/// 親(子を迎える口)と子(親を迎える口)で、判断も断り方も同じ — 違うのは通ったあとだけ。
+fn admit_upgrade(
+    headers: &HeaderMap,
+    uri: &axum::http::Uri,
+    token: &str,
+    who: &str,
+    ws: WebSocketUpgrade,
+) -> Result<(String, WebSocketUpgrade), axum::response::Response> {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    match Admit::of(
+        uri.path(),
+        header("authorization"),
+        header("sec-websocket-protocol"),
+        token,
+    ) {
+        Admit::Ok(id) => Ok((id, ws)),
+        // 到達確認 — upgrade は通すが、接続簿には載せない
+        Admit::Probe => {
+            rlog("debug", "answered a reachability probe — not recorded");
+            Err(ws
+                .protocols([LINK_SUBPROTOCOL])
+                .on_upgrade(|_socket| async {}))
+        }
+        decision => {
+            // **黙って断らない。** 何が駄目だったのかを、こちらのログにも1行残す
+            rlog(
+                "info",
+                &format!("refused {who} on {}: {}", uri.path(), decision.why()),
+            );
+            let code = decision.status().unwrap_or(400);
+            Err((
+                StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST),
+                decision.why(),
+            )
+                .into_response())
+        }
+    }
+}
+
+/// 子が dial してくる口。`/bridge/{id}`。
+async fn on_upgrade(
+    State(fleet): State<Arc<Fleet>>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+    ws: WebSocketUpgrade,
+) -> axum::response::Response {
+    let (bridge_id, ws) = match admit_upgrade(&headers, &uri, &fleet.token, "a link", ws) {
+        Ok(ok) => ok,
+        Err(response) => return response,
+    };
+    // 自分と同じ名前は通さない。通すと `route <自分の id>` の行き先が2つになる
+    if bridge_id == fleet.self_id {
+        rlog(
+            "info",
+            &format!("refused a link named \"{bridge_id}\" — that is this machine's own name"),
+        );
+        return (StatusCode::CONFLICT, "that name is taken by the parent").into_response();
+    }
+    // upgrade の応答に subprotocol を返すのが作法(返さないと厳しいクライアントは切る)
+    ws.protocols([LINK_SUBPROTOCOL])
+        .on_upgrade(move |socket| on_socket(fleet, bridge_id, socket))
+}
+
+/// axum 側の読み口。差を埋めるだけ — 見張りの時計と状態機械は `link::beat` に1つしか無い。
+impl link_watch::LinkRead for WebSocket {
+    async fn read_frame(&mut self) -> link_watch::Frame {
+        match self.recv().await {
+            Some(Ok(Message::Text(t))) => link_watch::Frame::Text(t.to_string()),
+            Some(Ok(Message::Close(_))) | None => {
+                link_watch::Frame::Closed("closed by the other side".to_string())
+            }
+            Some(Ok(_)) => link_watch::Frame::Other,
+            Some(Err(e)) => link_watch::Frame::Closed(e.to_string()),
+        }
+    }
+}
+
+/// 1本の link の一生(**子が dial してきた側**)。
+async fn on_socket(fleet: Arc<Fleet>, bridge_id: String, mut socket: WebSocket) {
+    let (conn, mut rx) = fleet.attach(&bridge_id).await;
+
+    // ソケットを分割しない(futures_util の Sink 側を使わない)。**握手のあと子は何も送って
+    // こない**ので、この1本のループで「送る」と「閉じるのを待つ」を兼ねられる。
+    //
+    // **黙って消えた子を掴んだままにしない。** 握手のあと子は何も送ってこないので、この口は
+    // 無通信が正常。だから Ping で叩かないと half-open と区別がつかず、居ない子が
+    // `status` に「つながっています」と出続け、その子宛の配達が宙に消える
+    let mut watch = link_watch::IdleWatch::default();
+    loop {
+        tokio::select! {
+            outgoing = rx.recv() => match outgoing {
+                Some(text) => {
+                    watch.on_traffic();
+                    if socket.send(Message::Text(text.into())).await.is_err() {
+                        break;
+                    }
+                }
+                None => break,
+            },
+            // **受信は `beat` 経由だけ。** 直に `recv()` を待つと half-open で永久に止まる
+            incoming = link_watch::beat(&mut socket, &mut watch) => match incoming {
+                link_watch::Beat::Text(_) | link_watch::Beat::Alive => {} // 送ってくるものは無いはず
+                link_watch::Beat::Ping => {
+                    if socket.send(Message::Ping(Default::default())).await.is_err() {
+                        break;
+                    }
+                }
+                link_watch::Beat::Gone(why) => {
+                    rlog("info", &format!("{bridge_id}: link closed ({why})"));
+                    break;
+                }
+            },
+        }
+    }
+    // axum の WebSocket は drop で閉じる
+    fleet.detach(&bridge_id, &conn).await;
+}
+
+/// 走っている親に「いま誰が繋がっているか」を聞く口。**生きているプロセスしか知らない。**
+/// loopback にしか bind しないが、前段の proxy が全パスを転送する構成もありうるので鍵で守る。
+async fn on_status(
+    State(fleet): State<Arc<Fleet>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let presented = headers
+        .get("x-api-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !secret_eq(presented, &fleet.token) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    let tunnels = fleet.tunnels.lock().unwrap().clone();
+    axum::Json(serde_json::json!({ "connected": fleet.links.connected(), "tunnels": tunnels }))
+        .into_response()
+}
+
+/// 子を迎える口を開ける。**戻ってこない。**
+///
+/// bind に失敗しても Bridge は止めない — 自分のワーカーは動き続ける。ただし子は1台も
+/// 繋がらないので、error で大きく残す(黙ると「繋がらない」の原因がどこにも出ない)。
+pub async fn serve_children(fleet: Arc<Fleet>, addr: std::net::SocketAddr) {
+    let Some(listener) = bind_link_port(addr, "children").await else {
+        return;
+    };
+    rlog("info", &format!("listening on {addr}/bridge/<id>"));
+    serve_children_on(fleet, listener).await;
+}
+
+/// link の口を開ける。**開けなくても Bridge は止めない** — 自分のワーカーは動き続ける。
+/// ただし相手は1台も繋がらないので、error で大きく残す(黙ると原因がどこにも出ない)。
+async fn bind_link_port(addr: std::net::SocketAddr, what: &str) -> Option<tokio::net::TcpListener> {
+    match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => Some(l),
+        Err(e) => {
+            rlog(
+                "error",
+                &format!("cannot listen on {addr} for the {what} ({e}) — nothing can connect"),
+            );
+            None
+        }
+    }
+}
+
+/// **この口に載っているのは link の3本だけ。** hook intake(`bridge.rs`)と MCP は
+/// **別の口**で、あちらは loopback + トークンで守られている。こちらは前段の proxy 経由で
+/// 公開されるので、同じ口に載せると hook と MCP が外から叩けるようになる。
+async fn serve_children_on(fleet: Arc<Fleet>, listener: tokio::net::TcpListener) {
+    let app = Router::new()
+        .route("/status", get(on_status))
+        .route(wire::PROBE_PATH, get(on_upgrade))
+        .route("/bridge/{id}", get(on_upgrade))
+        .with_state(fleet);
+    if let Err(e) = axum::serve(listener, app).await {
+        rlog("error", &format!("the link server stopped: {e}"));
+    }
+}
+
 
 // ── 節8: 子の口(親に迎えに来てもらう構成でだけ開く) ─────────────────────
 
