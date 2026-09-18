@@ -898,219 +898,6 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 /// ここが正 — コマンドの検出側(`command::parse_model_command`)もこの表を見る。
 pub const MODEL_NAMES: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
 
-// ── 手書きの走査ヘルパ(regex を足さない) ───────────────────────────────────
-
-/// ASCII 大小文字を無視した接頭辞一致(regex の `/i` の代わり)。
-fn starts_with_ci(s: &str, prefix: &str) -> bool {
-    s.get(..prefix.len())
-        .is_some_and(|p| p.eq_ignore_ascii_case(prefix))
-}
-
-/// regex の `\w`(語構成文字)。`\b` の判定は両側をこれで見る。
-fn is_word(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
-}
-
-/// ASCII 大小を無視した全出現位置(regex の `/i` + エンジンの位置送り相当)。
-/// `to_ascii_lowercase` は ASCII しか変えないのでバイト位置は原文と同じ。`needle` は小文字で渡す。
-fn match_indices_ci(hay: &str, needle: &str) -> Vec<usize> {
-    hay.to_ascii_lowercase()
-        .match_indices(needle)
-        .map(|(i, _)| i)
-        .collect()
-}
-
-/// `**Key:**` の**値**: 続く空白(改行も含む — 現物の `\s*` がそう)を飛ばした先の行。
-/// 値が空なら None。
-fn header_value(raw: &str, key: &str) -> Option<String> {
-    let i = raw.find(key)?;
-    let rest = raw[i + key.len()..].trim_start();
-    let line = rest.split('\n').next().unwrap_or("").trim_end();
-    (!line.is_empty()).then(|| line.to_string())
-}
-
-/// `**Tokens:** <used> / <total> (<pct>)`。 の3捕獲 regex 相当
-/// 形が崩れているヘッダは飛ばして次の `**Tokens:**` を試す(regex が位置を進めるのと同じ)。
-fn tokens_header(raw: &str) -> Option<(String, String, String)> {
-    const KEY: &str = "**Tokens:**";
-    for (i, _) in raw.match_indices(KEY) {
-        let s = raw[i + KEY.len()..].trim_start();
-        // `[^/\s]+` — スラッシュも空白も含まない一続き
-        let used: String = s
-            .chars()
-            .take_while(|c| !c.is_whitespace() && *c != '/')
-            .collect();
-        if used.is_empty() {
-            continue;
-        }
-        let Some(s) = s[used.len()..].trim_start().strip_prefix('/') else {
-            continue;
-        };
-        let s = s.trim_start();
-        let total: String = s
-            .chars()
-            .take_while(|c| !c.is_whitespace() && *c != '(')
-            .collect();
-        if total.is_empty() {
-            continue;
-        }
-        let Some(s) = s[total.len()..].trim_start().strip_prefix('(') else {
-            continue;
-        };
-        let Some(end) = s.find(')') else { continue };
-        return Some((used, total, s[..end].trim().to_string()));
-    }
-    None
-}
-
-/// `used` の後ろの残り: `(?:.*?\bresets\s+(.+?))?\s*$` 相当。
-/// `Some("")` = reset 節なしで行が終わっている / `Some(when)` = 節あり /
-/// **None = 上限行ではない**(`resets` でない余計な文字が残っている)。
-fn usage_reset_clause(tail: &str) -> Option<String> {
-    let lower = tail.to_ascii_lowercase(); // ASCII 変換なのでバイト位置は tail と同じ
-    let mut from = 0;
-    while let Some(rel) = lower[from..].find("resets") {
-        let i = from + rel;
-        // `\b`: 直前が語構成文字なら境界でない(`presets` は resets ではない)
-        let word_before = tail[..i]
-            .chars()
-            .next_back()
-            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
-        let after = &tail[i + "resets".len()..];
-        if !word_before && after.starts_with(char::is_whitespace) {
-            return Some(after.trim().to_string());
-        }
-        from = i + "resets".len();
-    }
-    tail.trim().is_empty().then(String::new)
-}
-
-/// 1行を上限行として読む。`^\s*(.+?):\s*(\d+)%\s+used\b…$` の手書き版 —
-/// ラベルは最短一致なので、**うまくパースできる最初のコロン**で切る。
-fn parse_usage_line(line: &str) -> Option<UsageRow> {
-    for (ci, _) in line.match_indices(':') {
-        let label = line[..ci].trim();
-        if label.is_empty() {
-            continue; // `(.+?)` は1文字以上
-        }
-        let after = line[ci + 1..].trim_start();
-        let pct: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if pct.is_empty() {
-            continue;
-        }
-        let Some(rest) = after[pct.len()..].strip_prefix('%') else {
-            continue;
-        };
-        let trimmed = rest.trim_start();
-        if trimmed.len() == rest.len() {
-            continue; // `\s+` は1文字以上
-        }
-        if !starts_with_ci(trimmed, "used") {
-            continue;
-        }
-        let rest = &trimmed["used".len()..];
-        // `used` の直後の `\b` — 語が続くなら別の語(`usedxx`)
-        if rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
-            continue;
-        }
-        // ここも continue — 残りが reset 節でなければ「このコロンでの切り方が違った」だけで、
-        // 現物の遅延一致は次のコロンを試す(`A: 12% used, X: 66% used` は2つ目で一致する)
-        let Some(reset) = usage_reset_clause(rest) else {
-            continue;
-        };
-        return Some(UsageRow {
-            label: label.to_string(),
-            pct,
-            reset,
-        });
-    }
-    None
-}
-
-/// `(33s)` / `(1m 4s · ↑ 876 tokens)` の経過秒。`\((?:(\d+)m\s*)?(\d+)s\b[^)]*\)` の手書き版 —
-/// 数字は `(` の**直後**から始まる(`(elapsed 33s)` は一致しない)。
-fn parse_elapsed(spinner: &str) -> Option<u32> {
-    for (i, _) in spinner.match_indices('(') {
-        let s = &spinner[i + 1..];
-        let d1: String = s.chars().take_while(char::is_ascii_digit).collect();
-        if d1.is_empty() {
-            continue;
-        }
-        let after = &s[d1.len()..];
-        // `Nm` があれば分。無ければ最初の数字がそのまま秒(regex の optional group の backtrack)
-        let (mins, secs, rest) = match after.strip_prefix(['m', 'M']) {
-            Some(r) => {
-                let r = r.trim_start();
-                let d2: String = r.chars().take_while(char::is_ascii_digit).collect();
-                if d2.is_empty() {
-                    continue;
-                }
-                (d1.parse().unwrap_or(0), d2.clone(), &r[d2.len()..])
-            }
-            None => (0u32, d1.clone(), after),
-        };
-        // `s\b` の後は `[^)]*\)` — `[^)]*` は `)` を跨げないので「後ろに `)` がある」と同義
-        let Some(tail) = rest.strip_prefix(['s', 'S']) else {
-            continue;
-        };
-        if tail.starts_with(is_word) || !tail.contains(')') {
-            continue;
-        }
-        return Some(mins * 60 + secs.parse().unwrap_or(0));
-    }
-    None
-}
-
-/// スピナー行の括弧内のトークン数: `([↑↓])\s*([\d.]+[km]?)\s*tokens` 相当。
-fn parse_tokens(spinner: &str) -> Option<(char, String)> {
-    for (i, dir) in spinner
-        .char_indices()
-        .filter(|(_, c)| matches!(c, '↑' | '↓'))
-    {
-        let s = spinner[i + dir.len_utf8()..].trim_start();
-        let mut num: String = s
-            .chars()
-            .take_while(|c| c.is_ascii_digit() || *c == '.')
-            .collect();
-        if num.is_empty() {
-            continue;
-        }
-        let after = &s[num.len()..];
-        // `[km]?` は捕獲の中(`1.6k` で1つの印字)
-        let after = match after.strip_prefix(['k', 'm', 'K', 'M']) {
-            Some(r) => {
-                num.push_str(&after[..after.len() - r.len()]);
-                r
-            }
-            None => after,
-        };
-        if starts_with_ci(after.trim_start(), "tokens") {
-            return Some((dir, num));
-        }
-    }
-    None
-}
-
-/// 1行から `(\d{1,3})\s*%` の**最初の**一致。`%` の手前の空白を飛ばして最大3桁を後ろから取る。
-fn parse_percent_line(line: &str) -> Option<u32> {
-    for (i, _) in line.match_indices('%') {
-        let head = line[..i].trim_end();
-        let digits: String = head
-            .chars()
-            .rev()
-            .take_while(char::is_ascii_digit)
-            .take(3)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        if !digits.is_empty() {
-            return digits.parse().ok(); // 行内の最初の一致だけ(現物も break せず次の行へ)
-        }
-    }
-    None
-}
-
 /// スライダの状態行に出る表示レベル。`auto` は**入らない** — auto の時は解決先の
 /// レベルが名乗られる。 の選択肢そのまま。
 const STATUS_LEVELS: [&str; 6] = ["low", "medium", "high", "xhigh", "max", "ultracode"];
@@ -1148,48 +935,11 @@ const LOGIN_ERROR_MARKERS: [&str; 9] = [
     "try again",
 ];
 
-/// 起動直後の窓に出うる画面。**誰かが答えるまで claude はプロンプトを1文字も読まない。**
-///
-/// 現行 `classifySpawnPane` の移植。4種のうち上2つは Enter で答えられ、
-/// 下2つは**答えられない**(アカウントの事情なので、何度起こし直しても同じ壁に当たる)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SpawnScreen {
-    /// claude 自身の workspace-trust。cwd が `~/.claude.json` の
-    /// `projects[cwd].hasTrustDialogAccepted` に無いと出る(2026-08-02、実機)
-    Trust,
-    /// dev channels の確認。既定の選択肢が Yes なので Enter で通る
-    Confirm,
-    /// サインイン画面。Enter では消えない
-    LoginRequired,
-    /// 上限モーダル。Enter では消えない
-    UsageLimited,
-    None_,
-}
-
-/// 見張りの結末。現行 `SpawnOutcome` の移植だが、**成功の意味が違う**:
-/// Rust の「起動できた」は `starting` の掛け金を最初の user_prompt が外すことで表しているので、
-/// ここは「答えるべき画面に答えたか」しか言わない。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SpawnOutcome {
-    /// 答えられる画面に答えた(あるいは答えた上で期限まで見ていた)
-    Answered,
-    /// サインイン画面。**誰も答えられない** — Owner に言うしかない
-    LoginRequired,
-    /// 上限モーダル。同上(裏取りは呼び手の仕事)
-    UsageLimited,
-    /// 期限まで何も出なかった。**失敗ではない** — 普通に立ち上がった窓がこれ
-    NoScreen,
-}
-
 /// 画面が**自分で印字した行**の頭に出うる飾り(枠線・選択子・選択肢の番号)。
 /// 現行 `MODAL_LINE_DECORATION` と同じ集合。
 const MODAL_DECORATION: &[char] = &[
     ' ', '\t', '│', '┃', '|', '┆', '╎', '▏', '▕', '>', '❯', '➤', '·', '•', '-', '–', '—',
 ];
-
-/// 「省略可の前置き」×「語幹」。現行の正規表現を `regex` 無しで言うための形
-/// (`(?:…)?` は空も許すので前置きに `""` が入っている)。
-type Prompts = &'static [(&'static [&'static str], &'static [&'static str])];
 
 /// 現行 `LIMIT_MODAL_PROMPTS`。
 const LIMIT_PROMPTS: Prompts = &[
@@ -1230,37 +980,42 @@ const LOGIN_PROMPTS: Prompts = &[(&[""], &["select login method:"])];
 /// 実機で撮った実物: ` ❯ 1. Yes, I trust this folder` → 飾りを落として `yes, i trust…`。
 const TRUST_PROMPTS: Prompts = &[(&[""], &["yes, i trust this folder"])];
 
-/// 行頭の飾りを落とす。現行 `MODAL_LINE_DECORATION` と同じ順(飾り → 選択肢番号 → 空白)。
-fn strip_modal_decoration(line: &str) -> &str {
-    let t = line.trim_start_matches(MODAL_DECORATION);
-    let digits = t.len() - t.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-    if digits == 0 {
-        return t;
-    }
-    match t[digits..]
-        .strip_prefix('.')
-        .or_else(|| t[digits..].strip_prefix(')'))
-    {
-        Some(rest) => rest.trim_start(),
-        None => t,
-    }
+/// 起動直後の窓に出うる画面。**誰かが答えるまで claude はプロンプトを1文字も読まない。**
+///
+/// 現行 `classifySpawnPane` の移植。4種のうち上2つは Enter で答えられ、
+/// 下2つは**答えられない**(アカウントの事情なので、何度起こし直しても同じ壁に当たる)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnScreen {
+    /// claude 自身の workspace-trust。cwd が `~/.claude.json` の
+    /// `projects[cwd].hasTrustDialogAccepted` に無いと出る(2026-08-02、実機)
+    Trust,
+    /// dev channels の確認。既定の選択肢が Yes なので Enter で通る
+    Confirm,
+    /// サインイン画面。Enter では消えない
+    LoginRequired,
+    /// 上限モーダル。Enter では消えない
+    UsageLimited,
+    None_,
 }
 
-/// 「画面が**自分で**このプロンプトを印字しているか」。現行
-/// `paneShowsPrompt` の移植 — **行頭アンカーが全部**。同じ語が文の途中にあるもの
-/// (このリポのソース・grep の結果・引用された Slack の発言)は画面ではない。
-fn shows_prompt(pane: &str, prompts: Prompts) -> bool {
-    pane.lines().any(|line| {
-        let lower = line.to_ascii_lowercase();
-        let body = strip_modal_decoration(&lower);
-        prompts.iter().any(|(prefixes, stems)| {
-            prefixes.iter().any(|p| {
-                body.strip_prefix(p)
-                    .is_some_and(|rest| stems.iter().any(|s| rest.starts_with(s)))
-            })
-        })
-    })
+/// 見張りの結末。現行 `SpawnOutcome` の移植だが、**成功の意味が違う**:
+/// Rust の「起動できた」は `starting` の掛け金を最初の user_prompt が外すことで表しているので、
+/// ここは「答えるべき画面に答えたか」しか言わない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnOutcome {
+    /// 答えられる画面に答えた(あるいは答えた上で期限まで見ていた)
+    Answered,
+    /// サインイン画面。**誰も答えられない** — Owner に言うしかない
+    LoginRequired,
+    /// 上限モーダル。同上(裏取りは呼び手の仕事)
+    UsageLimited,
+    /// 期限まで何も出なかった。**失敗ではない** — 普通に立ち上がった窓がこれ
+    NoScreen,
 }
+
+/// 「省略可の前置き」×「語幹」。現行の正規表現を `regex` 無しで言うための形
+/// (`(?:…)?` は空も許すので前置きに `""` が入っている)。
+type Prompts = &'static [(&'static [&'static str], &'static [&'static str])];
 
 /// claude の画面(`capture-pane` の出力)と、headless 実行の出力。読むだけ。
 ///
@@ -1625,46 +1380,6 @@ impl<'a> Pane<'a> {
     }
 }
 
-/// `[...]` を全部落として trim(`id.replace(/\[[^\]]*\]/g, '').trim()` 相当)。
-/// 閉じない `[` は括弧でない — そのまま残す。
-fn strip_brackets(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(i) = rest.find('[') {
-        let Some(j) = rest[i + 1..].find(']') else {
-            break;
-        };
-        out.push_str(&rest[..i]);
-        rest = &rest[i + 1 + j + 1..];
-    }
-    out.push_str(rest);
-    out.trim().to_string()
-}
-
-/// id の `[<n>m]` サフィックスから窓の大きさ(`"1M"`)。無ければ None。`/\[(\d+)\s*m\]/i`
-fn id_context_suffix(id: &str) -> Option<String> {
-    for (i, _) in id.match_indices('[') {
-        let s = &id[i + 1..];
-        let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if digits.is_empty() {
-            continue;
-        }
-        let r = s[digits.len()..].trim_start();
-        if matches!(r.chars().next(), Some('m' | 'M')) && r[1..].starts_with(']') {
-            return Some(format!("{digits}M"));
-        }
-    }
-    None
-}
-
-fn capitalize(s: &str) -> String {
-    let mut cs = s.chars();
-    match cs.next() {
-        Some(c) => c.to_uppercase().collect::<String>() + cs.as_str(),
-        None => String::new(),
-    }
-}
-
 /// claude のモデル識別子(`claude-opus-4-8[1m]` のような**フルの id**)。
 pub struct ModelId<'a>(&'a str);
 
@@ -2022,6 +1737,292 @@ impl HookIntake {
             ctx.error("hooks", &format!("hook queue closed: {e}"));
         }
         Ok(Self::json_body("{}".into()))
+    }
+}
+
+// ── parsing helpers ──
+// 手書きの走査ヘルパ(regex を足さない)
+
+/// ASCII 大小文字を無視した接頭辞一致(regex の `/i` の代わり)。
+fn starts_with_ci(s: &str, prefix: &str) -> bool {
+    s.get(..prefix.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(prefix))
+}
+
+/// regex の `\w`(語構成文字)。`\b` の判定は両側をこれで見る。
+fn is_word(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// ASCII 大小を無視した全出現位置(regex の `/i` + エンジンの位置送り相当)。
+/// `to_ascii_lowercase` は ASCII しか変えないのでバイト位置は原文と同じ。`needle` は小文字で渡す。
+fn match_indices_ci(hay: &str, needle: &str) -> Vec<usize> {
+    hay.to_ascii_lowercase()
+        .match_indices(needle)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// `**Key:**` の**値**: 続く空白(改行も含む — 現物の `\s*` がそう)を飛ばした先の行。
+/// 値が空なら None。
+fn header_value(raw: &str, key: &str) -> Option<String> {
+    let i = raw.find(key)?;
+    let rest = raw[i + key.len()..].trim_start();
+    let line = rest.split('\n').next().unwrap_or("").trim_end();
+    (!line.is_empty()).then(|| line.to_string())
+}
+
+/// `**Tokens:** <used> / <total> (<pct>)`。 の3捕獲 regex 相当
+/// 形が崩れているヘッダは飛ばして次の `**Tokens:**` を試す(regex が位置を進めるのと同じ)。
+fn tokens_header(raw: &str) -> Option<(String, String, String)> {
+    const KEY: &str = "**Tokens:**";
+    for (i, _) in raw.match_indices(KEY) {
+        let s = raw[i + KEY.len()..].trim_start();
+        // `[^/\s]+` — スラッシュも空白も含まない一続き
+        let used: String = s
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != '/')
+            .collect();
+        if used.is_empty() {
+            continue;
+        }
+        let Some(s) = s[used.len()..].trim_start().strip_prefix('/') else {
+            continue;
+        };
+        let s = s.trim_start();
+        let total: String = s
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != '(')
+            .collect();
+        if total.is_empty() {
+            continue;
+        }
+        let Some(s) = s[total.len()..].trim_start().strip_prefix('(') else {
+            continue;
+        };
+        let Some(end) = s.find(')') else { continue };
+        return Some((used, total, s[..end].trim().to_string()));
+    }
+    None
+}
+
+/// `used` の後ろの残り: `(?:.*?\bresets\s+(.+?))?\s*$` 相当。
+/// `Some("")` = reset 節なしで行が終わっている / `Some(when)` = 節あり /
+/// **None = 上限行ではない**(`resets` でない余計な文字が残っている)。
+fn usage_reset_clause(tail: &str) -> Option<String> {
+    let lower = tail.to_ascii_lowercase(); // ASCII 変換なのでバイト位置は tail と同じ
+    let mut from = 0;
+    while let Some(rel) = lower[from..].find("resets") {
+        let i = from + rel;
+        // `\b`: 直前が語構成文字なら境界でない(`presets` は resets ではない)
+        let word_before = tail[..i]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+        let after = &tail[i + "resets".len()..];
+        if !word_before && after.starts_with(char::is_whitespace) {
+            return Some(after.trim().to_string());
+        }
+        from = i + "resets".len();
+    }
+    tail.trim().is_empty().then(String::new)
+}
+
+/// 1行を上限行として読む。`^\s*(.+?):\s*(\d+)%\s+used\b…$` の手書き版 —
+/// ラベルは最短一致なので、**うまくパースできる最初のコロン**で切る。
+fn parse_usage_line(line: &str) -> Option<UsageRow> {
+    for (ci, _) in line.match_indices(':') {
+        let label = line[..ci].trim();
+        if label.is_empty() {
+            continue; // `(.+?)` は1文字以上
+        }
+        let after = line[ci + 1..].trim_start();
+        let pct: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if pct.is_empty() {
+            continue;
+        }
+        let Some(rest) = after[pct.len()..].strip_prefix('%') else {
+            continue;
+        };
+        let trimmed = rest.trim_start();
+        if trimmed.len() == rest.len() {
+            continue; // `\s+` は1文字以上
+        }
+        if !starts_with_ci(trimmed, "used") {
+            continue;
+        }
+        let rest = &trimmed["used".len()..];
+        // `used` の直後の `\b` — 語が続くなら別の語(`usedxx`)
+        if rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        // ここも continue — 残りが reset 節でなければ「このコロンでの切り方が違った」だけで、
+        // 現物の遅延一致は次のコロンを試す(`A: 12% used, X: 66% used` は2つ目で一致する)
+        let Some(reset) = usage_reset_clause(rest) else {
+            continue;
+        };
+        return Some(UsageRow {
+            label: label.to_string(),
+            pct,
+            reset,
+        });
+    }
+    None
+}
+
+/// `(33s)` / `(1m 4s · ↑ 876 tokens)` の経過秒。`\((?:(\d+)m\s*)?(\d+)s\b[^)]*\)` の手書き版 —
+/// 数字は `(` の**直後**から始まる(`(elapsed 33s)` は一致しない)。
+fn parse_elapsed(spinner: &str) -> Option<u32> {
+    for (i, _) in spinner.match_indices('(') {
+        let s = &spinner[i + 1..];
+        let d1: String = s.chars().take_while(char::is_ascii_digit).collect();
+        if d1.is_empty() {
+            continue;
+        }
+        let after = &s[d1.len()..];
+        // `Nm` があれば分。無ければ最初の数字がそのまま秒(regex の optional group の backtrack)
+        let (mins, secs, rest) = match after.strip_prefix(['m', 'M']) {
+            Some(r) => {
+                let r = r.trim_start();
+                let d2: String = r.chars().take_while(char::is_ascii_digit).collect();
+                if d2.is_empty() {
+                    continue;
+                }
+                (d1.parse().unwrap_or(0), d2.clone(), &r[d2.len()..])
+            }
+            None => (0u32, d1.clone(), after),
+        };
+        // `s\b` の後は `[^)]*\)` — `[^)]*` は `)` を跨げないので「後ろに `)` がある」と同義
+        let Some(tail) = rest.strip_prefix(['s', 'S']) else {
+            continue;
+        };
+        if tail.starts_with(is_word) || !tail.contains(')') {
+            continue;
+        }
+        return Some(mins * 60 + secs.parse().unwrap_or(0));
+    }
+    None
+}
+
+/// スピナー行の括弧内のトークン数: `([↑↓])\s*([\d.]+[km]?)\s*tokens` 相当。
+fn parse_tokens(spinner: &str) -> Option<(char, String)> {
+    for (i, dir) in spinner
+        .char_indices()
+        .filter(|(_, c)| matches!(c, '↑' | '↓'))
+    {
+        let s = spinner[i + dir.len_utf8()..].trim_start();
+        let mut num: String = s
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        if num.is_empty() {
+            continue;
+        }
+        let after = &s[num.len()..];
+        // `[km]?` は捕獲の中(`1.6k` で1つの印字)
+        let after = match after.strip_prefix(['k', 'm', 'K', 'M']) {
+            Some(r) => {
+                num.push_str(&after[..after.len() - r.len()]);
+                r
+            }
+            None => after,
+        };
+        if starts_with_ci(after.trim_start(), "tokens") {
+            return Some((dir, num));
+        }
+    }
+    None
+}
+
+/// 1行から `(\d{1,3})\s*%` の**最初の**一致。`%` の手前の空白を飛ばして最大3桁を後ろから取る。
+fn parse_percent_line(line: &str) -> Option<u32> {
+    for (i, _) in line.match_indices('%') {
+        let head = line[..i].trim_end();
+        let digits: String = head
+            .chars()
+            .rev()
+            .take_while(char::is_ascii_digit)
+            .take(3)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        if !digits.is_empty() {
+            return digits.parse().ok(); // 行内の最初の一致だけ(現物も break せず次の行へ)
+        }
+    }
+    None
+}
+
+/// 行頭の飾りを落とす。現行 `MODAL_LINE_DECORATION` と同じ順(飾り → 選択肢番号 → 空白)。
+fn strip_modal_decoration(line: &str) -> &str {
+    let t = line.trim_start_matches(MODAL_DECORATION);
+    let digits = t.len() - t.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    if digits == 0 {
+        return t;
+    }
+    match t[digits..]
+        .strip_prefix('.')
+        .or_else(|| t[digits..].strip_prefix(')'))
+    {
+        Some(rest) => rest.trim_start(),
+        None => t,
+    }
+}
+
+/// 「画面が**自分で**このプロンプトを印字しているか」。現行
+/// `paneShowsPrompt` の移植 — **行頭アンカーが全部**。同じ語が文の途中にあるもの
+/// (このリポのソース・grep の結果・引用された Slack の発言)は画面ではない。
+fn shows_prompt(pane: &str, prompts: Prompts) -> bool {
+    pane.lines().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        let body = strip_modal_decoration(&lower);
+        prompts.iter().any(|(prefixes, stems)| {
+            prefixes.iter().any(|p| {
+                body.strip_prefix(p)
+                    .is_some_and(|rest| stems.iter().any(|s| rest.starts_with(s)))
+            })
+        })
+    })
+}
+
+/// `[...]` を全部落として trim(`id.replace(/\[[^\]]*\]/g, '').trim()` 相当)。
+/// 閉じない `[` は括弧でない — そのまま残す。
+fn strip_brackets(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('[') {
+        let Some(j) = rest[i + 1..].find(']') else {
+            break;
+        };
+        out.push_str(&rest[..i]);
+        rest = &rest[i + 1 + j + 1..];
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
+/// id の `[<n>m]` サフィックスから窓の大きさ(`"1M"`)。無ければ None。`/\[(\d+)\s*m\]/i`
+fn id_context_suffix(id: &str) -> Option<String> {
+    for (i, _) in id.match_indices('[') {
+        let s = &id[i + 1..];
+        let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            continue;
+        }
+        let r = s[digits.len()..].trim_start();
+        if matches!(r.chars().next(), Some('m' | 'M')) && r[1..].starts_with(']') {
+            return Some(format!("{digits}M"));
+        }
+    }
+    None
+}
+
+fn capitalize(s: &str) -> String {
+    let mut cs = s.chars();
+    match cs.next() {
+        Some(c) => c.to_uppercase().collect::<String>() + cs.as_str(),
+        None => String::new(),
     }
 }
 
