@@ -16,11 +16,19 @@
 //! 子がこれで5時間15分止まった。デプロイ中の一瞬の 401 で子が恒久的に上がってこなくなる。
 //! 直らない断りでも間を空けて繋ぎ直し続け、直された瞬間に自力で戻る。
 
-use crate::bridge::relay::wire::{self, LinkFrame};
+use crate::bridge::gateway::wire::{self, LinkFrame};
 use crate::bridge::state::LogCtx;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+use axum::Router;
+use axum::extract::State;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::http::HeaderMap;
+use axum::routing::get;
+
+use crate::bridge::gateway;
 
 pub const RECONNECT_MIN_MS: u64 = 1_000;
 pub const RECONNECT_MAX_MS: u64 = 30_000;
@@ -208,9 +216,9 @@ pub enum FromRelay {
 
 /// 親から届いたフレームは、そのまま上流の知らせになる。**dial した側でも迎えられた側でも
 /// 同じ受け皿**に流すための橋(`Fatal` だけはこちら側の事情なので `From` に無い)。
-impl From<crate::bridge::relay::wire::LinkFrame> for FromRelay {
-    fn from(frame: crate::bridge::relay::wire::LinkFrame) -> Self {
-        use crate::bridge::relay::wire::LinkFrame as F;
+impl From<crate::bridge::gateway::wire::LinkFrame> for FromRelay {
+    fn from(frame: crate::bridge::gateway::wire::LinkFrame) -> Self {
+        use crate::bridge::gateway::wire::LinkFrame as F;
         match frame {
             F::Ready { bot_token, home } => FromRelay::Ready { bot_token, home },
             F::Event { name, event } => FromRelay::Event { name, event },
@@ -632,6 +640,90 @@ impl Wiring {
             }),
             inlet: None,
         })
+    }
+}
+
+// ── waiting for the gateway (machines the gateway dials)  ─────────────────────
+
+/// 親の接続を待つ子の一式。**上流が入ってくる口**なので、[`gateway::Fleet`](crate::bridge::gateway::Fleet)(子を迎える口)とは別物。
+pub struct GatewayInlet {
+    pub token: String,
+    /// 受け取ったフレームの行き先。子から dial したときと**同じ受け皿**に流す。
+    pub tx: tokio::sync::mpsc::Sender<FromRelay>,
+}
+
+async fn on_parent_upgrade(
+    State(inlet): State<Arc<GatewayInlet>>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+    ws: WebSocketUpgrade,
+) -> axum::response::Response {
+    match gateway::admit_upgrade(&headers, &uri, &inlet.token, "a parent", ws) {
+        Ok((parent_id, ws)) => ws
+            .protocols([wire::LINK_SUBPROTOCOL])
+            .on_upgrade(move |socket| on_parent_socket(inlet, parent_id, socket)),
+        Err(response) => response,
+    }
+}
+
+/// 親から来たフレームを読み続ける。**ワーカーには触らない** — 親を失っても、
+/// 起きるのは「戻るまで新しい Slack メッセージが来ない」だけ。
+async fn on_parent_socket(inlet: Arc<GatewayInlet>, parent_id: String, mut socket: WebSocket) {
+    gateway::rlog("info", &format!("parent \"{parent_id}\" connected"));
+    // 親が黙って消えても、こちらは受信で永久に止まったまま気づけない。叩いて確かめる
+    let mut watch = IdleWatch::default();
+    loop {
+        // **受信は `beat` 経由だけ。** 直に `recv()` を待つと half-open で永久に止まる
+        let raw = match beat(&mut socket, &mut watch).await {
+            Beat::Text(t) => t,
+            Beat::Alive => continue,
+            Beat::Ping => {
+                if socket
+                    .send(Message::Ping(Default::default()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                continue;
+            }
+            Beat::Gone(why) => {
+                gateway::rlog(
+                    "info",
+                    &format!("parent \"{parent_id}\": link closed ({why})"),
+                );
+                break;
+            }
+        };
+        let Some(frame) = wire::decode(&raw) else {
+            gateway::rlog("info", "dropped an unrecognised frame from the parent");
+            continue;
+        };
+        if inlet.tx.send(frame.into()).await.is_err() {
+            break;
+        }
+    }
+    gateway::rlog("info", &format!("parent \"{parent_id}\" disconnected"));
+}
+
+/// 親を迎える口を開ける。**戻ってこない。**
+impl GatewayInlet {
+    /// 親を迎える口を開ける。**戻ってこない。**
+    pub async fn serve(self: Arc<Self>, addr: std::net::SocketAddr) {
+        let app = Router::new()
+            .route(wire::PROBE_PATH, get(on_parent_upgrade))
+            .route("/bridge/{id}", get(on_parent_upgrade))
+            .with_state(self);
+        let Some(listener) = gateway::bind_link_port(addr, "parent").await else {
+            return;
+        };
+        gateway::rlog(
+            "info",
+            &format!("waiting for the parent on {addr}/bridge/<id>"),
+        );
+        if let Err(e) = axum::serve(listener, app).await {
+            gateway::rlog("error", &format!("the inlet stopped: {e}"));
+        }
     }
 }
 

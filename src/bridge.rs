@@ -7,7 +7,7 @@
 
 pub mod command;
 pub mod link;
-pub mod relay;
+pub mod gateway;
 pub mod state;
 pub mod worker;
 
@@ -5237,7 +5237,7 @@ impl Bridge {
                     return Err("AGENTGW_LINK_LISTEN is not set, so the gateway has nowhere to connect".into());
                 };
                 let (tx, mut rx) = mpsc::channel(64);
-                let inlet = Arc::new(crate::bridge::relay::Inlet {
+                let inlet = Arc::new(link::GatewayInlet {
                     token: listen.token,
                     tx,
                 });
@@ -5296,8 +5296,8 @@ impl Bridge {
                     ),
                 );
             }
-            let fleet = Arc::new(crate::bridge::relay::Fleet {
-                links: crate::bridge::relay::LinkServer::new(),
+            let fleet = Arc::new(crate::bridge::gateway::Fleet {
+                links: crate::bridge::gateway::LinkServer::new(),
                 token: listen.token,
                 self_id: wiring.self_id.clone().unwrap_or_default(),
                 bot_token: bot_token.clone(),
@@ -5312,7 +5312,7 @@ impl Bridge {
                 reload: reload_tx.clone(),
                 tunnels: Default::default(),
             });
-            tokio::spawn(crate::bridge::relay::serve_children(
+            tokio::spawn(crate::bridge::gateway::serve_children(
                 fleet.clone(),
                 listen.addr,
             ));

@@ -7,7 +7,7 @@ use slack_morphism::prelude::*;
 use std::sync::Arc;
 
 /// 親が引き取る Slack の生イベント。**子へそのまま転送できる形**で持つ
-/// (どのマシンの担当かを決めるのは `bridge::relay` の仕事で、ここは運ぶだけ)。
+/// (どのマシンの担当かを決めるのは `bridge::gateway` の仕事で、ここは運ぶだけ)。
 #[derive(Debug, Clone)]
 pub enum FleetEvent {
     Event {

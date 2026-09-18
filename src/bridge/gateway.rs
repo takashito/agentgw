@@ -449,7 +449,7 @@ use std::sync::{Arc, Mutex};
 pub type Routes = BTreeMap<String, String>;
 
 /// この節の1行ログ。component は `relay` で固定 — フリートの出来事だけをここに集める。
-fn rlog(level: &str, message: &str) {
+pub(super) fn rlog(level: &str, message: &str) {
     let ctx = LogCtx::default();
     match level {
         "error" => ctx.error("relay", message),
@@ -2084,7 +2084,7 @@ impl Fleet {
 /// upgrade を通してよいか。**通すなら名乗り**、通さない/到達確認なら**返す応答**。
 ///
 /// 親(子を迎える口)と子(親を迎える口)で、判断も断り方も同じ — 違うのは通ったあとだけ。
-fn admit_upgrade(
+pub(super) fn admit_upgrade(
     headers: &HeaderMap,
     uri: &axum::http::Uri,
     token: &str,
@@ -2233,7 +2233,7 @@ pub async fn serve_children(fleet: Arc<Fleet>, addr: std::net::SocketAddr) {
 
 /// link の口を開ける。**開けなくても Bridge は止めない** — 自分のワーカーは動き続ける。
 /// ただし相手は1台も繋がらないので、error で大きく残す(黙ると原因がどこにも出ない)。
-async fn bind_link_port(addr: std::net::SocketAddr, what: &str) -> Option<tokio::net::TcpListener> {
+pub(super) async fn bind_link_port(addr: std::net::SocketAddr, what: &str) -> Option<tokio::net::TcpListener> {
     match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => Some(l),
         Err(e) => {
@@ -2260,90 +2260,6 @@ async fn serve_children_on(fleet: Arc<Fleet>, listener: tokio::net::TcpListener)
     }
 }
 
-
-// ── 節8: 子の口(親に迎えに来てもらう構成でだけ開く) ─────────────────────
-
-/// 親の接続を待つ子の一式。**上流が入ってくる口**なので、[`Fleet`](子を迎える口)とは別物。
-pub struct Inlet {
-    pub token: String,
-    /// 受け取ったフレームの行き先。子から dial したときと**同じ受け皿**に流す。
-    pub tx: tokio::sync::mpsc::Sender<crate::bridge::link::FromRelay>,
-}
-
-async fn on_parent_upgrade(
-    State(inlet): State<Arc<Inlet>>,
-    headers: HeaderMap,
-    uri: axum::http::Uri,
-    ws: WebSocketUpgrade,
-) -> axum::response::Response {
-    match admit_upgrade(&headers, &uri, &inlet.token, "a parent", ws) {
-        Ok((parent_id, ws)) => ws
-            .protocols([LINK_SUBPROTOCOL])
-            .on_upgrade(move |socket| on_parent_socket(inlet, parent_id, socket)),
-        Err(response) => response,
-    }
-}
-
-/// 親から来たフレームを読み続ける。**ワーカーには触らない** — 親を失っても、
-/// 起きるのは「戻るまで新しい Slack メッセージが来ない」だけ。
-async fn on_parent_socket(inlet: Arc<Inlet>, parent_id: String, mut socket: WebSocket) {
-    rlog("info", &format!("parent \"{parent_id}\" connected"));
-    // 親が黙って消えても、こちらは受信で永久に止まったまま気づけない。叩いて確かめる
-    let mut watch = link_watch::IdleWatch::default();
-    loop {
-        // **受信は `beat` 経由だけ。** 直に `recv()` を待つと half-open で永久に止まる
-        let raw = match link_watch::beat(&mut socket, &mut watch).await {
-            link_watch::Beat::Text(t) => t,
-            link_watch::Beat::Alive => continue,
-            link_watch::Beat::Ping => {
-                if socket
-                    .send(Message::Ping(Default::default()))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-                continue;
-            }
-            link_watch::Beat::Gone(why) => {
-                rlog(
-                    "info",
-                    &format!("parent \"{parent_id}\": link closed ({why})"),
-                );
-                break;
-            }
-        };
-        let Some(frame) = wire::decode(&raw) else {
-            rlog("info", "dropped an unrecognised frame from the parent");
-            continue;
-        };
-        if inlet.tx.send(frame.into()).await.is_err() {
-            break;
-        }
-    }
-    rlog("info", &format!("parent \"{parent_id}\" disconnected"));
-}
-
-/// 親を迎える口を開ける。**戻ってこない。**
-impl Inlet {
-    /// 親を迎える口を開ける。**戻ってこない。**
-    pub async fn serve(self: Arc<Self>, addr: std::net::SocketAddr) {
-        let app = Router::new()
-            .route(wire::PROBE_PATH, get(on_parent_upgrade))
-            .route("/bridge/{id}", get(on_parent_upgrade))
-            .with_state(self);
-        let Some(listener) = bind_link_port(addr, "parent").await else {
-            return;
-        };
-        rlog(
-            "info",
-            &format!("waiting for the parent on {addr}/bridge/<id>"),
-        );
-        if let Err(e) = axum::serve(listener, app).await {
-            rlog("error", &format!("the inlet stopped: {e}"));
-        }
-    }
-}
 
 // ── 節9: CLI(`status` のフリート欄) ─────────────────────────────────
 

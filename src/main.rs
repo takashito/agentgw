@@ -63,7 +63,7 @@ async fn main() {
             // 子を迎える設定があるときだけ、フリートの様子を続けて出す
             if c == "status" {
                 let dir = agentgw::bridge::state::StateDir::resolve();
-                agentgw::bridge::relay::Cli::print_fleet(&dir).await;
+                agentgw::bridge::gateway::Cli::print_fleet(&dir).await;
             }
             std::process::exit(rc);
         }

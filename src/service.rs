@@ -568,7 +568,7 @@ impl Service {
             "  Connection string from the gateway (SCLINK1-…): ",
             "  ゲートウェイから受け取った接続文字列 (SCLINK1-…): "
         ));
-        let conn = crate::bridge::relay::wire::decode_connection(&raw)?;
+        let conn = crate::bridge::gateway::wire::decode_connection(&raw)?;
         // 名前は自動で決めない(衝突したマシンは互いの Slack メッセージを奪い合う)
         let name = crate::bridge::link::prompt_bridge_id()
             .ok_or_else(|| {

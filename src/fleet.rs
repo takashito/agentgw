@@ -163,8 +163,8 @@ pub fn tunnels_with(raw: &str, child: &str, target: Option<&str>) -> String {
 
 pub mod remote;
 
-use crate::bridge::relay::Cli as RelayCli;
-use crate::bridge::relay::wire;
+use crate::bridge::gateway::Cli as RelayCli;
+use crate::bridge::gateway::wire;
 use crate::bridge::state::StateDir;
 
 /// 子に送るブートストラップ。**バイナリに焼き込む** — release から入れた親には
@@ -398,7 +398,7 @@ fn ensure_inlet(dir: &StateDir) -> Result<Listener, String> {
     let listen = env
         .get("AGENTGW_LINK_LISTEN")
         .cloned()
-        .unwrap_or_else(|| crate::bridge::relay::DEFAULT_LISTEN.to_string());
+        .unwrap_or_else(|| crate::bridge::gateway::DEFAULT_LISTEN.to_string());
     let (token, minted) =
         RelayCli::key_for_invite(env.get("AGENTGW_LINK_TOKEN").map(String::as_str));
     let name = env
@@ -493,7 +493,7 @@ fn set_tunnel(dir: &StateDir, child: &str, target: Option<&str>) -> Result<(), S
 /// 居なくなっていれば、次の ssh が新しい親玉になって転送を持つ)。多重化を使っていない
 /// 設定なら ssh は前に居続け、`kill_on_drop` で agentgw と一緒に消える。
 pub async fn keep_tunnel(
-    fleet: std::sync::Arc<crate::bridge::relay::Fleet>,
+    fleet: std::sync::Arc<crate::bridge::gateway::Fleet>,
     child: String,
     target: String,
     parent_addr: String,
@@ -526,7 +526,7 @@ pub async fn keep_tunnel(
             // `status` に経路を出すため、親の手元に今の様子を置く
             fleet.tunnels.lock().unwrap().insert(
                 child.clone(),
-                crate::bridge::relay::Tunnel {
+                crate::bridge::gateway::Tunnel {
                     target: target.clone(),
                     error: (!ok).then(|| why.clone()),
                 },
