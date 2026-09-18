@@ -2,7 +2,7 @@
 
 <h1>agentgw</h1>
 
-<p><b>Run Claude Code on the machines you own — and drive every one of them from Slack.</b></p>
+<p><b>Your own Claude Code agents, on every machine in your homelab — driven from one Slack bot, by you alone.</b></p>
 
 [![Release](https://img.shields.io/github/v/release/takashito/agentgw?style=flat-square&labelColor=black)](https://github.com/takashito/agentgw/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square&labelColor=black)](LICENSE)
@@ -13,7 +13,7 @@
 
 </div>
 
-agentgw is a small service that connects a Slack workspace to Claude Code sessions on your own machines. Post in a channel and a Claude Code worker starts **on the machine that channel belongs to**, in that project's directory, and answers in the thread — showing its progress as it goes and asking for your approval in Slack when it needs it.
+agentgw is a small service that connects one Slack bot to Claude Code on every machine you own. Post in a channel and a Claude Code worker starts **on the machine that channel belongs to**, in that project's directory, and answers in the thread — showing its progress as it goes and asking for your approval in Slack when it needs it.
 
 <p align="center">
   <img src="assets/thread.svg" width="780" alt="A Slack thread: you ask agentgw to fix flaky tests; a live progress message lists the tools Claude Code runs; a permission request with Allow and Deny buttons; the worker replies with the fix.">
@@ -21,16 +21,33 @@ agentgw is a small service that connects a Slack workspace to Claude Code sessio
 
 ## Why agentgw?
 
-Remote control and terminal multiplexers keep a session you **already started** within reach. agentgw is for what they leave to you:
+### 🔑 Your agents, for you alone
+
+Only you — the owner — can talk to the agents. They run on **your own Claude subscription** (you sign Claude Code in from Slack by DMing the bot `login`) or on an **API key set up on that machine**. agentgw never handles model credentials, and it is not a shared bot running on somebody else's account: other people in a channel can follow a thread and add context, but they can't start work or run commands.
+
+### 🖧 Every machine, one bot
+
+The agents on your laptop, your NAS, your hypervisor and your build box all answer through **one Slack bot**. Each channel belongs to a machine and a project directory; `route` moves a channel, `status` shows the whole fleet and how each machine is linked, and `add-child` brings in a new machine with a single command. It's built for a homelab, not a single desk.
+
+| Channel | Machine | Works in |
+|---|---|---|
+| `#laptop` | the Mac you carry (parent) | `~/code/app` |
+| `#nas` | a storage box in the closet | `/srv/compose` |
+| `#proxmox` | the hypervisor | `/root/infra` |
+| `#build` | a Linux build box | `~/src/firmware` |
+
+### What remote control and multiplexers leave to you
+
+They keep a session you **already started** within reach. The rest is agentgw's job:
 
 | | |
 |---|---|
-| 🏠 **Machines you don't sit at** | The home server, the build box, the hypervisor. No terminal is open there, so nothing is waiting for you. agentgw runs as a service on each one and starts a worker — in the right directory — when a thread arrives. It starts again on its own after a reboot (on macOS, once you log in). |
-| 🧭 **Not having to remember where things run** | With several machines and several repos on each, the friction is *which box, which directory, which session*. Map a channel to a machine and a directory once; after that, where you post is all that decides. |
-| 🔔 **Work that already arrives in Slack** | Alerts from monitoring, failures from CI, requests from people. Let a bot's messages through with `allow-bot`, and its alert can start an investigation — with a guard against two bots answering each other forever. |
+| 🏠 **Machines you don't sit at** | No terminal is open on the server in the closet, so nothing is waiting there. agentgw runs as a service on each machine and starts a worker — in the right directory — when a thread arrives. It starts again on its own after a reboot (on macOS, once you log in). |
+| 🧭 **Not remembering where things run** | With several machines and several repos on each, the friction is *which box, which directory, which session*. Map a channel once; after that, where you post is all that decides. |
+| 🔔 **Work that already arrives in Slack** | Alerts from monitoring, failures from CI. Let a bot's messages through with `allow-bot`, and its alert can start an investigation — with a guard against two bots answering each other forever. |
 | 📝 **A record where people look** | The request, every tool the agent ran, what you approved and what it concluded stay in the thread, searchable in Slack. |
 
-It drives the **official Claude Code CLI**, on your hardware, with your subscription. Nothing is proxied through a third-party service.
+It drives the **official Claude Code CLI**, on your hardware. Nothing is proxied through a third-party service.
 
 ## Features
 
@@ -142,7 +159,9 @@ It downloads the binary, installs the service, and asks for the two tokens.
 
 **3. Sign in**
 
-DM the bot **`login`**. The first person to do so becomes the **owner**, the only person it takes commands from.
+DM the bot **`login`**. It signs Claude Code on that machine in to **your** Claude account — you get a sign-in link, and paste the code back into the DM. The person who signs in becomes the **owner**, the only person the bot works for.
+
+> Already use an API key? If Claude Code on the machine is set up with one, workers use it. agentgw itself never sees model credentials.
 
 **4. Use it**
 
@@ -217,7 +236,7 @@ Mention the bot (`@agentgw <command>`), or type in a thread it's working in.
 | `warm on\|off` | Keep a worker pre-started for this channel |
 | `set-home` | Send notices (online, offline, errors) to this channel |
 | `allow-bot @bot` · `remove-bot @bot` | Let another bot's messages start work |
-| `login` · `logout` | Sign in (by DM) · sign out and stop all workers |
+| `login` · `logout` | Sign Claude Code in to your account (by DM) · sign out and stop all workers |
 | `help` | All commands |
 
 ## CLI
@@ -256,7 +275,8 @@ Every machine uses the same layout.
 
 ## Security
 
-- **Only the owner can start work or run commands.** In a thread that's already running, other people's messages reach the worker as context only.
+- **Only the owner can start work or run commands** — the person who signed Claude Code in with `login`. In a thread that's already running, other people's messages reach the worker as context only.
+- **Agents run on your own credentials** — your Claude subscription, or an API key set up for Claude Code on that machine. agentgw never handles model credentials.
 - **Workers run as the user that installed agentgw** and can do anything that user can. Install under a dedicated account (e.g. `agentgw add-child agent@host`) rather than `root`.
 - **Tokens stay local**, in `.env` with mode 600. Children never get the app token; they hold the bot token in memory only.
 - **The link secret is a password.** Whoever has it can join as a child and receive that machine's messages. `add-child` sends it over ssh stdin, never on a command line.
