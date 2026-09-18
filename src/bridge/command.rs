@@ -33,7 +33,7 @@ use crate::agent::screen::SpawnOutcome;
 use crate::agent::tmux::Window;
 use crate::agent::{CompactOutcome, CompactProgress, LoginOutcome, ProbeErr, SessionId};
 use crate::bridge::inbound;
-use crate::{ports, slack};
+use crate::slack;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
@@ -2226,11 +2226,11 @@ impl Bridge {
     /// `/compact` を打ち込み、pane のスピナーを Slack の付箋に流す。付箋は**最初の進捗が出てから**作る — busy / no-session の
     /// 断りが1本で済むのはそのため。最後の1行は付箋があれば書き換え、無ければ新規投稿。
     ///
-    /// TUI を回すのはエージェント側(`AgentPort::compact`)。ここは**進捗を Slack に描く側**だけ —
+    /// TUI を回すのはエージェント側(`Agent::compact`)。ここは**進捗を Slack に描く側**だけ —
     /// 最長6分かかるので select ループの外(spawn)で回す。
     async fn run_compact(
-        api: ports::Slack,
-        agent: ports::AgentRef,
+        api: crate::chat::ChatRef,
+        agent: crate::agent::AgentRef,
         channel: String,
         root: String,
         key: ThreadKey,
@@ -2305,10 +2305,10 @@ impl Bridge {
     }
 
     /// 素の `effort`。今の level を TUI に訊くのはエージェント側
-    /// (`AgentPort::effort`)。ここは答えを1行にして投げるだけ。
+    /// (`Agent::effort`)。ここは答えを1行にして投げるだけ。
     async fn run_effort_show(
-        api: ports::Slack,
-        agent: ports::AgentRef,
+        api: crate::chat::ChatRef,
+        agent: crate::agent::AgentRef,
         channel: String,
         root: String,
         key: ThreadKey,

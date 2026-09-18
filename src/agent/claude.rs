@@ -891,7 +891,7 @@ impl Claude {
 }
 
 #[async_trait::async_trait]
-impl crate::ports::AgentPort for Claude {
+impl crate::agent::Agent for Claude {
     fn spawn(&self, req: &SpawnReq) -> Result<Window, String> {
         Claude::spawn(self, req)
     }

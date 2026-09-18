@@ -3,6 +3,6 @@ pub mod bridge;
 pub mod fleet;
 pub mod i18n;
 pub mod mcp;
-pub mod ports;
+pub mod chat;
 pub mod service;
 pub mod slack;

@@ -1833,6 +1833,48 @@ impl std::ops::Deref for WallClock {
     }
 }
 
+
+// ── the clock ──
+
+/// The time. Implemented by [`SystemClock`]; tests move a `fake::FakeClock` by hand.
+pub trait Clock: Send + Sync + 'static {
+    fn now_ms(&self) -> u64;
+}
+
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_ms(&self) -> u64 {
+        crate::bridge::state::now_ms()
+    }
+}
+
+pub type ClockRef = std::sync::Arc<dyn Clock>;
+
+#[cfg(test)]
+pub mod fake {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub struct FakeClock(pub AtomicU64);
+
+    impl FakeClock {
+        pub fn at(ms: u64) -> Arc<FakeClock> {
+            Arc::new(FakeClock(AtomicU64::new(ms)))
+        }
+        pub fn advance(&self, ms: u64) {
+            self.0.fetch_add(ms, Ordering::SeqCst);
+        }
+    }
+
+    impl Clock for FakeClock {
+        fn now_ms(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -2965,5 +3007,13 @@ SPACES = padded ";
         assert_eq!(WallClock::parse_reset("in 5 hours", &now), None);
         assert_eq!(WallClock::parse_reset("13pm", &now), None); // 1–12 の外
         assert_eq!(WallClock::parse_reset("5:30 spam", &now), None); // am/pm の語境界
+    }
+
+    #[test]
+    fn fake_clock_moves_only_when_told() {
+        let c = fake::FakeClock::at(1_000);
+        assert_eq!(c.now_ms(), 1_000);
+        c.advance(500);
+        assert_eq!(c.now_ms(), 1_500);
     }
 }

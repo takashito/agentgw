@@ -1,7 +1,7 @@
 //! 生きているワーカーと在庫の台帳。
 //!
 //! **このファイルは tmux コマンドを1つも打たない。** 「どのスレッドにどのワーカーが居るか」の
-//! 記録だけを持つ。実際に窓を叩くのは [`crate::ports::AgentPort`] 越し。
+//! 記録だけを持つ。実際に窓を叩くのは [`crate::agent::Agent`] 越し。
 //!
 //! Slack へ投稿するもの・threads.json を書くものはここに置かない — あれは「台帳を見て
 //! Slack と agent に指示を出す」ので Bridge の仕事。
@@ -14,7 +14,7 @@ use crate::bridge::state as bridge;
 use crate::bridge::state::LogCtx;
 use crate::bridge::{Bridge, CmdFx, Host};
 use crate::{mcp, slack};
-use crate::ports::AgentPort;
+use crate::agent::Agent;
 use crate::agent::WorkerState;
 use crate::bridge::state::{PoolKey, ThreadEntry, ThreadKey};
 use std::collections::{HashMap, HashSet};
@@ -80,7 +80,7 @@ pub struct PoolWorker {
     pub resumed: bool,
 }
 
-/// 生きているワーカーと在庫の台帳。tmux は叩かない — 叩くのは [`AgentPort`]。
+/// 生きているワーカーと在庫の台帳。tmux は叩かない — 叩くのは [`Agent`]。
 #[derive(Default)]
 pub struct Workers {
     /// session_id → 暖機の印
@@ -179,7 +179,7 @@ impl Workers {
         &self,
         entry: Option<&ThreadEntry>,
         window: &str,
-        agent: &dyn AgentPort,
+        agent: &dyn Agent,
     ) -> WorkerState {
         let Some(sid) = entry.and_then(|e| e.agent_id.as_deref()) else {
             return WorkerState::Absent;

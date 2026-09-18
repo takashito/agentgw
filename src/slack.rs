@@ -3,10 +3,10 @@
 pub mod sticky;
 pub use sticky::{StickyAction, StickyBoard, ToolStatus};
 
-use crate::ports::{FetchedMsg, MessageAt};
+use crate::chat::{FetchedMsg, MessageAt};
 use crate::bridge::inbound::InboundMsg;
 use crate::bridge::state::{self as bridge_state, LogCtx, ThreadKey};
-use crate::ports::SlackPort;
+use crate::chat::Chat;
 use slack_morphism::prelude::*;
 use std::sync::Arc;
 
@@ -1088,7 +1088,7 @@ impl Api {
 }
 
 /// Helpers every Slack port gets, real or fake.
-impl dyn SlackPort {
+impl dyn Chat {
     /// assistant ステータスを1本投げてログに残す。**best-effort, but never silent** —
     /// 成功も失敗も残す。呼び手を待たせないのは呼び手側の責任。
     pub async fn thinking(&self, channel: &str, thread_ts: &str, status: &str) {
@@ -1261,7 +1261,7 @@ async fn notify(
 
 /// MCP 受け口に差す実体。
 pub struct ToolExec {
-    pub slack: crate::ports::Slack,
+    pub slack: crate::chat::ChatRef,
     pub state_dir: std::path::PathBuf,
     /// disposition の通知先(受けて台帳を消すのは main)。
     pub dispo: tokio::sync::mpsc::Sender<bridge_state::Disposition>,
@@ -1282,7 +1282,7 @@ impl crate::mcp::ToolExecutor for ToolExec {
 }
 
 #[async_trait::async_trait]
-impl crate::ports::SlackPort for Api {
+impl crate::chat::Chat for Api {
     async fn post_message(
         &self,
         channel: &str,
@@ -1425,7 +1425,7 @@ impl crate::ports::SlackPort for Api {
 pub struct Thinking(tokio::sync::mpsc::UnboundedSender<String>);
 
 impl Thinking {
-    pub fn new(api: crate::ports::Slack, channel: &str, thread_ts: &str, status: &str) -> Self {
+    pub fn new(api: crate::chat::ChatRef, channel: &str, thread_ts: &str, status: &str) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let (channel, thread_ts) = (channel.to_string(), thread_ts.to_string());
         tokio::spawn(async move {
@@ -1455,7 +1455,7 @@ impl Drop for Thinking {
     }
 }
 
-// ── What the worker's MCP tools do, written once against `SlackPort` ──
+// ── What the worker's MCP tools do, written once against `Chat` ──
 
 /// 添付を**投稿前に**まとめて検証する。1つでも読めない・
 /// 大きすぎるものがあれば、テキストも含めて何も投稿しないための門番。
@@ -1474,7 +1474,7 @@ fn check_attachment_sizes(paths: &[String], max_bytes: u64) -> Result<(), String
 }
 /// 根が消えたスレッドか(`probeThreadRoot`)。判断できないときは「生きている」に倒す —
 /// 分からないことを理由に返信を握りつぶさない。
-pub async fn root_gone(slack: &dyn SlackPort, channel: &str, thread_ts: &str) -> bool {
+pub async fn root_gone(slack: &dyn Chat, channel: &str, thread_ts: &str) -> bool {
     match slack.replies(channel, thread_ts, 1).await {
         Ok(msgs) => msgs.is_empty(),
         Err(e) => e.contains("thread_not_found") || e.contains("message_not_found"),
@@ -1484,7 +1484,7 @@ pub async fn root_gone(slack: &dyn SlackPort, channel: &str, thread_ts: &str) ->
 /// 長い本文を分けて投げる。返すのは**最初の**投稿の ts(以後の断片は続きとして並ぶ)。
 /// 上限と切り方は access.json で変えられる(`textChunkLimit` / `chunkMode`)。
 pub async fn post_chunked(
-    slack: &dyn SlackPort,
+    slack: &dyn Chat,
     state_dir: &std::path::Path,
     channel: &str,
     text: &str,
@@ -1513,7 +1513,7 @@ pub async fn post_chunked(
 /// file_id → inbox に落としたローカルパス。MCP の `download_attachment` ツールと、
 /// 受信時の先読みダウンロードが共有する(保存先の作法と上限判定を1箇所に置くため)。
 pub async fn download_attachment(
-    slack: &dyn SlackPort,
+    slack: &dyn Chat,
     file_id: &str,
     state_dir: &std::path::Path,
 ) -> Result<String, String> {
@@ -1542,7 +1542,7 @@ pub async fn download_attachment(
 /// 配達済みの見た目に直す: ack と ⟳ を外して 🤖 を付ける。
 /// 全て best-effort — リアクションは台帳でなく観測シグナルなので、
 /// no_reaction / already_reacted で配達を失敗扱いにはしない。
-pub async fn flip_to_received(slack: &dyn SlackPort, channel: &str, message_ts: &str, ack: &str) {
+pub async fn flip_to_received(slack: &dyn Chat, channel: &str, message_ts: &str, ack: &str) {
     let ctx = LogCtx {
         session_id: None,
         thread_key: Some(ThreadKey::new(channel, message_ts)),
@@ -1564,7 +1564,7 @@ pub async fn flip_to_received(slack: &dyn SlackPort, channel: &str, message_ts: 
 /// `dispo` に流すだけ** — 台帳を消すのは Threads を持つ main 側(現行の
 /// 「slack-action は通知、tracker は bridge」 同じ分担)。
 pub async fn execute_tool(
-    slack: &dyn SlackPort,
+    slack: &dyn Chat,
     state_dir: &std::path::Path,
     session_id: &str,
     tool: &str,
@@ -1916,13 +1916,13 @@ mod tests {
         assert_eq!(Api::attachment_file_name("F1", "a\"b.png"), "F1-ab.png");
     }
 
-    use crate::ports::fake::FakeSlack;
+    use crate::chat::fake::FakeChat;
 
-    /// 大きすぎる添付はダウンロードに**入る前に**断る(FakeSlack の download_to は
+    /// 大きすぎる添付はダウンロードに**入る前に**断る(FakeChat の download_to は
     /// 別の文言で Err を返す — 判定が先に返らなければ文言の比較で落ちる)。
     #[tokio::test]
     async fn oversized_attachment_is_refused_before_downloading() {
-        let mut api = FakeSlack::default();
+        let mut api = FakeChat::default();
         api.file_size = MAX_ATTACHMENT_BYTES + 1;
         let err = download_attachment(&api, "F1", std::path::Path::new("/nonexistent"))
             .await
@@ -1931,8 +1931,8 @@ mod tests {
     }
 
     /// スレッドの根が**生きている** fake(返信の抑止に掛からない普通の状態)。
-    fn with_live_root() -> FakeSlack {
-        let mut api = FakeSlack::default();
+    fn with_live_root() -> FakeChat {
+        let mut api = FakeChat::default();
         api.msgs = vec![FetchedMsg {
             ts: "1.0".into(),
             user: "U1".into(),
@@ -1943,15 +1943,15 @@ mod tests {
     }
 
     /// 全ての呼び出しが Err を返す fake。
-    fn failing() -> FakeSlack {
-        let mut api = FakeSlack::default();
+    fn failing() -> FakeChat {
+        let mut api = FakeChat::default();
         api.fail = true;
         api
     }
 
     /// execute_tool を呼ぶのに要るもの一式(disposition の受信口つき)。
     fn harness() -> (
-        FakeSlack,
+        FakeChat,
         std::path::PathBuf,
         tokio::sync::mpsc::Sender<bridge_state::Disposition>,
         tokio::sync::mpsc::Receiver<bridge_state::Disposition>,
@@ -1968,7 +1968,7 @@ mod tests {
 
     #[tokio::test]
     async fn upload_file_round_trip_is_recorded() {
-        let api = FakeSlack::default();
+        let api = FakeChat::default();
         let path = std::env::temp_dir().join(format!("sc-upload-{}.txt", std::process::id()));
         std::fs::write(&path, b"hello").unwrap();
         api.upload_file("C1", Some("171.002"), &path).await.unwrap();
@@ -2142,14 +2142,14 @@ mod tests {
 
     #[tokio::test]
     async fn upload_file_missing_path_is_err() {
-        let api = FakeSlack::default();
+        let api = FakeChat::default();
         let missing = std::path::Path::new("/nonexistent/definitely-not-here.txt");
         assert!(api.upload_file("C1", None, missing).await.is_err());
     }
 
     #[tokio::test]
     async fn flip_removes_ack_and_adds_robot() {
-        let api = FakeSlack::default();
+        let api = FakeChat::default();
         flip_to_received(&api, "C1", "171.002", "eyes").await;
         assert_eq!(
             api.calls(),
@@ -2422,7 +2422,7 @@ mod tests {
     /// status / allow-bot が使う3種を trait 経由で踏む(実 API の形は E2E で確かめる)。
     #[tokio::test]
     async fn lookup_apis_go_through_the_trait() {
-        let api = FakeSlack::default();
+        let api = FakeChat::default();
         assert_eq!(
             api.get_permalink("C1", "17.5").await.unwrap(),
             "https://slack/C1/17.5"
@@ -2466,10 +2466,10 @@ mod tests {
         assert_eq!(Status::Restart.text(), "Restarting\u{2026}");
     }
 
-    /// 空文字がクリア(Slack の約束)。FakeSlack は素通しで記録するだけ。
+    /// 空文字がクリア(Slack の約束)。FakeChat は素通しで記録するだけ。
     #[tokio::test]
     async fn set_thinking_status_records_set_and_clear() {
-        let api = FakeSlack::default();
+        let api = FakeChat::default();
         api.set_thinking_status("C1", "1.1", THINKING_STATUS)
             .await
             .expect("set");

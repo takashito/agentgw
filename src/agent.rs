@@ -1,11 +1,19 @@
 //! エージェント抽象化レイヤー。Bridge はここから下を直接知らない。
 //!
-//! Bridge talks to the agent through `ports::AgentPort`; the only implementation is
+//! Bridge talks to the agent through `crate::agent::Agent`; the only implementation is
 //! [`claude::Claude`]. This module keeps the types that cross that edge.
 
 pub mod claude;
 pub mod screen;
 pub mod tmux;
+
+
+use async_trait::async_trait;
+use tokio::sync::mpsc;
+
+use crate::bridge::state::{LogCtx, ThreadKey};
+use screen::SpawnOutcome;
+use tmux::{Pid, Window, WindowRow};
 
 /// ワーカー1本のセッション識別子。
 ///
@@ -258,6 +266,262 @@ pub enum ProbeErr {
     Failed(String),
     /// spawn できない(実体が PATH に無い等)
     Errored(String),
+}
+
+
+// ── the agent as the core sees it ──
+
+/// Starting and driving the coding agent. Implemented by [`claude::Claude`].
+///
+/// Mostly synchronous because the implementation drives tmux with blocking commands.
+/// The optional features answer `None` when the agent does not support them — whether to
+/// say so is the caller's call.
+#[async_trait]
+pub trait Agent: Send + Sync + 'static {
+    fn spawn(&self, req: &SpawnReq) -> Result<Window, String>;
+    /// Hands `text` to the agent as its next message and confirms it was submitted.
+    /// Errs when the window can't take keys (a dialog is open) or the text never left the
+    /// input box — the caller keeps the message instead of assuming it arrived.
+    fn deliver(&self, w: &Window, text: &str) -> Result<(), String>;
+    /// Answers the start-up screens of a freshly spawned window until `budget_ms` runs out.
+    async fn watch_spawn_screens(
+        &self,
+        w: &Window,
+        budget_ms: u64,
+        poll_ms: u64,
+        ctx: &LogCtx,
+    ) -> SpawnOutcome;
+    /// The worker's process. The only proof that it is alive.
+    fn pid_of(&self, window_id: Option<&str>, window_name: &str) -> Option<Pid>;
+    /// Every window the agent's session holds, workers or not.
+    fn windows(&self) -> Vec<WindowRow>;
+    fn terminate(&self, w: &Window) -> Result<(), String>;
+    /// Cancels what the worker is doing (Escape).
+    fn interrupt(&self, w: &Window) -> Result<(), String>;
+    fn login_kill(&self);
+
+    /// Compacts the conversation. Progress goes to `progress` one reading at a time;
+    /// the sender is dropped when this returns.
+    async fn compact(
+        &self,
+        w: &Window,
+        key: &ThreadKey,
+        session_id: &str,
+        progress: mpsc::Sender<CompactProgress>,
+    ) -> Option<CompactOutcome>;
+    async fn effort(&self, w: &Window, key: &ThreadKey, session_id: &str)
+    -> Option<&'static str>;
+    async fn set_effort(
+        &self,
+        w: &Window,
+        level: &str,
+        key: &ThreadKey,
+        ctx: &LogCtx,
+    ) -> Option<bool>;
+    fn mode(&self, w: &Window, ctx: &LogCtx) -> Option<&'static str>;
+    async fn set_mode(&self, w: &Window, name: &str, key: &ThreadKey, ctx: &LogCtx)
+    -> Option<bool>;
+    async fn set_model(
+        &self,
+        w: &Window,
+        name: &str,
+        key: &ThreadKey,
+        ctx: &LogCtx,
+    ) -> Option<bool>;
+
+    // `remembered` is the history path a hook carried (first candidate: a worker that
+    // moved into a worktree takes its history with it).
+    fn session_cwd(&self, remembered: Option<&str>, session_id: &str) -> Option<String>;
+    fn session_history_exists(&self, remembered: Option<&str>, session_id: &str) -> bool;
+    fn last_activity_ms(&self, remembered: Option<&str>, session_id: &str) -> Option<u64>;
+    fn current_model(
+        &self,
+        remembered: Option<&str>,
+        session_id: &str,
+    ) -> Option<std::io::Result<Option<String>>>;
+    fn session_limit_error(
+        &self,
+        remembered: Option<&str>,
+        session_id: &str,
+        now_ms: u64,
+    ) -> Option<std::io::Result<Option<LimitHit>>>;
+    fn model_alias(&self, model_id: &str) -> Option<&'static str>;
+    /// Reads the history from `offset` on: `(text, new offset)`.
+    fn new_history_lines(&self, path: String, offset: u64, ctx: &LogCtx)
+    -> Option<(String, u64)>;
+
+    fn context_argv(&self, session_id: &str) -> Vec<String>;
+    fn usage_argv(&self) -> Vec<String>;
+    async fn probe(&self, argv: Vec<String>, cwd: String) -> Result<String, ProbeErr>;
+    fn context_report(&self, raw: &str) -> Option<ContextReport>;
+    fn usage_rows(&self, raw: &str) -> Option<Vec<UsageRow>>;
+
+    fn login_begin(&self, cwd: &str) -> Result<(), String>;
+    fn login_url(&self) -> Option<String>;
+    fn login_submit_code(&self, code: &str) -> Result<(), String>;
+    fn login_outcome(&self) -> LoginOutcome;
+    async fn logout(&self) -> Result<(), ProbeErr>;
+}
+
+pub type AgentRef = std::sync::Arc<dyn Agent>;
+
+#[cfg(test)]
+pub mod fake {
+    use super::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Records spawns and deliveries; windows live until terminated.
+    #[derive(Default)]
+    pub struct FakeAgent {
+        pub spawned: Mutex<Vec<SpawnReq>>,
+        /// (window id, text)
+        pub delivered: Mutex<Vec<(String, String)>>,
+        /// Window ids that got an interrupt (Escape).
+        pub interrupted: Mutex<Vec<String>>,
+        /// When set, `deliver` fails the way a window with an open dialog does.
+        pub fail_deliver: std::sync::atomic::AtomicBool,
+        windows: Mutex<Vec<WindowRow>>,
+        next: AtomicU64,
+    }
+
+    #[async_trait]
+    impl Agent for FakeAgent {
+        fn spawn(&self, req: &SpawnReq) -> Result<Window, String> {
+            let n = self.next.fetch_add(1, Ordering::SeqCst);
+            let id = format!("@{n}");
+            self.spawned.lock().unwrap().push(req.clone());
+            self.windows.lock().unwrap().push(WindowRow {
+                id: id.clone(),
+                pid: Pid(4242 + n as u32),
+                command: "claude".into(),
+                name: req.window.clone(),
+            });
+            Ok(Window::of(&id))
+        }
+        fn deliver(&self, w: &Window, text: &str) -> Result<(), String> {
+            if self.fail_deliver.load(Ordering::SeqCst) {
+                return Err(format!("{w}: a dialog is open"));
+            }
+            self.delivered
+                .lock()
+                .unwrap()
+                .push((w.as_str().to_string(), text.to_string()));
+            Ok(())
+        }
+        async fn watch_spawn_screens(
+            &self,
+            _w: &Window,
+            _b: u64,
+            _p: u64,
+            _c: &LogCtx,
+        ) -> SpawnOutcome {
+            SpawnOutcome::NoScreen
+        }
+        fn pid_of(&self, id: Option<&str>, name: &str) -> Option<Pid> {
+            let rows = self.windows.lock().unwrap();
+            rows.iter()
+                .find(|r| id == Some(r.id.as_str()))
+                .or_else(|| rows.iter().find(|r| r.name == name))
+                .map(|r| r.pid)
+        }
+        fn windows(&self) -> Vec<WindowRow> {
+            self.windows.lock().unwrap().clone()
+        }
+        fn terminate(&self, w: &Window) -> Result<(), String> {
+            self.windows.lock().unwrap().retain(|r| r.id != w.as_str());
+            Ok(())
+        }
+        fn interrupt(&self, w: &Window) -> Result<(), String> {
+            self.interrupted.lock().unwrap().push(w.as_str().to_string());
+            Ok(())
+        }
+        fn login_kill(&self) {}
+        async fn compact(
+            &self,
+            _w: &Window,
+            _k: &ThreadKey,
+            _s: &str,
+            _p: mpsc::Sender<CompactProgress>,
+        ) -> Option<CompactOutcome> {
+            Some(CompactOutcome::Done)
+        }
+        async fn effort(&self, _w: &Window, _k: &ThreadKey, _s: &str) -> Option<&'static str> {
+            None
+        }
+        async fn set_effort(&self, _w: &Window, _l: &str, _k: &ThreadKey, _c: &LogCtx) -> Option<bool> {
+            Some(true)
+        }
+        fn mode(&self, _w: &Window, _c: &LogCtx) -> Option<&'static str> {
+            None
+        }
+        async fn set_mode(&self, _w: &Window, _m: &str, _k: &ThreadKey, _c: &LogCtx) -> Option<bool> {
+            Some(true)
+        }
+        async fn set_model(&self, _w: &Window, _m: &str, _k: &ThreadKey, _c: &LogCtx) -> Option<bool> {
+            Some(true)
+        }
+        fn session_cwd(&self, _r: Option<&str>, _s: &str) -> Option<String> {
+            None
+        }
+        fn session_history_exists(&self, _r: Option<&str>, _s: &str) -> bool {
+            false
+        }
+        fn last_activity_ms(&self, _r: Option<&str>, _s: &str) -> Option<u64> {
+            None
+        }
+        fn current_model(
+            &self,
+            _r: Option<&str>,
+            _s: &str,
+        ) -> Option<std::io::Result<Option<String>>> {
+            None
+        }
+        fn session_limit_error(
+            &self,
+            _r: Option<&str>,
+            _s: &str,
+            _now: u64,
+        ) -> Option<std::io::Result<Option<LimitHit>>> {
+            None
+        }
+        fn model_alias(&self, _m: &str) -> Option<&'static str> {
+            None
+        }
+        fn new_history_lines(&self, _p: String, _o: u64, _c: &LogCtx) -> Option<(String, u64)> {
+            None
+        }
+        fn context_argv(&self, _s: &str) -> Vec<String> {
+            vec![]
+        }
+        fn usage_argv(&self) -> Vec<String> {
+            vec![]
+        }
+        async fn probe(&self, _a: Vec<String>, _c: String) -> Result<String, ProbeErr> {
+            Ok(String::new())
+        }
+        fn context_report(&self, _r: &str) -> Option<ContextReport> {
+            None
+        }
+        fn usage_rows(&self, _r: &str) -> Option<Vec<UsageRow>> {
+            None
+        }
+        fn login_begin(&self, _c: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn login_url(&self) -> Option<String> {
+            Some("https://claude.ai/oauth".into())
+        }
+        fn login_submit_code(&self, _c: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn login_outcome(&self) -> LoginOutcome {
+            LoginOutcome::Success
+        }
+        async fn logout(&self) -> Result<(), ProbeErr> {
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]

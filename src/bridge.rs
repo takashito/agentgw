@@ -25,7 +25,7 @@ use crate::bridge::state as bridge;
 use crate::bridge::inbound::InboundMsg;
 use crate::bridge::state::{LogCtx, ThreadKey};
 use crate::bridge::turn::{PermPending, Stall};
-use crate::{mcp, ports, slack};
+use crate::{mcp, slack};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -105,9 +105,9 @@ pub struct Bridge {
 /// and hand it to `Bridge::new`.
 #[derive(Clone)]
 pub struct Deps {
-    pub slack: ports::Slack,
-    pub agent: ports::AgentRef,
-    pub clock: ports::ClockRef,
+    pub slack: crate::chat::ChatRef,
+    pub agent: crate::agent::AgentRef,
+    pub clock: crate::bridge::state::ClockRef,
     pub dir: bridge::StateDir,
 }
 
@@ -513,7 +513,7 @@ impl Bridge {
         // 起動通知(online)は最初から親と同じチャンネルに出る
         adopt_home(&dir, link_home);
 
-        let api: ports::Slack = Arc::new(slack::Api::new(&bot_token)?);
+        let api: crate::chat::ChatRef = Arc::new(slack::Api::new(&bot_token)?);
         let (hook_tx, mut hook_rx) = mpsc::channel(64);
         let (dispo_tx, mut dispo_rx) = mpsc::channel(64);
         let (hook_port, hook_token) = HookIntake::serve(&dir, hook_tx.clone()).await?;
@@ -678,7 +678,7 @@ impl Bridge {
             Deps {
                 slack: api.clone(),
                 agent: Arc::new(Claude::real()),
-                clock: Arc::new(ports::SystemClock),
+                clock: Arc::new(crate::bridge::state::SystemClock),
                 dir,
             },
             Config {
@@ -760,7 +760,7 @@ impl Bridge {
 /// 前のプロセスが `restart` で降りるときに残したマーカーを**消費**する(読んで消す)。
 /// 残すと、次の起動が身に覚えの無い「✅ 再起動が完了しました」を出す。
 /// 中断スレッドの自動再開はこの実装に無いので、再開の行は 0 件で閉じる。
-async fn consume_restart_marker(dir: &bridge::StateDir, api: &dyn ports::SlackPort) {
+async fn consume_restart_marker(dir: &bridge::StateDir, api: &dyn crate::chat::Chat) {
     let ctx = LogCtx::default();
     let path = dir.restart_marker();
     let Ok(raw) = std::fs::read_to_string(&path) else {
@@ -1127,15 +1127,17 @@ mod tests {
 
     // ── flows through Bridge, with fakes for Slack, the agent and the clock ──
 
-    use crate::ports::fake::{FakeAgent, FakeClock, FakeSlack};
+    use crate::agent::fake::FakeAgent;
+    use crate::bridge::state::fake::FakeClock;
+    use crate::chat::fake::FakeChat;
 
     /// A fresh state dir with only the owner in access.json.
-    fn flow_deps(name: &str) -> (Deps, Arc<FakeSlack>, Arc<FakeAgent>, Arc<FakeClock>) {
+    fn flow_deps(name: &str) -> (Deps, Arc<FakeChat>, Arc<FakeAgent>, Arc<FakeClock>) {
         let path = std::env::temp_dir().join(format!("agentgw-flow-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
         std::fs::write(path.join("access.json"), r#"{"owner":"U_OWNER"}"#).unwrap();
-        let slack = Arc::new(FakeSlack::default());
+        let slack = Arc::new(FakeChat::default());
         let agent = Arc::new(FakeAgent::default());
         let clock = FakeClock::at(1_782_000_000_000);
         let deps = Deps {
@@ -1339,7 +1341,7 @@ mod tests {
         // Limited notice in its thread — no ack reaction, no agent.
         let (d, slack, agent, clock) = flow_deps("limit");
         let (mut b, _fx) = Bridge::for_test(d);
-        let until_ms = ports::Clock::now_ms(clock.as_ref()) + 3_600_000;
+        let until_ms = crate::bridge::state::Clock::now_ms(clock.as_ref()) + 3_600_000;
         b.limited_until_ms = until_ms;
         b.on_inbound(&channel_msg(ROOT, "U_OWNER", "<@U_BOT> fix the tests"))
             .await;
@@ -1355,7 +1357,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_delivery_to_a_pool_agent_is_kept_and_reported() {
         use crate::agent::{SessionId, SpawnReq};
-        use crate::ports::AgentPort;
+        use crate::agent::Agent;
         let (d, slack, agent, _clock) = flow_deps("pool-fail");
         let (mut b, _fx) = Bridge::for_test(d);
         let sid = "pool-sid".to_string();
