@@ -117,16 +117,15 @@ impl JobSpec {
   <integer>1</integer>
 
   <key>StandardOutPath</key>
-  <string>{log_dir}/launchd-{base}.out.log</string>
+  <string>{log_dir}/service.out.log</string>
   <key>StandardErrorPath</key>
-  <string>{log_dir}/launchd-{base}.err.log</string>
+  <string>{log_dir}/service.err.log</string>
 </dict>
 </plist>
 "#,
             label = Self::xml_escape(&self.label),
             program = Self::xml_escape(&self.program),
             log_dir = Self::xml_escape(&self.log_dir),
-            base = "bridge",
             args = "    <string>serve</string>",
         )
     }
@@ -156,8 +155,8 @@ impl JobSpec {
              Environment=HOME={home}\n\
              Environment={state_env}={state_dir}\n\
              Environment=AGENTGW_MANAGED=1\n\
-             StandardOutput=append:{log_dir}/systemd-{base}.out.log\n\
-             StandardError=append:{log_dir}/systemd-{base}.err.log\n\
+             StandardOutput=append:{log_dir}/service.out.log\n\
+             StandardError=append:{log_dir}/service.err.log\n\
              \n\
              [Install]\n\
              WantedBy=default.target\n",
@@ -169,7 +168,6 @@ impl JobSpec {
             state_env = "AGENTGW_STATE_DIR",
             state_dir = self.state_dir,
             log_dir = self.log_dir,
-            base = "bridge",
         )
     }
 
@@ -693,10 +691,10 @@ impl Service {
                 return 1;
             }
         };
-        let log_dir = job
-            .parent()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
+        // サービスの標準出力・エラーも**状態の置き場の logs/ に**置く。サービス定義の隣
+        // (~/Library/LaunchAgents など)に出すと、調べる人が探す場所が2つに割れる
+        let log_dir = state_dir.join("logs").to_string_lossy().to_string();
+        let _ = std::fs::create_dir_all(&log_dir);
         let spec = JobSpec {
             label: Self::label(),
             program,
@@ -821,7 +819,7 @@ mod tests {
             state_dir: "/Users/x/.local/state/agentgw-dev".to_string(),
             path: "/usr/local/bin:/usr/bin:/bin".to_string(),
             home: "/Users/x".to_string(),
-            log_dir: "/Users/x/Library/LaunchAgents".to_string(),
+            log_dir: "/Users/x/.local/state/agentgw-dev/logs".to_string(),
         }
     }
 
@@ -867,6 +865,23 @@ mod tests {
         assert!(
             !p.contains("/opt/a&b:"),
             "生の & が残ると launchd は plist ごと読めない: {p}"
+        );
+    }
+
+    #[test]
+    fn service_logs_live_with_the_rest_of_the_state() {
+        // サービスの標準出力・エラーは状態の置き場の logs/ に(探す場所を1つにする)
+        let p = spec().launchd_plist();
+        assert!(
+            p.contains("<string>/Users/x/.local/state/agentgw-dev/logs/service.err.log</string>"),
+            "{p}"
+        );
+        let u = spec().systemd_unit();
+        assert!(
+            u.contains(
+                "StandardError=append:/Users/x/.local/state/agentgw-dev/logs/service.err.log"
+            ),
+            "{u}"
         );
     }
 

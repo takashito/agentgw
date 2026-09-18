@@ -45,6 +45,10 @@ GitHub の release からこのマシン用のバイナリを取り、`~/.local/
 入ったら、Slack で自分がボットに **`login` を DM** してサインインを済ませます。
 最初に DM した人が Owner(ボットに命令できる人)になります。
 
+Mac では、初回に**署名の身元**(自己署名の証明書)を login キーチェーンに1つ作ります。
+入れ直しても macOS の許可(ファイアウォールやファイルへのアクセス)が消えないようにするためで、
+作るときにキーチェーンのパスワードを訊かれます。
+
 <details>
 <summary>ソースから入れる</summary>
 
@@ -101,12 +105,26 @@ agentgw shutdown    # 止める(ワーカーも畳む)
 agentgw uninstall   # サービスの定義を消す(トークンと状態は残る)
 ```
 
-| | |
+### 置かれるもの
+
+親も子も同じ形です。
+
+| 場所 | 中身 |
 |---|---|
-| 状態 | `~/.local/state/agentgw/`(`AGENTGW_STATE_DIR` で変えられる) |
-| 設定 | 状態の中の `.env` |
-| launchd | `com.agentgw.bridge` |
-| systemd | `agentgw-bridge.service`(user unit) |
+| `~/.local/bin/agentgw` | 本体(1ファイル) |
+| `~/.local/state/agentgw/` | 状態の置き場(`AGENTGW_STATE_DIR` で変えられる) |
+| ├ `.env` | 設定(権限 600)。親は Slack のトークンと子を迎える口・鍵、子は親の URL と鍵 |
+| ├ `access.json` | Owner・通知先・チャンネルの担当・作業ディレクトリ・ワーカーの在庫 |
+| ├ `threads.json` | Slack のスレッドとワーカーのセッションの対応 |
+| ├ `plugin-debug.log` | 全体のログ(大きくなると `.1` に回す) |
+| ├ `logs/` | スレッドごと・セッションごとのログと、サービスの標準出力・エラー(`service.*.log`) |
+| └ `inbox/` | Slack の添付をダウンロードした先 |
+| サービス定義 | macOS: `~/Library/LaunchAgents/com.agentgw.bridge.plist` / Linux: `~/.config/systemd/user/agentgw-bridge.service` |
+| `$TMPDIR/agentgw-agentgw/` | ワーカーに渡す hook と MCP の設定(起動のたびに作り直す) |
+| tmux のセッション `agentgw-workers` | ワーカー1本 = 窓1つ |
+
+調べものはまず `plugin-debug.log`、起動しない・すぐ落ちるときは `logs/service.err.log` を
+見てください。
 
 サービスの定義には状態の場所が焼き込まれるので、試験用の2つ目を同じマシンで並べて
 動かせます(`AGENTGW_STATE_DIR=~/.local/state/agentgw-dev ./scripts/install.sh`)。

@@ -322,10 +322,13 @@ async fn add_child(target: &str, name: Option<&str>, from: Option<&str>) -> Resu
 
     // 6. 子を起こして、親から見えるかを確かめる
     println!("==> {target} に入れて起こす");
-    remote::ssh_interactive(
+    let installed = remote::ssh_interactive(
         target,
         &format!("{state_prefix}~/.local/bin/agentgw-install.sh --from ~/{remote_bin}"),
-    )?;
+    );
+    // 送り込んだ install.sh は使い捨て。**成否に関わらず片付ける**(次の add-child がまた送る)
+    let _ = remote::ssh_run(target, "rm -f ~/.local/bin/agentgw-install.sh");
+    installed?;
 
     if !wait_connected(&inlet, &child).await {
         // 直結が駄目だったなら、トンネルに落ちてもう一度

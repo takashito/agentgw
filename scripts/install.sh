@@ -178,22 +178,57 @@ rm -f "$target.old"
 # macOS のファイアウォールもゲートキーパーも TCC も実行ファイルを署名で見るので、署名が
 # 無いものは毎回「素性の分からない実行ファイル」として扱われる。sudo は要らない。
 #
-# **身元を固定する。** ad-hoc(`--sign -`)の身元は中身のハッシュ(cdhash)なので、ビルド
-# し直すたびに別物になり、出した許可が毎回リセットされる(デスクトップ/他アプリのデータの
-# ダイアログが起動のたびに並ぶ)。`scripts/signing-cert.sh` で作った固定の証明書があれば
-# それで署名する — 要求が `identifier + 証明書のリーフ` で一致するので許可が生き残る。
+# **身元を固定する。** ad-hoc(`--sign -`)の身元は中身のハッシュ(cdhash)なので、入れ直す
+# たびに別物になり、出した許可が毎回リセットされる(デスクトップ/他アプリのデータの
+# ダイアログが起動のたびに並ぶ)。login キーチェーンに固定の自己署名証明書を1つ持ち、
+# それで署名すれば、要求が `identifier + 証明書のリーフ` で一致するので許可が生き残る。
 # `--identifier` も明示する。既定の識別子は Mach-O の UUID 由来でビルドごとに変わるため、
 # 証明書だけ固定しても一致しない。
 # macOS 以外には codesign が無いので黙って飛ばす
 sign_id="${SIGN_IDENTITY:-agentgw dev}"
+
+# 証明書を1つ作る(**このマシンで一度だけ**。以後は見つかるので素通り)。
+# 途中で macOS がパスワードを訊く(鍵の取り込みと、コード署名用の信頼設定)ので、
+# **端末で対話しているときだけ**やる。作れなければ ad-hoc に落ちるだけで、入れるのは止めない
+make_signing_identity() {
+  keychain="$HOME/Library/Keychains/login.keychain-db"
+  work="$(mktemp -d)"
+  if security find-certificate -c "$sign_id" >/dev/null 2>&1; then
+    # 証明書はもう居る(= 前回、信頼設定の手前で止まった)。作り直さず取り出すだけ
+    security find-certificate -c "$sign_id" -p > "$work/cert.pem"
+  else
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+      -keyout "$work/key.pem" -out "$work/cert.pem" -subj "/CN=$sign_id" \
+      -addext "basicConstraints=critical,CA:false" \
+      -addext "keyUsage=critical,digitalSignature" \
+      -addext "extendedKeyUsage=critical,codeSigning" 2>/dev/null || { rm -rf "$work"; return 1; }
+    # **パスワードは空にしない。** security(1) は空パスワードの p12 を「MAC verification failed」で
+    # 撥ねる。-legacy も要る(既定の AES-256 な p12 を security は読めない)
+    openssl pkcs12 -export -legacy -passout pass:tmp \
+      -inkey "$work/key.pem" -in "$work/cert.pem" -out "$work/id.p12" 2>/dev/null \
+      || { rm -rf "$work"; return 1; }
+    # -A: codesign が鍵を使うたびに許可を訊かれないようにする
+    security import "$work/id.p12" -k "$keychain" -P tmp -A -T /usr/bin/codesign >/dev/null \
+      || { rm -rf "$work"; return 1; }
+  fi
+  security add-trusted-cert -r trustRoot -p codeSign -k "$keychain" "$work/cert.pem" \
+    || { rm -rf "$work"; return 1; }
+  rm -rf "$work"
+}
+
 if command -v codesign >/dev/null 2>&1; then
+  if ! security find-identity -v -p codesigning 2>/dev/null | grep -qF "$sign_id" && [ -t 0 ]; then
+    echo "==> 署名の身元を作ります(このマシンで一度だけ。入れ直しても macOS の許可が消えないように)"
+    echo "    macOS がキーチェーンのパスワードを訊きます"
+    make_signing_identity || echo "  作れませんでした。今回は ad-hoc で署名します(続けます)"
+  fi
   if security find-identity -v -p codesigning 2>/dev/null | grep -qF "$sign_id"; then
     codesign --force --sign "$sign_id" --identifier agentgw "$target" 2>/dev/null \
       || echo "  署名できませんでした(続けます)"
   else
     codesign --force --sign - "$target" 2>/dev/null \
       || echo "  署名できませんでした(続けます)"
-    echo "  ad-hoc 署名です。許可のダイアログが毎回出るなら ./scripts/signing-cert.sh"
+    echo "  ad-hoc 署名です(入れ直すたびに macOS の許可ダイアログが出ます)"
   fi
 fi
 
