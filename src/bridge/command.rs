@@ -1091,7 +1091,7 @@ mod tests {
         assert!(SlackId::is_user("U012AB") && !SlackId::is_user("U") && !SlackId::is_user("BU12"));
         assert!(SlackId::is_bot("B01") && SlackId::is_channel("C01") && SlackId::is_channel("G01"));
         assert_eq!(
-            SlackId::from_user_mention("<@U01|taito>").as_deref(),
+            SlackId::from_user_mention("<@U01|alice>").as_deref(),
             Some("U01")
         );
         assert_eq!(SlackId::from_user_mention("U01").as_deref(), Some("U01")); // a bare id works too

@@ -347,7 +347,7 @@ pub struct StatusThread {
     pub permalink: Option<String>,
     /// The thread's topic (first line of the opening message) — used as the link text
     pub topic: Option<String>,
-    /// The resolved channel name (`#general`, or `@taito` for a DM)
+    /// The resolved channel name (`#general`, or `@alice` for a DM)
     pub channel_name: Option<String>,
 }
 
@@ -757,7 +757,7 @@ mod tests {
                     repo_path: None,
                     permalink: None,
                     topic: None,
-                    channel_name: Some("@taito".into()),
+                    channel_name: Some("@alice".into()),
                 },
             ],
             pools: vec![],
@@ -768,14 +768,14 @@ mod tests {
         assert!(out.starts_with("🟢 *agentgw* `0.1.0-rs` · local\n　\n"));
         assert!(out.contains("*Active threads* — 2"));
         // DMs first; the mention is stripped from the link text
-        assert!(out.find("@taito").unwrap() < out.find("general").unwrap());
+        assert!(out.find("@alice").unwrap() < out.find("general").unwrap());
         assert!(!out.contains("UBOT"));
         // Elapsed time is a monospace chip at the start of the line, followed by the linked topic
         assert!(
             out.contains("\n<#C1|general> · `~/dev/x`\n`1m ago`　<https://s/p1|READMEを要約して>")
         );
         // A thread with an unknown time gets no chip, only the leading alignment
-        assert!(out.contains("\n@taito\n　(untitled)\n"));
+        assert!(out.contains("\n@alice\n　(untitled)\n"));
         assert!(out.contains("*Warm agents* — none"));
         // Empty thread
         let empty = StatusReport {
