@@ -5975,4 +5975,153 @@ mod tests {
         b.on_inbound(&m).await;
         assert_eq!(agent.spawned.lock().unwrap().len(), 1);
     }
+
+    const ROOT: &str = "1782000000.000100";
+
+    /// The first `user_prompt` hook: what lifts the "still starting" latch.
+    async fn on_hook_user_prompt_for_test(b: &mut Bridge, sid: &str) {
+        b.on_hook(HookEvent {
+            kind: "user_prompt".into(),
+            session_id: sid.into(),
+            payload: serde_json::json!({}),
+            respond: None,
+        })
+        .await;
+    }
+
+    /// Lets the tasks Bridge spawned (posts, the status line, reaction flips) run.
+    async fn settle() {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn in_thread(ts: &str, text: &str) -> InboundMsg {
+        let mut m = channel_msg(ts, "U_OWNER", text);
+        m.thread_ts = Some(ROOT.into());
+        m
+    }
+
+    /// Starts a thread at ROOT and lets its agent take the first turn. Returns the session id.
+    async fn running_thread(b: &mut Bridge, agent: &FakeAgent) -> String {
+        b.on_inbound(&channel_msg(ROOT, "U_OWNER", "<@U_BOT> fix the tests"))
+            .await;
+        let sid = agent.spawned.lock().unwrap()[0].session_id.as_str().to_string();
+        on_hook_user_prompt_for_test(b, &sid).await;
+        sid
+    }
+
+    #[tokio::test]
+    async fn a_reply_in_a_running_thread_reaches_the_same_agent() {
+        // Observed: once user_prompt clears the latch, the entry's session is Ready and
+        // Dispatch::Deliver types the envelope into the window the spawn returned (@0).
+        let (d, _slack, agent, _clock) = flow_deps("reply");
+        let (mut b, _fx) = Bridge::for_test(d);
+        running_thread(&mut b, &agent).await;
+        b.on_inbound(&in_thread("1782000000.000200", "and also this"))
+            .await;
+        assert_eq!(agent.spawned.lock().unwrap().len(), 1, "no second agent");
+        let delivered = agent.delivered.lock().unwrap().clone();
+        assert_eq!(delivered.len(), 1, "{delivered:?}");
+        assert_eq!(delivered[0].0, "@0");
+        assert!(delivered[0].1.contains("and also this"), "{delivered:?}");
+    }
+
+    #[tokio::test]
+    async fn stop_interrupts_the_running_agent() {
+        // Observed: `stop` from the Owner with a request still unanswered sends Escape to the
+        // worker's window id and posts nothing.
+        let (d, slack, agent, _clock) = flow_deps("stop");
+        let (mut b, _fx) = Bridge::for_test(d);
+        running_thread(&mut b, &agent).await;
+        settle().await;
+        let before = slack.calls().len();
+        b.on_inbound(&in_thread("1782000000.000200", "stop")).await;
+        settle().await;
+        assert_eq!(*agent.interrupted.lock().unwrap(), vec!["@0".to_string()]);
+        assert!(
+            !slack.calls()[before..].iter().any(|c| c.starts_with("post")),
+            "{:?}",
+            slack.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_prompt_is_posted_and_answered_on_allow() {
+        // Observed: a tool no standing rule covers (Bash) gets one prompt in the thread; Allow
+        // answers the worker with "allow" and rewrites the prompt to ✅ (it is not deleted).
+        let (d, slack, agent, _clock) = flow_deps("perm");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let sid = running_thread(&mut b, &agent).await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        b.on_hook(HookEvent {
+            kind: "perm".into(),
+            session_id: sid,
+            payload: serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": "cargo test"},
+                "tool_use_id": "toolu_1",
+            }),
+            respond: Some(tx),
+        })
+        .await;
+        let perms: Vec<String> = slack
+            .calls()
+            .into_iter()
+            .filter(|c| c.starts_with("perm "))
+            .collect();
+        assert_eq!(perms.len(), 1, "{:?}", slack.calls());
+        let req_id = perms[0].split(' ').nth(3).unwrap().to_string();
+        assert_eq!(perms[0], format!("perm C1 {ROOT} {req_id} Bash"));
+        let prompt_ts = b.perm_pending[&req_id].prompt_ts.clone();
+
+        b.on_perm_click(slack::PermClick {
+            req_id: req_id.clone(),
+            action: "allow".into(),
+            by: "U_OWNER".into(),
+        })
+        .await;
+        let answer = rx.await.unwrap();
+        assert!(answer.to_string().contains("\"allow\""), "{answer}");
+        assert!(b.perm_pending.is_empty());
+        assert!(
+            slack
+                .calls()
+                .contains(&format!("update C1 {prompt_ts} ✅ `Bash` — allow by <@U_OWNER>")),
+            "{:?}",
+            slack.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn silence_shows_the_thinking_status_once() {
+        // Observed: the user_prompt hook arms the watchdog quietly; after SILENCE_MS with the
+        // request unanswered, stall_tick sets "is thinking…" once and a second tick is a no-op.
+        let (d, slack, agent, clock) = flow_deps("stall");
+        let (mut b, _fx) = Bridge::for_test(d);
+        running_thread(&mut b, &agent).await;
+        clock.advance(slack::SILENCE_MS + 1);
+        b.stall_tick();
+        b.stall_tick();
+        settle().await;
+        let thinking = format!("status C1 {ROOT} {}", slack::THINKING_STATUS);
+        let shown = slack.calls().iter().filter(|c| **c == thinking).count();
+        assert_eq!(shown, 1, "{:?}", slack.calls());
+    }
+
+    #[tokio::test]
+    async fn the_usage_limit_gate_refuses_a_new_thread() {
+        // Observed: while limited_until_ms is ahead of the clock, a new request gets the
+        // Limited notice in its thread — no ack reaction, no agent.
+        let (d, slack, agent, clock) = flow_deps("limit");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let until_ms = ports::Clock::now_ms(clock.as_ref()) + 3_600_000;
+        b.limited_until_ms = until_ms;
+        b.on_inbound(&channel_msg(ROOT, "U_OWNER", "<@U_BOT> fix the tests"))
+            .await;
+        settle().await;
+        assert!(agent.spawned.lock().unwrap().is_empty());
+        let notice = crate::bridge::render::Notice::Limited { until_ms }.render();
+        assert_eq!(slack.calls(), vec![format!("post C1 {ROOT} {notice}")]);
+    }
 }

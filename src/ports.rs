@@ -352,6 +352,8 @@ pub mod fake {
         pub spawned: Mutex<Vec<SpawnReq>>,
         /// (window id, text)
         pub delivered: Mutex<Vec<(String, String)>>,
+        /// Window ids that got an interrupt (Escape).
+        pub interrupted: Mutex<Vec<String>>,
         windows: Mutex<Vec<WindowRow>>,
         next: AtomicU64,
     }
@@ -400,7 +402,8 @@ pub mod fake {
             self.windows.lock().unwrap().retain(|r| r.id != w.as_str());
             Ok(())
         }
-        fn interrupt(&self, _w: &Window) -> Result<(), String> {
+        fn interrupt(&self, w: &Window) -> Result<(), String> {
+            self.interrupted.lock().unwrap().push(w.as_str().to_string());
             Ok(())
         }
         fn login_kill(&self) {}
