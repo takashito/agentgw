@@ -981,10 +981,7 @@ impl Bridge {
         // usage 上限中は新規の依頼を受けない。キューイングもしない。
         // コマンドの**後ろ**なのは現行どおり — 上限中でも stop/restart/logout は効く
         if self.deps.clock.now_ms() < self.limited_until_ms {
-            let text = crate::bridge::render::Notice::Limited {
-                until_ms: self.limited_until_ms,
-            }
-            .render();
+            let text = super::turn::limited_notice(self.limited_until_ms);
             self.post(&msg.channel, &root_ts, text, &key);
             return;
         }

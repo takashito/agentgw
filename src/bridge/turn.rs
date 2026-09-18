@@ -6,7 +6,7 @@ use super::{Bridge, Host};
 use crate::agent::tmux::Window;
 use crate::agent::{HookEvent, ProbeErr, SessionId};
 use crate::bridge::state as bridge;
-use crate::bridge::state::{Disposition, LogCtx, ThreadKey};
+use crate::bridge::state::{Disposition, LogCtx, ThreadKey, WallClock};
 use crate::chat::slack;
 
 const NARRATION_CAP: usize = 600;
@@ -154,7 +154,7 @@ impl Bridge {
     /// 手順は現行のまま崩さない: ログ → スレッド門番 → **上限ゲート** → **再配達** → 文面。
     fn on_turn_failure(&mut self, ev: &HookEvent, key: Option<&ThreadKey>, ctx: &LogCtx) {
         let reason = ev.payload["error_type"].as_str().unwrap_or("");
-        let (klass, text) = crate::bridge::render::TurnFailureClass::of(reason);
+        let (klass, text) = TurnFailureClass::of(reason);
         let raw = serde_json::json!({
             "hook_event_name": ev.payload["hook_event_name"],
             "error_type": ev.payload["error_type"],
@@ -186,7 +186,7 @@ impl Bridge {
         }
         // retry 級は「もう一度配達する」で晴れるもの。配達できたら何も投稿しない —
         // 人が見るべきは再送したターンの結末そのもの
-        if klass == crate::bridge::render::TurnFailureClass::Retry
+        if klass == TurnFailureClass::Retry
             && self.retry_turn_failure(key, reason, ctx)
         {
             return;
@@ -239,10 +239,7 @@ impl Bridge {
         );
         let (channel, thread_ts) = key.split();
         if let Some(ts) = thread_ts {
-            let text = crate::bridge::render::Notice::Limited {
-                until_ms: hit.reset_ms,
-            }
-            .render();
+            let text = limited_notice(hit.reset_ms);
             self.post(&channel, &ts, text, key);
         }
         true
@@ -432,7 +429,7 @@ impl Bridge {
         // 予測(この先どれくらいで上限に当たるか)。間隔もこれで決まる
         let w = crate::bridge::state::WallClock::now();
         let projection = crate::bridge::state::WallClock::parse_reset(&reset_text, &w)
-            .map(|reset| crate::bridge::render::UsageProjection::of(pct, &reset, &w, 300));
+            .map(|reset| UsageProjection::of(pct, &reset, &w, 300));
         self.usage_at_risk = projection
             .as_ref()
             .is_some_and(|p| p.enough_data && p.at_risk);
@@ -469,14 +466,13 @@ impl Bridge {
         let Some(highest) = crossed.iter().max().copied() else {
             return;
         };
-        let text = crate::bridge::render::Notice::UsageWarning {
-            pct: pct as u32,
-            reset: reset_text,
-            projected_hit: projection
+        let text = usage_warning_notice(
+            pct as u32,
+            &reset_text,
+            projection
                 .filter(|p| p.enough_data && p.at_risk)
                 .and_then(|p| p.projected_hit),
-        }
-        .render();
+        );
         // 生きているワーカーを抱えたスレッドにだけ1回ずつ
         let targets: Vec<ThreadKey> = self.live_thread_keys();
         ctx.info(
@@ -1149,5 +1145,282 @@ impl Bridge {
                 Err(e) => ctx.error("bridge", &format!("sticky post failed: {e}")),
             },
         }
+    }
+}
+
+/// 1回の `/usage` 読み取りから立てたバーンレート予測。
+///
+/// `enough_data` が false のときは(現行同様)警告もロックもしてはいけない。
+/// `at_risk` = 窓が reset する**前**に 100% に達する見込み。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsageProjection {
+    pub enough_data: bool,
+    pub at_risk: bool,
+    pub projected_hit: Option<WallClock>,
+}
+
+impl UsageProjection {
+    /// 週の窓(7日)。
+    pub const WEEK_MINUTES: i64 = 7 * 24 * 60;
+
+    /// 予測ノイズガード: これだけ経っていない/使われていない窓は「データ不足」。
+    const MIN_ELAPSED_MINUTES: i64 = 30;
+    const MIN_PCT: f64 = 5.0;
+
+    /// 判断材料が足りないときの答え。**警告もロックもしない。**
+    const NONE: UsageProjection = UsageProjection {
+        enough_data: false,
+        at_risk: false,
+        projected_hit: None,
+    };
+
+    /// 窓の開始 = reset − window、burn = pct / 経過分、上限到達 = now + 残り% / burn。
+    /// reset が過去(= `minutes_to` が None)なら読みが壊れているので安全側に倒す。
+    pub fn of(
+        pct: f64,
+        reset: &WallClock,
+        now: &WallClock,
+        window_minutes: i64,
+    ) -> UsageProjection {
+        let Some(to_reset) = WallClock::minutes_to(now, reset) else {
+            return Self::NONE;
+        };
+        let elapsed = window_minutes - to_reset;
+        if elapsed < Self::MIN_ELAPSED_MINUTES || pct < Self::MIN_PCT {
+            return Self::NONE;
+        }
+        let burn = pct / elapsed as f64;
+        if !burn.is_finite() || burn <= 0.0 {
+            return Self::NONE;
+        }
+        let to_limit = (100.0 - pct).max(0.0) / burn;
+        let hit = now.plus_minutes(to_limit.round() as i64);
+        UsageProjection {
+            enough_data: true,
+            at_risk: WallClock::minutes_to(&hit, reset).is_some_and(|m| m > 0),
+            projected_hit: Some(hit),
+        }
+    }
+}
+
+// ── 節8: ターン失敗の分類 — 級と文面は**1つの表** ─────
+// 級(retry / tell-user)と文面は1つの判断の2つの面。2枚の表に分けると片方だけが直されて
+// 食い違うので、現行はここを1枚に統合してある。**文面は原文コピー**(互換の約束)。
+
+/// ターン失敗の扱い。`Retry` は「未応答をもう一度配達する」級。
+///
+/// **再配達自体はまだ無い**(別コミット)ので、いまはどちらも文面を出す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnFailureClass {
+    Retry,
+    TellUser,
+}
+
+impl TurnFailureClass {
+    /// `error` フレームの `error_type` を**部分一致・大小無視**で引く表。
+    /// (`error_type` に含まれる語, 扱い, 英語, 日本語)
+    const TABLE: &'static [(&'static str, TurnFailureClass, &'static str, &'static str)] = &[
+        (
+            "rate_limit",
+            TurnFailureClass::Retry,
+            "Claude is busy right now, so no reply was written. Wait a moment and send it again.",
+            "Claude が混み合っていて、返信を書けませんでした。少し待ってからもう一度送ってください。",
+        ),
+        (
+            "overloaded",
+            TurnFailureClass::Retry,
+            "Claude had a temporary problem, so no reply was written. Wait a moment and send it again.",
+            "Claude 側の一時的な不具合で、返信を書けませんでした。少し待ってからもう一度送ってください。",
+        ),
+        (
+            "server_error",
+            TurnFailureClass::Retry,
+            "Claude had a temporary problem, so no reply was written. Wait a moment and send it again.",
+            "Claude 側の一時的な不具合で、返信を書けませんでした。少し待ってからもう一度送ってください。",
+        ),
+        (
+            "authentication_failed",
+            TurnFailureClass::TellUser,
+            "Claude Code is signed out, so no reply was written. DM the bot `login` to sign in again.",
+            "Claude Code のサインインが切れていて、返信を書けませんでした。ボットに `login` と DM してサインインし直してください。",
+        ),
+        (
+            "oauth_org_not_allowed",
+            TurnFailureClass::TellUser,
+            "Your organization doesn't allow this account to use Claude Code, so no reply was written. Ask your admin.",
+            "組織の設定で、このアカウントは Claude Code を使えません。返信を書けなかったので、管理者に確認してください。",
+        ),
+        (
+            "billing_error",
+            TurnFailureClass::TellUser,
+            "There's a billing problem with your Claude account, so no reply was written. Check your billing settings.",
+            "Claude のアカウントの支払いに問題があり、返信を書けませんでした。支払いの設定を確認してください。",
+        ),
+        (
+            "max_output_tokens",
+            TurnFailureClass::TellUser,
+            "The answer hit the output limit before it was finished. Ask for a narrower part.",
+            "答えが長すぎて、出力の上限を超えました。範囲を絞って聞き直してください。",
+        ),
+        (
+            "invalid_request",
+            TurnFailureClass::TellUser,
+            "The request was too large (or invalid). Run `compact` to shrink the conversation, or send a shorter message.",
+            "依頼が大きすぎるか、正しくありません。`compact` で会話を圧縮するか、短くして送り直してください。",
+        ),
+        (
+            "model_not_found",
+            TurnFailureClass::TellUser,
+            "The selected model doesn't exist, so no reply was written. Check the model with `model`.",
+            "選んだモデルが見つからず、返信を書けませんでした。`model` でモデルを確認してください。",
+        ),
+    ];
+
+    /// ターン失敗を分類し、**同時に**人が動ける言葉にする(`turnFailure`)。
+    ///
+    /// 10番目の `unknown`、そして知らない型・**空の型**はすべて `Retry` に落ちる — 空は実際に
+    /// 起きる(2026-07-14 に実機で観測、次のターンは同じ資格で成功した)。何も飲み込まない:
+    /// 生のキーワードは唯一の手掛かりなので文面に残す。
+    pub fn of(reason: &str) -> (TurnFailureClass, String) {
+        let r = reason.to_lowercase();
+        if let Some((_, klass, en, ja)) = Self::TABLE.iter().find(|(needle, ..)| r.contains(needle)) {
+            let text = match crate::i18n::lang() {
+                crate::i18n::Lang::En => en,
+                crate::i18n::Lang::Ja => ja,
+            };
+            return (*klass, (*text).to_string());
+        }
+        (
+            TurnFailureClass::Retry,
+            if reason.is_empty() {
+                crate::t!(
+                    "No reply was written. Send it again.",
+                    "返信を書けませんでした。もう一度送ってください。"
+                )
+            } else {
+                crate::t!(
+                    "No reply was written (`{reason}`). Send it again.",
+                    "返信を書けませんでした(`{reason}`)。もう一度送ってください。"
+                )
+            },
+        )
+    }
+}
+
+impl std::fmt::Display for TurnFailureClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Retry => "retry",
+            Self::TellUser => "tell-user",
+        })
+    }
+}
+
+/// usage 上限中に来た依頼へ返す1本。ホスト = Asia/Tokyo はこのリポの usage 機能全体の
+/// 前提 — 固定 +9:00 で足すだけ。
+pub fn limited_notice(limited_until_ms: u64) -> String {
+    let at = WallClock::tokyo(limited_until_ms).format("%-m/%-d %H:%M");
+    crate::t!(
+        "⏸️ You've reached your Claude Code usage limit. New requests are paused until it resets around {at} (Asia/Tokyo) — send yours again after that.",
+        "⏸️ Claude Code の利用上限に達しました。{at}(Asia/Tokyo)ごろのリセットまで新しい依頼は受け付けません。リセット後にもう一度送ってください。"
+    )
+}
+
+/// 上限が近い(80% / 90% を跨いだ)。生きているスレッドに1回ずつ出す。
+/// `reset` は `/usage` が印字した reset 節(そのまま出す)、`projected_hit` はこのペースで
+/// 使い続けたときに上限へ当たる見込みの時刻。
+fn usage_warning_notice(pct: u32, reset: &str, projected_hit: Option<WallClock>) -> String {
+    let mut lines = vec![crate::t!(
+        "⚠️ You're close to your usage limit — current session *{pct}% used*",
+        "⚠️ 利用上限が近づいています — 今のセッションで *{pct}%* 使用"
+    )];
+    if !reset.is_empty() {
+        lines.push(crate::t!("Resets {reset}", "リセット: {reset}"));
+    }
+    if let Some(hit) = projected_hit {
+        let at = hit.reset_like();
+        lines.push(crate::t!(
+            "At this pace you'll hit the limit around {at}.",
+            "このペースだと {at} ごろに上限に達します。"
+        ));
+    }
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 壁時計1つ。テストの主役は年月日ではないので、1行で書けるようにする。
+    fn wc(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> WallClock {
+        WallClock::new(year, month, day, hour, minute).expect("valid wall clock")
+    }
+
+    /// 分類は**部分一致・大小無視**。表に無いものと空はどちらも retry 級に落ち、
+    /// 生のキーワードは文面に残る(唯一の手掛かりなので隠さない)。
+    #[test]
+    fn turn_failure_classifies_and_speaks() {
+        use TurnFailureClass::*;
+        let (k, t) = TurnFailureClass::of("API Error: rate_limit_error");
+        assert_eq!(k, Retry);
+        assert!(t.contains("Claude is busy"), "{t}");
+
+        let (k, t) = TurnFailureClass::of("BILLING_ERROR");
+        assert_eq!(k, TellUser);
+        assert!(t.contains("billing problem"), "{t}");
+
+        let (k, t) = TurnFailureClass::of("unknown");
+        assert_eq!(k, Retry);
+        assert_eq!(t, "No reply was written (`unknown`). Send it again.");
+
+        // 実機で起きた「型が空のまま」— 飲み込まず、キーワード無しの文面で言う
+        let (k, t) = TurnFailureClass::of("");
+        assert_eq!(k, Retry);
+        assert_eq!(t, "No reply was written. Send it again.");
+    }
+
+    #[test]
+    fn format_limit_reply_names_the_reset_time() {
+        // 実測値(Python zoneinfo で確認): epoch ms → Asia/Tokyo の壁時計
+        let out = limited_notice(1_782_635_400_000); // 2026-06-28 17:30 JST
+        assert!(out.contains("6/28 17:30"), "{out}");
+        assert_eq!(
+            out,
+            "⏸️ You've reached your Claude Code usage limit. New requests are paused until it resets around 6/28 17:30 (Asia/Tokyo) — send yours again after that."
+        );
+        // 分が0埋めされる例
+        let out = limited_notice(1_785_283_500_000); // 2026-07-29 09:05 JST
+        assert!(out.contains("7/29 09:05"), "{out}");
+    }
+
+    fn sample_now() -> WallClock {
+        wc(2026, 7, 29, 13, 0)
+    }
+
+    #[test]
+    fn project_usage_not_enough_data_below_threshold() {
+        let now = wc(2026, 7, 29, 10, 0);
+        let reset = wc(2026, 7, 29, 15, 0);
+        let p = UsageProjection::of(3.0, &reset, &now, 300); // pct<5% → enough_data=false
+        assert!(!p.enough_data);
+        // 窓が丸ごと未経過(reset がちょうど window 先)でも同じく取らない
+        assert!(!UsageProjection::of(40.0, &reset, &now, 300).enough_data);
+    }
+
+    #[test]
+    fn project_usage_at_risk_when_burn_rate_outpaces_reset() {
+        let now = sample_now();
+        let reset = wc(2026, 7, 29, 17, 30);
+        // 経過 300-270=30分で40%消費 → burn=1.333%/min → 残り60% ÷ 1.333 = 45分後に到達
+        // reset までの270分より早く枯渇する → at_risk
+        let p = UsageProjection::of(40.0, &reset, &now, 300);
+        assert!(p.enough_data);
+        assert!(p.at_risk);
+        assert_eq!(p.projected_hit, Some(wc(2026, 7, 29, 13, 45)));
+        // 週窓(10080分)は経過が長く burn が緩いので、同じ %でも枯渇しないことがある
+        let week_reset = wc(2026, 8, 3, 9, 0);
+        let w = UsageProjection::of(20.0, &week_reset, &now, UsageProjection::WEEK_MINUTES);
+        assert!(w.enough_data);
+        assert!(!w.at_risk);
     }
 }

@@ -5,14 +5,13 @@
 //! 機能ごとの `impl Bridge` は子モジュールに1つずつ:
 //! [`inbound`](crate::bridge::inbound)(受信と門)/ [`turn`](crate::bridge::turn)(hook・ターン・許可・沈黙の見張り・進捗)/
 //! [`worker`](crate::bridge::worker)(エージェントの起動・在庫・回収)/ [`command`](crate::bridge::command)(コマンドの解釈と実行)。
-//! Slack に出す文面は [`render`]、ディスクに残る状態とログは [`state`]、
+//! ディスクに残る状態とログは [`state`]、
 //! ゲートウェイ側は [`gateway`]、マシン側の接続は [`machine`]。
 
 pub mod command;
 pub mod machine;
 pub mod gateway;
 pub mod inbound;
-pub mod render;
 pub mod turn;
 pub mod state;
 pub mod worker;
@@ -20,7 +19,6 @@ pub mod worker;
 use crate::agent::claude::HookIntake;
 use crate::agent::claude::Claude;
 use crate::bridge::command::CmdFx;
-use crate::bridge::render::RestartPhase;
 use crate::bridge::state as bridge;
 use crate::bridge::inbound::InboundMsg;
 use crate::bridge::state::{LogCtx, ThreadKey};
@@ -180,16 +178,14 @@ impl Bridge {
     /// (子にとって「繋がった」を人に知らせるのはこの1行だけ — 親側の presence は 🔴 だけを言う)。
     async fn announce_online(&mut self, connected_as: &str) {
         let pools: Vec<String> = self.access.pool_targets(&Host::home());
-        let text = crate::bridge::render::Notice::Online {
-            label: Host::name().await,
+        let text = online_notice(
+            &Host::name().await,
             // 人が読む通知なので**名前**を出す(現行と同じ)
-            connected_as: connected_as.to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            pid: std::process::id(),
-            pools,
-            pending: 0,
-        }
-        .render();
+            connected_as,
+            env!("CARGO_PKG_VERSION"),
+            &pools,
+            0,
+        );
         self.post_notice(&text, &LogCtx::default()).await;
     }
 
@@ -306,13 +302,7 @@ impl Bridge {
             }
         }
         // (d) 降りることを home に1回知らせる(後継が online 通知を出す)
-        let offline = crate::bridge::render::Notice::Offline {
-            label: Host::name().await,
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            pid: std::process::id(),
-            reason: "restart".to_string(),
-        }
-        .render();
+        let offline = offline_notice(&Host::name().await, env!("CARGO_PKG_VERSION"), "restart");
         self.post_notice(&offline, ctx).await;
         // (e) 「Bridge を停止」まで done にしてから降りる。後継が繋がるまでの数秒、表は凍る
         if let (Some((channel, _)), Some(ts)) = (req, &progress_ts) {
@@ -396,13 +386,7 @@ impl Bridge {
         });
         // offline を**先に**出す。teardown は数秒かかるので、後回しにすると
         // 上のハード exit に食われて通知が落ちる(同じ事故を書いている)
-        let offline = crate::bridge::render::Notice::Offline {
-            label: Host::name().await,
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            pid: std::process::id(),
-            reason: reason.to_string(),
-        }
-        .render();
+        let offline = offline_notice(&Host::name().await, env!("CARGO_PKG_VERSION"), reason);
         self.post_notice(&offline, &ctx).await;
         // 畳む前に逃がす — ワーカーごと落とすので、queue に残った依頼はここでしか救えない
         self.flush_pending_to_disk(&ctx);
@@ -939,6 +923,150 @@ async fn pump_relay(
 }
 
 
+// ── `restart` の進捗チェックリスト ────────────────────
+// Owner のスレッドに**1本**投稿し、再起動が進むごとにその場で編集する。
+// 形を決めている制約: 再起動は2つの Bridge プロセスをまたぐ。古い方が最初の数段を進めて
+// 降り(Slack に何も繋がっていない数秒間があり、launchd が最新コードで起こし直す)、
+// **後継**が残りを終える(どのメッセージを編集するかは restart マーカーから知る)。だから
+// 両者が「どこまで進んだか」という1つの値から同じ固定チェックリストを描く — 表示は跳ねない。
+//
+// 現行との**意図的な差**: 版注記(`Bridge を停止 (vX)` / `…復帰(vX)`)は落とす —
+// この実装には版報告の機構が部品ごと無い。
+
+/// 再起動の段。`Done`/`Failed` は終端で、行ではない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartPhase {
+    /// Owner の restart を受理した(最初の投稿)
+    Received,
+    /// **古い** Bridge が止まる(launchd が起こし直す)
+    Switching,
+    /// **後継** Bridge が Slack に繋ぎ直した
+    Online,
+    /// 再起動完了(全行 done)
+    Done,
+    /// 再起動が中断(進行中の行を failed に)
+    Failed,
+}
+
+impl RestartPhase {
+    /// チェックリストの1行の文言。
+    fn step_label(self) -> String {
+        match self {
+            RestartPhase::Received => crate::t!("Restart requested", "再起動を受け付けました"),
+            RestartPhase::Switching => crate::t!("Stopping agentgw", "agentgw を止めています"),
+            RestartPhase::Online => crate::t!("agentgw is back online", "agentgw がオンラインに戻りました"),
+            RestartPhase::Done | RestartPhase::Failed => String::new(),
+        }
+    }
+
+    /// 与えられた進捗点でチェックリスト全体を描く:
+    ///   - `completed_through` までの行 → `•`(done)
+    ///   - その次の1行 → `◌ …`(進行中)、`failed_reason` があれば `💥`
+    ///   - それ以降 → `◌`(未着手)
+    ///   - done なら末尾に `✅ 再起動が完了しました`、失敗なら `💥 再起動に失敗しました — <理由>`
+    ///
+    /// `RestartPhase::Done` は全行 done、`Failed` は**最初の行**を failed に。
+    pub fn render(&self, failed_reason: Option<&str>) -> String {
+        let completed_through = *self;
+        let failed = completed_through == RestartPhase::Failed || failed_reason.is_some();
+        // done な行の**本数**。途中での失敗は「最後に done だった段 + failed_reason」で表され
+        // (その次の行が 💥 になる)、`Failed` そのものは何もしないうちに落ちた退化ケース。
+        let done_count = match completed_through {
+            RestartPhase::Done => RESTART_STEPS.len(),
+            RestartPhase::Failed => 0,
+            p => RESTART_STEPS
+                .iter()
+                .position(|k| *k == p)
+                .map_or(0, |i| i + 1),
+        };
+        let active = (completed_through != RestartPhase::Done).then_some(done_count);
+
+        // 1行は `<glyph> <label>` — 字下げはしない
+        let mut lines: Vec<String> = RESTART_STEPS
+            .iter()
+            .enumerate()
+            .map(|(i, step)| {
+                let label = step.step_label();
+                if i < done_count {
+                    format!("• {label}")
+                } else if active == Some(i) {
+                    if failed {
+                        format!("💥 {label}")
+                    } else {
+                        format!("◌ {label}…")
+                    }
+                } else {
+                    format!("◌ {label}")
+                }
+            })
+            .collect();
+        if completed_through == RestartPhase::Done {
+            lines.push(crate::t!("✅ Restart complete", "✅ 再起動が完了しました"));
+        } else if failed {
+            let why = failed_reason.map(|r| format!(" — {r}")).unwrap_or_default();
+            lines.push(crate::t!("💥 Restart failed{why}", "💥 再起動に失敗しました{why}"));
+        }
+        lines.join("\n")
+    }
+}
+
+/// 固定の行の集合、順番どおり。`completed_through` は**完全に done な最後の行**を指し、
+/// その次の行が進行中。両 Bridge がこの表を共有するのでメッセージは跳ねない。
+/// Bun の表にあった「Bridge を更新」と「中断していたスレッドの処理を再開」は**持たない**:
+/// Rust はバイナリ1個で更新機能が無く(差し替えは install script の仕事)、自動再開も無いので、
+/// どちらも毎回「何もせず done」になる飾りだった。
+const RESTART_STEPS: [RestartPhase; 3] = [
+    RestartPhase::Received,
+    RestartPhase::Switching,
+    RestartPhase::Online,
+];
+
+/// home への起動通知に付く要約。
+fn startup_notice(pools: &[String], pending_count: u32) -> String {
+    let n = pools.len();
+    let mut lines = vec![crate::t!("• Started {n} warm agent(s)", "• 待機用のエージェントを {n} 個起動")];
+    lines.extend(pools.iter().map(|cwd| format!("  • {cwd}")));
+    if pending_count > 0 {
+        lines.push(crate::t!(
+            "• Resumed {pending_count} unfinished thread(s)",
+            "• 途中だったスレッドを {pending_count} 件再開"
+        ));
+    }
+    lines.join("\n")
+}
+
+/// home への起動通知。
+fn online_notice(
+    label: &str,
+    connected_as: &str,
+    version: &str,
+    pools: &[String],
+    pending_count: u32,
+) -> String {
+    let summary = startup_notice(pools, pending_count);
+    crate::t!(
+        "🟢 *{label}* is online — as {connected_as}, agentgw v{version}\n{summary}",
+        "🟢 *{label}* がオンラインになりました — {connected_as} として、agentgw v{version}\n{summary}"
+    )
+}
+
+/// home への終了通知。`reason` は止まった理由の内部の名前なので、人の言葉にしてから出す。
+fn offline_notice(label: &str, version: &str, reason: &str) -> String {
+    let why = if reason.starts_with("signal:") {
+        crate::t!("stopped by the system", "システムに止められたため")
+    } else {
+        match reason {
+            "restart" => crate::t!("restarting", "再起動のため"),
+            "logout" => crate::t!("signed out", "サインアウトしたため"),
+            other => other.to_string(),
+        }
+    };
+    crate::t!(
+        "🔴 *{label}* is going offline ({why}) — agentgw v{version}",
+        "🔴 *{label}* がオフラインになります({why})— agentgw v{version}"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1348,7 +1476,7 @@ mod tests {
             .await;
         settle().await;
         assert!(agent.spawned.lock().unwrap().is_empty());
-        let notice = crate::bridge::render::Notice::Limited { until_ms }.render();
+        let notice = crate::bridge::turn::limited_notice(until_ms);
         assert_eq!(slack.calls(), vec![format!("post C1 {ROOT} {notice}")]);
     }
 
@@ -1397,5 +1525,42 @@ mod tests {
             "{:?}",
             slack.calls()
         );
+    }
+
+    #[test]
+    fn startup_summary_lists_pools_and_omits_zero_pending() {
+        let out = startup_notice(&["/home/orchestrator".into(), "/repo/one".into()], 0);
+        assert!(out.contains("Started 2 warm agent(s)"));
+        assert!(out.contains("/home/orchestrator"));
+        assert!(!out.contains("unfinished"));
+    }
+
+    #[test]
+    fn startup_summary_includes_pending_when_nonzero() {
+        let out = startup_notice(&[], 1);
+        assert!(out.contains("Resumed 1 unfinished thread(s)"));
+    }
+
+    #[test]
+    fn online_notice_matches_bun_shape() {
+        let out = online_notice("myhost", "botname", "1.2.3", &["/repo/one".into()], 0);
+        assert!(out.starts_with("🟢 *myhost* is online — as botname, agentgw v1.2.3\n"), "{out}");
+        assert!(out.contains("Started 1 warm agent(s)"));
+    }
+
+    #[test]
+    fn offline_notice_names_the_reason() {
+        let out = offline_notice("myhost", "1.2.3", "restart");
+        assert_eq!(out, "🔴 *myhost* is going offline (restarting) — agentgw v1.2.3");
+    }
+
+    #[test]
+    fn restart_checklist_renders() {
+        let first = RestartPhase::Received.render(None);
+        assert!(first.starts_with("• Restart requested\n◌ Stopping agentgw…"), "{first}");
+        let done = RestartPhase::Done.render(None);
+        assert!(done.ends_with("• agentgw is back online\n✅ Restart complete"), "{done}");
+        let failed = RestartPhase::Received.render(Some("could not restart"));
+        assert!(failed.contains("💥"));
     }
 }

@@ -1630,7 +1630,7 @@ pub const STOP_BLOCK_REASON: &str = "You ended your turn without delivering. You
 pub struct WallClock(NaiveDateTime);
 
 impl WallClock {
-    /// タイムゾーンは **Asia/Tokyo 固定**。表示側([`Notice::Limited`])が既にそうなっており
+    /// タイムゾーンは **Asia/Tokyo 固定**。表示側([`limited_notice`](crate::bridge::turn::limited_notice))が既にそうなっており
     /// (文面に「（Asia/Tokyo）」と書いてある)、Bridge も TUI も同じホストの同じゾーンで動く。
     /// 他ゾーンへ移すならこの2箇所を一緒に直す。
     const TOKYO_OFFSET_MS: i64 = 9 * 3_600_000;
@@ -2884,7 +2884,7 @@ SPACES = padded ";
     }
 
     /// 現行 parseResetToEpoch。時刻だけなら「今日のその時刻、過ぎていれば明日」。
-    /// 月日が付いていればその日。タイムゾーンは Asia/Tokyo 固定(Notice::Limited と同じ前提)。
+    /// 月日が付いていればその日。タイムゾーンは Asia/Tokyo 固定(turn::limited_notice と同じ前提)。
     #[test]
     fn reset_time_is_read_in_tokyo_time() {
         let now = 1_785_387_600_000u64; // 2026-07-30T05:00:00Z = 30日 14:00 JST

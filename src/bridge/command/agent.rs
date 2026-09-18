@@ -1,12 +1,20 @@
 //! Commands aimed at the thread's agent: stop / exit / resume / context / usage / compact /
 //! model / effort / mode, and signing in and out (login / logout).
+//!
+//! The one place allowed to implement methods on agent types (`ContextReport`,
+//! `CompactProgress`, `UsageRow`): how they look in Slack is this file's concern.
 
 use super::CmdFx;
 use crate::agent::screen::SpawnOutcome;
 use crate::agent::tmux::Window;
-use crate::agent::{CompactOutcome, CompactProgress, LoginOutcome, ProbeErr, SessionId};
+use crate::agent::screen::ModelId;
+use crate::agent::{
+    CompactOutcome, CompactProgress, ContextCategory, ContextReport, LoginOutcome, ProbeErr,
+    SessionId, UsageRow,
+};
 use crate::bridge::inbound::{self, InboundMsg};
-use crate::bridge::state::{LogCtx, ThreadKey};
+use crate::bridge::state::{LogCtx, ThreadKey, WallClock};
+use crate::bridge::turn::UsageProjection;
 use crate::bridge::{Bridge, Host};
 use crate::chat::slack;
 use tokio::sync::mpsc;
@@ -128,7 +136,7 @@ impl Bridge {
                 "bridge",
                 &format!("resume: no bound session for thread tts={root_ts} — nothing to resume"),
             );
-            let none = crate::bridge::render::ResumeInfo {
+            let none = ResumeInfo {
                 session_id: None,
                 cwd: None,
                 transcript_missing: false,
@@ -150,7 +158,7 @@ impl Bridge {
         let name = SessionId::from(sid.clone()).window_name();
         let window_id = self.workers.window_of(&sid);
         let worker_running = self.deps.agent.pid_of(window_id.as_deref(), &name).is_some();
-        let info = crate::bridge::render::ResumeInfo {
+        let info = ResumeInfo {
             // cwd は id と同じくらい大事 — claude は cwd ごとに履歴を仕舞うので、
             // 違う場所で --resume すると見つからない
             cwd: Some(history_cwd.or(entry.repo_path).unwrap_or_else(Host::home)),
@@ -301,7 +309,7 @@ impl Bridge {
                     match agent.usage_rows(&raw) {
                         // 300 = "Current session" の窓(5h)。"Current week" 行の窓は
                         // format_usage_report_with_projection が内側で差し替える
-                        Some(rows) => crate::bridge::render::UsageReport {
+                        Some(rows) => UsageReport {
                             rows: &rows,
                             projection: Some((crate::bridge::state::WallClock::now(), 300)),
                         }
@@ -1161,5 +1169,485 @@ impl Bridge {
                 }
             }
         }
+    }
+}
+
+impl UsageRow {
+    /// この行を何分の窓で予測するか(予測しない行は None)。
+    pub fn window_minutes(label: &str, session_minutes: i64) -> Option<i64> {
+        let l = label.to_ascii_lowercase();
+        if l.contains("current session") {
+            Some(session_minutes)
+        } else if l.contains("current week") {
+            Some(UsageProjection::WEEK_MINUTES)
+        } else {
+            None
+        }
+    }
+}
+
+/// `resume` の材料。
+pub struct ResumeInfo {
+    pub session_id: Option<String>,
+    /// セッションの履歴が置かれた場所(= ワーカーの起動 cwd)
+    pub cwd: Option<String>,
+    /// 履歴がディスク上に見つからなかった → 再開はまず失敗する
+    pub transcript_missing: bool,
+    /// 今このスレッドでワーカーが生きている → 手元に線を渡したら終了する
+    pub worker_running: bool,
+}
+
+impl ResumeInfo {
+    /// `resume` の答えを Slack mrkdwn で。
+    pub fn render(&self) -> String {
+        let info = self;
+        let Some(sid) = info.session_id.as_deref().filter(|s| !s.is_empty()) else {
+            return crate::t!(
+                "This thread has no session to resume yet. Send a message to start one first.",
+                "このスレッドには、まだ再開できるセッションがありません。先にメッセージを送ってセッションを始めてください。"
+            );
+        };
+        let cmd = match info.cwd.as_deref().filter(|c| !c.is_empty()) {
+            Some(cwd) => format!("cd {cwd} && claude --resume {sid}"),
+            None => format!("claude --resume {sid}"),
+        };
+        let mut lines = vec![
+            crate::t!(
+                "Run this to continue the session in your own terminal:",
+                "手元の端末でセッションを続けるには、次を実行してください。"
+            ),
+            String::new(),
+            "```".to_string(),
+            cmd,
+            "```".to_string(),
+        ];
+        if info.transcript_missing {
+            lines.push(String::new());
+            lines.push(crate::t!(
+                "⚠️ This session's history isn't on disk, so resuming may fail.",
+                "⚠️ このセッションの履歴がディスクに見つからないので、再開できないかもしれません。"
+            ));
+        }
+        if info.worker_running {
+            lines.push(String::new());
+            lines.push(crate::t!(
+                "The agent for this thread has been stopped so the session can continue there.",
+                "続きを手元で進められるよう、このスレッドのエージェントは止めました。"
+            ));
+        }
+        lines.join("\n")
+    }
+}
+
+// ── `context` / `ctx` — このスレッド自身のコンテキスト内訳 ─
+// 出力の**読み取り**は `agent/claude.rs` の `Pane::context_report`(画面と出力を読むのは
+// エージェント実体の仕事)。ここに残るのは Slack へ出す**描き方**だけ。
+
+/// パース済み `/context` を Slack mrkdwn で: 人が読めるモデル名 + 等幅の使用バー + 桁揃えの内訳表。
+/// 表は生の `Free space` 行の代わりに **`Used space` の合計行**で閉じる(バーと同じ「使った側」を
+/// 見せるため)。使用率は `100 − Free space` を優先する — ヘッダの整数 `4%` より1桁細かい。
+impl ContextReport {
+    /// JS の `parseFloat` 相当 — 先頭の数値部分だけ読む(`"95.6%"` → 95.6)。読めなければ NaN。
+    /// 指数表記は扱わない: /context が印字するのは十進のパーセントとトークン数だけ。
+    fn leading_f64(s: &str) -> f64 {
+        let t = s.trim_start();
+        let mut end = 0;
+        let mut seen_dot = false;
+        for (i, c) in t.char_indices() {
+            match c {
+                '+' | '-' if i == 0 => {}
+                '.' if !seen_dot => seen_dot = true,
+                _ if c.is_ascii_digit() => {}
+                _ => break,
+            }
+            end = i + c.len_utf8();
+        }
+        t[..end].parse().unwrap_or(f64::NAN)
+    }
+
+    pub fn render(&self) -> String {
+        let r = self;
+        let mut lines = vec![
+            "📊 *Context Usage*".to_string(),
+            ModelId::new(&r.model).friendly(&r.total),
+        ];
+
+        let free_pct = r
+            .categories
+            .iter()
+            .find(|(name, _, _)| name.eq_ignore_ascii_case("free space"))
+            .map_or(f64::NAN, |(_, _, pct)| Self::leading_f64(pct));
+        let used_pct = if free_pct.is_finite() {
+            100.0 - free_pct
+        } else {
+            Self::leading_f64(&r.pct)
+        };
+        let used_int = if used_pct.is_finite() {
+            used_pct.round() as i64
+        } else {
+            0
+        };
+        lines.push(format!(
+            "`{}`  {} / {} ( {used_int}% used )",
+            UsageReport::bar(used_pct, 24),
+            r.used,
+            r.total
+        ));
+
+        // 表: 消費側のカテゴリ(生の Free space は落とす)+ `Used space` の合計行
+        let consumers: Vec<&ContextCategory> = r
+            .categories
+            .iter()
+            .filter(|(name, _, _)| !name.eq_ignore_ascii_case("free space"))
+            .collect();
+        let used_row_pct = if used_pct.is_finite() {
+            format!("{used_pct:.1}%")
+        } else {
+            r.pct.clone()
+        };
+        // 桁は「消費側の全行 + 合計行 + 最低幅」の最大
+        let width = |min: usize, f: fn(&ContextCategory) -> &String, own: &str| {
+            consumers
+                .iter()
+                .map(|c| f(c).chars().count())
+                .chain([min, own.chars().count()])
+                .max()
+                .unwrap_or(min)
+        };
+        let name_w = width(10, |c| &c.0, "Used space");
+        let tok_w = width(6, |c| &c.1, &r.used);
+        let pct_w = width(5, |c| &c.2, &used_row_pct);
+        let row = |n: &str, t: &str, p: &str| format!("{n:<name_w$}  {t:>tok_w$}  {p:>pct_w$}");
+        let divider = "─".repeat(name_w + tok_w + pct_w + 4);
+
+        let mut body = vec![
+            "```".to_string(),
+            row("Category", "Tokens", "%"),
+            divider.clone(),
+        ];
+        body.extend(consumers.iter().map(|(n, t, p)| row(n, t, p)));
+        body.push(divider);
+        body.push(row("Used space", &r.used, &used_row_pct));
+        body.push("```".to_string());
+        lines.push(body.join("\n"));
+        lines.join("\n")
+    }
+}
+
+// ── `usage` / `usg` — アカウントのサブスク上限の要約 ────
+// スレッド単位ではなく **bot アカウント**の使用状況。バーンレート予測(projection)は
+// この実装では出さない — ラベル + バー + `Resets …` まで。
+
+// 上限行の**読み取り**は `agent/claude.rs` の `Pane::usage_rows`。ここは描き方だけ。
+
+// ── `compact` — 進捗行を描く ──────────────────────────
+// 圧縮中の pane を**読む**のは `agent/claude.rs` の `Pane::compact_progress`。
+
+/// 描くバーの幅と、その上を流れる光る窓の幅。
+const CELLS: usize = 24;
+const WINDOW: usize = 5;
+
+/// 圧縮の状態を Slack の進捗行に。🗜️ のラベル + 経過時間、pane が本物の % を出していれば
+/// そこまで満たした**確定**バー(% はバーの**後ろ** — 実 TUI のバー行 `▐▏███…░ 31%` に合わせる)。
+/// % が無い時はトークン数と、経過秒とともに光る窓が進む(そして巻き戻る)不定バーに落ちる。
+impl CompactProgress {
+    pub fn render(&self) -> String {
+        let p = self;
+        let s = p.seconds.unwrap_or(0);
+        let elapsed = match p.seconds {
+            None => String::new(),
+            Some(_) if s >= 60 => format!(" {}m{}s", s / 60, s % 60),
+            Some(_) => format!(" {s}s"),
+        };
+        if let Some(pct) = p.percent {
+            // 確定: /usage が描くのと同じバー。% はその後ろ
+            let pct = pct.min(100);
+            let bar = UsageReport::bar(f64::from(pct), CELLS);
+            return crate::t!(
+                "🗜️ Compacting the context…{elapsed}\n`{bar}` {pct}%",
+                "🗜️ コンテキストを圧縮中…{elapsed}\n`{bar}` {pct}%"
+            );
+        }
+        // 不定: 経過秒とともにバーの上を流れる光る窓
+        let tok = match &p.tokens {
+            // 矢印が無ければ**空文字**(現物の `?? ''`)。`Option<char>` の既定は `'\0'` なので使えない
+            Some(t) => format!(
+                " · {}{t} tokens",
+                p.tokens_dir.map(String::from).unwrap_or_default()
+            ),
+            None => String::new(),
+        };
+        let pos = s as usize % CELLS;
+        let bar: String = (0..CELLS)
+            .map(|i| {
+                if (i + CELLS - pos) % CELLS < WINDOW {
+                    '█'
+                } else {
+                    '░'
+                }
+            })
+            .collect();
+        crate::t!(
+            "🗜️ Compacting the context…{elapsed}{tok}\n`{bar}`",
+            "🗜️ コンテキストを圧縮中…{elapsed}{tok}\n`{bar}`"
+        )
+    }
+}
+
+/// `/usage` の答えを描くのに要るもの。
+///
+/// `projection` があればバーンレート予測行を足す
+/// (位置 — `Resets …` の直後)。
+pub struct UsageReport<'a> {
+    pub rows: &'a [UsageRow],
+    /// `(now, window_minutes)` — "Current session" 行に使う窓(通常 300)。
+    /// "Current week" 行は `USAGE_WEEK_WINDOW_MINUTES` を使う。
+    pub projection: Option<(WallClock, i64)>,
+}
+
+impl UsageReport<'_> {
+    /// パース済みの `/usage` 行を Slack mrkdwn で: 太字のラベル + 等幅のバー + `<n>% used`、
+    /// その下に `Resets <when>`。ラベルと reset の文言は**原文のまま**。
+    pub fn render(&self) -> String {
+        match self.projection {
+            Some((now, w)) => Self::inner(self.rows, Some(now), w),
+            None => Self::inner(self.rows, None, 0),
+        }
+    }
+
+    fn inner(rows: &[UsageRow], now: Option<WallClock>, window_minutes: i64) -> String {
+        let mut lines = vec!["📊 *Claude Code Usage*".to_string(), String::new()];
+        for r in rows {
+            let pct = r.pct.parse().unwrap_or(0.0);
+            lines.push(format!("*{}*", r.label));
+            lines.push(format!("`{}` {}% used", Self::bar(pct, 24), r.pct));
+            if !r.reset.is_empty() {
+                lines.push(format!("Resets {}", r.reset)); // 0% 行は reset を印字しない
+            }
+            if let Some(hit) = now.and_then(|now| {
+                UsageRow::window_minutes(&r.label, window_minutes)
+                    .zip(WallClock::parse_reset(&r.reset, &now))
+                    .map(|(window, reset)| UsageProjection::of(pct, &reset, &now, window))
+                    .filter(|p| p.enough_data && p.at_risk)
+                    .and_then(|p| p.projected_hit)
+            }) {
+                lines.push(format!(
+                    "- Expected to reach limit at : {}",
+                    hit.reset_like()
+                ));
+            }
+            lines.push(String::new());
+        }
+        if lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
+        lines.join("\n")
+    }
+
+    /// 0–100 の百分率を固定幅の unicode バーに(/usage の TUI 画面を写したもの)。
+    fn bar(pct: f64, width: usize) -> String {
+        let p = if pct.is_finite() {
+            pct.clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
+        let filled = (p / 100.0 * width as f64).round() as usize;
+        "█".repeat(filled) + &"░".repeat(width - filled)
+    }
+}
+
+/// `help`'s sections for the commands in this file: (title, [(trigger, description)]).
+pub(super) fn help_sections() -> Vec<(String, Vec<(&'static str, String)>)> {
+    vec![
+        (
+            crate::t!("In this thread", "このスレッドで"),
+            vec![
+                ("stop", crate::t!("stop the current turn (a 🛑 reaction works too)", "実行中のターンを止める(🛑 のリアクションでも可)")),
+                ("exit / bye / done", crate::t!("end this thread's agent; your next message resumes it", "このスレッドのエージェントを終える。次に書けば再開する")),
+                ("compact", crate::t!("compact the context, with a progress bar", "コンテキストを圧縮する(進捗バー付き)")),
+                ("model [fable|opus|sonnet|haiku]", crate::t!("show or switch the model", "モデルを見る・切り替える")),
+                ("effort [low|medium|high|xhigh|max|ultracode|auto]", crate::t!("show or set the effort level", "effort を見る・決める")),
+                ("mode [manual|plan|edit|auto]", crate::t!("show or switch the permission mode", "権限モードを見る・切り替える")),
+                ("context / ctx", crate::t!("show this agent's context usage", "このエージェントのコンテキストの使用量")),
+                ("resume", crate::t!("show the command to continue this session in your own terminal (stops the agent here)", "このセッションを手元の端末で続けるコマンドを出す(ここのエージェントは止める)")),
+            ],
+        ),
+        (
+            crate::t!("Account", "アカウント"),
+            vec![
+                ("login", crate::t!("sign Claude Code in to your account (in a DM)", "Claude Code を自分のアカウントでサインインする(DM で)")),
+                ("logout", crate::t!("sign out and stop every agent", "サインアウトして、すべてのエージェントを止める")),
+                ("usage / usg", crate::t!("show your Claude subscription usage", "Claude のサブスクリプションの使用状況")),
+            ],
+        ),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // 描き方のテストが読み手を1つ呼ぶ(`renders_context_report`)。パーサ本体の網は
+    // `agent/claude.rs` の `mod tests` に居る。
+    use crate::agent::screen::Pane;
+
+    fn sample_now() -> WallClock {
+        WallClock::new(2026, 7, 29, 13, 0).expect("valid wall clock")
+    }
+
+    #[test]
+    fn resume_report_variants() {
+        let none = ResumeInfo {
+            session_id: None,
+            cwd: None,
+            transcript_missing: false,
+            worker_running: false,
+        };
+        assert!(
+            none.render()
+                .starts_with("This thread has no session to resume yet")
+        );
+        let full = ResumeInfo {
+            session_id: Some("sid-1".into()),
+            cwd: Some("/repo".into()),
+            transcript_missing: true,
+            worker_running: true,
+        };
+        let out = full.render();
+        assert!(out.contains("cd /repo && claude --resume sid-1"));
+        assert!(out.contains("⚠️ This session's history isn't on disk"));
+        assert!(out.contains("The agent for this thread has been stopped"));
+    }
+
+    const CONTEXT_RAW: &str = "\
+some preamble\n\n**Model:** claude-opus-4-8[1m]\n**Tokens:** 43.8k / 1m (4%)\n\n\
+### Estimated usage by category\n\n| Category | Tokens | % |\n| --- | --- | --- |\n\
+| System prompt | 3.2k | 0.3% |\n| Messages | 40.6k | 4.1% |\n| Free space | 956k | 95.6% |\n\n\
+### Custom Agents\nignored\n";
+
+    /// 描く側の網。**読む側**(`Pane::context_report`)の網は `agent/claude.rs` に居る。
+    #[test]
+    fn renders_context_report() {
+        let r = Pane::new(CONTEXT_RAW).context_report().unwrap();
+        let out = r.render();
+        assert!(out.starts_with("📊 *Context Usage*\nOpus 4.8（1M context）"));
+        assert!(out.contains("43.8k / 1m ( 4% used )"));
+        assert!(out.contains("Used space")); // 合計行
+        assert!(!out.contains("Free space")); // 生の Free 行は出さない
+    }
+
+    #[test]
+    fn renders_usage_report() {
+        let rows = vec![UsageRow {
+            label: "Current week (all models)".into(),
+            pct: "66".into(),
+            reset: "Aug 1 at 9am".into(),
+        }];
+        let out = UsageReport {
+            rows: &rows,
+            projection: None,
+        }
+        .render();
+        assert!(out.starts_with("📊 *Claude Code Usage*"));
+        assert!(out.contains("*Current week (all models)*"));
+        assert!(out.contains("66% used"));
+        assert!(out.contains("Resets Aug 1 at 9am"));
+        assert_eq!(
+            UsageReport::bar(50.0, 24),
+            format!("{}{}", "█".repeat(12), "░".repeat(12))
+        );
+        // 範囲外は clamp、0% 行は Resets 行を出さない
+        assert_eq!(UsageReport::bar(150.0, 10), "█".repeat(10));
+        assert_eq!(UsageReport::bar(-5.0, 10), "░".repeat(10));
+        let zero = vec![UsageRow {
+            label: "Current session".into(),
+            pct: "0".into(),
+            reset: String::new(),
+        }];
+        assert!(
+            !UsageReport {
+                rows: &zero,
+                projection: None
+            }
+            .render()
+            .contains("Resets")
+        );
+    }
+
+    #[test]
+    fn usage_report_appends_projection_line_only_when_at_risk() {
+        let rows = vec![UsageRow {
+            label: "Current session".into(),
+            pct: "40".into(),
+            reset: "5:30pm".into(),
+        }];
+        let out = UsageReport {
+            rows: &rows,
+            projection: Some((sample_now(), 300)),
+        }
+        .render();
+        assert!(out.contains("Expected to reach limit at"));
+        // 原文どおり `at :`(スペース+コロン+スペース)+ fmtResetLike 形
+        assert!(out.contains("- Expected to reach limit at : Jul 29 at 1:45 pm"));
+
+        // 予測できない/危なくない行には何も足さない
+        let calm = vec![UsageRow {
+            label: "Current session".into(),
+            pct: "6".into(),
+            reset: "5:30pm".into(),
+        }];
+        assert!(
+            !UsageReport {
+                rows: &calm,
+                projection: Some((sample_now(), 300))
+            }
+            .render()
+            .contains("Expected to reach limit")
+        );
+        let unknown = vec![UsageRow {
+            label: "Current month".into(),
+            pct: "40".into(),
+            reset: "5:30pm".into(),
+        }];
+        assert!(
+            !UsageReport {
+                rows: &unknown,
+                projection: Some((sample_now(), 300))
+            }
+            .render()
+            .contains("Expected to reach limit")
+        );
+        // 週の行は 7 日窓で判定(session 窓を当てると誤判定する)
+        assert_eq!(
+            UsageRow::window_minutes("Current week (Fable)", 300),
+            Some(UsageProjection::WEEK_MINUTES)
+        );
+        assert_eq!(UsageRow::window_minutes("Current session", 300), Some(300));
+        assert_eq!(UsageRow::window_minutes("Current month", 300), None);
+    }
+
+    #[test]
+    fn compact_progress_without_an_arrow_renders_no_nul() {
+        // driver が tokens だけ持つ状態を組み得る(全フィールド pub)。現物の `?? ''` は空文字で、
+        // `Option<char>::unwrap_or_default()` の `'\0'` を混ぜると不可視の NUL が Slack へ流れる
+        let p = CompactProgress {
+            active: true,
+            seconds: Some(3),
+            tokens: Some("876".into()),
+            tokens_dir: None,
+            percent: None,
+        };
+        let out = p.render();
+        assert!(!out.contains('\0'));
+        assert!(out.starts_with("🗜️ Compacting the context… 3s · 876 tokens\n"));
+        // 矢印があれば数字の直前に付く(空白は挟まない)
+        let with_dir = CompactProgress {
+            tokens_dir: Some('↑'),
+            ..p
+        };
+        assert!(
+            with_dir
+                .render()
+                .starts_with("🗜️ Compacting the context… 3s · ↑876 tokens\n")
+        );
     }
 }

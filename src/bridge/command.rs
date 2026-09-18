@@ -9,7 +9,7 @@
 //! 語句を含むだけの文は素通しし、普通のメッセージとしてワーカーに届く。
 //!
 //! ここから `agent::` を見るのは依存の向きどおり(Bridge → エージェント)。逆は無い。
-//! 文面(描画)は `render.rs` に居る。
+//! 答えの文面は、そのコマンドを走らせる側(`command/agent.rs` / `command/bridge.rs`)に居る。
 //!
 //! 並びは役割の順:
 //!
@@ -684,7 +684,7 @@ impl Bridge {
                 self.post(
                     &msg.channel,
                     root_ts,
-                    crate::bridge::render::Notice::Help { fleet: self.fleet }.render(),
+                    bridge::help(self.fleet),
                     key,
                 );
             }
