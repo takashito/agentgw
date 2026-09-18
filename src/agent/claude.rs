@@ -1019,6 +1019,11 @@ impl crate::agent::Agent for Claude {
         Transcript::locate(remembered, session_id).map(|t| t.limit_error(256 * 1024, now_ms))
     }
 
+    fn failure_type(&self, remembered: Option<&str>, session_id: &str) -> Option<&'static str> {
+        let tail = Transcript::locate(remembered, session_id)?.tail(256 * 1024).ok()?;
+        Transcript::failure_type(&tail)
+    }
+
     fn model_alias(&self, model_id: &str) -> Option<&'static str> {
         super::screen::ModelId::new(model_id).alias()
     }
@@ -1233,6 +1238,29 @@ impl Transcript {
     /// 後から来た無関係な api-error(混雑の一時障害)が、まだ効いている上限を隠してはいけないので
     /// 上限の記録だけを残す。読めないリセット時刻はエラー時刻 +1時間として**保守的に**縛り、
     /// それも過ぎていれば窓は既に開いた = ただの履歴なので `None`。
+    /// The `error_type` the **last** API error in `tail` stands for, when Claude Code wrote the
+    /// error but sent no type with the turn failure. Only what we recognise; the rest is `None`.
+    pub fn failure_type(tail: &str) -> Option<&'static str> {
+        let text = tail
+            .lines()
+            .filter(|l| l.contains("\"isApiErrorMessage\""))
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|rec| rec["isApiErrorMessage"] == serde_json::Value::Bool(true))
+            .map(|rec| match &rec["message"]["content"] {
+                serde_json::Value::Array(a) => a
+                    .iter()
+                    .filter_map(|c| c["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                serde_json::Value::String(s) => s.clone(),
+                _ => String::new(),
+            })
+            .last()?;
+        // 実機で見た文面(2026-09-18): `Login expired · Please run /login`
+        (text.contains("Login expired") || text.contains("run /login"))
+            .then_some("authentication_failed")
+    }
+
     pub fn limit_hit(tail: &str, now_ms: u64) -> Option<LimitHit> {
         let mut latest: Option<(String, u64)> = None;
         for line in tail.lines() {
@@ -2176,6 +2204,26 @@ mod tests {
             2,
             "confirm と trust に1回ずつ: {keys:?}"
         );
+    }
+
+    #[test]
+    fn a_login_error_in_the_transcript_reads_as_authentication_failed() {
+        let line = |text: &str| {
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "isApiErrorMessage": true,
+                    "timestamp": "2026-09-18T13:52:53.000Z",
+                    "message": { "content": [{ "type": "text", "text": text }] },
+                })
+            )
+        };
+        let login = line("Login expired · Please run /login");
+        assert_eq!(Transcript::failure_type(&login), Some("authentication_failed"));
+        // 見るのは**最後の**エラーだけ
+        let later = format!("{login}{}", line("API Error: overloaded_error"));
+        assert_eq!(Transcript::failure_type(&later), None);
+        assert_eq!(Transcript::failure_type(""), None);
     }
 
     /// 現行 LIMIT_MODAL_PROMPTS をアンカー無しの literal に還元したもの。

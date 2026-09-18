@@ -153,7 +153,19 @@ impl Bridge {
     ///
     /// 手順は現行のまま崩さない: ログ → スレッド門番 → **上限ゲート** → **再配達** → 文面。
     fn on_turn_failure(&mut self, ev: &HookEvent, key: Option<&ThreadKey>, ctx: &LogCtx) {
-        let reason = ev.payload["error_type"].as_str().unwrap_or("");
+        let sent = ev.payload["error_type"].as_str().unwrap_or("");
+        // 型が空で届いたら、エージェント自身の記録に訊く。実機(2026-09-18)ではサインイン切れが
+        // 空のまま届き、retry と読まれて「もう一度送って」と案内していた — 送り直しは効かない
+        let recorded = if sent.is_empty() && !ev.session_id.is_empty() {
+            let remembered = self
+                .workers
+                .warm(&ev.session_id)
+                .and_then(|h| h.transcript_path.clone());
+            self.deps.agent.failure_type(remembered.as_deref(), &ev.session_id)
+        } else {
+            None
+        };
+        let reason = recorded.unwrap_or(sent);
         let (klass, text) = TurnFailureClass::of(reason);
         let raw = serde_json::json!({
             "hook_event_name": ev.payload["hook_event_name"],
@@ -165,10 +177,10 @@ impl Bridge {
             &format!(
                 "slack-events: disposition=turn_failure thread={} reason={} class={klass} raw={raw}",
                 key.map_or("?", ThreadKey::as_str),
-                if reason.is_empty() {
-                    "(none sent)"
-                } else {
-                    reason
+                match (sent.is_empty(), recorded) {
+                    (false, _) => sent.to_string(),
+                    (true, Some(r)) => format!("{r} (none sent; read from the agent's record)"),
+                    (true, None) => "(none sent)".to_string(),
                 },
             ),
         );

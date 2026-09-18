@@ -1595,4 +1595,29 @@ mod tests {
         assert_eq!(spawned[0].resume_from.as_ref().map(|s| s.as_str()), Some("kept-sid"));
         assert_eq!(b.pools.session_of(&home), Some("kept-sid"));
     }
+
+    /// Claude Code sometimes reports a failed turn with no `error_type`. When its own record
+    /// says the sign-in expired, re-sending can't help: say so instead of "send it again".
+    #[tokio::test]
+    async fn a_signed_out_agent_is_reported_not_retried() {
+        let (d, slack, agent, _clock) = flow_deps("signed-out");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let sid = running_thread(&mut b, &agent).await;
+        *agent.failure_type.lock().unwrap() = Some("authentication_failed");
+        let delivered_before = agent.delivered.lock().unwrap().len();
+        b.on_hook(HookEvent {
+            kind: "error".into(),
+            session_id: sid,
+            payload: serde_json::json!({ "hook_event_name": "StopFailure", "error_type": null }),
+            respond: None,
+        })
+        .await;
+        settle().await;
+        assert_eq!(agent.delivered.lock().unwrap().len(), delivered_before, "no re-send");
+        assert!(
+            slack.calls().iter().any(|c| c.contains("signed out")),
+            "{:?}",
+            slack.calls()
+        );
+    }
 }

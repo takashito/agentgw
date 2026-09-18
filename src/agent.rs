@@ -345,6 +345,10 @@ pub trait Agent: Send + Sync + 'static {
         session_id: &str,
         now_ms: u64,
     ) -> Option<std::io::Result<Option<LimitHit>>>;
+    /// What a turn that ended with no `error_type` actually failed on, read from the agent's
+    /// own record — in the same words as `error_type` (e.g. `authentication_failed`).
+    /// `None` = can't tell (no record, or an error this agent doesn't recognise).
+    fn failure_type(&self, remembered: Option<&str>, session_id: &str) -> Option<&'static str>;
     fn model_alias(&self, model_id: &str) -> Option<&'static str>;
     /// The values `model` / `effort` / `mode` accept, in the order `help` lists them.
     fn models(&self) -> &'static [&'static str];
@@ -391,6 +395,8 @@ pub mod fake {
         pub fail_deliver: std::sync::atomic::AtomicBool,
         /// Sessions whose conversation history exists (others can't be resumed).
         pub histories: Mutex<Vec<String>>,
+        /// What `failure_type` answers (what the agent's own record says a failed turn died of).
+        pub failure_type: Mutex<Option<&'static str>>,
         windows: Mutex<Vec<WindowRow>>,
         next: AtomicU64,
     }
@@ -494,6 +500,9 @@ pub mod fake {
             _now: u64,
         ) -> Option<std::io::Result<Option<LimitHit>>> {
             None
+        }
+        fn failure_type(&self, _r: Option<&str>, _s: &str) -> Option<&'static str> {
+            *self.failure_type.lock().unwrap()
         }
         fn model_alias(&self, _m: &str) -> Option<&'static str> {
             None
