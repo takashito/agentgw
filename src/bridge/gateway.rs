@@ -1359,7 +1359,7 @@ pub struct FleetView {
 }
 
 /// 親が張っている ssh トンネル1本の様子。**親は自分で張っているので知っている**
-/// (`fleet::keep_tunnel` が状態の変わり目で書く)。
+/// ([`keep_tunnel`] が状態の変わり目で書く)。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Tunnel {
     /// ssh 先(`me@laptop` など)
@@ -2261,6 +2261,97 @@ async fn serve_children_on(fleet: Arc<Fleet>, listener: tokio::net::TcpListener)
     }
 }
 
+/// トンネルを使うときの、**マシンの loopback 側**のポート。
+pub const TUNNEL_PORT: u16 = 8799;
+
+/// ゲートウェイが張り続ける ssh の引数。**-N でコマンドは流さない。**
+///
+/// `ExitOnForwardFailure=yes` が要る — 無いと転送に失敗しても ssh だけ生き残り、
+/// 「繋がっているのに届かない」状態になる。
+pub fn tunnel_ssh_args(target: &str, remote_port: u16, parent_addr: &str) -> Vec<String> {
+    [
+        "-N",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-o",
+        "ServerAliveInterval=30",
+        "-o",
+        "ServerAliveCountMax=3",
+        "-R",
+        &format!("127.0.0.1:{remote_port}:{parent_addr}"),
+        target,
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// ゲートウェイの agentgw の中で、マシン1台分の ssh トンネルを張り続ける。
+///
+/// **別サービスにしない。** agentgw が動いている間だけ見張ればよいので、子プロセス(OS の意味)として持つ。
+///
+/// **ssh の多重化(`ControlMaster auto` + `ControlPersist`)はそのまま使う。** そのときの ssh は
+/// 既にある親玉に転送を預けて、すぐ**終了 0** で抜ける(2026-09-18 実機)。これは失敗ではない —
+/// 転送は親玉の中で生きている。なので 0 で抜けたら間を空けて頼み直すだけにする(親玉が
+/// 居なくなっていれば、次の ssh が新しい親玉になって転送を持つ)。多重化を使っていない
+/// 設定なら ssh は前に居続け、`kill_on_drop` で agentgw と一緒に消える。
+pub async fn keep_tunnel(
+    fleet: Arc<Fleet>,
+    child: String,
+    target: String,
+    parent_addr: String,
+) {
+    use crate::bridge::state::LogCtx;
+    let args = tunnel_ssh_args(&target, TUNNEL_PORT, &parent_addr);
+    // ログは状態が変わったときだけ(1分ごとの頼み直しで plugin-debug.log を埋めない)
+    let mut was_ok: Option<bool> = None;
+    loop {
+        let out = tokio::process::Command::new("ssh")
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await;
+        let (ok, why) = match out {
+            Ok(o) if o.status.success() => (true, String::new()),
+            // 抜けた理由を残す。黙って張り直し続けると、鍵が無いのか相手が居ないのか分からない
+            Ok(o) => (
+                false,
+                format!(
+                    "exited ({}) {}",
+                    o.status,
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+            ),
+            Err(e) => (false, format!("could not start ssh: {e}")),
+        };
+        if was_ok != Some(ok) {
+            // `status` に経路を出すため、ゲートウェイの手元に今の様子を置く
+            fleet.tunnels.lock().unwrap().insert(
+                child.clone(),
+                Tunnel {
+                    target: target.clone(),
+                    error: (!ok).then(|| why.clone()),
+                },
+            );
+            if ok {
+                LogCtx::default().info(
+                    "relay",
+                    &format!(
+                        "tunnel {child}: up via ssh {target} (child 127.0.0.1:{TUNNEL_PORT} -> {parent_addr})"
+                    ),
+                );
+            } else {
+                LogCtx::default().error("relay", &format!("tunnel {child}: {why} — retrying"));
+            }
+            was_ok = Some(ok);
+        }
+        let wait = if ok { 60 } else { 5 };
+        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+    }
+}
 
 // ── 節9: CLI(`status` のフリート欄) ─────────────────────────────────
 
@@ -2277,7 +2368,7 @@ impl Cli {
     pub(crate) fn write_env(dir: &StateDir, pairs: &[(&str, String)]) -> std::io::Result<()> {
         let path = dir.path().join(".env");
         let before = std::fs::read_to_string(&path).unwrap_or_default();
-        let after = crate::bridge::link::set_env_keys(&before, pairs);
+        let after = crate::setup::set_env_keys(&before, pairs);
         crate::bridge::state::write_atomic_mode(&path, &after, Some(0o600))
     }
 
@@ -3655,5 +3746,23 @@ mod tests {
         p.on_connect("desktop");
         p.on_disconnect("desktop", 100);
         assert_eq!(p.due(110).len(), 1, "2度目の切断も言う");
+    }
+
+    #[test]
+    fn the_tunnel_forwards_the_childs_loopback_to_the_parents_listener() {
+        let args = tunnel_ssh_args("me@laptop", 8799, "127.0.0.1:8787");
+        assert!(
+            args.contains(&"-N".to_string()),
+            "コマンドは流さない: {args:?}"
+        );
+        assert!(
+            args.contains(&"127.0.0.1:8799:127.0.0.1:8787".to_string()),
+            "子の 8799 を親の listener へ: {args:?}"
+        );
+        assert!(
+            args.contains(&"ExitOnForwardFailure=yes".to_string()),
+            "転送に失敗したら黙って生き残らない: {args:?}"
+        );
+        assert_eq!(args.last().unwrap(), "me@laptop", "ssh 先は最後: {args:?}");
     }
 }

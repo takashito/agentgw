@@ -8,8 +8,6 @@
 //! それが「1マシン1ボット」の制約になっている(skills/setup/SKILL.md:244-251)。dev の Rust 版を
 //! 本番 Bun 版と同じマシンで並走させるには、ここを渡さないと隔離できない。
 
-use crate::bridge::state::StateDir;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// この実装の既定。`AGENTGW_SERVICE_LABEL` で上書きできる(dev を並走させるとき)。
@@ -207,54 +205,6 @@ impl Action {
     }
 }
 
-/// bot/app トークンの組。
-pub struct Tokens {
-    pub bot: String,
-    pub app: String,
-}
-
-impl Tokens {
-    /// 取り違えは実際に起きる(どちらも「Slack のトークン」に見える)。接頭辞で両方向を弾く。
-    pub fn validate(&self) -> Result<(), String> {
-        if !self.bot.starts_with("xoxb-") {
-            return Err(crate::t!(
-                "The bot token should start with xoxb- (got {:?}). Did you swap it with the app token?",
-                "bot token は xoxb- で始まるはず(受け取ったのは {:?})— app token と取り違えていませんか",
-                self.bot.chars().take(8).collect::<String>()
-            ));
-        }
-        if !self.app.starts_with("xapp-") {
-            return Err(crate::t!(
-                "The app token should start with xapp- (got {:?}). Did you swap it with the bot token?",
-                "app token は xapp- で始まるはず(受け取ったのは {:?})— bot token と取り違えていませんか",
-                self.app.chars().take(8).collect::<String>()
-            ));
-        }
-        Ok(())
-    }
-
-    /// `.env` にトークンを**置換で**書き入れる。積み増しにすると `load_env` は後勝ちで読むので、
-    /// 消したはずの旧トークンが残り続ける。値は素で書く — 読み手(bridge::state::parse_env)は
-    /// 引用符を剥ぐが、剥がれた後の値が正になるので最初から付けない。
-    pub fn apply_to_env(&self, env_text: &str) -> String {
-        let mut out: Vec<String> = env_text
-            .lines()
-            .filter(|line| {
-                let k = line.trim_start();
-                !k.starts_with("SLACK_BOT_TOKEN=") && !k.starts_with("SLACK_APP_TOKEN=")
-            })
-            .map(str::to_string)
-            .collect();
-        while out.last().is_some_and(|l| l.trim().is_empty()) {
-            out.pop();
-        }
-        out.push(format!("SLACK_BOT_TOKEN={}", self.bot));
-        out.push(format!("SLACK_APP_TOKEN={}", self.app));
-        out.push(String::new()); // 末尾改行1つ
-        out.join("\n")
-    }
-}
-
 impl RestartStep {
     /// `pid` = サービスマネージャに聞いた本体 pid(None = 走っていない)。
     /// `alive` = その pid がまだ居るか。`waited_ms` = SIGUSR1 を送ってからの経過。
@@ -323,7 +273,7 @@ impl Service {
         })
     }
 
-    fn home() -> PathBuf {
+    pub(crate) fn home() -> PathBuf {
         std::env::var("HOME").map(PathBuf::from).unwrap_or_default()
     }
 
@@ -417,7 +367,7 @@ impl Service {
         c
     }
 
-    fn run_ctl(cmd: &str, args: &[String]) -> i32 {
+    pub(crate) fn run_ctl(cmd: &str, args: &[String]) -> i32 {
         match Self::ctl_command(cmd).args(args).status() {
             Ok(s) => s.code().unwrap_or(-1),
             Err(e) => {
@@ -428,7 +378,7 @@ impl Service {
     }
 
     /// getuid は libc 無しでは引けないので `id -u` に聞く。
-    fn uid() -> u32 {
+    pub(crate) fn uid() -> u32 {
         std::process::Command::new("id")
             .arg("-u")
             .output()
@@ -479,190 +429,6 @@ impl Service {
             .unwrap_or(false)
     }
 
-    /// 端末から1行受け取る。パイプ越し(非対話)なら空文字が返るので、呼び手が弾く。
-    fn prompt(question: &str) -> String {
-        print!("{question}");
-        let _ = std::io::stdout().flush();
-        let mut line = String::new();
-        let _ = std::io::stdin().read_line(&mut line);
-        line.trim().to_string()
-    }
-
-    /// `.env` に「このマシンが何者か」が書かれていなければ、**役割を1問だけ訊いて**書く。
-    /// 既に書かれているなら何も触らない(**上書きしない** — 動いている設定を install の
-    /// 副作用で壊さない)。
-    ///
-    /// 役割をここで訊くのが要だ。子は Slack のトークンを持たない(持てない — 直結と
-    /// Relay 経由は同時に有効にできない)ので、トークンだけを求めると子は install を
-    /// 通り抜けられない。
-    fn ensure_config(state_dir: &StateDir) -> Result<(), String> {
-        use std::io::IsTerminal;
-        let env_file = state_dir.join(".env");
-        let parsed = state_dir.load_env().unwrap_or_default();
-        let has = |k: &str| {
-            parsed
-                .iter()
-                .any(|(kk, v): &(String, String)| kk == k && !v.is_empty())
-        };
-        if has("SLACK_BOT_TOKEN") && has("SLACK_APP_TOKEN") {
-            println!(
-                "{}",
-                crate::t!(
-                    "This machine is already set up as the gateway. Leaving .env as it is.\n  \
-                     Settings: {}",
-                    "このマシンはゲートウェイとして設定済みです。.env は書き換えません。\n  \
-                     設定ファイル: {}",
-                    env_file.display()
-                )
-            );
-            return Ok(());
-        }
-        // 子は2通り(自分から dial / 親に迎えに来てもらう)。どちらも Slack トークンは持たない
-        if (has("AGENTGW_RELAY_URL") && has("AGENTGW_RELAY_TOKEN"))
-            || (has("AGENTGW_LINK_LISTEN") && has("AGENTGW_LINK_TOKEN"))
-        {
-            println!(
-                "{}",
-                crate::t!(
-                    "This machine is already connected to a gateway. Leaving .env as it is.\n  \
-                     Settings: {}",
-                    "このマシンはゲートウェイにつながる設定済みです。.env は書き換えません。\n  \
-                     設定ファイル: {}",
-                    env_file.display()
-                )
-            );
-            return Ok(());
-        }
-        if !std::io::stdin().is_terminal() {
-            return Err(crate::t!(
-                "There's no terminal to ask which role this machine plays. For the gateway, put \
-                 SLACK_BOT_TOKEN= and SLACK_APP_TOKEN= in {} and run install again; for any other \
-                 machine, run `agentgw add-machine` on the gateway instead.",
-                "端末が無いので、このマシンの役割を訊けません。ゲートウェイにするなら {} に \
-                 SLACK_BOT_TOKEN= と SLACK_APP_TOKEN= を書いて install し直してください。\
-                 ほかのマシンは、ゲートウェイで `agentgw add-machine` を実行して加えます。",
-                env_file.display()
-            ));
-        }
-        println!(
-            "{}",
-            crate::t!(
-                "\nWhat role does this machine play?\n  \
-                 1) Gateway — connects to Slack (one per Slack app)\n  \
-                 2) Machine — works for a gateway on another machine",
-                "\nこのマシンの役割を選んでください。\n  \
-                 1) ゲートウェイ — Slack につなぐ(Slack アプリ1つにつき1台)\n  \
-                 2) マシン — 別のマシンのゲートウェイの下で動く"
-            )
-        );
-        match Self::prompt("> ").as_str() {
-            "1" | "" => Self::ask_parent(state_dir),
-            "2" => Self::ask_child(state_dir),
-            other => Err(crate::t!("Choose 1 or 2 (got {other:?})", "1 か 2 を選んでください(受け取ったのは {other:?})")),
-        }
-    }
-
-    /// 子として設定する — 親が出した接続文字列1本と、このマシンの名前。
-    fn ask_child(state_dir: &StateDir) -> Result<(), String> {
-        let raw = Self::prompt(&crate::t!(
-            "  Connection string from the gateway (SCLINK1-…): ",
-            "  ゲートウェイから受け取った接続文字列 (SCLINK1-…): "
-        ));
-        let conn = crate::bridge::gateway::wire::decode_connection(&raw)?;
-        // 名前は自動で決めない(衝突したマシンは互いの Slack メッセージを奪い合う)
-        let name = crate::bridge::link::prompt_bridge_id()
-            .ok_or_else(|| {
-                crate::t!(
-                    "This machine needs a name (it's what `route <name>` points at)",
-                    "このマシンの名前が要ります(`route <名前>` の指名先)"
-                )
-            })?;
-        let env_file = state_dir.join(".env");
-        let before = std::fs::read_to_string(&env_file).unwrap_or_default();
-        let after = crate::bridge::link::apply_connection(&before, &conn, &name);
-        std::fs::create_dir_all(state_dir.path())
-            .map_err(|e| format!("{}: {e}", state_dir.path().display()))?;
-        crate::bridge::state::write_atomic_mode(&env_file, &after, Some(0o600))
-            .map_err(|e| format!("{}: {e}", env_file.display()))?;
-        println!(
-            "{}",
-            crate::t!(
-                "Saved as machine \"{name}\": {} (chmod 600)",
-                "マシン「{name}」として保存しました: {} (chmod 600)",
-                env_file.display()
-            )
-        );
-        Ok(())
-    }
-
-    /// 親として設定する — Slack の bot / app トークン2本。
-    fn ask_parent(state_dir: &StateDir) -> Result<(), String> {
-        let env_file = state_dir.join(".env");
-        let text = std::fs::read_to_string(&env_file).unwrap_or_default();
-        // **アプリがまだ無い人のために、設定入りの作成画面を開く。** 権限・イベント・
-        // Socket Mode・Interactivity を手で選ばせると、1つ抜けるだけで黙って動かない
-        // (Interactivity を忘れるとボタンが届かない、DM タブを忘れると login できない)
-        let url = SlackApp::create_url();
-        println!(
-            "{}",
-            crate::t!(
-                "No Slack app yet? This link creates one with everything pre-configured:\n  {url}\n\
-                 Then (1) install it to your workspace and copy the Bot User OAuth Token (xoxb-…), and\n\
-                 (2) under Basic Information → App-Level Tokens, create a token with connections:write (xapp-…).\n\
-                 Paste both below.\n",
-                "Slack アプリがまだ無ければ、次の URL で設定済みのまま作れます:\n  {url}\n\
-                 作ったら (1) ワークスペースにインストールして Bot User OAuth Token(xoxb-…)を、\n\
-                 (2) Basic Information → App-Level Tokens で connections:write のトークン(xapp-…)を作って、\n\
-                 下に貼ってください。\n"
-            )
-        );
-        SlackApp::open_in_browser(&url);
-        println!("{}", crate::t!("Paste your Slack tokens.", "Slack のトークンを貼ってください。"));
-        let bot = Self::prompt("  bot token (xoxb-…): ");
-        let app = Self::prompt("  app token (xapp-…): ");
-        if bot.is_empty() || app.is_empty() {
-            return Err(crate::t!(
-                "No tokens were entered. To install without prompts, put SLACK_BOT_TOKEN= and \
-                 SLACK_APP_TOKEN= in {} and run install again.",
-                "トークンが入力されませんでした。非対話で入れるなら {} に \
-                 SLACK_BOT_TOKEN= と SLACK_APP_TOKEN= を書いてから install し直してください",
-                env_file.display()
-            ));
-        }
-        Tokens {
-            bot: bot.clone(),
-            app: app.clone(),
-        }
-        .validate()?;
-        std::fs::create_dir_all(state_dir.path())
-            .map_err(|e| format!("{}: {e}", state_dir.path().display()))?;
-        state_dir
-            .write_atomic(
-                ".env",
-                &Tokens {
-                    bot: bot.clone(),
-                    app: app.clone(),
-                }
-                .apply_to_env(&text),
-            )
-            .map_err(|e| format!("{}: {e}", env_file.display()))?;
-        // トークンが入ったファイルを他人に読ませない
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&env_file, std::fs::Permissions::from_mode(0o600));
-        }
-        println!(
-            "{}",
-            crate::t!(
-                "Saved the tokens: {} (chmod 600)",
-                "トークンを保存しました: {} (chmod 600)",
-                env_file.display()
-            )
-        );
-        Ok(())
-    }
-
     /// サブコマンド1つを実行し、プロセスの終了コードを返す。
     pub fn run(cmd: &str, rest: &[String]) -> i32 {
         if !cfg!(target_os = "macos") && !cfg!(target_os = "linux") {
@@ -680,7 +446,7 @@ impl Service {
         let mac = cfg!(target_os = "macos");
         let job = Self::job_path();
         match cmd {
-            "install" => Self::install(mac, &job, rest),
+            "install" => crate::setup::install(mac, &job, rest),
             "start" => {
                 if mac {
                     Self::run_ctl(
@@ -706,116 +472,13 @@ impl Service {
                 }
             }
             "status" => Self::status(mac, rest, &job),
-            "uninstall" => Self::uninstall(mac, &job),
+            "uninstall" => crate::setup::uninstall(mac, &job),
             "restart" => Self::graceful_restart(mac, &job),
             other => {
                 eprintln!("{}", crate::t!("Unknown command: {other}", "知らないサブコマンドです: {other}"));
                 2
             }
         }
-    }
-
-    fn uninstall(mac: bool, job: &Path) -> i32 {
-        // 止めてから定義を消す。止まっている相手への bootout は非ゼロを返すが、
-        // 欲しいのは「消えていること」なので終了コードは見ない
-        if mac {
-            Self::run_ctl(
-                "launchctl",
-                &Action::Shutdown.launchctl_argv(Self::uid(), &Self::label(), ""),
-            );
-        } else {
-            Self::run_ctl(
-                "systemctl",
-                &Action::systemctl_argv("disable", &Self::unit()),
-            );
-        }
-        match std::fs::remove_file(job) {
-            Ok(()) => println!("{}", crate::t!("Removed {}", "消しました: {}", job.display())),
-            Err(e) => println!("{}", crate::t!("Nothing to remove ({}): {e}", "消すものがありません({}): {e}", job.display())),
-        }
-        if !mac {
-            Self::run_ctl(
-                "systemctl",
-                &Action::systemctl_argv("daemon-reload", &Self::unit()),
-            );
-        }
-        println!("{}", crate::t!("Your tokens and the state directory are left in place.", "トークンと状態ディレクトリはそのままです。"));
-        0
-    }
-
-    fn install(mac: bool, job: &Path, rest: &[String]) -> i32 {
-        let state_dir = StateDir::resolve();
-        if let Err(e) = Self::ensure_config(&state_dir) {
-            eprintln!("install: {e}");
-            return 1;
-        }
-        let program = match std::env::current_exe() {
-            Ok(p) => p.to_string_lossy().to_string(),
-            Err(e) => {
-                eprintln!("install: {}", crate::t!("couldn't find my own path: {e}", "自分の実行パスが引けません: {e}"));
-                return 1;
-            }
-        };
-        // サービスの標準出力・エラーも**状態の置き場の logs/ に**置く。サービス定義の隣
-        // (~/Library/LaunchAgents など)に出すと、調べる人が探す場所が2つに割れる
-        let log_dir = state_dir.join("logs").to_string_lossy().to_string();
-        let _ = std::fs::create_dir_all(&log_dir);
-        let spec = JobSpec {
-            label: Self::label(),
-            program,
-            state_dir: state_dir.path().to_string_lossy().to_string(),
-            path: std::env::var("PATH").unwrap_or_default(),
-            home: Self::home().to_string_lossy().to_string(),
-            log_dir,
-        };
-        let text = if mac {
-            spec.launchd_plist()
-        } else {
-            spec.systemd_unit()
-        };
-        if let Err(e) = crate::bridge::state::write_atomic_at(job, &text) {
-            eprintln!("install: {}", crate::t!("couldn't write {}: {e}", "{} が書けません: {e}", job.display()));
-            return 1;
-        }
-        // 「.env は書き換えません」の直後に来る行。**何を書いたのかを言い分ける** —
-        // どちらも「設定」と呼ぶと、書かないと言った直後に書いたことになって読めない
-        println!("{}", crate::t!("Wrote the service definition: {}", "サービスの定義を書きました: {}", job.display()));
-        let name = if mac { Self::label() } else { Self::unit() };
-        println!("{}", crate::t!("  Service name: {name}", "  サービス名: {name}"));
-        let state = &spec.state_dir;
-        println!("{}", crate::t!("  State directory: {state}", "  状態を置くディレクトリ: {state}"));
-        if mac {
-            // **この定義が今すぐ効くのは、次に起動したときだけ。** launchd は起動時の定義を
-            // 握ったままなので restart では古い方が起き直る。ただしそれを毎回説くのは
-            // うるさい — 効かせ方は1行で足りる。
-            // 呼び手が直後に起こし直すなら**言わない** — 読んだ人が同じことを手で打つ
-            if !rest.iter().any(|a| a == "--no-restart-hint") {
-                println!("{}", crate::t!("  To apply it: agentgw shutdown && agentgw start", "  反映するには: agentgw shutdown && agentgw start"));
-            }
-        } else {
-            Self::run_ctl(
-                "systemctl",
-                &Action::systemctl_argv("daemon-reload", &Self::unit()),
-            );
-            Self::run_ctl(
-                "systemctl",
-                &Action::systemctl_argv("enable", &Self::unit()),
-            );
-            // --user のサービスはログアウトで死ぬ。headless で使うなら linger が要る
-            let user = std::env::var("USER").unwrap_or_default();
-            if Self::run_ctl("loginctl", &["enable-linger".to_string(), user.clone()]) != 0 {
-                println!(
-                    "{}",
-                    crate::t!(
-                        "NOTE: couldn't enable linger. To keep agentgw running after you log out, run once:\n  \
-                         sudo loginctl enable-linger {user}",
-                        "NOTE: linger を有効にできませんでした。ログアウト後も動かすなら1回だけ:\n  \
-                         sudo loginctl enable-linger {user}"
-                    )
-                );
-            }
-        }
-        0
     }
 
     /// SIGUSR1 を送って降りるのを待つ。待ちきれなければサービスマネージャの強制再起動に落とす
@@ -881,45 +544,6 @@ impl Service {
         }
     }
 }
-/// agentgw が要る Slack アプリの設定(マニフェスト)と、それを入れた作成リンク。
-///
-/// マニフェストはリポジトリ直下の `slack-app-manifest.json` が唯一の正。README の
-/// ワンクリックのリンクも同じものから作る(ずれたらテストで落ちる)。
-pub struct SlackApp;
-
-impl SlackApp {
-    pub const MANIFEST: &'static str = include_str!("../slack-app-manifest.json");
-
-    /// `https://api.slack.com/apps?new_app=1&manifest_json=…` — 開くと Slack の「マニフェストから
-    /// 作る」画面が、この設定を入れた状態で出る。
-    pub fn create_url() -> String {
-        // 空白と改行を落としてから符号化する(URL を短くするため)
-        let compact = serde_json::from_str::<serde_json::Value>(Self::MANIFEST)
-            .map(|v| v.to_string())
-            .unwrap_or_default();
-        format!(
-            "https://api.slack.com/apps?new_app=1&manifest_json={}",
-            percent_encoding::utf8_percent_encode(&compact, percent_encoding::NON_ALPHANUMERIC)
-        )
-    }
-
-    /// 開けるならブラウザで開く。開けなくても(ssh 越し、画面の無い Linux)何もしない —
-    /// URL は既に印字してある。
-    fn open_in_browser(url: &str) {
-        let opener = if cfg!(target_os = "macos") {
-            "open"
-        } else if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
-            "xdg-open"
-        } else {
-            return;
-        };
-        let _ = std::process::Command::new(opener)
-            .arg(url)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -979,50 +603,6 @@ mod tests {
             !p.contains("/opt/a&b:"),
             "生の & が残ると launchd は plist ごと読めない: {p}"
         );
-    }
-
-    #[test]
-    fn the_slack_app_link_carries_the_whole_manifest() {
-        let url = SlackApp::create_url();
-        assert!(url.starts_with("https://api.slack.com/apps?new_app=1&manifest_json=%7B"), "{url}");
-        // 符号化を戻すと、マニフェストと同じ JSON になる
-        let encoded = url.split("manifest_json=").nth(1).unwrap();
-        let decoded = percent_encoding::percent_decode_str(encoded).decode_utf8().unwrap();
-        let back: serde_json::Value = serde_json::from_str(&decoded).unwrap();
-        let want: serde_json::Value = serde_json::from_str(SlackApp::MANIFEST).unwrap();
-        assert_eq!(back, want);
-    }
-
-    #[test]
-    fn the_manifest_turns_on_what_silently_breaks_when_missing() {
-        let m: serde_json::Value = serde_json::from_str(SlackApp::MANIFEST).unwrap();
-        // 無いとボタンが届かない
-        assert_eq!(m["settings"]["interactivity"]["is_enabled"], true);
-        // 無いと Socket Mode でつながらない
-        assert_eq!(m["settings"]["socket_mode_enabled"], true);
-        // 無いと DM できない(login は DM で打つ)
-        assert_eq!(m["features"]["app_home"]["messages_tab_enabled"], true);
-        assert_eq!(m["features"]["app_home"]["messages_tab_read_only_enabled"], false);
-    }
-
-    #[test]
-    fn the_readme_links_to_the_same_manifest() {
-        // README のワンクリックのリンクは、マニフェストから作ったものと同じでなければならない
-        let readme = include_str!("../README.md");
-        assert!(
-            readme.contains(&SlackApp::create_url()),
-            "README のリンクが slack-app-manifest.json とずれています。\n\
-             `cargo test -- --ignored print_slack_app_url --nocapture` で出る URL に差し替えてください"
-        );
-        let ja = include_str!("../README.ja.md");
-        assert!(ja.contains(&SlackApp::create_url()), "README.ja.md も同じく");
-    }
-
-    /// README に貼る URL を印字する(`cargo test -- --ignored print_slack_app_url --nocapture`)。
-    #[test]
-    #[ignore = "README に貼る URL を出すだけ"]
-    fn print_slack_app_url() {
-        println!("{}", SlackApp::create_url());
     }
 
     #[test]
@@ -1178,103 +758,6 @@ mod tests {
         // systemd は「本体プロセス無し」を 0 で言う。生きた pid と混ぜてはいけない
         assert_eq!(Service::parse_systemd_main_pid("MainPID=0\n"), None);
         assert_eq!(Service::parse_systemd_main_pid(""), None);
-    }
-
-    #[test]
-    fn tokens_must_look_like_slack_tokens() {
-        assert!(
-            Tokens {
-                bot: "xoxb-1-2".into(),
-                app: "xapp-1-2".into()
-            }
-            .validate()
-            .is_ok()
-        );
-        // 取り違えは実際に起きる(どちらも「Slack のトークン」に見える)ので、両方向を弾く
-        assert!(
-            Tokens {
-                bot: "xapp-1-2".into(),
-                app: "xoxb-1-2".into()
-            }
-            .validate()
-            .is_err()
-        );
-        assert!(
-            Tokens {
-                bot: "".into(),
-                app: "xapp-1".into()
-            }
-            .validate()
-            .is_err()
-        );
-        assert!(
-            Tokens {
-                bot: "xoxb-1".into(),
-                app: "".into()
-            }
-            .validate()
-            .is_err()
-        );
-        assert!(
-            Tokens {
-                bot: "bot".into(),
-                app: "app".into()
-            }
-            .validate()
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn applying_tokens_replaces_in_place_and_keeps_everything_else() {
-        let before = "# 手書きのメモ\nSLACK_BOT_TOKEN=xoxb-old\nSOMETHING=else\n";
-        let after = Tokens {
-            bot: "xoxb-new".into(),
-            app: "xapp-new".into(),
-        }
-        .apply_to_env(before);
-        // 既存行は**置換**。2本目を積み増すと load_env は後勝ちになり、消したはずの旧値が残る
-        assert_eq!(after.matches("SLACK_BOT_TOKEN=").count(), 1, "{after}");
-        assert!(after.contains("SLACK_BOT_TOKEN=xoxb-new"), "{after}");
-        assert!(after.contains("SLACK_APP_TOKEN=xapp-new"), "{after}");
-        assert!(!after.contains("xoxb-old"), "{after}");
-        // 無関係な行とコメントは保つ — .env は人も編集する
-        assert!(after.contains("# 手書きのメモ"), "{after}");
-        assert!(after.contains("SOMETHING=else"), "{after}");
-    }
-
-    #[test]
-    fn applied_env_round_trips_through_the_reader() {
-        let after = Tokens {
-            bot: "xoxb-new".into(),
-            app: "xapp-new".into(),
-        }
-        .apply_to_env("");
-        // 書き手と読み手の形式が食い違うと静かに壊れる。読み手そのもので確かめる
-        let dir = crate::bridge::state::StateDir::at(
-            std::env::temp_dir().join(format!("sc-env-{}", std::process::id())),
-        );
-        dir.write_atomic(".env", &after).unwrap();
-        let parsed = dir.load_env().unwrap();
-        let get = |k: &str| {
-            parsed
-                .iter()
-                .find(|(kk, _)| kk == k)
-                .map(|(_, v)| v.clone())
-        };
-        assert_eq!(get("SLACK_BOT_TOKEN"), Some("xoxb-new".to_string()));
-        assert_eq!(get("SLACK_APP_TOKEN"), Some("xapp-new".to_string()));
-    }
-
-    #[test]
-    fn applying_tokens_to_an_empty_file_ends_with_exactly_one_newline() {
-        let after = Tokens {
-            bot: "xoxb-1".into(),
-            app: "xapp-1".into(),
-        }
-        .apply_to_env("");
-        assert!(after.ends_with('\n'), "{after:?}");
-        assert!(!after.ends_with("\n\n"), "{after:?}");
     }
 
     #[test]

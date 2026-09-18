@@ -607,7 +607,7 @@ impl Bridge {
                 .and_then(|l| l.rsplit(':').next().map(str::to_string))
                 .unwrap_or_else(|| "8787".to_string());
             for (child, target) in link::child_urls(&raw) {
-                tokio::spawn(crate::fleet::keep_tunnel(
+                tokio::spawn(gateway::keep_tunnel(
                     fleet.clone(),
                     child,
                     target,

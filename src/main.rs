@@ -46,21 +46,21 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        // 接続文字列1本を .env に落とす(親にぶら下がる側)
+        // 接続文字列1本を .env に落とす(ゲートウェイにつなぐマシンの側)
         "link" => {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             let dir = agentgw::bridge::state::StateDir::resolve();
-            std::process::exit(agentgw::bridge::link::cli(&rest, &dir));
+            std::process::exit(agentgw::setup::cli(&rest, &dir));
         }
-        // 子を1台足す(届ける → 繋ぐ → 入れて起こす)
+        // マシンを1台足す(届ける → 繋ぐ → 入れて起こす)
         "add-machine" => {
             let rest: Vec<String> = std::env::args().skip(2).collect();
-            std::process::exit(agentgw::fleet::cli(&rest).await);
+            std::process::exit(agentgw::setup::add_machine::cli(&rest).await);
         }
         c if Service::COMMANDS.contains(&c) => {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             let rc = Service::run(c, &rest);
-            // 子を迎える設定があるときだけ、フリートの様子を続けて出す
+            // マシンを迎える設定があるときだけ、フリートの様子を続けて出す
             if c == "status" {
                 let dir = agentgw::bridge::state::StateDir::resolve();
                 agentgw::bridge::gateway::Cli::print_fleet(&dir).await;
