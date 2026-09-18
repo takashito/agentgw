@@ -11,14 +11,14 @@ use crate::service::{Action, JobSpec, Service};
 use std::io::Write;
 use std::path::Path;
 
-/// bot/app トークンの組。
+/// A bot/app token pair.
 pub struct Tokens {
     pub bot: String,
     pub app: String,
 }
 
 impl Tokens {
-    /// 取り違えは実際に起きる(どちらも「Slack のトークン」に見える)。接頭辞で両方向を弾く。
+    /// Mixing them up really happens (both look like "a Slack token"). The prefixes catch it both ways.
     pub fn validate(&self) -> Result<(), String> {
         if !self.bot.starts_with("xoxb-") {
             return Err(crate::t!(
@@ -37,9 +37,9 @@ impl Tokens {
         Ok(())
     }
 
-    /// `.env` にトークンを**置換で**書き入れる。積み増しにすると `load_env` は後勝ちで読むので、
-    /// 消したはずの旧トークンが残り続ける。値は素で書く — 読み手(bridge::state::parse_env)は
-    /// 引用符を剥ぐが、剥がれた後の値が正になるので最初から付けない。
+    /// Writes the tokens into `.env` **by replacing**. If appended instead, `load_env` reads last-wins,
+    /// so an old token you thought you removed keeps living. Values are written bare — the reader
+    /// (bridge::state::parse_env) strips quotes, and the stripped value is what counts, so don't add them.
     pub fn apply_to_env(&self, env_text: &str) -> String {
         let mut out: Vec<String> = env_text
             .lines()
@@ -54,24 +54,24 @@ impl Tokens {
         }
         out.push(format!("SLACK_BOT_TOKEN={}", self.bot));
         out.push(format!("SLACK_APP_TOKEN={}", self.app));
-        out.push(String::new()); // 末尾改行1つ
+        out.push(String::new()); // one trailing newline
         out.join("\n")
     }
 }
 
-/// agentgw が要る Slack アプリの設定(マニフェスト)と、それを入れた作成リンク。
+/// The Slack app settings (manifest) agentgw needs, and a creation link carrying them.
 ///
-/// マニフェストはリポジトリ直下の `slack-app-manifest.json` が唯一の正。README の
-/// ワンクリックのリンクも同じものから作る(ずれたらテストで落ちる)。
+/// `slack-app-manifest.json` at the repo root is the single source of truth. The README's
+/// one-click link is built from the same file (a test fails if they drift).
 pub struct SlackApp;
 
 impl SlackApp {
     pub const MANIFEST: &'static str = include_str!("../slack-app-manifest.json");
 
-    /// `https://api.slack.com/apps?new_app=1&manifest_json=…` — 開くと Slack の「マニフェストから
-    /// 作る」画面が、この設定を入れた状態で出る。
+    /// `https://api.slack.com/apps?new_app=1&manifest_json=…` — opening it shows Slack's "create from
+    /// a manifest" screen with these settings already filled in.
     pub fn create_url() -> String {
-        // 空白と改行を落としてから符号化する(URL を短くするため)
+        // Strip whitespace and newlines before encoding (to keep the URL short)
         let compact = serde_json::from_str::<serde_json::Value>(Self::MANIFEST)
             .map(|v| v.to_string())
             .unwrap_or_default();
@@ -81,8 +81,8 @@ impl SlackApp {
         )
     }
 
-    /// 開けるならブラウザで開く。開けなくても(ssh 越し、画面の無い Linux)何もしない —
-    /// URL は既に印字してある。
+    /// Opens it in a browser if possible. If not (over ssh, Linux without a display), does nothing —
+    /// the URL has already been printed.
     fn open_in_browser(url: &str) {
         let opener = if cfg!(target_os = "macos") {
             "open"
@@ -99,7 +99,7 @@ impl SlackApp {
     }
 }
 
-/// 端末から1行受け取る。パイプ越し(非対話)なら空文字が返るので、呼び手が弾く。
+/// Reads one line from the terminal. Over a pipe (non-interactive) it returns "", which the caller rejects.
 fn prompt(question: &str) -> String {
     print!("{question}");
     let _ = std::io::stdout().flush();
@@ -108,13 +108,13 @@ fn prompt(question: &str) -> String {
     line.trim().to_string()
 }
 
-/// `.env` に「このマシンが何者か」が書かれていなければ、**役割を1問だけ訊いて**書く。
-/// 既に書かれているなら何も触らない(**上書きしない** — 動いている設定を install の
-/// 副作用で壊さない)。
+/// If `.env` doesn't say what this machine is, **ask the one role question** and write it.
+/// If it already does, touch nothing (**no overwrite** — don't break a working setup as a
+/// side effect of install).
 ///
-/// 役割をここで訊くのが要だ。マシンは Slack のトークンを持たない(持てない — 直結と
-/// ゲートウェイ経由は同時に有効にできない)ので、トークンだけを求めるとマシンは install を
-/// 通り抜けられない。
+/// Asking the role here is the point. A machine holds no Slack tokens (it can't — a direct
+/// connection and going through the gateway can't both be on), so asking only for tokens would
+/// leave a machine unable to get through install.
 fn ensure_config(state_dir: &StateDir) -> Result<(), String> {
     use std::io::IsTerminal;
     let env_file = state_dir.join(".env");
@@ -137,7 +137,7 @@ fn ensure_config(state_dir: &StateDir) -> Result<(), String> {
         );
         return Ok(());
     }
-    // マシンは2通り(自分から dial / ゲートウェイに迎えに来てもらう)。どちらも Slack トークンは持たない
+    // A machine connects one of two ways (dials out itself / the gateway comes to fetch it). Neither holds Slack tokens
     if (has("AGENTGW_RELAY_URL") && has("AGENTGW_RELAY_TOKEN"))
         || (has("AGENTGW_LINK_LISTEN") && has("AGENTGW_LINK_TOKEN"))
     {
@@ -182,14 +182,14 @@ fn ensure_config(state_dir: &StateDir) -> Result<(), String> {
     }
 }
 
-/// マシンとして設定する — ゲートウェイが出した接続文字列1本と、このマシンの名前。
+/// Set up as a machine — one connection string from the gateway, and this machine's name.
 fn ask_child(state_dir: &StateDir) -> Result<(), String> {
     let raw = prompt(&crate::t!(
         "  Connection string from the gateway (SCLINK1-…): ",
         "  ゲートウェイから受け取った接続文字列 (SCLINK1-…): "
     ));
     let conn = crate::bridge::gateway::wire::decode_connection(&raw)?;
-    // 名前は自動で決めない(衝突したマシンは互いの Slack メッセージを奪い合う)
+    // Never pick the name automatically (machines with the same name steal each other's Slack messages)
     let name = prompt_bridge_id()
         .ok_or_else(|| {
             crate::t!(
@@ -215,13 +215,13 @@ fn ask_child(state_dir: &StateDir) -> Result<(), String> {
     Ok(())
 }
 
-/// ゲートウェイとして設定する — Slack の bot / app トークン2本。
+/// Set up as the gateway — the two Slack tokens, bot and app.
 fn ask_parent(state_dir: &StateDir) -> Result<(), String> {
     let env_file = state_dir.join(".env");
     let text = std::fs::read_to_string(&env_file).unwrap_or_default();
-    // **アプリがまだ無い人のために、設定入りの作成画面を開く。** 権限・イベント・
-    // Socket Mode・Interactivity を手で選ばせると、1つ抜けるだけで黙って動かない
-    // (Interactivity を忘れるとボタンが届かない、DM タブを忘れると login できない)
+    // **For people without an app yet, open a creation screen with the settings filled in.** Picking
+    // the scopes, events, Socket Mode and Interactivity by hand means one miss and it silently doesn't work
+    // (forget Interactivity and buttons never arrive; forget the DM tab and login is impossible)
     let url = SlackApp::create_url();
     println!(
         "{}",
@@ -266,7 +266,7 @@ fn ask_parent(state_dir: &StateDir) -> Result<(), String> {
             .apply_to_env(&text),
         )
         .map_err(|e| format!("{}: {e}", env_file.display()))?;
-    // トークンが入ったファイルを他人に読ませない
+    // Don't let anyone else read a file holding tokens
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -284,8 +284,8 @@ fn ask_parent(state_dir: &StateDir) -> Result<(), String> {
 }
 
 pub fn uninstall(mac: bool, job: &Path) -> i32 {
-    // 止めてから定義を消す。止まっている相手への bootout は非ゼロを返すが、
-    // 欲しいのは「消えていること」なので終了コードは見ない
+    // Stop first, then remove the definition. bootout on a stopped service returns non-zero, but
+    // what we want is "it is gone", so the exit code is ignored
     if mac {
         Service::run_ctl(
             "launchctl",
@@ -324,8 +324,8 @@ pub fn install(mac: bool, job: &Path, rest: &[String]) -> i32 {
             return 1;
         }
     };
-    // サービスの標準出力・エラーも**状態の置き場の logs/ に**置く。サービス定義の隣
-    // (~/Library/LaunchAgents など)に出すと、調べる人が探す場所が2つに割れる
+    // The service's stdout/stderr also go **under logs/ in the state directory**. Putting them next to
+    // the service definition (~/Library/LaunchAgents etc.) splits the places to look in two
     let log_dir = state_dir.join("logs").to_string_lossy().to_string();
     let _ = std::fs::create_dir_all(&log_dir);
     let spec = JobSpec {
@@ -345,18 +345,18 @@ pub fn install(mac: bool, job: &Path, rest: &[String]) -> i32 {
         eprintln!("install: {}", crate::t!("couldn't write {}: {e}", "{} が書けません: {e}", job.display()));
         return 1;
     }
-    // 「.env は書き換えません」の直後に来る行。**何を書いたのかを言い分ける** —
-    // どちらも「設定」と呼ぶと、書かないと言った直後に書いたことになって読めない
+    // The line right after ".env is not rewritten". **Say which thing was written** — if both are
+    // called "settings", it reads as writing right after saying we wouldn't
     println!("{}", crate::t!("Wrote the service definition: {}", "サービスの定義を書きました: {}", job.display()));
     let name = if mac { Service::label() } else { Service::unit() };
     println!("{}", crate::t!("  Service name: {name}", "  サービス名: {name}"));
     let state = &spec.state_dir;
     println!("{}", crate::t!("  State directory: {state}", "  状態を置くディレクトリ: {state}"));
     if mac {
-        // **この定義が今すぐ効くのは、次に起動したときだけ。** launchd は起動時の定義を
-        // 握ったままなので restart では古い方が起き直る。ただしそれを毎回説くのは
-        // うるさい — 効かせ方は1行で足りる。
-        // 呼び手が直後に起こし直すなら**言わない** — 読んだ人が同じことを手で打つ
+        // **This definition only takes effect the next time it starts.** launchd holds on to the definition
+        // from start time, so restart brings the old one back up. Explaining that every time is noisy
+        // though — one line on how to apply it is enough.
+        // If the caller restarts it right after, **don't say it** — the reader would type the same thing by hand
         if !rest.iter().any(|a| a == "--no-restart-hint") {
             println!("{}", crate::t!("  To apply it: agentgw shutdown && agentgw start", "  反映するには: agentgw shutdown && agentgw start"));
         }
@@ -369,7 +369,7 @@ pub fn install(mac: bool, job: &Path, rest: &[String]) -> i32 {
             "systemctl",
             &Action::systemctl_argv("enable", &Service::unit()),
         );
-        // --user のサービスはログアウトで死ぬ。headless で使うなら linger が要る
+        // A --user service dies at logout. Headless use needs linger
         let user = std::env::var("USER").unwrap_or_default();
         if Service::run_ctl("loginctl", &["enable-linger".to_string(), user.clone()]) != 0 {
             println!(
@@ -386,13 +386,13 @@ pub fn install(mac: bool, job: &Path, rest: &[String]) -> i32 {
     0
 }
 
-/// `.env` にゲートウェイへつなぐ設定を書き、**直結のトークンを畳む**。
+/// Writes the gateway connection settings into `.env` and **retires the direct-connection token**.
 ///
-/// 3つを手で書かせるのは、間違いを作る機会が3回あるということ。接続文字列1本から起こす。
-/// `SLACK_APP_TOKEN` をコメントアウトするのが要 — 残っていると [`Mode::resolve`](crate::bridge::machine::Mode::resolve) が
-/// 起動を拒否する(そしてそれは正しい)。
+/// Having someone write three values by hand is three chances to get one wrong, so everything comes
+/// from one connection string. Commenting out `SLACK_APP_TOKEN` is the key — if it stays,
+/// [`Mode::resolve`](crate::bridge::machine::Mode::resolve) refuses to start (rightly).
 pub fn apply_connection(env_text: &str, conn: &wire::Invite, bridge_id: &str) -> String {
-    // 直結の口を閉じる。**消さずにコメントにする** — 戻したくなる日のために
+    // Close the direct connection. **Comment it out rather than delete it** — for the day you want it back
     let folded: Vec<String> = env_text
         .lines()
         .map(|line| match line.split_once('=').map(|(k, _)| k.trim()) {
@@ -410,9 +410,9 @@ pub fn apply_connection(env_text: &str, conn: &wire::Invite, bridge_id: &str) ->
     )
 }
 
-/// `.env` のキーを**置換で**書き入れる(無ければ末尾に足す)。他の行は1文字も触らない。
+/// Writes a `.env` key **by replacing** (appends it if missing). No other line is touched.
 ///
-/// 積み増しにすると `load_env` は後勝ちで読むので、消したはずの値が残り続ける。
+/// If appended instead, `load_env` reads last-wins, so a value you thought you removed keeps living.
 pub fn set_env_keys(env_text: &str, pairs: &[(&str, String)]) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut seen = vec![false; pairs.len()];
@@ -438,13 +438,13 @@ pub fn set_env_keys(env_text: &str, pairs: &[(&str, String)]) -> String {
     text
 }
 
-/// `agentgw link [--name <名前>] [<接続文字列>|-]` — 接続文字列1本を `.env` に落とす。
+/// `agentgw link [--name <name>] [<connection-string>|-]` — puts one connection string into `.env`.
 ///
-/// **引数が `-`、または引数が無く stdin が端末でないときは stdin から読む。** ssh 越しに
-/// 渡すとき argv に置くと、相手の `ps` とシェル履歴に秘密が残る。
+/// **Reads stdin when the argument is `-`, or when there is no argument and stdin is not a terminal.**
+/// Passing it in argv over ssh would leave the secret in the other side's `ps` and shell history.
 ///
-/// `--name` が要るのは、その stdin から読む経路だ — 接続文字列がパイプで来ていると、
-/// 名前を訊く口([`prompt_bridge_id`])が塞がっている。名前は秘密ではないので argv でよい。
+/// `--name` is needed for exactly that stdin path — with the connection string coming through a pipe,
+/// the name prompt ([`prompt_bridge_id`]) has no input. The name is not a secret, so argv is fine.
 pub fn cli(args: &[String], dir: &StateDir) -> i32 {
     use std::io::{IsTerminal, Read};
     let mut named: Option<String> = None;
@@ -491,7 +491,7 @@ pub fn cli(args: &[String], dir: &StateDir) -> i32 {
             return 1;
         }
     };
-    // 名前は明示。**自動命名はしない**(衝突したマシンは互いの Slack メッセージを奪い合う)
+    // Name given explicitly. **No automatic naming** (machines with the same name steal each other's Slack messages)
     let bridge_id = match named
         .or_else(|| std::env::var("AGENTGW_BRIDGE_ID").ok())
         .map(|s| s.trim().to_string())
@@ -554,7 +554,7 @@ pub(crate) fn prompt_bridge_id() -> Option<String> {
     let mut line = String::new();
     std::io::stdin().read_line(&mut line).ok()?;
     let typed = line.trim();
-    // 空 Enter は「表示した候補でよい」の意思表示。何も候補が無ければ None
+    // An empty Enter means "the suggestion shown is fine". None if there is no suggestion
     let id = if typed.is_empty() {
         host
     } else {
@@ -572,7 +572,7 @@ mod tests {
     fn the_slack_app_link_carries_the_whole_manifest() {
         let url = SlackApp::create_url();
         assert!(url.starts_with("https://api.slack.com/apps?new_app=1&manifest_json=%7B"), "{url}");
-        // 符号化を戻すと、マニフェストと同じ JSON になる
+        // Decoding gives back the same JSON as the manifest
         let encoded = url.split("manifest_json=").nth(1).unwrap();
         let decoded = percent_encoding::percent_decode_str(encoded).decode_utf8().unwrap();
         let back: serde_json::Value = serde_json::from_str(&decoded).unwrap();
@@ -583,18 +583,18 @@ mod tests {
     #[test]
     fn the_manifest_turns_on_what_silently_breaks_when_missing() {
         let m: serde_json::Value = serde_json::from_str(SlackApp::MANIFEST).unwrap();
-        // 無いとボタンが届かない
+        // Without it buttons never arrive
         assert_eq!(m["settings"]["interactivity"]["is_enabled"], true);
-        // 無いと Socket Mode でつながらない
+        // Without it Socket Mode can't connect
         assert_eq!(m["settings"]["socket_mode_enabled"], true);
-        // 無いと DM できない(login は DM で打つ)
+        // Without it DMs don't work (login is typed in a DM)
         assert_eq!(m["features"]["app_home"]["messages_tab_enabled"], true);
         assert_eq!(m["features"]["app_home"]["messages_tab_read_only_enabled"], false);
     }
 
     #[test]
     fn the_readme_links_to_the_same_manifest() {
-        // README のワンクリックのリンクは、マニフェストから作ったものと同じでなければならない
+        // The README's one-click link must match the one built from the manifest
         let readme = include_str!("../README.md");
         assert!(
             readme.contains(&SlackApp::create_url()),
@@ -605,7 +605,7 @@ mod tests {
         assert!(ja.contains(&SlackApp::create_url()), "README.ja.md も同じく");
     }
 
-    /// README に貼る URL を印字する(`cargo test -- --ignored print_slack_app_url --nocapture`)。
+    /// Prints the URL for the README (`cargo test -- --ignored print_slack_app_url --nocapture`).
     #[test]
     #[ignore = "README に貼る URL を出すだけ"]
     fn print_slack_app_url() {
@@ -622,7 +622,7 @@ mod tests {
             .validate()
             .is_ok()
         );
-        // 取り違えは実際に起きる(どちらも「Slack のトークン」に見える)ので、両方向を弾く
+        // Mixing them up really happens (both look like "a Slack token"), so catch it both ways
         assert!(
             Tokens {
                 bot: "xapp-1-2".into(),
@@ -665,12 +665,12 @@ mod tests {
             app: "xapp-new".into(),
         }
         .apply_to_env(before);
-        // 既存行は**置換**。2本目を積み増すと load_env は後勝ちになり、消したはずの旧値が残る
+        // Existing lines are **replaced**. Appending a second one makes load_env read last-wins, and the old value survives
         assert_eq!(after.matches("SLACK_BOT_TOKEN=").count(), 1, "{after}");
         assert!(after.contains("SLACK_BOT_TOKEN=xoxb-new"), "{after}");
         assert!(after.contains("SLACK_APP_TOKEN=xapp-new"), "{after}");
         assert!(!after.contains("xoxb-old"), "{after}");
-        // 無関係な行とコメントは保つ — .env は人も編集する
+        // Unrelated lines and comments are kept — people edit .env too
         assert!(after.contains("# 手書きのメモ"), "{after}");
         assert!(after.contains("SOMETHING=else"), "{after}");
     }
@@ -682,7 +682,7 @@ mod tests {
             app: "xapp-new".into(),
         }
         .apply_to_env("");
-        // 書き手と読み手の形式が食い違うと静かに壊れる。読み手そのもので確かめる
+        // If writer and reader disagree on the format it breaks silently. Check with the reader itself
         let dir = crate::bridge::state::StateDir::at(
             std::env::temp_dir().join(format!("sc-env-{}", std::process::id())),
         );
@@ -709,7 +709,7 @@ mod tests {
         assert!(!after.ends_with("\n\n"), "{after:?}");
     }
 
-    // ── .env の書き換え ─────────────────────────────────────────────────────
+    // ── rewriting .env ─────────────────────────────────────────────────────
 
     fn conn() -> wire::Invite {
         wire::Invite {
@@ -718,7 +718,7 @@ mod tests {
         }
     }
 
-    /// 直結の口を**コメントにして**閉じ、ゲートウェイへつなぐ3つを書く。他の行は1文字も変えない。
+    /// Closes the direct connection **by commenting it out** and writes the three gateway settings. No other line changes.
     #[test]
     fn applying_a_connection_folds_the_direct_token_and_keeps_everything_else() {
         let before = "SLACK_BOT_TOKEN=xoxb-1\nSLACK_APP_TOKEN=xapp-1\nOTHER=keep me\n";
@@ -738,7 +738,7 @@ mod tests {
         assert!(after.contains("AGENTGW_BRIDGE_ID=desktop"), "{after}");
     }
 
-    /// 貼り直しは**上書き**で、行を増やさない。
+    /// Pasting again **overwrites**; it doesn't add lines.
     #[test]
     fn re_applying_replaces_rather_than_appends() {
         let once = apply_connection("", &conn(), "desktop");
@@ -755,7 +755,7 @@ mod tests {
         assert!(twice.contains("AGENTGW_BRIDGE_ID=laptop"), "{twice}");
     }
 
-    /// 書いた .env が、そのままゲートウェイ経由のモード(`Mode::Relay`)として読めること(往復)。
+    /// The written .env reads back as the via-gateway mode (`Mode::Relay`) (round trip).
     #[test]
     fn what_it_writes_is_what_resolve_reads() {
         let text = apply_connection("SLACK_APP_TOKEN=xapp-1\n", &conn(), "desktop");

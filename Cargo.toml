@@ -4,17 +4,18 @@ version = "0.23.21"
 edition = "2024"
 license = "MIT"
 
-# target が 32GB まで育った原因(2026-08-01 実測): debuginfo フルだと成果物1つが巨大で、
-# cargo は古い世代を消さない — `.o` が 48,374 個 / incremental が 214 世代溜まっていた。
-# デバッグ情報は使っていないので落とす(パニック時のバックトレースは関数名までは出る。
-# 行番号が要る場面が来たら `debug = "line-tables-only"` に上げる)。
-# ビルド時間は同条件3回の中央値で 11.8s → 11.6s(誤差)= 速度の代償なしでサイズだけ落ちる
+# Why target/ grew to 32GB (measured 2026-08-01): with full debuginfo each artifact is huge,
+# and cargo never deletes old generations — 48,374 `.o` files and 214 incremental generations
+# had piled up. We don't use debug info, so drop it (panic backtraces still show function
+# names; if line numbers are ever needed, raise this to `debug = "line-tables-only"`).
+# Build time, median of 3 runs under the same conditions: 11.8s -> 11.6s (noise) = smaller
+# output at no cost in speed
 [profile.dev]
 debug = 0
 
-# リリース版は**他のマシンへ scp する物**(add-child)。既定のままだとシンボルを
-# 抱えたまま運ぶことになるので落とす。lto は入れない — ビルド時間が伸びる側の代償が、
-# 並行ワーカーで target/ を取り合っているこのリポでは重い
+# The release build is **what gets copied to other machines** (add-machine). The default
+# would ship it with its symbols, so strip them. No lto — the longer build time costs too
+# much in this repo, where parallel workers compete for target/
 [profile.release]
 strip = true
 
@@ -24,17 +25,19 @@ slack-morphism = { version = "2", features = ["hyper"] }
 rmcp = { version = "0.8", features = ["server", "transport-streamable-http-server"] }
 axum = { version = "0.8", features = ["ws"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
-# WebSocket は Stream/Sink なので、駆動にこの2 trait が要る。rmcp / axum / slack-morphism が
-# 既に同版を引いているので新規コンパイルは無い(宣言していないと trait を名前で呼べないだけ)
+# WebSocket is a Stream/Sink, so driving it needs these two traits. rmcp / axum / slack-morphism
+# already pull the same version, so there is no new compile (without the declaration we just
+# can't name the traits)
 futures-util = { version = "0.3", default-features = false }
-# 接続文字列の base64url。**自前で40行持っていたものを畳んだ** — 既に依存グラフに居るので
-# 新規コンパイルは無い(slack-morphism / rmcp が引いている)
+# base64url for the connection string. **Replaces 40 hand-written lines** — it is already in
+# the dependency graph, so there is no new compile (slack-morphism / rmcp pull it)
 base64 = "0.22"
-# 暦(うるう年・月の日数・通算日・時刻の書式)。**自前で持っていた 150 行を畳んだ** —
-# rmcp / schemars / slack-morphism が既に同版を引いているので新規コンパイルは無い
+# Calendar math (leap years, days per month, day of year, time formatting). **Replaces 150
+# hand-written lines** — rmcp / schemars / slack-morphism already pull the same version, so
+# there is no new compile
 chrono = "0.4"
-# Slack アプリの作成リンク(マニフェスト入りの URL)を組むため。url / reqwest が既に同版を
-# 引いているので新規コンパイルは無い
+# To build the Slack app creation link (a URL carrying the manifest). url / reqwest already
+# pull the same version, so there is no new compile
 percent-encoding = "2"
 # Async traits that can sit behind `Arc<dyn …>` (the ports in `ports.rs`).
 # slack-morphism already pulls the same version, so there is no new compile

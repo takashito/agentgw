@@ -11,26 +11,26 @@ use async_trait::async_trait;
 
 // ── what arrives from the chat ──
 
-/// 受信メッセージの出どころ。
+/// Where an incoming message came from.
 ///
-/// DM とチャンネルで**言い方も既定も変わる**(DM の `pwd` は拒む /
-/// チャンネルは mention の要否が違う)ので、素性を型で持つ。
+/// DMs and channels **differ in wording and in defaults** (`pwd` is refused in a DM /
+/// channels differ in whether a mention is required), so the origin is carried as a type.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ChannelKind {
     Dm,
     Channel,
 }
 
-/// 受信メッセージに付いていた添付1つ。先読みダウンロードの入力。
+/// One attachment on an incoming message. The input to the prefetch download.
 ///
-/// `name` は劣化ノートに出す表示名 — Slack が name を寄越さなければ id そのもの。
+/// `name` is the display name shown in the degradation note — the id itself when Slack gives no name.
 #[derive(Clone, Debug)]
 pub struct InboundFile {
     pub id: String,
     pub name: String,
 }
 
-/// Bridge の語彙。slack.rs が生成し、worker/endpoints も参照する。
+/// The Bridge's vocabulary. Built by slack.rs, also read by worker/endpoints.
 #[derive(Clone, Debug)]
 pub struct InboundMsg {
     pub channel: String,
@@ -39,38 +39,38 @@ pub struct InboundMsg {
     pub thread_ts: Option<String>,
     pub user: Option<String>,
     pub is_bot: bool,
-    /// Slack が付ける bot の id。`allow-bot` で許した相手かを照合するのに要る。
+    /// The bot id Slack attaches. Needed to check whether the sender was allowed with `allow-bot`.
     pub bot_id: Option<String>,
     pub text: String,
-    /// Slack の `files[]`(slack.rs が埋める)。
+    /// Slack's `files[]` (filled in by slack.rs).
     pub files: Vec<InboundFile>,
-    /// 先読みダウンロードの結果 — 成功したローカルパスと、失敗の劣化ノート。
-    /// 受信経路(main.rs)が配達の直前に埋める。queue された分もこの値ごと持ち越す。
+    /// Result of the prefetch download — local paths that succeeded, and degradation notes for failures.
+    /// Filled in by the receive path (main.rs) right before delivery. Queued messages carry it along.
     pub file_paths: Vec<String>,
     pub file_errors: Vec<String>,
-    /// このメッセージがリアクション由来ならその素性。ワーカーには合成テキストで
-    /// 届く(`text` に入っている)が、**進捗付箋に付いた stop 絵文字だけ**は配達せず停止に使う。
+    /// Set when this message came from a reaction. The agent gets it as synthesized text (in `text`),
+    /// but **a stop emoji on a progress message** is not delivered — it is used to stop the turn.
     pub reaction: Option<Reaction>,
-    /// ユーザーが**消した**メッセージの ts。埋まっていれば、これは削除の合図で
-    /// `text` は取り消しの指示文(`deletion_notice`)。
+    /// The ts of a message the user **deleted**. When set, this is a deletion signal and
+    /// `text` is the instruction to take it back (`deletion_notice`).
     pub deleted_ts: Option<String>,
-    /// ユーザーが**書き換えた**メッセージの ts と、その改訂 id(dedup 用)。
-    /// 埋まっていれば `text` は**新しい本文そのもの** — 指示文は Bridge が組む
-    /// (「いま処理中のものか」で言い方が変わり、それを知っているのは Bridge だけ)。
+    /// The ts of a message the user **edited**, and its revision id (for dedup).
+    /// When set, `text` is **the new body itself** — the Bridge builds the instruction
+    /// (the wording depends on "is this the one being worked on now", which only the Bridge knows).
     pub edited: Option<Edited>,
 }
 
-/// 書き換え1件。`revision` は Slack の `edited.ts`(同じ編集が再配達されたときの目印)。
+/// One edit. `revision` is Slack's `edited.ts` (marks the same edit being redelivered).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Edited {
     pub ts: String,
     pub revision: String,
 }
 
-/// リアクション1つ。
+/// One reaction.
 ///
-/// `item_ts` は**付けられた側のメッセージ**の ts — 付箋かどうかをこれで見分ける
-/// (付箋以外への stop 絵文字はただのリアクション)。
+/// `item_ts` is the ts of **the message it was put on** — that is how we tell a progress message
+/// (a stop emoji on anything else is just a reaction).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Reaction {
     pub emoji: String,
@@ -78,9 +78,9 @@ pub struct Reaction {
     pub added: bool,
 }
 
-/// stop として扱うリアクション名(6つ)。`hand` と `raised_hand` は
-/// 同じ ✋ の別名なので、どちらを選んでも通す。**コロンは付かない** — Slack のリアクション名は
-/// `red_circle` の形で来る(本文の `:red_circle:` とは別物)。
+/// Reaction names treated as stop (six). `hand` and `raised_hand` are aliases of the same ✋,
+/// so either one works. **No colons** — Slack sends reaction names in the form
+/// `red_circle` (not the `:red_circle:` of message text).
 const STOP_REACTION_NAMES: [&str; 6] = [
     "red_circle",
     "octagonal_sign",
@@ -95,8 +95,8 @@ impl Reaction {
         self.added && STOP_REACTION_NAMES.contains(&self.emoji.as_str())
     }
 
-    /// ワーカーに渡す合成テキスト。リアクションは
-    /// 軽い合図なので、**黙らないように**と念を押す一文が付く(added のときだけ)。
+    /// Synthesized text handed to the agent. A reaction is a light signal, so a sentence is added
+    /// reminding the agent **not to stay silent** (only when added).
     pub fn synthetic_text(&self, reactor: &str, item_text: &str) -> String {
         let truncated: String = if item_text.chars().count() > 280 {
             item_text.chars().take(280).chain(['…']).collect()
@@ -123,9 +123,9 @@ impl Reaction {
     }
 }
 
-/// 書き換えをワーカーに伝える文。
-/// `is_current` = いま処理中の依頼が書き換わった(捨てて新しい方をやる)/ そうでなければ
-/// 過去の依頼の改訂(いまの仕事は続け、手が空いてから)。
+/// Text telling the agent about an edit.
+/// `is_current` = the request being worked on now was rewritten (drop it and do the new one) / otherwise
+/// a past request was revised (keep the current work going, handle it once free).
 pub fn edit_notice(edited_ts: &str, new_text: &str, had_files: bool, is_current: bool) -> String {
     const SNIPPET_MAX: usize = 1000;
     let trimmed = new_text.trim();
@@ -161,9 +161,9 @@ pub fn edit_notice(edited_ts: &str, new_text: &str, had_files: bool, is_current:
     )
 }
 
-/// 取り消しをワーカーに伝える文。
-/// **「消されました」とだけ言い返させない** — まだ外に出していない作業は捨てる、
-/// もう外に出した副作用があるときだけ説明する、という判断をさせる。
+/// Text telling the agent about a deletion.
+/// **Don't let it just reply "it was deleted"** — make it decide: throw away work not yet
+/// visible outside, and explain only when side effects have already gone out.
 pub fn deletion_notice(deleted_ts: &str, text: &str, had_files: bool) -> String {
     const SNIPPET_MAX: usize = 1000;
     let trimmed = text.trim();
@@ -196,29 +196,29 @@ pub fn deletion_notice(deleted_ts: &str, text: &str, had_files: bool) -> String 
 
 // ── what reads return ──
 
-/// 既にある1件の投稿について、**イベントからは分からないこと**だけ。
-/// [`Chat::message_at`] が返す。
+/// Only what **the event doesn't tell us** about an existing message.
+/// Returned by [`Chat::message_at`].
 pub struct MessageAt {
-    /// 書き手(bot が投げたものには入らないことがある)。
+    /// The author (may be missing on bot posts).
     pub user: Option<String>,
-    /// bot が投げたもの。
+    /// Posted by a bot.
     pub is_bot: bool,
-    /// 属するスレッドの根。返信でなければ自分自身の ts。
+    /// Root of the thread it belongs to. Its own ts if it is not a reply.
     pub thread_ts: String,
 }
 
-/// history/replies の1行。
+/// One line of history/replies.
 #[derive(Clone)]
 pub struct FetchedMsg {
     pub ts: String,
     pub user: String,
     pub text: String,
-    /// スレッドの根。返信なら親の ts、根自身なら自分の ts、スレッド外なら None。
+    /// Thread root. The parent's ts for a reply, its own ts for a root, None outside a thread.
     pub thread_ts: Option<String>,
 }
 
 impl FetchedMsg {
-    /// oldest-first の `[ts] user: text`。
+    /// `[ts] user: text`, oldest first.
     pub fn render_all(msgs: &[FetchedMsg]) -> String {
         let mut rows: Vec<&FetchedMsg> = msgs.iter().collect();
         rows.sort_by(|a, b| a.ts.cmp(&b.ts));
@@ -470,7 +470,7 @@ mod tests {
         );
     }
 
-    /// stop になるのは**付けられた**stop 絵文字だけ。合成テキストは Bun の原文。
+    /// Only an **added** stop emoji means stop. The synthesized text keeps its original wording.
     #[test]
     fn a_stop_reaction_is_only_a_stop_when_added() {
         let r = |emoji: &str, added: bool| Reaction {
@@ -500,13 +500,13 @@ mod tests {
             !removed.contains("Do not stay silent"),
             "外した側は促さない"
         );
-        // 長い本文は 280 文字で切る
+        // Long bodies are cut at 280 characters
         let long = r("eyes", true).synthetic_text("U1", &"あ".repeat(400));
         assert!(long.contains(&format!("{}…", "あ".repeat(280))));
     }
 
-    /// 書き換えの文は「いま処理中か」で言い方が変わる。処理中なら古い作業を捨てさせ、
-    /// 過去の依頼なら今の仕事を続けさせる。
+    /// The edit text depends on "is it being worked on now". If so, drop the old work;
+    /// if it is a past request, keep doing the current work.
     #[test]
     fn an_edit_tells_the_worker_to_redo_only_when_it_is_the_current_work() {
         let now = edit_notice("1.2", "こっちでお願い", false, true);
@@ -517,11 +517,11 @@ mod tests {
         let past = edit_notice("1.2", "こっちでお願い", false, false);
         assert!(past.contains("EDITED an earlier message (id 1.2)"));
         assert!(past.contains("Do NOT abandon your current work"));
-        // どちらも締めは同じ — 何も変わらないなら黙る
+        // Both end the same way — stay silent if nothing changes
         for n in [&now, &past] {
             assert!(n.ends_with("if the edit changes nothing you need to do, call no_reply."));
         }
-        // 本文が消えた編集は、添付だけになったのか読めないのかで言い分ける
+        // An edit that empties the body is worded differently for attachments-only vs unreadable
         assert!(edit_notice("1.2", "", true, true).contains("a file/attachment only"));
         assert!(edit_notice("1.2", "", false, true).contains("Its new text is unavailable."));
         assert!(edit_notice("1.2", &"あ".repeat(1500), false, true).contains("… (truncated)"));
