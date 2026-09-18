@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::bridge::inbound::{ChannelKind, InboundMsg};
+use crate::chat::{ChannelKind, InboundMsg};
 
 /// 空の JSON オブジェクト。`read_json_or` の既定として何度も要る。
 fn json_obj() -> serde_json::Value {
@@ -1879,7 +1879,7 @@ pub mod fake {
 mod tests {
 
     use super::*;
-    use crate::bridge::inbound::deletion_notice;
+    use crate::chat::deletion_notice;
 
     #[test]
     fn port_is_remembered_across_calls() {

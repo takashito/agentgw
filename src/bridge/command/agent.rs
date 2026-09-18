@@ -13,7 +13,7 @@ use crate::agent::{
     CompactOutcome, CompactProgress, ContextCategory, ContextReport, LoginOutcome, ProbeErr,
     SessionId, UsageRow,
 };
-use crate::bridge::inbound::{self, InboundMsg};
+use crate::chat::InboundMsg;
 use crate::bridge::state::{LogCtx, ThreadKey, WallClock};
 use crate::bridge::turn::UsageProjection;
 use crate::bridge::{Bridge, Host};
@@ -764,7 +764,7 @@ impl Bridge {
     ///   • Owner が route したチャンネル — 受けるのは**貼り付けコードだけ**、しかも
     ///     そのサインインを始めた本人からのものだけ(相席の第三者にコードプロンプトを触らせない)
     pub(in crate::bridge) fn login_carve_out(&mut self, msg: &InboundMsg) -> bool {
-        let dm = msg.channel_kind == inbound::ChannelKind::Dm;
+        let dm = msg.channel_kind == crate::chat::ChannelKind::Dm;
         let sender = msg.user.as_deref().unwrap_or("");
         let pending = self.sign_in.pending.get(&msg.channel).cloned();
         if !dm && pending.as_deref() != Some(sender) {

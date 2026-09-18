@@ -1,5 +1,6 @@
-//! What arrives from Slack, and the gate it passes through: the inbound message model,
+//! What arrives from Slack, and the gate it passes through: the envelope handed to the agent,
 //! edits / deletions / reactions, duplicate suppression, and the owner gate.
+//! The message types themselves ([`InboundMsg`] and friends) live in `chat.rs`.
 //!
 //! `impl Access` here holds only the gate (`gate`, per-channel tool grants); `Access`
 //! itself is persisted state and lives in `state.rs`.
@@ -11,8 +12,7 @@ use crate::agent::{Envelope, SessionId, SpawnReq, WorkerState};
 use crate::bridge::state as bridge;
 use crate::bridge::state::{Access, LogCtx, ThreadEntry, ThreadKey};
 use crate::bridge::{inbound, worker};
-use crate::chat::slack;
-use slack_morphism::prelude::*;
+use crate::chat::{ChannelKind, InboundMsg, Reaction, slack};
 
 /// ドレインを諦めてでも殺す上限。現行は受信確認のタイムアウトを流用する
 /// (RECEIPT_TIMEOUT_MS = 30s)— 新しいつまみを増やさないため。
@@ -25,302 +25,32 @@ const DRAIN_TIMEOUT_MS: u64 = 30_000;
 /// 「この Bridge が聞き始める前に投稿されたか」だけになる。
 const RETRY_NUM: u32 = 0;
 
-/// 受信メッセージの出どころ。
-///
-/// DM とチャンネルで**言い方も既定も変わる**(DM の `pwd` は拒む /
-/// チャンネルは mention の要否が違う)ので、素性を型で持つ。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ChannelKind {
-    Dm,
-    Channel,
+/// この1通 → エージェントに渡す封筒テキスト。`ts` は**配達時点**の now(`now_ms`)、
+/// `thread_ts` は解決済みの根(現行`threadTs || msg.ts` を渡す)。
+pub fn envelope(msg: &InboundMsg, root_ts: &str, now_ms: u64) -> String {
+    envelope_guarded(msg, root_ts, None, now_ms)
 }
 
-/// 受信メッセージに付いていた添付1つ。先読みダウンロードの入力。
-///
-/// `name` は劣化ノートに出す表示名 — Slack が name を寄越さなければ id そのもの。
-#[derive(Clone, Debug)]
-pub struct InboundFile {
-    pub id: String,
-    pub name: String,
-}
-
-/// Bridge の語彙。slack.rs が生成し、worker/endpoints も参照する。
-#[derive(Clone, Debug)]
-pub struct InboundMsg {
-    pub channel: String,
-    pub channel_kind: ChannelKind,
-    pub ts: String,
-    pub thread_ts: Option<String>,
-    pub user: Option<String>,
-    pub is_bot: bool,
-    /// Slack が付ける bot の id。`allow-bot` で許した相手かを照合するのに要る。
-    pub bot_id: Option<String>,
-    pub text: String,
-    /// Slack の `files[]`(slack.rs が埋める)。
-    pub files: Vec<InboundFile>,
-    /// 先読みダウンロードの結果 — 成功したローカルパスと、失敗の劣化ノート。
-    /// 受信経路(main.rs)が配達の直前に埋める。queue された分もこの値ごと持ち越す。
-    pub file_paths: Vec<String>,
-    pub file_errors: Vec<String>,
-    /// このメッセージがリアクション由来ならその素性。ワーカーには合成テキストで
-    /// 届く(`text` に入っている)が、**進捗付箋に付いた stop 絵文字だけ**は配達せず停止に使う。
-    pub reaction: Option<Reaction>,
-    /// ユーザーが**消した**メッセージの ts。埋まっていれば、これは削除の合図で
-    /// `text` は取り消しの指示文(`deletion_notice`)。
-    pub deleted_ts: Option<String>,
-    /// ユーザーが**書き換えた**メッセージの ts と、その改訂 id(dedup 用)。
-    /// 埋まっていれば `text` は**新しい本文そのもの** — 指示文は Bridge が組む
-    /// (「いま処理中のものか」で言い方が変わり、それを知っているのは Bridge だけ)。
-    pub edited: Option<Edited>,
-}
-
-impl InboundMsg {
-    /// この1通 → エージェントに渡す封筒テキスト。`ts` は**配達時点**の now(`now_ms`)、
-    /// `thread_ts` は解決済みの根(現行`threadTs || msg.ts` を渡す)。
-    pub fn envelope(&self, root_ts: &str, now_ms: u64) -> String {
-        self.envelope_guarded(root_ts, None, now_ms)
+/// ループ遮断が立った配達だけ `loop_guard` を載せる(空文字 = 呼ぶ相手が居ない)。
+pub fn envelope_guarded(
+    msg: &InboundMsg,
+    root_ts: &str,
+    loop_guard: Option<String>,
+    now_ms: u64,
+) -> String {
+    Envelope {
+        loop_guard,
+        channel_id: msg.channel.clone(),
+        message_id: msg.ts.clone(),
+        user: msg.user.clone().unwrap_or_else(|| "unknown".to_string()),
+        ts: crate::bridge::state::iso8601(now_ms),
+        thread_ts: Some(root_ts.to_string()),
+        text: msg.text.clone(),
+        // 先読みダウンロードの結果はメッセージが持っている(queue 経由でも持ち越す)
+        file_paths: msg.file_paths.clone(),
+        file_errors: msg.file_errors.clone(),
     }
-
-    /// ループ遮断が立った配達だけ `loop_guard` を載せる(空文字 = 呼ぶ相手が居ない)。
-    pub fn envelope_guarded(&self, root_ts: &str, loop_guard: Option<String>, now_ms: u64) -> String {
-        Envelope {
-            loop_guard,
-            channel_id: self.channel.clone(),
-            message_id: self.ts.clone(),
-            user: self.user.clone().unwrap_or_else(|| "unknown".to_string()),
-            ts: crate::bridge::state::iso8601(now_ms),
-            thread_ts: Some(root_ts.to_string()),
-            text: self.text.clone(),
-            // 先読みダウンロードの結果はメッセージが持っている(queue 経由でも持ち越す)
-            file_paths: self.file_paths.clone(),
-            file_errors: self.file_errors.clone(),
-        }
-        .render()
-    }
-
-    /// Slack の message イベント → Bridge の語彙。返信できない形(中身も添付も無い・channel 無し)は None。
-    /// Slack の push イベントを Bridge の語彙へ。落とすべきものは None。
-    pub(crate) fn from_event(ev: &SlackMessageEvent) -> Option<InboundMsg> {
-        let content = ev.content.as_ref()?;
-        // 画像だけの投稿は `subtype:"file_share"` で text 無しに届く。テキストが無くても
-        // 添付があれば通す(現行は `msg.text ?? ''` で素通り)
-        let files: Vec<InboundFile> = content
-            .files
-            .iter()
-            .flatten()
-            .map(|f| InboundFile {
-                id: f.id.to_string(),
-                name: f.name.clone().unwrap_or_else(|| f.id.to_string()),
-            })
-            .collect();
-        // subtype 付きは**システムメッセージ**(「〜が参加しました」「トピックを変えました」)。
-        // 通すのは `bot_message` と `thread_broadcast`、そして添付付き(file_share = 画像だけの
-        // 投稿。)だけ(関門)。これが無いと、チャンネルへの
-        // 入退室までワーカーに配達される
-        if let Some(sub) = &ev.subtype
-            && !matches!(
-                sub,
-                SlackMessageEventType::BotMessage | SlackMessageEventType::ThreadBroadcast
-            )
-            && files.is_empty()
-        {
-            return None;
-        }
-        let text = content.text.clone();
-        if text.is_none() && files.is_empty() {
-            return None;
-        }
-        let text = text.unwrap_or_default();
-        let channel = ev.origin.channel.as_ref()?.to_string();
-        let kind = match ev.origin.channel_type.as_ref().map(|t| t.0.as_str()) {
-            Some("im") => ChannelKind::Dm,
-            _ => ChannelKind::Channel,
-        };
-        Some(InboundMsg {
-            channel,
-            channel_kind: kind,
-            ts: ev.origin.ts.to_string(),
-            thread_ts: ev.origin.thread_ts.as_ref().map(|t| t.to_string()),
-            user: ev.sender.user.as_ref().map(|u| u.to_string()),
-            // 自分の返信を拾って無限ループしないための判定(スパイクA 実証)
-            is_bot: ev.sender.bot_id.is_some() || ev.sender.user.is_none(),
-            bot_id: ev.sender.bot_id.as_ref().map(|b| b.to_string()),
-            text,
-            files,
-            file_paths: Vec::new(),
-            file_errors: Vec::new(),
-            reaction: None,
-            deleted_ts: None,
-            edited: None,
-        })
-    }
-
-    /// `message_deleted` を1件の受信メッセージに仕立てる。ワーカーに渡すのは
-    /// 取り消しの指示文で、消された本文はその中に引用する。
-    ///
-    /// **bot 自身の投稿の削除は無視する**(付箋や返信をユーザーが消しただけ) — 取り消す
-    /// 「依頼」が無いので、伝えてもワーカーを惑わせるだけ。
-    pub(crate) fn from_deletion(ev: &SlackMessageEvent) -> Option<InboundMsg> {
-        let deleted_ts = ev.deleted_ts.as_ref()?.to_string();
-        let prev = ev.previous_message.as_ref();
-        let sender = prev.map(|p| &p.sender);
-        // bot が書いたものは「依頼」ではない。人が書いたものだけ通す
-        if sender.is_some_and(|s| s.bot_id.is_some() || s.user.is_none()) {
-            return None;
-        }
-        let content = prev.and_then(|p| p.content.as_ref());
-        let text = content.and_then(|c| c.text.as_deref()).unwrap_or_default();
-        let had_files = content.is_some_and(|c| c.files.iter().flatten().next().is_some());
-        // 削除イベントは根を寄越さないことがある(`previous_message` に thread_ts が無い形)。
-        // 暫定で「消された ts 自身」を根に置き、Bridge 側が台帳から本当の根に読み替える
-        let thread_ts = ev
-            .origin
-            .thread_ts
-            .as_ref()
-            .map(|t| t.to_string())
-            .unwrap_or_else(|| deleted_ts.clone());
-        Some(InboundMsg {
-            channel: ev.origin.channel.as_ref()?.to_string(),
-            channel_kind: match ev.origin.channel_type.as_ref().map(|t| t.0.as_str()) {
-                Some("im") => ChannelKind::Dm,
-                _ => ChannelKind::Channel,
-            },
-            ts: deleted_ts.clone(),
-            thread_ts: Some(thread_ts),
-            user: sender.and_then(|s| s.user.as_ref().map(|u| u.to_string())),
-            bot_id: None,
-            is_bot: false,
-            text: deletion_notice(&deleted_ts, text, had_files),
-            files: Vec::new(),
-            file_paths: Vec::new(),
-            file_errors: Vec::new(),
-            reaction: None,
-            deleted_ts: Some(deleted_ts),
-            edited: None,
-        })
-    }
-
-    /// `message_changed` を1件の受信メッセージに仕立てる。`text` は**新しい本文
-    /// そのもの**で、ワーカーに渡す指示文は Bridge が組む(言い方が「いま処理中かどうか」で
-    /// 変わり、それを知っているのは台帳を持つ Bridge だけ)。
-    ///
-    /// Slack は編集以外でも `message_changed` を撃つ — リンクのプレビューが付いたとき、
-    /// bot が自分の付箋を編集したとき。**本文が変わっていないもの**と **bot の投稿**は捨てる
-    pub(crate) fn from_edit(ev: &SlackMessageEvent) -> Option<InboundMsg> {
-        let m = ev.message.as_ref()?;
-        if m.sender.bot_id.is_some() || m.sender.user.is_none() {
-            return None; // bot 自身の編集(付箋の描き直しがこれ)
-        }
-        let new_text = m.content.as_ref()?.text.clone().unwrap_or_default();
-        let old_text = ev
-            .previous_message
-            .as_ref()
-            .and_then(|p| p.content.as_ref())
-            .and_then(|c| c.text.clone())
-            .unwrap_or_default();
-        if new_text == old_text {
-            return None; // unfurl などのメタ変更 — 編集ではない
-        }
-        let edited_ts = m.ts.to_string();
-        let files: Vec<InboundFile> = m
-            .content
-            .iter()
-            .flat_map(|c| c.files.iter().flatten())
-            .map(|f| InboundFile {
-                id: f.id.to_string(),
-                name: f.name.clone().unwrap_or_else(|| f.id.to_string()),
-            })
-            .collect();
-        Some(InboundMsg {
-            channel: ev.origin.channel.as_ref()?.to_string(),
-            channel_kind: match ev.origin.channel_type.as_ref().map(|t| t.0.as_str()) {
-                Some("im") => ChannelKind::Dm,
-                _ => ChannelKind::Channel,
-            },
-            ts: edited_ts.clone(),
-            // 編集イベントも根を寄越さないことがある(削除と同じ。Bridge が台帳で読み替える)
-            thread_ts: ev.origin.thread_ts.as_ref().map(|t| t.to_string()),
-            user: m.sender.user.as_ref().map(|u| u.to_string()),
-            bot_id: None,
-            is_bot: false,
-            text: new_text,
-            files,
-            file_paths: Vec::new(),
-            file_errors: Vec::new(),
-            reaction: None,
-            deleted_ts: None,
-            edited: Some(Edited {
-                // 改訂ごとに変わる id。取れなければ本文長で代用する(再配達の目印)
-                revision: m
-                    .edited
-                    .as_ref()
-                    .map(|e| e.ts.to_string())
-                    .unwrap_or_else(|| {
-                        m.content
-                            .as_ref()
-                            .map_or(0, |c| c.text.as_ref().map_or(0, |t| t.len()))
-                            .to_string()
-                    }),
-                ts: edited_ts,
-            }),
-        })
-    }
-
-    /// リアクションを1件の受信メッセージに仕立てる。**bot が書いたメッセージへの
-    /// リアクションだけ**扱う(`authored` と同じ判定)
-    /// 人同士のやり取りに付いた絵文字までワーカーに流さない。
-    ///
-    /// スレッドの根は付けられた側の `thread_ts`、無ければそのメッセージ自身。`ts` は
-    /// **付けられた側の ts** にする — 👀 を付ける先も、dedup の鍵もそこになる。
-    pub(crate) fn from_reaction(
-        item: &SlackReactionsItem,
-        reactor: &str,
-        emoji: String,
-        added: bool,
-    ) -> Option<InboundMsg> {
-        let SlackReactionsItem::Message(m) = item else {
-            return None; // ファイルへのリアクションは扱わない
-        };
-        // **書き手はここでは分からない。** リアクションの `item` に入るのは種別・チャンネル・ts
-        // だけで、送り主の欄は常に空。ここで「自分の投稿か」を判断しようとすると、空欄を
-        // 「自分の投稿」と読んで**全部通す**検査になる(2026-08-02 に実測)。判断は Bridge 側 —
-        // 元の投稿を1回引いた後(`Api::message_at`)。
-        let channel = m.origin.channel.as_ref()?.to_string();
-        let item_ts = m.origin.ts.to_string();
-        let reaction = Reaction {
-            emoji,
-            item_ts: item_ts.clone(),
-            added,
-        };
-        Some(InboundMsg {
-            channel,
-            channel_kind: match m.origin.channel_type.as_ref().map(|t| t.0.as_str()) {
-                Some("im") => ChannelKind::Dm,
-                _ => ChannelKind::Channel,
-            },
-            ts: item_ts,
-            thread_ts: m.origin.thread_ts.as_ref().map(|t| t.to_string()),
-            user: Some(reactor.to_string()),
-            // リアクションを**付けた**のは人。付けられた側が bot なのは上で確かめた
-            is_bot: false,
-            bot_id: None,
-            text: reaction
-                .synthetic_text(reactor, m.content.text.as_deref().unwrap_or("(no text)")),
-            files: Vec::new(),
-            file_paths: Vec::new(),
-            file_errors: Vec::new(),
-            reaction: Some(reaction),
-            deleted_ts: None,
-            edited: None,
-        })
-    }
-}
-
-/// 書き換え1件。`revision` は Slack の `edited.ts`(同じ編集が再配達されたときの目印)。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Edited {
-    pub ts: String,
-    pub revision: String,
+    .render()
 }
 
 /// 書き換えをワーカーに伝える文。
@@ -359,95 +89,6 @@ pub fn edit_notice(edited_ts: &str, new_text: &str, had_files: bool, is_current:
         "{lead}\n\nRespond to the now-edited request as you normally would; if the edit changes \
          nothing you need to do, call no_reply."
     )
-}
-
-/// 取り消しをワーカーに伝える文。
-/// **「消されました」とだけ言い返させない** — まだ外に出していない作業は捨てる、
-/// もう外に出した副作用があるときだけ説明する、という判断をさせる。
-pub fn deletion_notice(deleted_ts: &str, text: &str, had_files: bool) -> String {
-    const SNIPPET_MAX: usize = 1000;
-    let trimmed = text.trim();
-    let content_desc = if trimmed.is_empty() {
-        if had_files {
-            "It had no text (it was a file/attachment upload).".to_string()
-        } else {
-            "Its text is unavailable.".to_string()
-        }
-    } else if trimmed.chars().count() > SNIPPET_MAX {
-        let head: String = trimmed.chars().take(SNIPPET_MAX).collect();
-        format!("Its content was:\n\"\"\"\n{head}… (truncated)\n\"\"\"")
-    } else {
-        format!("Its content was:\n\"\"\"\n{trimmed}\n\"\"\"")
-    };
-    format!(
-        "[message_deleted] The user DELETED their own message (id {deleted_ts}). They removed \
-         that request from the conversation — handle it as if the message had never been sent. \
-         {content_desc}\n\nDecide based on what you have ACTUALLY done for it so far:\n\
-         • If you have NOT yet performed any external/irreversible action for it — including the \
-         case where you only prepared, computed, or were about to send an answer — then DISCARD \
-         that work: call no_reply and output nothing. A not-yet-sent answer is NOT a side-effect; \
-         throw it away.\n\
-         • Only reply if you ALREADY performed a real external side-effect that the user must know \
-         about or that needs reverting (e.g. created/edited a file, ran a command with lasting \
-         effects, or already posted a message), in which case briefly explain and/or undo it.\n\
-         Never output any text merely stating that the message was deleted."
-    )
-}
-
-/// リアクション1つ。
-///
-/// `item_ts` は**付けられた側のメッセージ**の ts — 付箋かどうかをこれで見分ける
-/// (付箋以外への stop 絵文字はただのリアクション)。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Reaction {
-    pub emoji: String,
-    pub item_ts: String,
-    pub added: bool,
-}
-
-/// stop として扱うリアクション名(6つ)。`hand` と `raised_hand` は
-/// 同じ ✋ の別名なので、どちらを選んでも通す。**コロンは付かない** — Slack のリアクション名は
-/// `red_circle` の形で来る(本文の `:red_circle:` とは別物)。
-const STOP_REACTION_NAMES: [&str; 6] = [
-    "red_circle",
-    "octagonal_sign",
-    "black_square_for_stop",
-    "hand",
-    "raised_hand",
-    "x",
-];
-
-impl Reaction {
-    pub fn is_stop(&self) -> bool {
-        self.added && STOP_REACTION_NAMES.contains(&self.emoji.as_str())
-    }
-
-    /// ワーカーに渡す合成テキスト。リアクションは
-    /// 軽い合図なので、**黙らないように**と念を押す一文が付く(added のときだけ)。
-    pub fn synthetic_text(&self, reactor: &str, item_text: &str) -> String {
-        let truncated: String = if item_text.chars().count() > 280 {
-            item_text.chars().take(280).chain(['…']).collect()
-        } else {
-            item_text.to_string()
-        };
-        let kind = if self.added { "added" } else { "removed" };
-        let verb = if self.added {
-            "reacted with"
-        } else {
-            "removed reaction"
-        };
-        let hint = if self.added {
-            " Do not stay silent: at minimum call the `react` tool to acknowledge (e.g. mirror \
-             the emoji, or use 👍/🙏/🤔 as appropriate). Reply with text only if the reaction \
-             calls for a substantive response."
-        } else {
-            ""
-        };
-        format!(
-            "[reaction {kind}] <@{reactor}> {verb} :{}: on your message: {truncated}{hint}",
-            self.emoji
-        )
-    }
 }
 
 /// 門番の答え — この1通をワーカーに渡すか。
@@ -645,7 +286,7 @@ pub(super) enum ForeignReaction {
 }
 
 pub(super) fn foreign_reaction(
-    r: &inbound::Reaction,
+    r: &Reaction,
     reactor: Option<&str>,
     author: Option<&str>,
     owner: &str,
@@ -1017,7 +658,7 @@ impl Bridge {
             .and_then(|sid| self.workers.warm(sid))
             .and_then(|h| h.window_id.clone())
             .unwrap_or_else(|| window.clone());
-        let envelope = msg.envelope_guarded(&root_ts, loop_guard, self.deps.clock.now_ms());
+        let envelope = envelope_guarded(msg, &root_ts, loop_guard, self.deps.clock.now_ms());
         // ターン失敗の再送に要る。`track` は ack の直後(封筒がまだ無い時点)なので、
         // 封筒ができた**ここ**で台帳に預ける — これより下の配達経路は全部この後ろ
         self.ledger.remember_envelope(&key, &msg.ts, &envelope);
@@ -1236,7 +877,7 @@ impl Bridge {
                 }
             ),
         );
-        let envelope = notice.envelope(root_ts, self.deps.clock.now_ms());
+        let envelope = envelope(&notice, root_ts, self.deps.clock.now_ms());
         if let Err(e) = self.deps.agent.deliver(&Window::of(&target), &envelope) {
             ctx.error("bridge", &format!("message_changed delivery failed: {e}"));
             return;
@@ -1350,7 +991,7 @@ impl Bridge {
         });
         match target {
             Some(w) => {
-                let envelope = msg.envelope(root_ts, self.deps.clock.now_ms());
+                let envelope = envelope(msg, root_ts, self.deps.clock.now_ms());
                 match self.deps.agent.deliver(&Window::of(&w), &envelope) {
                     Ok(()) => ctx.info(
                         "bridge",
@@ -1630,7 +1271,7 @@ impl Bridge {
         let mut delivered = false;
         let mut i = 0;
         while i < queued.len() {
-            let text = queued[i].envelope(&root_ts, self.deps.clock.now_ms());
+            let text = envelope(&queued[i], &root_ts, self.deps.clock.now_ms());
             match self.deps.agent.deliver(&Window::of(&window), &text) {
                 Ok(()) => {
                     ctx.info("bridge", "flushed queued message");
@@ -1687,41 +1328,6 @@ mod tests {
         assert!(edit_notice("1.2", "", true, true).contains("a file/attachment only"));
         assert!(edit_notice("1.2", "", false, true).contains("Its new text is unavailable."));
         assert!(edit_notice("1.2", &"あ".repeat(1500), false, true).contains("… (truncated)"));
-    }
-
-    /// stop になるのは**付けられた**stop 絵文字だけ。合成テキストは Bun の原文。
-    #[test]
-    fn a_stop_reaction_is_only_a_stop_when_added() {
-        let r = |emoji: &str, added: bool| Reaction {
-            emoji: emoji.into(),
-            item_ts: "1.1".into(),
-            added,
-        };
-        assert!(r("red_circle", true).is_stop());
-        assert!(r("raised_hand", true).is_stop(), "hand の別名も通す");
-        assert!(!r("red_circle", false).is_stop(), "外したのは停止ではない");
-        assert!(!r("eyes", true).is_stop());
-
-        let added = r("tada", true).synthetic_text("U1", "done");
-        assert!(
-            added.starts_with("[reaction added] <@U1> reacted with :tada: on your message: done"),
-            "{added}"
-        );
-        assert!(added.contains("Do not stay silent"));
-        let removed = r("tada", false).synthetic_text("U1", "done");
-        assert!(
-            removed.starts_with(
-                "[reaction removed] <@U1> removed reaction :tada: on your message: done"
-            ),
-            "{removed}"
-        );
-        assert!(
-            !removed.contains("Do not stay silent"),
-            "外した側は促さない"
-        );
-        // 長い本文は 280 文字で切る
-        let long = r("eyes", true).synthetic_text("U1", &"あ".repeat(400));
-        assert!(long.contains(&format!("{}…", "あ".repeat(280))));
     }
 
     fn msg(kind: ChannelKind, user: Option<&str>, is_bot: bool) -> InboundMsg {
@@ -1897,86 +1503,4 @@ mod tests {
         );
     }
 
-    /// 実物の file_share イベント(画像だけ = text 無し)が落ちずに添付ごと通ること。
-    #[test]
-    fn normalize_keeps_a_text_less_file_share() {
-        let ev: SlackMessageEvent = serde_json::from_str(
-            r#"{"type":"message","subtype":"file_share","ts":"171.002","channel":"D1",
-                "channel_type":"im","user":"U1",
-                "files":[{"id":"F1","name":"shot.png"},{"id":"F2"}]}"#,
-        )
-        .expect("file_share event must deserialize");
-        let m = InboundMsg::from_event(&ev)
-            .expect("a message with files is answerable even without text");
-        assert_eq!(m.text, "");
-        assert_eq!(
-            m.files
-                .iter()
-                .map(|f| (f.id.as_str(), f.name.as_str()))
-                .collect::<Vec<_>>(),
-            [("F1", "shot.png"), ("F2", "F2")],
-            "name が無ければ id を表示名に使う(劣化ノート用)"
-        );
-        // 添付も本文も無ければ従来どおり落とす
-        let empty: SlackMessageEvent = serde_json::from_str(
-            r#"{"type":"message","ts":"171.003","channel":"D1","channel_type":"im","user":"U1"}"#,
-        )
-        .unwrap();
-        assert!(InboundMsg::from_event(&empty).is_none());
-    }
-
-    fn ev(json: &str) -> SlackMessageEvent {
-        serde_json::from_str(json).expect("event json")
-    }
-
-    #[test]
-    fn normalizes_channel_message() {
-        let m = InboundMsg::from_event(&ev(
-            r#"{"ts":"1.1","channel":"C1","channel_type":"channel","user":"U1","text":"hi"}"#,
-        ))
-        .expect("should normalize");
-        assert_eq!(m.channel, "C1");
-        assert_eq!(m.channel_kind, ChannelKind::Channel);
-        assert_eq!(m.ts, "1.1");
-        assert_eq!(m.thread_ts, None);
-        assert_eq!(m.user.as_deref(), Some("U1"));
-        assert!(!m.is_bot);
-        assert_eq!(m.text, "hi");
-    }
-
-    #[test]
-    fn normalizes_dm_with_thread() {
-        let m = InboundMsg::from_event(&ev(
-            r#"{"ts":"2.2","thread_ts":"2.0","channel":"D1","channel_type":"im","user":"U1","text":"yo"}"#,
-        ))
-        .expect("should normalize");
-        assert_eq!(m.channel_kind, ChannelKind::Dm);
-        assert_eq!(m.thread_ts.as_deref(), Some("2.0"));
-    }
-
-    #[test]
-    fn marks_bot_and_system_senders() {
-        // bot_id 付き
-        let m = InboundMsg::from_event(&ev(
-            r#"{"ts":"3.3","channel":"C1","user":"U1","bot_id":"B1","text":"echo"}"#,
-        ))
-        .expect("should normalize");
-        assert!(m.is_bot, "bot_id present must mark is_bot");
-        // 送信者不明(システム)
-        let m = InboundMsg::from_event(&ev(r#"{"ts":"3.4","channel":"C1","text":"joined"}"#))
-            .expect("normalize");
-        assert!(m.is_bot, "missing user must mark is_bot");
-    }
-
-    #[test]
-    fn skips_messages_we_cannot_answer() {
-        assert!(
-            InboundMsg::from_event(&ev(r#"{"ts":"4.4","channel":"C1","user":"U1"}"#)).is_none(),
-            "no text"
-        );
-        assert!(
-            InboundMsg::from_event(&ev(r#"{"ts":"4.5","user":"U1","text":"x"}"#)).is_none(),
-            "no channel"
-        );
-    }
 }

@@ -20,7 +20,7 @@ use crate::agent::claude::HookIntake;
 use crate::agent::claude::Claude;
 use crate::bridge::command::CmdFx;
 use crate::bridge::state as bridge;
-use crate::bridge::inbound::InboundMsg;
+use crate::chat::InboundMsg;
 use crate::bridge::state::{LogCtx, ThreadKey};
 use crate::bridge::turn::{PermPending, Stall};
 use crate::chat::slack;
@@ -1081,7 +1081,7 @@ mod tests {
     fn dedup_key_separates_a_deletion_from_the_message_it_removes() {
         let base = InboundMsg {
             channel: "C1".into(),
-            channel_kind: inbound::ChannelKind::Channel,
+            channel_kind: crate::chat::ChannelKind::Channel,
             ts: "1.1".into(),
             thread_ts: None,
             user: Some("U1".into()),
@@ -1105,7 +1105,7 @@ mod tests {
         // 自分が付けた印だけ捨てる。人が付けたものは今までどおり通す(stop の ✋ が死ぬ)
         let react = |by: &str| InboundMsg {
             user: Some(by.into()),
-            reaction: Some(inbound::Reaction {
+            reaction: Some(crate::chat::Reaction {
                 emoji: "eyes".into(),
                 item_ts: "1.1".into(),
                 added: true,
@@ -1122,7 +1122,7 @@ mod tests {
     /// 自分が書いたのではない投稿への stop は、**Owner が自分の依頼に付けたときだけ**通す。
     #[test]
     fn only_the_owner_stopping_their_own_request_counts() {
-        let r = |emoji: &str| inbound::Reaction {
+        let r = |emoji: &str| crate::chat::Reaction {
             emoji: emoji.into(),
             item_ts: "1.1".into(),
             added: true,
@@ -1154,7 +1154,7 @@ mod tests {
             "Owner がまだ居ない"
         );
         // 外したときは止めない(`is_stop` は added のときだけ真)
-        let removed = inbound::Reaction {
+        let removed = crate::chat::Reaction {
             added: false,
             ..r("raised_hand")
         };
@@ -1281,7 +1281,7 @@ mod tests {
     fn channel_msg(ts: &str, user: &str, text: &str) -> InboundMsg {
         InboundMsg {
             channel: "C1".into(),
-            channel_kind: inbound::ChannelKind::Channel,
+            channel_kind: crate::chat::ChannelKind::Channel,
             ts: ts.into(),
             thread_ts: None,
             user: Some(user.into()),

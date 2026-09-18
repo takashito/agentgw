@@ -1,5 +1,6 @@
 //! Talking to the chat platform. [`Chat`] is what the core asks of it; `chat::slack` implements
 //! it. Another platform would sit next to `slack` as `chat::<name>`.
+//! The shape of what arrives ([`InboundMsg`] and friends) lives here; `chat::slack` parses into it.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -7,6 +8,153 @@ use std::sync::Arc;
 pub mod slack;
 
 use async_trait::async_trait;
+
+// ── what arrives from the chat ──
+
+/// 受信メッセージの出どころ。
+///
+/// DM とチャンネルで**言い方も既定も変わる**(DM の `pwd` は拒む /
+/// チャンネルは mention の要否が違う)ので、素性を型で持つ。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ChannelKind {
+    Dm,
+    Channel,
+}
+
+/// 受信メッセージに付いていた添付1つ。先読みダウンロードの入力。
+///
+/// `name` は劣化ノートに出す表示名 — Slack が name を寄越さなければ id そのもの。
+#[derive(Clone, Debug)]
+pub struct InboundFile {
+    pub id: String,
+    pub name: String,
+}
+
+/// Bridge の語彙。slack.rs が生成し、worker/endpoints も参照する。
+#[derive(Clone, Debug)]
+pub struct InboundMsg {
+    pub channel: String,
+    pub channel_kind: ChannelKind,
+    pub ts: String,
+    pub thread_ts: Option<String>,
+    pub user: Option<String>,
+    pub is_bot: bool,
+    /// Slack が付ける bot の id。`allow-bot` で許した相手かを照合するのに要る。
+    pub bot_id: Option<String>,
+    pub text: String,
+    /// Slack の `files[]`(slack.rs が埋める)。
+    pub files: Vec<InboundFile>,
+    /// 先読みダウンロードの結果 — 成功したローカルパスと、失敗の劣化ノート。
+    /// 受信経路(main.rs)が配達の直前に埋める。queue された分もこの値ごと持ち越す。
+    pub file_paths: Vec<String>,
+    pub file_errors: Vec<String>,
+    /// このメッセージがリアクション由来ならその素性。ワーカーには合成テキストで
+    /// 届く(`text` に入っている)が、**進捗付箋に付いた stop 絵文字だけ**は配達せず停止に使う。
+    pub reaction: Option<Reaction>,
+    /// ユーザーが**消した**メッセージの ts。埋まっていれば、これは削除の合図で
+    /// `text` は取り消しの指示文(`deletion_notice`)。
+    pub deleted_ts: Option<String>,
+    /// ユーザーが**書き換えた**メッセージの ts と、その改訂 id(dedup 用)。
+    /// 埋まっていれば `text` は**新しい本文そのもの** — 指示文は Bridge が組む
+    /// (「いま処理中のものか」で言い方が変わり、それを知っているのは Bridge だけ)。
+    pub edited: Option<Edited>,
+}
+
+/// 書き換え1件。`revision` は Slack の `edited.ts`(同じ編集が再配達されたときの目印)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Edited {
+    pub ts: String,
+    pub revision: String,
+}
+
+/// リアクション1つ。
+///
+/// `item_ts` は**付けられた側のメッセージ**の ts — 付箋かどうかをこれで見分ける
+/// (付箋以外への stop 絵文字はただのリアクション)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reaction {
+    pub emoji: String,
+    pub item_ts: String,
+    pub added: bool,
+}
+
+/// stop として扱うリアクション名(6つ)。`hand` と `raised_hand` は
+/// 同じ ✋ の別名なので、どちらを選んでも通す。**コロンは付かない** — Slack のリアクション名は
+/// `red_circle` の形で来る(本文の `:red_circle:` とは別物)。
+const STOP_REACTION_NAMES: [&str; 6] = [
+    "red_circle",
+    "octagonal_sign",
+    "black_square_for_stop",
+    "hand",
+    "raised_hand",
+    "x",
+];
+
+impl Reaction {
+    pub fn is_stop(&self) -> bool {
+        self.added && STOP_REACTION_NAMES.contains(&self.emoji.as_str())
+    }
+
+    /// ワーカーに渡す合成テキスト。リアクションは
+    /// 軽い合図なので、**黙らないように**と念を押す一文が付く(added のときだけ)。
+    pub fn synthetic_text(&self, reactor: &str, item_text: &str) -> String {
+        let truncated: String = if item_text.chars().count() > 280 {
+            item_text.chars().take(280).chain(['…']).collect()
+        } else {
+            item_text.to_string()
+        };
+        let kind = if self.added { "added" } else { "removed" };
+        let verb = if self.added {
+            "reacted with"
+        } else {
+            "removed reaction"
+        };
+        let hint = if self.added {
+            " Do not stay silent: at minimum call the `react` tool to acknowledge (e.g. mirror \
+             the emoji, or use 👍/🙏/🤔 as appropriate). Reply with text only if the reaction \
+             calls for a substantive response."
+        } else {
+            ""
+        };
+        format!(
+            "[reaction {kind}] <@{reactor}> {verb} :{}: on your message: {truncated}{hint}",
+            self.emoji
+        )
+    }
+}
+
+/// 取り消しをワーカーに伝える文。
+/// **「消されました」とだけ言い返させない** — まだ外に出していない作業は捨てる、
+/// もう外に出した副作用があるときだけ説明する、という判断をさせる。
+pub fn deletion_notice(deleted_ts: &str, text: &str, had_files: bool) -> String {
+    const SNIPPET_MAX: usize = 1000;
+    let trimmed = text.trim();
+    let content_desc = if trimmed.is_empty() {
+        if had_files {
+            "It had no text (it was a file/attachment upload).".to_string()
+        } else {
+            "Its text is unavailable.".to_string()
+        }
+    } else if trimmed.chars().count() > SNIPPET_MAX {
+        let head: String = trimmed.chars().take(SNIPPET_MAX).collect();
+        format!("Its content was:\n\"\"\"\n{head}… (truncated)\n\"\"\"")
+    } else {
+        format!("Its content was:\n\"\"\"\n{trimmed}\n\"\"\"")
+    };
+    format!(
+        "[message_deleted] The user DELETED their own message (id {deleted_ts}). They removed \
+         that request from the conversation — handle it as if the message had never been sent. \
+         {content_desc}\n\nDecide based on what you have ACTUALLY done for it so far:\n\
+         • If you have NOT yet performed any external/irreversible action for it — including the \
+         case where you only prepared, computed, or were about to send an answer — then DISCARD \
+         that work: call no_reply and output nothing. A not-yet-sent answer is NOT a side-effect; \
+         throw it away.\n\
+         • Only reply if you ALREADY performed a real external side-effect that the user must know \
+         about or that needs reverting (e.g. created/edited a file, ran a command with lasting \
+         effects, or already posted a message), in which case briefly explain and/or undo it.\n\
+         Never output any text merely stating that the message was deleted."
+    )
+}
 
 // ── what reads return ──
 
@@ -282,5 +430,40 @@ mod tests {
             s.calls(),
             vec!["post C1 1.0 hello".to_string(), format!("react C1 {ts} eyes")]
         );
+    }
+
+    /// stop になるのは**付けられた**stop 絵文字だけ。合成テキストは Bun の原文。
+    #[test]
+    fn a_stop_reaction_is_only_a_stop_when_added() {
+        let r = |emoji: &str, added: bool| Reaction {
+            emoji: emoji.into(),
+            item_ts: "1.1".into(),
+            added,
+        };
+        assert!(r("red_circle", true).is_stop());
+        assert!(r("raised_hand", true).is_stop(), "hand の別名も通す");
+        assert!(!r("red_circle", false).is_stop(), "外したのは停止ではない");
+        assert!(!r("eyes", true).is_stop());
+
+        let added = r("tada", true).synthetic_text("U1", "done");
+        assert!(
+            added.starts_with("[reaction added] <@U1> reacted with :tada: on your message: done"),
+            "{added}"
+        );
+        assert!(added.contains("Do not stay silent"));
+        let removed = r("tada", false).synthetic_text("U1", "done");
+        assert!(
+            removed.starts_with(
+                "[reaction removed] <@U1> removed reaction :tada: on your message: done"
+            ),
+            "{removed}"
+        );
+        assert!(
+            !removed.contains("Do not stay silent"),
+            "外した側は促さない"
+        );
+        // 長い本文は 280 文字で切る
+        let long = r("eyes", true).synthetic_text("U1", &"あ".repeat(400));
+        assert!(long.contains(&format!("{}…", "あ".repeat(280))));
     }
 }

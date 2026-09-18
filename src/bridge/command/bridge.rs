@@ -3,7 +3,7 @@
 
 use super::PwdMode;
 use crate::agent::SessionId;
-use crate::bridge::inbound::InboundMsg;
+use crate::chat::InboundMsg;
 use crate::bridge::state::{self as bridge, LogCtx, ThreadKey};
 use crate::bridge::{Bridge, Host};
 use crate::chat::slack;

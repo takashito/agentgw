@@ -31,10 +31,9 @@ use crate::agent::Agent;
 use std::path::Path;
 
 use super::Bridge;
-use super::inbound::InboundMsg;
+use crate::chat::InboundMsg;
 use super::state::{LogCtx, ThreadKey};
 use crate::agent::screen::SpawnOutcome;
-use crate::bridge::inbound;
 use std::collections::HashMap;
 
 // ── 節1: 本文の読み方 ────────────────────────────────────────────────────────
@@ -626,7 +625,7 @@ impl Bridge {
             );
             return true;
         }
-        let dm = msg.channel_kind == inbound::ChannelKind::Dm;
+        let dm = msg.channel_kind == crate::chat::ChannelKind::Dm;
 
         match cmd {
             // stop。ESC は tmux を通るので
