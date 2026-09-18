@@ -733,29 +733,46 @@ impl Bridge {
                 self.maintenance_restart("slack restart command", Some((&channel, root_ts)), &ctx)
                     .await;
             }
-            // 既にサインイン済みでの `login`。ワーカーに落とすと
-            // 「何にログインしますか?」と訊き返してくるので、ここで打ち止める
+            // Owner が居るときの `login`。Owner が決まっていても、**このマシンの** Claude Code の
+            // サインインは別に切れる(2026-09-18、あるマシンだけ切れていて Slack から戻す手段が無かった)。
+            // だから実際の状態を訊き、切れていればここで(このマシンで)サインインを始める。
+            // サインイン済みなら打ち止める — ワーカーに落とすと「何にログインしますか?」と訊き返す
             Cmd::Login => {
-                ctx.info(
-                    "bridge",
-                    &format!(
-                        "slack-events: login command from Owner while already signed in — \
-                         replying already-signed-in msg={} channel={} dm={dm}",
-                        msg.ts, msg.channel
-                    ),
-                );
-                self.post(
-                    &msg.channel,
-                    root_ts,
-                    {
-                        let owner = &self.access.owner;
-                        crate::t!(
-                            "Already signed in (owner: <@{owner}>). To switch accounts, send `logout`, then `login`.",
-                            "既にサインインしています(Owner: <@{owner}>)。アカウントを切り替えるには、`logout` のあとに `login` を送ってください。"
-                        )
-                    },
-                    key,
-                );
+                let signed_in = self.deps.agent.signed_in().await;
+                if signed_in == Some(true) {
+                    ctx.info(
+                        "bridge",
+                        &format!(
+                            "slack-events: login command from Owner while already signed in — \
+                             replying already-signed-in msg={} channel={} dm={dm}",
+                            msg.ts, msg.channel
+                        ),
+                    );
+                    self.post(
+                        &msg.channel,
+                        root_ts,
+                        {
+                            let owner = &self.access.owner;
+                            crate::t!(
+                                "Already signed in (owner: <@{owner}>). To switch accounts, send `logout`, then `login`.",
+                                "既にサインインしています(Owner: <@{owner}>)。アカウントを切り替えるには、`logout` のあとに `login` を送ってください。"
+                            )
+                        },
+                        key,
+                    );
+                } else {
+                    ctx.info(
+                        "bridge",
+                        &format!(
+                            "slack-events: login command from Owner — this machine's agent is {} — \
+                             starting sign-in here msg={} channel={} dm={dm}",
+                            if signed_in == Some(false) { "signed out" } else { "of unknown sign-in state" },
+                            msg.ts,
+                            msg.channel
+                        ),
+                    );
+                    self.start_login(msg.channel.clone(), sender.to_string(), root_ts.to_string());
+                }
             }
             Cmd::Logout => {
                 ctx.info(

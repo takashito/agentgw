@@ -365,6 +365,8 @@ pub trait Agent: Send + Sync + 'static {
     fn context_argv(&self, session_id: &str) -> Vec<String>;
     fn usage_argv(&self) -> Vec<String>;
     async fn probe(&self, argv: Vec<String>, cwd: String) -> Result<String, ProbeErr>;
+    /// Whether the agent is signed in right now. `None` = couldn't find out.
+    async fn signed_in(&self) -> Option<bool>;
     fn context_report(&self, raw: &str) -> Option<ContextReport>;
     fn usage_rows(&self, raw: &str) -> Option<Vec<UsageRow>>;
 
@@ -397,6 +399,8 @@ pub mod fake {
         pub histories: Mutex<Vec<String>>,
         /// What `failure_type` answers (what the agent's own record says a failed turn died of).
         pub failure_type: Mutex<Option<&'static str>>,
+        /// What `signed_in` answers once set; unset means `Some(true)` (the usual case).
+        pub signed_in: Mutex<Option<Option<bool>>>,
         windows: Mutex<Vec<WindowRow>>,
         next: AtomicU64,
     }
@@ -534,6 +538,9 @@ pub mod fake {
         }
         async fn probe(&self, _a: Vec<String>, _c: String) -> Result<String, ProbeErr> {
             Ok(String::new())
+        }
+        async fn signed_in(&self) -> Option<bool> {
+            self.signed_in.lock().unwrap().unwrap_or(Some(true))
         }
         fn context_report(&self, _r: &str) -> Option<ContextReport> {
             None

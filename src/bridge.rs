@@ -98,6 +98,8 @@ pub struct Bridge {
     /// (実行するのは `relay::CommandCtx::route`。持っていないマシンで一覧に出しても
     /// 振り分ける相手が居ない)。
     fleet: bool,
+    /// This machine's name as the gateway knows it (`route <name>`); the hostname if unset.
+    machine_name: String,
 }
 
 /// The outside world. Only `Bridge::run()` wires the real ones; tests fill it with fakes
@@ -119,6 +121,7 @@ struct Config {
     /// When this Bridge started listening. Commands posted before it are stale.
     started_at_ms: u64,
     fleet: bool,
+    machine_name: String,
     cmd_tx: mpsc::Sender<CmdFx>,
 }
 
@@ -154,6 +157,7 @@ impl Bridge {
             usage_warned_pct: 0,
             stall: HashMap::new(),
             fleet: config.fleet,
+            machine_name: config.machine_name,
         }
     }
 
@@ -167,6 +171,7 @@ impl Bridge {
             bot_user_id: Some("U_BOT".into()),
             started_at_ms: deps.clock.now_ms(),
             fleet: false,
+            machine_name: "test-machine".into(),
             cmd_tx,
         };
         (Bridge::new(deps, config), cmd_rx)
@@ -673,6 +678,10 @@ impl Bridge {
                 bot_user_id,
                 started_at_ms,
                 fleet: fleet.is_some(),
+                machine_name: match wiring.self_id.clone() {
+                    Some(id) if !id.is_empty() => id,
+                    _ => Host::name().await,
+                },
                 cmd_tx,
             },
         );
@@ -1619,5 +1628,43 @@ mod tests {
             "{:?}",
             slack.calls()
         );
+        // Names the machine and sends the person to `login` in this very thread: the thread's
+        // messages reach this machine, so `login` here signs this machine in
+        assert!(
+            slack.calls().iter().any(|c| c.contains("*test-machine*") && c.contains("Send `login` here")),
+            "{:?}",
+            slack.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn login_on_a_signed_out_machine_starts_the_sign_in_here() {
+        let (d, slack, agent, _clock) = flow_deps("login-signed-out");
+        *agent.signed_in.lock().unwrap() = Some(Some(false));
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "<@U_BOT> login")).await;
+        settle().await;
+        let calls = slack.calls();
+        // The sign-in started here (the link follows after the first poll of the sign-in screen)
+        assert!(calls.iter().any(|c| c.starts_with("status C1") && c.contains("Signing in")), "{calls:?}");
+        assert!(!calls.iter().any(|c| c.contains("Already signed in")), "{calls:?}");
+    }
+
+    #[tokio::test]
+    async fn login_on_a_signed_in_machine_says_so() {
+        let (d, slack, _agent, _clock) = flow_deps("login-signed-in");
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "<@U_BOT> login")).await;
+        settle().await;
+        assert!(slack.calls().iter().any(|c| c.contains("Already signed in")), "{:?}", slack.calls());
+    }
+
+    #[tokio::test]
+    async fn signing_in_again_keeps_the_owner() {
+        let (d, _slack, _agent, _clock) = flow_deps("login-keeps-owner");
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.on_cmd_fx(CmdFx::LoginFinished { channel: "C1".into(), bound: Some("U_SOMEONE".into()) })
+            .await;
+        assert_eq!(b.access.owner, "U_OWNER");
     }
 }

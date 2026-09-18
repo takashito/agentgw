@@ -939,6 +939,8 @@ impl Bridge {
             &format!("login: submitting pasted code for {user} (channel {channel})"),
         );
         let (api, cmd_tx) = (self.deps.slack.clone(), self.cmd_tx.clone());
+        // Owner が既に居るなら、これはこのマシンの Claude Code のサインインし直し。Owner は変わらない
+        let had_owner = !self.access.owner.is_empty();
         // サインインの後半(貼られたコードの判定、最大 CODE_POLL_MAX 秒)も待ち時間 —
         // login_start の guard は URL を出した時点で落ちているので、ここで張り直す
         let thinking = slack::Thinking::new(self.deps.slack.clone(), &channel, &reply_ts, &slack::Status::Login.text());
@@ -977,10 +979,14 @@ impl Bridge {
             // セッションの片付けと pending の削除、Owner の書き込みは main の仕事
             let (text, bound) = if outcome == "success" {
                 (
-                    crate::t!(
-                        "Signed in ✅ — you're now the owner of this bot.",
-                        "サインインしました ✅ — あなたがこのボットの Owner になりました。"
-                    ),
+                    if had_owner {
+                        crate::t!("Signed in ✅", "サインインしました ✅")
+                    } else {
+                        crate::t!(
+                            "Signed in ✅ — you're now the owner of this bot.",
+                            "サインインしました ✅ — あなたがこのボットの Owner になりました。"
+                        )
+                    },
                     Some(user),
                 )
             } else {
@@ -1075,13 +1081,23 @@ impl Bridge {
                 self.deps.agent.login_kill();
                 self.sign_in.pending.remove(&channel);
                 let Some(user) = bound else { return };
-                let mut access = self.access.clone();
-                access.owner.clone_from(&user);
-                self.adopt_access(access, &ctx);
-                ctx.info(
-                    "bridge",
-                    &format!("login: SUCCESS — {user} bound as Owner (channel {channel})"),
-                );
+                if self.access.owner.is_empty() {
+                    let mut access = self.access.clone();
+                    access.owner.clone_from(&user);
+                    self.adopt_access(access, &ctx);
+                    ctx.info(
+                        "bridge",
+                        &format!("login: SUCCESS — {user} bound as Owner (channel {channel})"),
+                    );
+                } else {
+                    // Owner は決まっている — これはこのマシンのサインインし直し
+                    ctx.info(
+                        "bridge",
+                        &format!(
+                            "login: SUCCESS — signed in again by {user}; Owner unchanged (channel {channel})"
+                        ),
+                    );
+                }
                 // サインインは仕切り直し — 前の認証状態で諦めた枠をもう一度試す
                 // (これが無いと一時的な失敗で枠が Bridge の寿命いっぱい空く)
                 if !self.workers.gave_up_count() == 0 {

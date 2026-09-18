@@ -874,6 +874,25 @@ impl Claude {
         }
     }
 
+    /// Whether Claude Code is signed in on this machine, by `claude auth status`. Reads the
+    /// JSON it prints, not its exit code (it exits 1 when signed out). `None` = no answer.
+    pub async fn signed_in(&self) -> Option<bool> {
+        let run = tokio::process::Command::new("claude")
+            .args(["auth", "status"])
+            .env_remove("AGENTGW_SESSION_ID")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output();
+        let out = tokio::time::timeout(PROBE_TIMEOUT, run).await.ok()?.ok()?;
+        Self::auth_status_signed_in(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    /// `loggedIn` of `claude auth status`'s JSON.
+    pub fn auth_status_signed_in(json: &str) -> Option<bool> {
+        serde_json::from_str::<serde_json::Value>(json).ok()?["loggedIn"].as_bool()
+    }
+
     pub async fn probe(&self, argv: Vec<String>, cwd: String) -> Result<String, ProbeErr> {
         let Some((bin, args)) = argv.split_first() else {
             return Err(ProbeErr::Errored("empty probe argv".to_string()));
@@ -1075,6 +1094,10 @@ impl crate::agent::Agent for Claude {
 
     async fn probe(&self, argv: Vec<String>, cwd: String) -> Result<String, ProbeErr> {
         Claude::probe(self, argv, cwd).await
+    }
+
+    async fn signed_in(&self) -> Option<bool> {
+        Claude::signed_in(self).await
     }
 
     fn context_report(&self, raw: &str) -> Option<super::ContextReport> {
@@ -2204,6 +2227,15 @@ mod tests {
             2,
             "confirm と trust に1回ずつ: {keys:?}"
         );
+    }
+
+    #[test]
+    fn auth_status_is_read_from_its_json_not_its_exit_code() {
+        // `claude auth status` exits 1 when signed out but still prints the JSON
+        assert_eq!(Claude::auth_status_signed_in(r#"{"loggedIn": true, "authMethod": "claude.ai"}"#), Some(true));
+        assert_eq!(Claude::auth_status_signed_in(r#"{"loggedIn": false, "authMethod": "none"}"#), Some(false));
+        assert_eq!(Claude::auth_status_signed_in("not json"), None);
+        assert_eq!(Claude::auth_status_signed_in(r#"{"authMethod": "none"}"#), None);
     }
 
     #[test]

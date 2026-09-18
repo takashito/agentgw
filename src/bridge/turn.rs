@@ -166,7 +166,16 @@ impl Bridge {
             None
         };
         let reason = recorded.unwrap_or(sent);
-        let (klass, text) = TurnFailureClass::of(reason);
+        let (klass, mut text) = TurnFailureClass::of(reason);
+        // サインイン切れは**このマシンの**話。送り先を言う — このスレッドのメッセージはこのマシンに
+        // 届くので、ここで打つ `login` がこのマシンをサインインし直す
+        if reason.to_ascii_lowercase().contains("authentication_failed") {
+            let machine = &self.machine_name;
+            text = crate::t!(
+                "Claude Code on *{machine}* is signed out, so no reply was written. Send `login` here to sign in again.",
+                "*{machine}* の Claude Code のサインインが切れていて、返信を書けませんでした。ここで `login` と送ると、サインインし直せます。"
+            );
+        }
         let raw = serde_json::json!({
             "hook_event_name": ev.payload["hook_event_name"],
             "error_type": ev.payload["error_type"],
@@ -1253,8 +1262,8 @@ impl TurnFailureClass {
         (
             "authentication_failed",
             TurnFailureClass::TellUser,
-            "Claude Code is signed out, so no reply was written. DM the bot `login` to sign in again.",
-            "Claude Code のサインインが切れていて、返信を書けませんでした。ボットに `login` と DM してサインインし直してください。",
+            "Claude Code is signed out, so no reply was written. Send `login` here to sign in again.",
+            "Claude Code のサインインが切れていて、返信を書けませんでした。ここで `login` と送ると、サインインし直せます。",
         ),
         (
             "oauth_org_not_allowed",
