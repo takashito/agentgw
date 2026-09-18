@@ -198,7 +198,7 @@ impl StateDir {
     }
 }
 
-/// いまの epoch ミリ秒。chrono は使わない(依存は確定7つ)。
+/// いまの epoch ミリ秒。
 ///
 /// 時刻は**生の `u64` のまま持ち回る** — newtype を被せても、この repo の時刻は
 /// `deadline_ms` / `spawned_at_ms` / `until_ms` … と全部 epoch ms なので守るものが無い。
@@ -211,29 +211,10 @@ pub fn now_ms() -> u64 {
 
 /// `2026-07-27T12:00:00.000Z`
 pub fn iso8601(ms: u64) -> String {
-    let (secs, millis) = ((ms / 1000) as i64, (ms % 1000) as u32);
-    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
-    let (y, m, dd) = civil_from_days(days);
-    format!(
-        "{y:04}-{m:02}-{dd:02}T{:02}:{:02}:{:02}.{millis:03}Z",
-        rem / 3600,
-        (rem % 3600) / 60,
-        rem % 60
-    )
-}
-
-/// days-since-epoch → (year, month, day)。Howard Hinnant の civil_from_days。
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
+    chrono::DateTime::from_timestamp_millis(ms as i64)
+        .unwrap_or_default()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
 }
 
 /// ログ1行の宛先。
@@ -565,6 +546,17 @@ impl ThreadEntry {
             ..Default::default()
         }
     }
+
+    /// プールから引き当てた worker をスレッドに縛るときの threads.json エントリの器
+    /// `agent_id` は呼び出し側が claimed.session_id を差し込む。
+    pub fn for_pool_assignment(channel_id: &str, cwd: &str, topic: Option<String>) -> ThreadEntry {
+        ThreadEntry {
+            channel_id: Some(channel_id.to_string()),
+            repo_path: Some(cwd.to_string()),
+            topic,
+            ..Default::default()
+        }
+    }
 }
 
 /// threads.json — トップレベルは thread_ts → entry。キー順安定のため BTreeMap。
@@ -837,6 +829,14 @@ impl Threads {
         }
         self.upsert(thread_ts, e);
     }
+
+    // ── ウォームプール ──
+
+    /// プールを引き当ててよいか。**まだ知らないスレッドだけ**が対象
+    /// 既存スレッドは自分のセッションで resume/deliver しなければ会話の続きを失う。
+    pub fn should_claim_pool(entry: Option<&ThreadEntry>) -> bool {
+        entry.is_none()
+    }
 }
 
 /// access.json の `"pools"` — cwd → 在庫に**指名**したセッション ID。中身は cwd
@@ -1024,22 +1024,11 @@ impl Access {
     pub fn set_bridge(&mut self, channel: &str, bridge_id: &str) {
         self.routes.entry(channel.to_string()).or_default().bridge = Some(bridge_id.to_string());
     }
-}
 
-/// アクセス台帳への1変異。`SetHome` の空文字は Home 解除。
-#[derive(Clone, Debug)]
-pub enum AccessOp {
-    BotAllow(String),
-    BotRemove(String),
-    SetRepo { channel: String, path: String },
-    SetWarm { channel: String, on: bool },
-    SetHome(String),
-}
-
-/// 変異を純関数として適用する — prev は触らず、新しい Access と人間向けメッセージ・警告を返す。
-/// 検証失敗は Err(呼び手が出す)。**認可はしない**。移植元。
-/// メッセージ・警告・エラーの文言は原文コピー。
-impl Access {
+    // ── 変異(AccessOp) ──
+    // 変異を純関数として適用する — prev は触らず、新しい Access と人間向けメッセージ・警告を返す。
+    // 検証失敗は Err(呼び手が出す)。**認可はしない**。移植元。
+    // メッセージ・警告・エラーの文言は原文コピー。
     /// 変異を純関数として適用する — self は触らず、新しい Access と人間向けメッセージ・
     /// 警告を返す。検証失敗は Err(呼び手が出す)。**認可はしない**。
     pub fn apply(&self, op: AccessOp) -> Result<(Access, String, Vec<String>), String> {
@@ -1142,18 +1131,16 @@ impl Access {
             None => (home.to_string(), true),
         }
     }
-}
 
-// ─── ウォームプール: プールの粒度(純ロジック) ──────────────────────
+    // ── ウォームプール: プールの粒度(純ロジック) ──
 
-/// 在庫を保つべきプール集合 = **在庫を待たせる cwd の一覧**(ワーカー起動時に固定される)。
-/// access のみから決まる純関数。
-/// - owner 未設定なら空(誰にも仕えないので事前起動は純粋な無駄)
-/// - HOME プールは常に1つ(次の新規 DM / repo 無しチャンネル。opt-out 不可)
-/// - あとは routes の **distinct な repo_path** ごとに1つ。 フラグはチャンネル単位
-///   だがプールは repo 単位なので、同じ repo を指すチャンネルが1つでも opt-in(`warm != Some(false)`、
-///   未設定は opt-in)なら在庫する(OR)。opt-out したチャンネルも、その在庫があれば引き当てる。
-impl Access {
+    /// 在庫を保つべきプール集合 = **在庫を待たせる cwd の一覧**(ワーカー起動時に固定される)。
+    /// access のみから決まる純関数。
+    /// - owner 未設定なら空(誰にも仕えないので事前起動は純粋な無駄)
+    /// - HOME プールは常に1つ(次の新規 DM / repo 無しチャンネル。opt-out 不可)
+    /// - あとは routes の **distinct な repo_path** ごとに1つ。 フラグはチャンネル単位
+    ///   だがプールは repo 単位なので、同じ repo を指すチャンネルが1つでも opt-in(`warm != Some(false)`、
+    ///   未設定は opt-in)なら在庫する(OR)。opt-out したチャンネルも、その在庫があれば引き当てる。
     pub fn pool_targets(&self, home_dir: &str) -> Vec<String> {
         if self.owner.is_empty() {
             return Vec::new();
@@ -1174,7 +1161,106 @@ impl Access {
         }
         targets
     }
+
+    // ── 門 ──
+    // 疑わしきは Drop(fail-closed)。owner 空の access は誰も通さない。
+    /// このチャンネルで「以後訊かない」と押されたツールか。
+    pub fn channel_tool_allowed(&self, channel: &str, tool: &str) -> bool {
+        self.routes
+            .get(channel)
+            .and_then(|r| r.allowed_tools.as_ref())
+            .is_some_and(|v| v.iter().any(|t| t == tool))
+    }
+
+    /// 「以後このチャンネルでは訊かない」を覚える。**人がボタンを押したときだけ**呼ばれる。
+    pub fn grant_channel_tool(&mut self, channel: &str, tool: &str) {
+        if channel.is_empty() || tool.is_empty() {
+            return;
+        }
+        let allowed = self
+            .routes
+            .entry(channel.to_string())
+            .or_default()
+            .allowed_tools
+            .get_or_insert_with(Vec::new);
+        if !allowed.iter().any(|t| t == tool) {
+            allowed.push(tool.to_string());
+        }
+    }
+
+    /// 入れる / 文脈として入れる / 落とす の3値(`decideChannelAccess` と
+    /// `decideDmAccess`)。
+    ///
+    /// **チャンネルが access.json に載っているかは見ない。** 登録(routes)が持っているのは
+    /// 「そのチャンネルでどのフォルダを触るか」で、入れる判断には使わない — 未登録の
+    /// チャンネルでも Owner のメンションには応える(現行の判定と同じ)。
+    ///
+    /// チャンネルでは**メンション**か**既に動いているスレッド**が要る。これが無いと、
+    /// 登録済みチャンネルの雑談まで全部ワーカーに流れる。
+    pub fn gate(&self, msg: &InboundMsg, is_mention: bool, is_active_thread: bool) -> GateVerdict {
+        let dm = msg.channel_kind == ChannelKind::Dm;
+        // bot を DM に入れる道は無い(`isBotDMBlocked`)
+        if msg.is_bot && dm {
+            return GateVerdict::Drop("bot-dm-blocked");
+        }
+        if self.owner.is_empty() {
+            return GateVerdict::Drop(if dm { "dm-no-owner" } else { "no-owner" });
+        }
+        // Slack Web API 経由の投稿には**人が書いたものでも** bot_id が付く。
+        // それでも Slack は本当の `user` を刻む(トークン由来なので本文からは詐称できない)ので、
+        // その人が Owner なら人として扱う。Owner 以外・user 無しは bot(閉じる方に倒す)
+        let is_owner = msg.user.as_deref() == Some(self.owner.as_str());
+        if dm {
+            return if is_owner {
+                GateVerdict::Serve
+            } else {
+                GateVerdict::Drop("dm-not-owner")
+            };
+        }
+        let reachable = is_mention || is_active_thread;
+        if msg.is_bot && !is_owner {
+            // Owner が allow-bot で許した bot だけ。それ以外は名指しでも通さない
+            let allowed = msg
+                .bot_id
+                .as_deref()
+                .is_some_and(|id| self.allowed_bots.iter().any(|b| b == id));
+            if !allowed {
+                return GateVerdict::Drop("drop-bot-not-allowed");
+            }
+            return if reachable {
+                GateVerdict::Serve
+            } else {
+                GateVerdict::Drop("require-mention-unmet")
+            };
+        }
+        if is_owner {
+            return if reachable {
+                GateVerdict::Serve
+            } else {
+                GateVerdict::Drop("require-mention-unmet")
+            };
+        }
+        // Owner 以外の人 — 動いているスレッドの中でだけ**文脈として**渡す(返事はさせない)
+        if is_active_thread {
+            GateVerdict::Context
+        } else {
+            GateVerdict::Drop("drop-not-owner")
+        }
+    }
 }
+
+/// アクセス台帳への1変異。`SetHome` の空文字は Home 解除。
+#[derive(Clone, Debug)]
+pub enum AccessOp {
+    BotAllow(String),
+    BotRemove(String),
+    SetRepo { channel: String, path: String },
+    SetWarm { channel: String, on: bool },
+    SetHome(String),
+}
+
+
+// ─── ウォームプール: プールの粒度(純ロジック) ──────────────────────
 
 /// 起動/終了の home 通知をどこへ出すか(判定だけを純関数に)。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1201,27 +1287,6 @@ impl NoticeTarget {
 pub struct PoolStatus {
     pub present: bool,
     pub gave_up: bool,
-}
-
-/// プールを引き当ててよいか。**まだ知らないスレッドだけ**が対象
-/// 既存スレッドは自分のセッションで resume/deliver しなければ会話の続きを失う。
-impl Threads {
-    pub fn should_claim_pool(entry: Option<&ThreadEntry>) -> bool {
-        entry.is_none()
-    }
-}
-
-/// プールから引き当てた worker をスレッドに縛るときの threads.json エントリの器
-/// `agent_id` は呼び出し側が claimed.session_id を差し込む。
-impl ThreadEntry {
-    pub fn for_pool_assignment(channel_id: &str, cwd: &str, topic: Option<String>) -> ThreadEntry {
-        ThreadEntry {
-            channel_id: Some(channel_id.to_string()),
-            repo_path: Some(cwd.to_string()),
-            topic,
-            ..Default::default()
-        }
-    }
 }
 
 impl PoolStatus {
@@ -1483,93 +1548,6 @@ pub enum Dispatch {
     SpawnResume(String),
     Deliver,
     Queue,
-}
-
-/// 疑わしきは Drop(fail-closed)。owner 空の access は誰も通さない。
-impl Access {
-    /// このチャンネルで「以後訊かない」と押されたツールか。
-    pub fn channel_tool_allowed(&self, channel: &str, tool: &str) -> bool {
-        self.routes
-            .get(channel)
-            .and_then(|r| r.allowed_tools.as_ref())
-            .is_some_and(|v| v.iter().any(|t| t == tool))
-    }
-
-    /// 「以後このチャンネルでは訊かない」を覚える。**人がボタンを押したときだけ**呼ばれる。
-    pub fn grant_channel_tool(&mut self, channel: &str, tool: &str) {
-        if channel.is_empty() || tool.is_empty() {
-            return;
-        }
-        let allowed = self
-            .routes
-            .entry(channel.to_string())
-            .or_default()
-            .allowed_tools
-            .get_or_insert_with(Vec::new);
-        if !allowed.iter().any(|t| t == tool) {
-            allowed.push(tool.to_string());
-        }
-    }
-
-    /// 入れる / 文脈として入れる / 落とす の3値(`decideChannelAccess` と
-    /// `decideDmAccess`)。
-    ///
-    /// **チャンネルが access.json に載っているかは見ない。** 登録(routes)が持っているのは
-    /// 「そのチャンネルでどのフォルダを触るか」で、入れる判断には使わない — 未登録の
-    /// チャンネルでも Owner のメンションには応える(現行の判定と同じ)。
-    ///
-    /// チャンネルでは**メンション**か**既に動いているスレッド**が要る。これが無いと、
-    /// 登録済みチャンネルの雑談まで全部ワーカーに流れる。
-    pub fn gate(&self, msg: &InboundMsg, is_mention: bool, is_active_thread: bool) -> GateVerdict {
-        let dm = msg.channel_kind == ChannelKind::Dm;
-        // bot を DM に入れる道は無い(`isBotDMBlocked`)
-        if msg.is_bot && dm {
-            return GateVerdict::Drop("bot-dm-blocked");
-        }
-        if self.owner.is_empty() {
-            return GateVerdict::Drop(if dm { "dm-no-owner" } else { "no-owner" });
-        }
-        // Slack Web API 経由の投稿には**人が書いたものでも** bot_id が付く。
-        // それでも Slack は本当の `user` を刻む(トークン由来なので本文からは詐称できない)ので、
-        // その人が Owner なら人として扱う。Owner 以外・user 無しは bot(閉じる方に倒す)
-        let is_owner = msg.user.as_deref() == Some(self.owner.as_str());
-        if dm {
-            return if is_owner {
-                GateVerdict::Serve
-            } else {
-                GateVerdict::Drop("dm-not-owner")
-            };
-        }
-        let reachable = is_mention || is_active_thread;
-        if msg.is_bot && !is_owner {
-            // Owner が allow-bot で許した bot だけ。それ以外は名指しでも通さない
-            let allowed = msg
-                .bot_id
-                .as_deref()
-                .is_some_and(|id| self.allowed_bots.iter().any(|b| b == id));
-            if !allowed {
-                return GateVerdict::Drop("drop-bot-not-allowed");
-            }
-            return if reachable {
-                GateVerdict::Serve
-            } else {
-                GateVerdict::Drop("require-mention-unmet")
-            };
-        }
-        if is_owner {
-            return if reachable {
-                GateVerdict::Serve
-            } else {
-                GateVerdict::Drop("require-mention-unmet")
-            };
-        }
-        // Owner 以外の人 — 動いているスレッドの中でだけ**文脈として**渡す(返事はさせない)
-        if is_active_thread {
-            GateVerdict::Context
-        } else {
-            GateVerdict::Drop("drop-not-owner")
-        }
-    }
 }
 
 const DEDUP_CAP: usize = 512;
@@ -1866,17 +1844,17 @@ impl Ledger {
             .map(|entries| entries.iter().map(|e| e.id.clone()).collect())
             .unwrap_or_default()
     }
-}
 
-/// 封筒の `message_id` が transcript に現れた = ワーカーがそれを読んだ。ターン中に
-/// send-keys した分は UserPromptSubmit が発火しない(ステアリング消費)ので、受信確認は
-/// これが唯一の証拠になる。移植元 extractTranscriptMessageIds。
-///
-/// transcript は JSONL — 封筒は JSON 文字列の中にいるので**引用符はエスケープされている**
-/// (実測: `message_id=\"1783500885.490429\"`)。そこで `message_id` の後ろの区切り文字の
-/// 並びを読み飛ばして id に当てる(現行の正規表現 `message_id[\\"':=\s]*` と同じ集合)。
-/// 複数形の `message_ids`(= 覆いの申告であって受領ではない)は末尾の `s` で弾かれる。
-impl Ledger {
+    // ── transcript からの受信確認 ──
+
+    /// 封筒の `message_id` が transcript に現れた = ワーカーがそれを読んだ。ターン中に
+    /// send-keys した分は UserPromptSubmit が発火しない(ステアリング消費)ので、受信確認は
+    /// これが唯一の証拠になる。移植元 extractTranscriptMessageIds。
+    ///
+    /// transcript は JSONL — 封筒は JSON 文字列の中にいるので**引用符はエスケープされている**
+    /// (実測: `message_id=\"1783500885.490429\"`)。そこで `message_id` の後ろの区切り文字の
+    /// 並びを読み飛ばして id に当てる(現行の正規表現 `message_id[\\"':=\s]*` と同じ集合)。
+    /// 複数形の `message_ids`(= 覆いの申告であって受領ではない)は末尾の `s` で弾かれる。
     pub fn find_received_ids(new_bytes: &str, ids: &[String]) -> Vec<String> {
         let sep = |c: char| matches!(c, '\\' | '"' | '\'' | ':' | '=' | ' ' | '\t' | '\n' | '\r');
         ids.iter()
