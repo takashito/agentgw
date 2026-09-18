@@ -663,8 +663,28 @@ impl Bridge {
                 continue;
             }
             // 指名済みのセッションがあれば**それを resume** — 新規 ID を切ると、在庫を作り直す
-            // たびに使い捨てのセッションが claude の履歴に積まれる
-            let nominated = self.pools.session_of(&cwd).map(str::to_string);
+            // たびに使い捨てのセッションが claude の履歴に積まれる。
+            // **ただし会話が残っているときだけ。** 最初の待受プロンプトを踏む前に倒れた在庫は
+            // 会話が保存されておらず、resume は即終了する(「No conversation found」)。指名を
+            // 残したままだと、終了 → 5秒後に同じ resume、が止まらない(2026-09-18 に発覚、
+            // あるマシンで8月2日から続いていた)。新規で起こせば下で指名し直される
+            let nominated = self
+                .pools
+                .session_of(&cwd)
+                .map(str::to_string)
+                .filter(|sid| {
+                    let resumable = self.deps.agent.session_history_exists(None, sid);
+                    if !resumable {
+                        ctx.info(
+                            "bridge",
+                            &format!(
+                                "pool: nominated session {sid} has no conversation to resume — \
+                                 starting a new one (key={key})"
+                            ),
+                        );
+                    }
+                    resumable
+                });
             let sid = nominated
                 .clone()
                 .unwrap_or_else(|| SessionId::new().as_str().to_string());

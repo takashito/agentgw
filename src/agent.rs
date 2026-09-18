@@ -389,6 +389,8 @@ pub mod fake {
         pub interrupted: Mutex<Vec<String>>,
         /// When set, `deliver` fails the way a window with an open dialog does.
         pub fail_deliver: std::sync::atomic::AtomicBool,
+        /// Sessions whose conversation history exists (others can't be resumed).
+        pub histories: Mutex<Vec<String>>,
         windows: Mutex<Vec<WindowRow>>,
         next: AtomicU64,
     }
@@ -472,8 +474,8 @@ pub mod fake {
         fn session_cwd(&self, _r: Option<&str>, _s: &str) -> Option<String> {
             None
         }
-        fn session_history_exists(&self, _r: Option<&str>, _s: &str) -> bool {
-            false
+        fn session_history_exists(&self, _r: Option<&str>, s: &str) -> bool {
+            self.histories.lock().unwrap().iter().any(|h| h == s)
         }
         fn last_activity_ms(&self, _r: Option<&str>, _s: &str) -> Option<u64> {
             None

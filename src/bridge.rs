@@ -1563,4 +1563,36 @@ mod tests {
         let failed = RestartPhase::Received.render(Some("could not restart"));
         assert!(failed.contains("💥"));
     }
+
+    /// A warm-pool nomination whose conversation was never saved can't be resumed: `claude
+    /// --resume` exits at once ("No conversation found"). Seen on a machine where that exit
+    /// and the re-launch 5 s later repeated for weeks. Start a fresh session and nominate it.
+    #[tokio::test]
+    async fn a_pool_nomination_without_history_is_replaced_not_resumed() {
+        let (d, _slack, agent, _clock) = flow_deps("pool-nohistory");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let home = Host::home();
+        b.pools.nominate(&home, "gone-sid");
+        b.start_missing_pool_workers(&LogCtx::default());
+        let spawned = agent.spawned.lock().unwrap();
+        assert_eq!(spawned.len(), 1);
+        assert!(spawned[0].resume_from.is_none(), "there is nothing to resume");
+        let sid = spawned[0].session_id.as_str().to_string();
+        assert_ne!(sid, "gone-sid");
+        assert_eq!(b.pools.session_of(&home), Some(sid.as_str()), "the new session is nominated");
+    }
+
+    #[tokio::test]
+    async fn a_pool_nomination_with_history_is_resumed() {
+        let (d, _slack, agent, _clock) = flow_deps("pool-history");
+        agent.histories.lock().unwrap().push("kept-sid".to_string());
+        let (mut b, _fx) = Bridge::for_test(d);
+        let home = Host::home();
+        b.pools.nominate(&home, "kept-sid");
+        b.start_missing_pool_workers(&LogCtx::default());
+        let spawned = agent.spawned.lock().unwrap();
+        assert_eq!(spawned.len(), 1);
+        assert_eq!(spawned[0].resume_from.as_ref().map(|s| s.as_str()), Some("kept-sid"));
+        assert_eq!(b.pools.session_of(&home), Some("kept-sid"));
+    }
 }
