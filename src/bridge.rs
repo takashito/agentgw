@@ -9,6 +9,7 @@ pub mod command;
 pub mod link;
 pub mod gateway;
 pub mod inbound;
+pub mod render;
 pub mod state;
 pub mod worker;
 
@@ -19,7 +20,8 @@ use crate::agent::{
     Agent, CompactOutcome, CompactProgress, Envelope, HookEvent, LoginOutcome, ProbeErr, SessionId,
     SpawnReq,
 };
-use crate::bridge::command::{Cmd, PwdMode, RestartPhase};
+use crate::bridge::command::{Cmd, PwdMode};
+use crate::bridge::render::RestartPhase;
 use crate::bridge::state as bridge;
 use crate::bridge::inbound::{Dispatch, GateVerdict, InboundMsg};
 use crate::bridge::state::{Disposition, LogCtx, PoolKey, ThreadKey};
@@ -597,7 +599,7 @@ impl Bridge {
         // usage 上限中は新規の依頼を受けない。キューイングもしない。
         // コマンドの**後ろ**なのは現行どおり — 上限中でも stop/restart/logout は効く
         if Host::now_ms() < self.limited_until_ms {
-            let text = crate::bridge::command::Notice::Limited {
+            let text = crate::bridge::render::Notice::Limited {
                 until_ms: self.limited_until_ms,
             }
             .render();
@@ -864,7 +866,7 @@ impl Bridge {
                 self.post(
                     &msg.channel,
                     root_ts,
-                    crate::bridge::command::Notice::Help { fleet: self.fleet }.render(),
+                    crate::bridge::render::Notice::Help { fleet: self.fleet }.render(),
                     key,
                 );
             }
@@ -1340,7 +1342,7 @@ impl Bridge {
                 "bridge",
                 &format!("resume: no bound session for thread tts={root_ts} — nothing to resume"),
             );
-            let none = crate::bridge::command::ResumeInfo {
+            let none = crate::bridge::render::ResumeInfo {
                 session_id: None,
                 cwd: None,
                 transcript_missing: false,
@@ -1362,7 +1364,7 @@ impl Bridge {
         let name = SessionId::from(sid.clone()).window_name();
         let window_id = self.workers.window_of(&sid);
         let worker_running = self.agent.pid_of(window_id.as_deref(), &name).is_some();
-        let info = crate::bridge::command::ResumeInfo {
+        let info = crate::bridge::render::ResumeInfo {
             // cwd は id と同じくらい大事 — claude は cwd ごとに履歴を仕舞うので、
             // 違う場所で --resume すると見つからない
             cwd: Some(history_cwd.or(entry.repo_path).unwrap_or_else(Host::home)),
@@ -1680,7 +1682,7 @@ impl Bridge {
                     match agent.usage_rows(&raw) {
                         // 300 = "Current session" の窓(5h)。"Current week" 行の窓は
                         // format_usage_report_with_projection が内側で差し替える
-                        Some(rows) => crate::bridge::command::UsageReport {
+                        Some(rows) => crate::bridge::render::UsageReport {
                             rows: &rows,
                             projection: Some((crate::bridge::command::WallClock::now(), 300)),
                         }
@@ -2021,7 +2023,7 @@ impl Bridge {
     /// ワーカーだけを載せる — 生死は tmux の claude pid が唯一の答え(記憶ではなく実物)。
     /// Slack への問い合わせ(permalink / チャンネル名)は select ループの外でやる。
     fn user_status(&self, msg: &InboundMsg, key: &ThreadKey, root_ts: &str, ctx: &LogCtx) {
-        let mut threads: Vec<crate::bridge::command::StatusThread> = Vec::new();
+        let mut threads: Vec<crate::bridge::render::StatusThread> = Vec::new();
         // ponytail: スレッド1本につき tmux list-windows 1回(claude_pid_of が都度呼ぶ)。
         // dev のスレッド数では十分 — 数百本に育ったら現行と同じく
         // 窓の列挙を1回にまとめ、生きた窓名の集合で先に篩う
@@ -2045,7 +2047,7 @@ impl Bridge {
                 .agent
                 .last_activity_ms(remembered.as_deref(), sid)
                 .unwrap_or(0);
-            threads.push(crate::bridge::command::StatusThread {
+            threads.push(crate::bridge::render::StatusThread {
                 channel_id,
                 thread_ts: tts.clone(),
                 last_activity_ms,
@@ -2112,7 +2114,7 @@ impl Bridge {
                 }
                 t.channel_name = names[&t.channel_id].clone();
             }
-            let report = crate::bridge::command::StatusReport {
+            let report = crate::bridge::render::StatusReport {
                 bridge_version: env!("CARGO_PKG_VERSION").to_string(),
                 now_ms: Host::now_ms(),
                 home,
@@ -2139,7 +2141,7 @@ impl Bridge {
         let home = Host::home();
         let entry = |access: &bridge::Access, ch: &str| {
             let (repo_path, is_fallback) = access.repo_path(ch, &home);
-            crate::bridge::command::PwdEntry {
+            crate::bridge::render::PwdEntry {
                 channel_id: ch.to_string(),
                 repo_path,
                 label: access.routes.get(ch).and_then(|r| r.label.clone()),
@@ -2157,7 +2159,7 @@ impl Bridge {
                     .keys()
                     .map(|ch| entry(&self.access, ch))
                     .collect();
-                crate::bridge::command::PwdEntry::render_all(&all, &home)
+                crate::bridge::render::PwdEntry::render_all(&all, &home)
             }
             // DM にはルートが無い(そのワーカーは常に Home で立つ)ので、黙って記録する
             // 代わりにそう言う
@@ -2169,7 +2171,7 @@ impl Bridge {
                         msg.ts
                     ),
                 );
-                crate::bridge::command::Notice::PwdDmSetRefusal.render()
+                crate::bridge::render::Notice::PwdDmSetRefusal.render()
             }
             PwdMode::Set(path) => {
                 let op = bridge::AccessOp::SetRepo {
@@ -2186,7 +2188,7 @@ impl Bridge {
                                 msg.channel, msg.ts
                             ),
                         );
-                        crate::bridge::command::Notice::with_warnings(&message, &warnings)
+                        crate::bridge::render::Notice::with_warnings(&message, &warnings)
                     }
                     // 検証に落ちたパスは、そのエラー文そのものが Owner の読むもの
                     Err(e) => {
@@ -2318,7 +2320,7 @@ impl Bridge {
                 self.post(
                     &msg.channel,
                     root_ts,
-                    crate::bridge::command::Notice::with_warnings(&message, &warnings),
+                    crate::bridge::render::Notice::with_warnings(&message, &warnings),
                     key,
                 );
             }
@@ -2652,7 +2654,7 @@ impl Bridge {
     /// (子にとって「繋がった」を人に知らせるのはこの1行だけ — 親側の presence は 🔴 だけを言う)。
     async fn announce_online(&mut self, connected_as: &str) {
         let pools: Vec<String> = self.access.pool_targets(&Host::home());
-        let text = crate::bridge::command::Notice::Online {
+        let text = crate::bridge::render::Notice::Online {
             label: Host::name().await,
             // 人が読む通知なので**名前**を出す(現行と同じ)
             connected_as: connected_as.to_string(),
@@ -2778,7 +2780,7 @@ impl Bridge {
             }
         }
         // (d) 降りることを home に1回知らせる(後継が online 通知を出す)
-        let offline = crate::bridge::command::Notice::Offline {
+        let offline = crate::bridge::render::Notice::Offline {
             label: Host::name().await,
             version: env!("CARGO_PKG_VERSION").to_string(),
             pid: std::process::id(),
@@ -3260,7 +3262,7 @@ impl Bridge {
         });
         // offline を**先に**出す。teardown は数秒かかるので、後回しにすると
         // 上のハード exit に食われて通知が落ちる(同じ事故を書いている)
-        let offline = crate::bridge::command::Notice::Offline {
+        let offline = crate::bridge::render::Notice::Offline {
             label: Host::name().await,
             version: env!("CARGO_PKG_VERSION").to_string(),
             pid: std::process::id(),
@@ -3856,7 +3858,7 @@ impl Bridge {
     /// 手順は現行のまま崩さない: ログ → スレッド門番 → **上限ゲート** → **再配達** → 文面。
     fn on_turn_failure(&mut self, ev: &HookEvent, key: Option<&ThreadKey>, ctx: &LogCtx) {
         let reason = ev.payload["error_type"].as_str().unwrap_or("");
-        let (klass, text) = crate::bridge::command::TurnFailureClass::of(reason);
+        let (klass, text) = crate::bridge::render::TurnFailureClass::of(reason);
         let raw = serde_json::json!({
             "hook_event_name": ev.payload["hook_event_name"],
             "error_type": ev.payload["error_type"],
@@ -3888,7 +3890,7 @@ impl Bridge {
         }
         // retry 級は「もう一度配達する」で晴れるもの。配達できたら何も投稿しない —
         // 人が見るべきは再送したターンの結末そのもの
-        if klass == crate::bridge::command::TurnFailureClass::Retry
+        if klass == crate::bridge::render::TurnFailureClass::Retry
             && self.retry_turn_failure(key, reason, ctx)
         {
             return;
@@ -3941,7 +3943,7 @@ impl Bridge {
         );
         let (channel, thread_ts) = key.split();
         if let Some(ts) = thread_ts {
-            let text = crate::bridge::command::Notice::Limited {
+            let text = crate::bridge::render::Notice::Limited {
                 until_ms: hit.reset_ms,
             }
             .render();
@@ -4171,7 +4173,7 @@ impl Bridge {
         // 予測(この先どれくらいで上限に当たるか)。間隔もこれで決まる
         let w = crate::bridge::command::WallClock::now();
         let projection = crate::bridge::command::WallClock::parse_reset(&reset_text, &w)
-            .map(|reset| crate::bridge::command::UsageProjection::of(pct, &reset, &w, 300));
+            .map(|reset| crate::bridge::render::UsageProjection::of(pct, &reset, &w, 300));
         self.usage_at_risk = projection
             .as_ref()
             .is_some_and(|p| p.enough_data && p.at_risk);
@@ -4208,7 +4210,7 @@ impl Bridge {
         let Some(highest) = crossed.iter().max().copied() else {
             return;
         };
-        let text = crate::bridge::command::Notice::UsageWarning {
+        let text = crate::bridge::render::Notice::UsageWarning {
             pct: pct as u32,
             reset: reset_text,
             projected_hit: projection
