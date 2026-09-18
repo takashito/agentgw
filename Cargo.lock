@@ -4,12 +4,13 @@ version = 4
 
 [[package]]
 name = "agentgw"
-version = "0.20.3"
+version = "0.21.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
  "chrono",
  "futures-util",
+ "percent-encoding",
  "rmcp",
  "schemars",
  "serde",

@@ -566,6 +566,17 @@ impl Service {
     fn ask_parent(state_dir: &StateDir) -> Result<(), String> {
         let env_file = state_dir.join(".env");
         let text = std::fs::read_to_string(&env_file).unwrap_or_default();
+        // **アプリがまだ無い人のために、設定入りの作成画面を開く。** 権限・イベント・
+        // Socket Mode・Interactivity を手で選ばせると、1つ抜けるだけで黙って動かない
+        // (Interactivity を忘れるとボタンが届かない、DM タブを忘れると login できない)
+        let url = SlackApp::create_url();
+        println!(
+            "Slack アプリがまだ無ければ、次の URL で設定済みのまま作れます:\n  {url}\n\
+             作ったら (1) ワークスペースにインストールして Bot User OAuth Token(xoxb-…)を、\n\
+             (2) Basic Information → App-Level Tokens で connections:write のトークン(xapp-…)を作って、\n\
+             下に貼ってください。\n"
+        );
+        SlackApp::open_in_browser(&url);
         println!("Slack のトークンを貼ってください。");
         let bot = Self::prompt("  bot token (xoxb-…): ");
         let app = Self::prompt("  app token (xapp-…): ");
@@ -808,6 +819,46 @@ impl Service {
         }
     }
 }
+/// agentgw が要る Slack アプリの設定(マニフェスト)と、それを入れた作成リンク。
+///
+/// マニフェストはリポジトリ直下の `slack-app-manifest.json` が唯一の正。README の
+/// ワンクリックのリンクも同じものから作る(ずれたらテストで落ちる)。
+pub struct SlackApp;
+
+impl SlackApp {
+    pub const MANIFEST: &'static str = include_str!("../slack-app-manifest.json");
+
+    /// `https://api.slack.com/apps?new_app=1&manifest_json=…` — 開くと Slack の「マニフェストから
+    /// 作る」画面が、この設定を入れた状態で出る。
+    pub fn create_url() -> String {
+        // 空白と改行を落としてから符号化する(URL を短くするため)
+        let compact = serde_json::from_str::<serde_json::Value>(Self::MANIFEST)
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        format!(
+            "https://api.slack.com/apps?new_app=1&manifest_json={}",
+            percent_encoding::utf8_percent_encode(&compact, percent_encoding::NON_ALPHANUMERIC)
+        )
+    }
+
+    /// 開けるならブラウザで開く。開けなくても(ssh 越し、画面の無い Linux)何もしない —
+    /// URL は既に印字してある。
+    fn open_in_browser(url: &str) {
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            "xdg-open"
+        } else {
+            return;
+        };
+        let _ = std::process::Command::new(opener)
+            .arg(url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -866,6 +917,50 @@ mod tests {
             !p.contains("/opt/a&b:"),
             "生の & が残ると launchd は plist ごと読めない: {p}"
         );
+    }
+
+    #[test]
+    fn the_slack_app_link_carries_the_whole_manifest() {
+        let url = SlackApp::create_url();
+        assert!(url.starts_with("https://api.slack.com/apps?new_app=1&manifest_json=%7B"), "{url}");
+        // 符号化を戻すと、マニフェストと同じ JSON になる
+        let encoded = url.split("manifest_json=").nth(1).unwrap();
+        let decoded = percent_encoding::percent_decode_str(encoded).decode_utf8().unwrap();
+        let back: serde_json::Value = serde_json::from_str(&decoded).unwrap();
+        let want: serde_json::Value = serde_json::from_str(SlackApp::MANIFEST).unwrap();
+        assert_eq!(back, want);
+    }
+
+    #[test]
+    fn the_manifest_turns_on_what_silently_breaks_when_missing() {
+        let m: serde_json::Value = serde_json::from_str(SlackApp::MANIFEST).unwrap();
+        // 無いとボタンが届かない
+        assert_eq!(m["settings"]["interactivity"]["is_enabled"], true);
+        // 無いと Socket Mode でつながらない
+        assert_eq!(m["settings"]["socket_mode_enabled"], true);
+        // 無いと DM できない(login は DM で打つ)
+        assert_eq!(m["features"]["app_home"]["messages_tab_enabled"], true);
+        assert_eq!(m["features"]["app_home"]["messages_tab_read_only_enabled"], false);
+    }
+
+    #[test]
+    fn the_readme_links_to_the_same_manifest() {
+        // README のワンクリックのリンクは、マニフェストから作ったものと同じでなければならない
+        let readme = include_str!("../README.md");
+        assert!(
+            readme.contains(&SlackApp::create_url()),
+            "README のリンクが slack-app-manifest.json とずれています。\n\
+             `cargo test -- --ignored print_slack_app_url --nocapture` で出る URL に差し替えてください"
+        );
+        let ja = include_str!("../README.ja.md");
+        assert!(ja.contains(&SlackApp::create_url()), "README.ja.md も同じく");
+    }
+
+    /// README に貼る URL を印字する(`cargo test -- --ignored print_slack_app_url --nocapture`)。
+    #[test]
+    #[ignore = "README に貼る URL を出すだけ"]
+    fn print_slack_app_url() {
+        println!("{}", SlackApp::create_url());
     }
 
     #[test]

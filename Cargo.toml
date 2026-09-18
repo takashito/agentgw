@@ -1,6 +1,6 @@
 [package]
 name = "agentgw"
-version = "0.20.3"
+version = "0.21.0"
 edition = "2024"
 license = "MIT"
 
@@ -33,6 +33,9 @@ base64 = "0.22"
 # 暦(うるう年・月の日数・通算日・時刻の書式)。**自前で持っていた 150 行を畳んだ** —
 # rmcp / schemars / slack-morphism が既に同版を引いているので新規コンパイルは無い
 chrono = "0.4"
+# Slack アプリの作成リンク(マニフェスト入りの URL)を組むため。url / reqwest が既に同版を
+# 引いているので新規コンパイルは無い
+percent-encoding = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "1"
