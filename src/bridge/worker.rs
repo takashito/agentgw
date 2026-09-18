@@ -1,10 +1,10 @@
-//! 生きているワーカーと在庫の台帳。
+//! The ledger of live agents and the pool.
 //!
-//! **このファイルは tmux コマンドを1つも打たない。** 「どのスレッドにどのワーカーが居るか」の
-//! 記録だけを持つ。実際に窓を叩くのは [`crate::agent::Agent`] 越し。
+//! **This file never runs a single tmux command.** It only records which agent lives in
+//! which thread. Actually poking windows goes through [`crate::agent::Agent`].
 //!
-//! Slack へ投稿するもの・threads.json を書くものはここに置かない — あれは「台帳を見て
-//! Slack と agent に指示を出す」ので Bridge の仕事。
+//! Nothing that posts to Slack or writes threads.json lives here — that is "read the
+//! ledger, then instruct Slack and the agent", which is the Bridge's job.
 
 use crate::agent::screen::SpawnOutcome;
 use crate::agent::tmux::{self as tmux_mod, Pid, Window};
@@ -20,8 +20,8 @@ use crate::agent::WorkerState;
 use crate::bridge::state::{PoolKey, ThreadEntry, ThreadKey};
 use std::collections::{HashMap, HashSet};
 
-/// 冷えたワーカーを畳む規則(2026-08-02 ユーザー決裁の4つの数字)。
-/// 現行 Bun は環境変数で動かせるが、こちらは決め打ち — 動かしたくなったら足す。
+/// Rules for tearing down cold agents (four numbers the user decided on 2026-08-02).
+/// Hard-coded rather than read from env vars — add that when someone needs to tune them.
 const CLEANUP: CleanupPolicy = CleanupPolicy {
     idle_ttl_ms: 30 * 60_000,
     idle_slots: 5,
@@ -29,102 +29,102 @@ const CLEANUP: CleanupPolicy = CleanupPolicy {
     max_concurrent: 10,
 };
 
-/// 起動画面を見張る時間。現行の 30秒(同期)+ 120秒(linger)= 150秒に合わせた。
-/// 現行の linger は `FIRST_PROMPT_TIMEOUT_MS`(60s、p99 45.6s)の2倍。
+/// How long to watch the startup screen: 30s (sync) + 120s (linger) = 150s.
+/// The linger is twice `FIRST_PROMPT_TIMEOUT_MS` (60s, p99 45.6s).
 const SPAWN_SCREEN_BUDGET_MS: u64 = 150_000;
 
 const SPAWN_SCREEN_POLL_MS: u64 = 1_000;
 
-/// プール worker が MCP を上げるまでの猶予(worker.ts の `MCP_INIT_TIMEOUT_MS` と同値)。
-/// これを超えたら諦める(= 実体ごと畳んで在庫から消す)。
+/// Grace period for a pool agent to bring up MCP (same value as `MCP_INIT_TIMEOUT_MS`).
+/// Past this we give up (tear it down and remove it from the pool).
 const POOL_MCP_INIT_TIMEOUT_MS: u64 = 50_000;
 
-/// 在庫を数え直す間隔。tick は 500ms 刻みなので、ここでスイープを間引く。
+/// How often to recount the pool. The tick runs every 500ms, so this thins out the sweeps.
 pub const POOL_SWEEP_INTERVAL_MS: u64 = 5_000;
 
-/// 冷えたワーカーを畳む頃合いを見る間隔(`WORKER_CLEANUP_MS` と同値)。
+/// How often to check for cold agents to tear down (same value as `WORKER_CLEANUP_MS`).
 pub const CLEANUP_INTERVAL_MS: u64 = 60_000;
 
-/// ワーカー1本の暖機の印。hook が来るたびに更新される。
+/// Warm-up markers for one agent. Updated on every hook.
 #[derive(Clone, Default, Debug)]
 pub struct Hooked {
     pub ended: bool,
-    /// MCP の initialize を観測したか(= disposition ツールを呼べる)。Stop の fail-open 判定に使う。
+    /// Whether we saw MCP initialize (= it can call the disposition tools). Used for Stop's fail-open decision.
     pub mcp_ready: bool,
     pub window_id: Option<String>,
-    /// ワーカーの .jsonl(hook payload が毎回運んでくる)と、そこまで読んだ位置。
+    /// The agent's .jsonl (every hook payload carries it) and how far we have read it.
     pub transcript_path: Option<String>,
     pub transcript_offset: u64,
 }
 
-/// 生死判定の材料。これだけで [`WorkerState`] が決まる。
+/// Inputs for the liveness check. These alone decide the [`WorkerState`].
 pub struct WorkerFacts {
     pub pid: Option<u32>,
-    /// **この Bridge が起こして、まだ最初のターンを踏んでいない**([`Workers::starting`])。
+    /// **Started by this Bridge and has not reached its first turn yet** ([`Workers::starting`]).
     pub starting: bool,
     pub ended: bool,
 }
 
-/// 在庫1本。cwd は起動時に固定される。
+/// One pool entry. Its cwd is fixed at startup.
 ///
-/// **窓と ready は持たない** — どちらも同じ session_id の [`Hooked`] が既に持っている
-/// (`window_id` と `mcp_ready`)。在庫側にも置くと同じ事実の写しが2つになり、
-/// 継承経路のように片方だけ埋まる状態が作れてしまう。引くのは [`Workers`] のメソッド。
+/// **It holds no window and no ready flag** — the [`Hooked`] for the same session_id already
+/// has both (`window_id` and `mcp_ready`). Keeping them here too would make two copies of one
+/// fact, and paths like inheritance could fill in only one of them. Look them up through [`Workers`].
 pub struct PoolWorker {
     pub session_id: String,
     pub spawned_at_ms: u64,
-    /// 起動時に固定した作業ディレクトリ(status の Warm Pool 節がそのまま出す)。
+    /// Working directory fixed at startup (the status Warm Pool section prints it as is).
     pub cwd: String,
-    /// 指名済みセッションの `--resume` で起こしたか。**猶予切れの扱いが変わる** —
-    /// resume は「セッションが消えている/壊れている」で失敗しうるので、諦め札を立てる前に
-    /// 指名を捨てて新規 ID で1回だけやり直す(`give_up_stale_pools`)。
+    /// Whether it was started with `--resume` of a reserved session. **This changes how the timeout
+    /// is handled** — resume can fail because the session is gone or broken, so before marking
+    /// the slot as given up we drop the reservation and retry once with a fresh ID (`give_up_stale_pools`).
     pub resumed: bool,
 }
 
-/// 生きているワーカーと在庫の台帳。tmux は叩かない — 叩くのは [`Agent`]。
+/// The ledger of live agents and the pool. It never touches tmux — [`Agent`] does.
 #[derive(Default)]
 pub struct Workers {
-    /// session_id → 暖機の印
+    /// session_id → warm-up markers
     hooked: HashMap<String, Hooked>,
-    /// **この Bridge が起こして、まだ最初のターンを踏んでいない**セッション(bridge.ts の
-    /// `awaitingPushReady` と同じ掛け金)。claude の TUI が立ち上がりきる前に send-keys すると
-    /// 入力が消えるので、その数秒だけ配達を queue に回すためだけに存在する。
+    /// Sessions **started by this Bridge that have not reached their first turn yet** (the same
+    /// latch as `awaitingPushReady`). send-keys before claude's TUI has fully come up loses the
+    /// input, so this exists only to route deliveries to the queue for those few seconds.
     ///
-    /// **spawn した瞬間にだけ入れ、最初の user_prompt で外す。** hook から「起動した」を
-    /// 推測しない — session_start は compact / clear でも飛んでくるので、そこで起動中に
-    /// 戻すと、動いているワーカー宛の配達が queue に詰まったまま二度と流れない
-    /// (queue を流す user_prompt は、その queue の中の依頼を渡さないと発火しない)。
-    /// 2026-08-01 実機。前身の `started_here` は掛け金を裏返しに持っていて、この罠を作った。
+    /// **Set only at the moment of spawn, cleared on the first user_prompt.** Never infer
+    /// "started" from hooks — session_start also fires on compact / clear, and flipping back to
+    /// starting there leaves deliveries to a running agent stuck in the queue forever
+    /// (the user_prompt that flushes the queue only fires once a request from that queue is handed over).
+    /// Seen on a real machine 2026-08-01. The predecessor, `started_here`, held the latch inverted and caused this trap.
     ///
-    /// 永続化しない。Bridge を再起動したら誰も「起動中」ではない — 生きているワーカーは
-    /// 前世代が起こしきったもの = そのまま渡してよい、が正しい。
+    /// Not persisted. After a Bridge restart nobody is "starting" — live agents were fully
+    /// started by the previous generation, so handing them work directly is correct.
     starting: HashSet<String>,
-    /// `PoolKey::of_cwd(cwd)` → 在庫中のプール worker
+    /// `PoolKey::of_cwd(cwd)` → the pool agent in stock
     pools: HashMap<PoolKey, PoolWorker>,
-    /// 諦めた pool_key。在庫から消しても「二度と起こさない」を覚えておくための**一方通行の札**
-    /// (これが無いと次のスイープが同じ枠を spawn し直して無限リトライになる)
+    /// Pool keys we gave up on. A **one-way marker** that remembers "never start this again" after it
+    /// leaves the pool (without it the next sweep respawns the same slot and retries forever)
     gave_up: HashSet<PoolKey>,
-    /// 返信待ちの終了予約。満期は tick が見る。
+    /// Pending terminations waiting for replies. The tick checks when they are due.
     drains: Vec<DrainJob>,
-    /// 最後に在庫を数え直した時刻。
+    /// When the pool was last recounted.
     last_sweep_ms: u64,
-    /// 最後に冷えたワーカーを見に行った時刻。
+    /// When we last checked for cold agents.
     last_cleanup_ms: u64,
 }
 
 impl Workers {
-    // ── 暖機の印 ────────────────────────────────────────────────────────────
+    // ── Warm-up markers ─────────────────────────────────────────────────────
 
-    /// 起こした = 最初のターンまで配達を待たせる(掛け金の説明は [`Workers::starting`])。
+    /// Just started = hold deliveries until the first turn (see [`Workers::starting`] for the latch).
     pub fn mark_starting(&mut self, session_id: &str) {
         self.starting.insert(session_id.to_string());
     }
 
-    /// 最初のターンが来た = TUI がキーを取れている。以後は素通しで配達してよい。
+    /// The first turn arrived = the TUI accepts keys. From now on deliver straight through.
     ///
-    /// queue を流すのはここではなく呼び手(`flush_queued`)で、**毎ターン試す**。
-    /// 掛け金が外れる1回に紐づけると、Bridge 再起動をまたいで pending.json に残った分を
-    /// 拾う機会が無くなる(再起動後のワーカーは誰も掛け金に入っていない)。
+    /// Flushing the queue is not done here but by the caller (`flush_queued`), and **it is tried every turn**.
+    /// Tying it to the single latch release would lose the chance to pick up what stayed in
+    /// pending.json across a Bridge restart (no agent is in the latch after a restart).
     pub fn clear_starting(&mut self, session_id: &str) {
         self.starting.remove(session_id);
     }
@@ -137,7 +137,7 @@ impl Workers {
         self.hooked.get(session_id)
     }
 
-    /// 無ければ既定で作ってから返す(hook が最初に触った時点で席ができる)。
+    /// Creates a default entry if missing, then returns it (the seat exists from the first hook that touches it).
     pub fn warm_mut(&mut self, session_id: &str) -> &mut Hooked {
         self.hooked.entry(session_id.to_string()).or_default()
     }
@@ -147,7 +147,7 @@ impl Workers {
         self.starting.remove(session_id);
     }
 
-    /// 配達先の窓 id。窓名は改名されうるので、覚えている `@N` を優先する。
+    /// Window id to deliver to. Window names can be renamed, so prefer the remembered `@N`.
     pub fn window_of(&self, session_id: &str) -> Option<String> {
         self.hooked
             .get(session_id)
@@ -158,7 +158,7 @@ impl Workers {
         self.hooked.is_empty()
     }
 
-    /// 現在の transcript の読み位置たち `(session_id, path, offset)`。
+    /// Current transcript read positions `(session_id, path, offset)`.
     pub fn transcripts(&self) -> Vec<(String, String, u64)> {
         self.hooked
             .iter()
@@ -171,11 +171,11 @@ impl Workers {
             .collect()
     }
 
-    /// このスレッドのワーカーの生死。**問い合わせるだけで、何も書き換えない** — 書き換えると
-    /// 呼ばれた順番で答えが変わる(前身はここで「継承ワーカー」を検出して印を戻していたので、
-    /// 呼ばれないまま session_start が先に来ると誤判定した。2026-08-01 実機)。
+    /// Liveness of this thread's agent. **It only queries and never writes** — writing would make
+    /// the answer depend on call order (the predecessor detected "inherited agents" here and reset
+    /// markers, so it misjudged when session_start arrived before any call. Real machine, 2026-08-01).
     ///
-    /// 前の Bridge から継承したワーカーは掛け金に**入っていない**ので、推測なしで Ready。
+    /// Agents inherited from the previous Bridge are **not** in the latch, so they are Ready without guessing.
     pub fn state_of(
         &self,
         entry: Option<&ThreadEntry>,
@@ -195,9 +195,9 @@ impl Workers {
         })
     }
 
-    /// 生きているか。順序は優先度 — **終わったセッションは pid が残っていても居ない**
-    /// (Starting にすると `Action::decide` が Queue を返し、respawn されないまま
-    /// queue が永久に溜まる)。
+    /// Whether it is alive. The order is the priority — **an ended session is gone even if its pid remains**
+    /// (making it Starting makes `Action::decide` return Queue, and the queue grows forever
+    /// without a respawn).
     fn state_from(facts: &WorkerFacts) -> WorkerState {
         if facts.ended || facts.pid.is_none() {
             return WorkerState::Absent;
@@ -209,7 +209,7 @@ impl Workers {
         }
     }
 
-    // ── 在庫 ────────────────────────────────────────────────────────────────
+    // ── Pool ─────────────────────────────────────────────────────────────────
 
     pub fn pool(&self, pool_key: &PoolKey) -> Option<&PoolWorker> {
         self.pools.get(pool_key)
@@ -227,18 +227,18 @@ impl Workers {
         self.pools.remove(pool_key)
     }
 
-    /// 在庫を丸ごと引き取る(logout / restart の一斉畳み)。
+    /// Takes over the whole pool (bulk teardown on logout / restart).
     pub fn take_pools(&mut self) -> HashMap<PoolKey, PoolWorker> {
         std::mem::take(&mut self.pools)
     }
 
-    /// 在庫が「使える」か。**MCP を握った瞬間がその唯一の証拠**なので、
-    /// [`Hooked::mcp_ready`] をそのまま在庫の ready として読む。
+    /// Whether a pool entry is usable. **Grabbing MCP is the only proof of that**, so
+    /// [`Hooked::mcp_ready`] is read directly as the pool's ready flag.
     pub fn pool_ready(&self, session_id: &str) -> bool {
         self.hooked.get(session_id).is_some_and(|h| h.mcp_ready)
     }
 
-    /// `(pool_key, session_id, spawned_at_ms, ready)` の一覧。期限判定と status 表示に使う。
+    /// List of `(pool_key, session_id, spawned_at_ms, ready)`. Used for timeout checks and status.
     pub fn pool_rows(&self) -> Vec<(PoolKey, String, u64, bool)> {
         self.pools
             .iter()
@@ -253,7 +253,7 @@ impl Workers {
             .collect()
     }
 
-    /// 在庫の `(session_id, window_id)` 一覧。一斉畳みの pid 集めに使う。
+    /// List of pool `(session_id, window_id)`. Used to collect pids for bulk teardown.
     pub fn pool_pid_rows(&self) -> Vec<(String, Option<String>)> {
         self.pools
             .values()
@@ -261,7 +261,7 @@ impl Workers {
             .collect()
     }
 
-    /// status の Warm Pool 節がそのまま出す `(cwd, ready)`。
+    /// `(cwd, ready)` printed as is by the status Warm Pool section.
     pub fn pool_summary(&self) -> Vec<(String, bool)> {
         self.pools
             .values()
@@ -269,11 +269,11 @@ impl Workers {
             .collect()
     }
 
-    /// この session_id の在庫を登録簿から**落とすだけ**。実体は既に死んでいる前提なので
-    /// 窓は畳まない。`gave_up` には**入れない** — 死は「諦めた」ではなく、次のスイープで
-    /// 立て直してよい枠だから。落とせたら pool_key を返す。
+    /// **Only drops** this session_id's pool entry from the registry. The process is assumed to be
+    /// dead already, so the window is not closed. It is **not** added to `gave_up` — dying is not
+    /// "giving up"; the next sweep may rebuild the slot. Returns the pool_key if something was dropped.
     pub fn drop_pool_of_session(&mut self, session_id: &str) -> Option<PoolKey> {
-        // ponytail: プールはせいぜい数個 — session_id からの逆引き表は要らない
+        // ponytail: a pool holds a few entries at most — no reverse index from session_id needed
         let key = self
             .pools
             .iter()
@@ -283,7 +283,7 @@ impl Workers {
         Some(key)
     }
 
-    // ── 諦めた枠の札 ─────────────────────────────────────────────────────────
+    // ── Given-up slot markers ─────────────────────────────────────────────────
 
     pub fn gave_up_on(&self, pool_key: &PoolKey) -> bool {
         self.gave_up.contains(pool_key)
@@ -297,14 +297,14 @@ impl Workers {
         self.gave_up.len()
     }
 
-    /// 札を全部剥がす(access 再読込 = 設定が変わったので、諦めた判断も無効になる)。
+    /// Clears all markers (access reload = settings changed, so earlier give-ups no longer apply).
     pub fn clear_gave_up(&mut self) {
         self.gave_up.clear();
     }
 
-    // ── スイープの間引き ─────────────────────────────────────────────────────
+    // ── Sweep throttling ─────────────────────────────────────────────────────
 
-    /// 在庫を数え直す頃合いなら true(その時点で時計を進める)。
+    /// True when it is time to recount the pool (and advances the clock at that point).
     pub fn sweep_due(&mut self, now_ms: u64) -> bool {
         if now_ms.saturating_sub(self.last_sweep_ms) < POOL_SWEEP_INTERVAL_MS {
             return false;
@@ -313,10 +313,10 @@ impl Workers {
         true
     }
 
-    /// 冷えたワーカーを見に行く頃合いなら true(その時点で時計を進める)。
+    /// True when it is time to check for cold agents (and advances the clock at that point).
     ///
-    /// **起動直後の1回は必ず見送る**(現行も初回は間隔ぶん待つ)。掃除は窓を閉じる側なので、
-    /// 在庫の起こし直しが済む前に走らせない — 生きている在庫が「持ち主なし」に見える。
+    /// **Always skips the first round right after startup** (the first run waits one interval). Cleanup
+    /// closes windows, so it must not run before the pool is re-adopted — live pool agents would look ownerless.
     pub fn cleanup_due(&mut self, now_ms: u64) -> bool {
         if self.last_cleanup_ms == 0 {
             self.last_cleanup_ms = now_ms;
@@ -329,7 +329,7 @@ impl Workers {
         true
     }
 
-    // ── 終了予約 ────────────────────────────────────────────────────────────
+    // ── Pending terminations ─────────────────────────────────────────────────
 
     pub fn is_draining(&self, key: &ThreadKey) -> bool {
         self.drains.iter().any(|j| &j.key == key)
@@ -339,7 +339,7 @@ impl Workers {
         self.drains.push(job);
     }
 
-    /// 満期の来た予約の位置(未応答が空になったか、期限切れ)。
+    /// Positions of reservations that are due (no unanswered messages left, or expired).
     pub fn due_drain(&self, now_ms: u64, is_settled: impl Fn(&ThreadKey) -> bool) -> Option<usize> {
         self.drains
             .iter()
@@ -351,50 +351,50 @@ impl Workers {
     }
 }
 
-// ── 冷えたワーカーの回収 ────────────────────────────────────────────────────
+// ── Reclaiming cold agents ───────────────────────────────────────────────────
 //
-// 現行 Bun の `selectCleanupKeys`と**同じ骨格・違う規則**。
-// 現行は「上限を超えたときだけ、冷えたものを落とす」で、席が空いていれば何時間冷えていても
-// 残す。こちらは「冷えたまま置ける本数」自体に枠を設ける(2026-08-02 ユーザー決裁)。
+// The other approach only drops cold agents once the cap is exceeded, keeping them however
+// long they sit cold while seats are free. Here the number of agents allowed to sit cold
+// has its own cap (user decision, 2026-08-02).
 
-/// 判定の材料1本ぶん。**tmux も transcript もここには出てこない** — 呼び手が実物を見て
-/// 数字にしてから渡す(この関数を純粋に保つ = テストが実機を要らない)。
+/// Input for one decision. **Neither tmux nor transcripts appear here** — the caller looks at the
+/// real things and turns them into numbers first (keeping this function pure = tests need no real machine).
 pub struct IdleSnapshot {
     pub key: ThreadKey,
-    /// 最後に**本当に働いた**時刻からの経過(= transcript の mtime との差)。
+    /// Time since it last **actually worked** (= difference from the transcript's mtime).
     pub idle_ms: u64,
-    /// 落としてよいか。起動中 / 返事をまだ返していない / 人のクリック待ち /
-    /// 既に終了予約が積まれている、はすべて false。
-    /// **transcript が読めず idle が測れないものも false** — 判断材料が無いものは触らない。
+    /// Whether it may be dropped. False while starting / not yet replied / waiting for a human click /
+    /// already having a pending termination.
+    /// **Also false when the transcript cannot be read and idle cannot be measured** — never touch what we cannot judge.
     pub eligible: bool,
 }
 
-/// 何本まで・どれだけ冷えたら畳むか。
+/// How many to keep, and how cold before tearing down.
 pub struct CleanupPolicy {
-    /// これを**超えた**ら「冷えている」。
+    /// **Beyond** this, it counts as "cold".
     pub idle_ttl_ms: u64,
-    /// 冷えたまま置いておける本数。
+    /// How many may stay cold.
     pub idle_slots: usize,
-    /// これを**超えた**ら席の空きに関係なく畳む。
+    /// **Beyond** this, tear down regardless of free seats.
     pub idle_max_ms: u64,
-    /// 同時に生かしておける本数(冷えていなくてもこれを超えたら畳む)。
+    /// How many may live at once (beyond this, tear down even if not cold).
     pub max_concurrent: usize,
 }
 
-/// 畳むべきスレッド。**規則は3つで、上から順に適用する**(先に落ちたものは後の分母から抜ける)。
+/// Threads to tear down. **Three rules, applied top to bottom** (whatever an earlier rule drops leaves the later counts).
 ///
-/// 1. 放置の絶対上限を超えたもの — 席が余っていても落とす
-/// 2. 冷えたもの(TTL 超え)が枠を超えた分 — 冷えている順に、枠ちょうどまで
-/// 3. それでも同時上限を超えていたら — 冷えている順に、**冷えていなくても**上限まで
+/// 1. Past the absolute idle limit — drop even if seats are free
+/// 2. Cold ones (past TTL) beyond the cold cap — coldest first, down to exactly the cap
+/// 3. If still above the concurrency cap — coldest first, **even if not cold**, down to the cap
 ///
-/// どの規則でも `eligible` でないものには手を出さない。落とせないものが多くて上限に
-/// 戻れないときは、戻れないまま返す(次の回で改めて見る)。
+/// No rule touches anything that is not `eligible`. If too many cannot be dropped to get back
+/// under the cap, return as is (the next round looks again).
 pub fn select_cleanup_keys(snaps: Vec<IdleSnapshot>, p: &CleanupPolicy) -> Vec<ThreadKey> {
     let mut snaps = snaps;
-    snaps.sort_by(|a, b| b.idle_ms.cmp(&a.idle_ms)); // 冷えている順。3つの規則すべてこの順で落とす
+    snaps.sort_by(|a, b| b.idle_ms.cmp(&a.idle_ms)); // coldest first; all three rules drop in this order
     let mut evict = Vec::new();
 
-    // 1. 放置の絶対上限
+    // 1. Absolute idle limit
     let mut kept: Vec<IdleSnapshot> = Vec::new();
     for s in snaps {
         if s.eligible && s.idle_ms > p.idle_max_ms {
@@ -404,8 +404,8 @@ pub fn select_cleanup_keys(snaps: Vec<IdleSnapshot>, p: &CleanupPolicy) -> Vec<T
         }
     }
 
-    // 2. 冷えたものの枠。冷えていないものは数にも入らない。**残すのは温かい方** —
-    //    次に話しかけられる見込みが高いものから席を守る(現行 Bun も warm-preserving)
+    // 2. Cold cap. Agents that are not cold do not count. **Keep the warmer ones** —
+    //    protect the seats most likely to be spoken to next (warm-preserving)
     let idle_now = kept.iter().filter(|s| s.idle_ms > p.idle_ttl_ms).count();
     let mut surplus = idle_now.saturating_sub(p.idle_slots);
     let mut kept2: Vec<IdleSnapshot> = Vec::new();
@@ -418,8 +418,8 @@ pub fn select_cleanup_keys(snaps: Vec<IdleSnapshot>, p: &CleanupPolicy) -> Vec<T
         kept2.push(s);
     }
 
-    // 3. 同時上限。ここまで残ったものは冷えていない = 働いている最中かもしれないが、
-    //    席が足りないので一番冷えたものから譲ってもらう
+    // 3. Concurrency cap. What remains is not cold = may be mid-work, but there
+    //    are not enough seats, so the coldest gives way first
     let mut over = kept2.len().saturating_sub(p.max_concurrent);
     for s in kept2 {
         if over == 0 {
@@ -433,27 +433,27 @@ pub fn select_cleanup_keys(snaps: Vec<IdleSnapshot>, p: &CleanupPolicy) -> Vec<T
     evict
 }
 
-/// exit / resume が積む「返信が着いてから殺す」予約。
+/// A "kill after the reply lands" reservation queued by exit / resume.
 ///
-/// 走っているターンは**切らない**(それは stop の仕事) —
-/// 最後の返信が Slack に着くのを待ってからワーカーを終わらせる。
+/// A running turn is **not cut** (that is stop's job) —
+/// wait for the last reply to reach Slack, then end the agent.
 pub struct DrainJob {
     pub key: ThreadKey,
     pub session_id: String,
     pub deadline_ms: u64,
-    /// 別れの挨拶を出す先 (channel, thread_ts)。exit だけが告げる —
-    /// resume は報告文が「本セッションは終了します。」と言い終えている。
+    /// Where to post the farewell (channel, thread_ts). Only exit announces it —
+    /// for resume the report text already says the session is ending.
     pub farewell: Option<(String, String)>,
-    /// ドレイン中ずっと出しておく shimmer(`resume` だけが預ける)。job を drains から
-    /// 取り出した時点で Drop = クリア。待っているのはこの予約なので、guard もここに置く。
+    /// Shimmer shown for the whole drain (only `resume` hands one over). Dropped = cleared when
+    /// the job is taken out of drains. This reservation is what we wait on, so the guard lives here too.
     pub thinking: Option<crate::chat::slack::Thinking>,
 }
 
 // ── starting, pooling and reaping agents ──
 
 impl Bridge {
-    /// ワーカーを終わらせる本体(順序をそのまま)。
-    /// **threads.json の entry は触らない** — セッションの紐付けが残るからこそ resume できる。
+    /// The body that ends the agent (keep the order as is).
+    /// **Does not touch the threads.json entry** — the session binding staying is what makes resume possible.
     pub(super) async fn terminate(
         &mut self,
         key: &ThreadKey,
@@ -464,13 +464,13 @@ impl Bridge {
             session_id: sid.map(str::to_string),
             thread_key: Some(key.clone()),
         };
-        // 1. kill の**前に**未応答を落とす。残したまま殺すと、切断を見たワーカー回収経路が
-        // 「返事を失った」と読んで代わりを cold spawn する
+        // 1. Drop unanswered messages **before** kill. Kill with them left and the agent-reclaim path
+        // that sees the disconnect reads it as "lost a reply" and cold-spawns a replacement
         self.ledger.dispose_all(key);
         let (_, root) = key.split();
         let root_ts = root.unwrap_or_default();
-        // 2. 実プロセスを pid 指名で殺してから窓を閉じる。pid を引けないまま窓だけ閉じると
-        // claude が孤児として生き残る(F5)
+        // 2. Kill the real process by pid, then close the window. Closing only the window without a pid
+        // leaves claude alive as an orphan (F5)
         if let Some(sid) = sid {
             let name = SessionId::from(sid.to_string()).window_name();
             let window_id = self.workers.window_of(sid);
@@ -493,17 +493,17 @@ impl Bridge {
                     ),
                 ),
             }
-            // 窓名で落ちてくる道がある(継承ワーカーは window_id を覚えていない)。素の名前を
-            // -t に渡すと tmux が**今いるセッション**に当てる — 必ずセッション修飾を通す
+            // There is a path that arrives by window name (inherited agents do not remember window_id). Passing
+            // a bare name to -t makes tmux target **the current session** — always qualify with the session
             let target = Window::of(window_id.as_deref().unwrap_or(&name));
             if let Err(e) = self.deps.agent.terminate(&target) {
                 ctx.error("bridge", &format!("exit: kill-window failed: {e}"));
             }
-            // 3. セッション鍵の記憶だけ落とす(threads.json は無傷 → 次のメッセージが --resume)
+            // 3. Drop only the session-key memory (threads.json intact → the next message uses --resume)
             self.workers.forget(sid);
         }
-        // 4. 待たせていた分は捨てる。残すと、次に立つワーカーの user_prompt で
-        // もう誰も待っていない古いメッセージが流し込まれる
+        // 4. Discard what was waiting. Keeping it would feed old messages nobody waits for
+        // into the next agent's user_prompt
         if let Some(q) = self.pending.remove(&root_ts) {
             ctx.info(
                 "bridge",
@@ -545,23 +545,23 @@ impl Bridge {
         }
     }
 
-    /// 前の Bridge が残した在庫を拾い直す(起動時に1回)。restart は在庫を畳まずに降りるので、
-    /// tmux には暖まった実体がそのまま残っている。それを在庫として復活させるのがここ。
+    /// Re-adopts the pool the previous Bridge left behind (once at startup). restart exits without
+    /// tearing down the pool, so warm processes are still in tmux. This revives them as the pool.
     ///
-    /// スレッドワーカーの「継承」と同じ論法で、**生きている = MCP initialize は前プロセス時代に
-    /// 済んでいる**とみなして印を立て直す。立てないと `claim_pool_worker` の条件
-    /// (`掛け金に入っていない && mcp_ready && !ended`)を永久に満たさず、在庫が居るのに
-    /// 誰にも引き当てられないまま残る(掛け金のほうは、継承ワーカーは元から入っていない)。
+    /// Same reasoning as inheriting thread agents: **alive = MCP initialize already happened under the
+    /// previous process**, so the marker is set again. Without it the `claim_pool_worker` condition
+    /// (`not in the latch && mcp_ready && !ended`) is never met, and the pool entry sits there
+    /// without ever being claimed (as for the latch, inherited agents were never in it).
     ///
-    /// 死んでいた指名には触らない — 直後の [`Self::start_missing_pool_workers`] が同じ
-    /// session_id を `--resume` で起こす。
+    /// Dead reservations are left alone — [`Self::start_missing_pool_workers`], called right after,
+    /// starts the same session_id with `--resume`.
     pub(super) async fn restore_pools(&mut self, ctx: &LogCtx) {
         let targets: Vec<String> = self.access.pool_targets(&Host::home());
         let mut dirty = false;
         for (cwd, sid) in self.pools.rows() {
             let name = SessionId::from(sid.clone()).window_name();
-            // 継承ワーカーと同じく window_id は覚えていない — 窓名で引く(spawn 直後に
-            // automatic-rename を切ってあるので名前は残る)
+            // Like inherited agents it does not remember window_id — look up by window name (automatic-rename
+            // is turned off right after spawn, so the name stays)
             let alive = self.deps.agent.pid_of(None, &name).is_some();
             let key = bridge::PoolKey::of_cwd(&cwd);
             let ctx = LogCtx {
@@ -569,7 +569,7 @@ impl Bridge {
                 thread_key: None,
             };
             match bridge::PoolRestore::decide(targets.contains(&cwd), alive) {
-                // プール対象から外れた cwd(設定変更)。残すと誰も引き当てない在庫が居座る
+                // A cwd no longer in the pool targets (settings changed). Keeping it leaves a pool entry nobody claims
                 bridge::PoolRestore::Discard => {
                     if alive {
                         let stale = worker::PoolWorker {
@@ -585,7 +585,7 @@ impl Bridge {
                     dirty = true;
                     continue;
                 }
-                // 指名はそのまま — 直後の start_missing_pool_workers が `--resume` で起こす
+                // Keep the reservation — start_missing_pool_workers right after starts it with `--resume`
                 bridge::PoolRestore::Respawn => continue,
                 bridge::PoolRestore::Adopt => {}
             }
@@ -595,14 +595,14 @@ impl Bridge {
                     "pool: inherited a live worker from a previous bridge process (key={key})"
                 ),
             );
-            // 前世代が起こしきったワーカー = 掛け金には入れない(そのまま引き当ててよい)。
-            // MCP だけは印を戻す — initialize は前プロセス時代に済んでいて二度と来ない
+            // An agent fully started by the previous generation = not put in the latch (claimable as is).
+            // Only MCP gets its marker back — initialize happened under the previous process and will not come again
             self.workers.warm_mut(&sid).mcp_ready = true;
             self.workers.insert_pool(
                 key,
                 worker::PoolWorker {
                     session_id: sid,
-                    // 猶予はこのプロセスから数え直す(前世代の時計で見捨てない)
+                    // The grace period restarts from this process (do not abandon it by the old clock)
                     spawned_at_ms: self.deps.clock.now_ms(),
                     cwd,
                     resumed: false,
@@ -614,13 +614,13 @@ impl Bridge {
         }
     }
 
-    /// 在庫が欠けているプールを起動する。owner が居ないうちは `pool_targets` が空なので何もしない。
-    /// **`milestone()` は呼ばない** — プール worker はまだどのスレッドのものでもない。
+    /// Starts pools that are missing entries. While there is no owner, `pool_targets` is empty so this does nothing.
+    /// **Does not call `milestone()`** — a pool agent does not belong to any thread yet.
     pub(super) fn start_missing_pool_workers(&mut self, ctx: &LogCtx) {
         let targets = self.access.pool_targets(&Host::home());
-        // **下方向にも**収束させる。プール対象から外れた枠の在庫は、誰も欲しがらない
-        // 席を占めたまま遊んでいる。これが無いと `warm off` はその在庫が死ぬまで何も解放しない。
-        // 引き当て済みのワーカーは在庫の名簿から抜けているので、ここが人の仕事を止めることはない
+        // Converge **downward too**. Pool entries for slots no longer targeted sit idle in seats
+        // nobody wants. Without this, `warm off` frees nothing until those entries die.
+        // Claimed agents have already left the pool roster, so this never stops someone's work
         let wanted: Vec<bridge::PoolKey> = targets
             .iter()
             .map(|cwd| bridge::PoolKey::of_cwd(cwd))
@@ -639,7 +639,7 @@ impl Bridge {
             );
             self.drop_pool_worker(&sid, "de-targeted", ctx);
         }
-        // 上限中は**起こす方だけ**やめる(解放は常に安全なので上で済ませてある)
+        // While at the cap, **only stop starting new ones** (releasing is always safe and was done above)
         if self.deps.clock.now_ms() < self.limited_until_ms {
             ctx.info(
                 "bridge",
@@ -653,8 +653,8 @@ impl Bridge {
         }
         for cwd in targets {
             let key = bridge::PoolKey::of_cwd(&cwd);
-            // 諦めた枠は在庫から消えている — 「居ない」だけを見ると再 spawn してしまうので、
-            // 一方通行の札(`gave_up_pool_keys`)も一緒に見る
+            // Given-up slots have been removed from the pool — looking only at "missing" would respawn them,
+            // so also check the one-way marker (`gave_up_pool_keys`)
             let status = Some(bridge::PoolStatus {
                 present: self.workers.has_pool(&key),
                 gave_up: self.workers.gave_up_on(&key),
@@ -662,12 +662,12 @@ impl Bridge {
             if !bridge::PoolStatus::needs_launch(status) {
                 continue;
             }
-            // 指名済みのセッションがあれば**それを resume** — 新規 ID を切ると、在庫を作り直す
-            // たびに使い捨てのセッションが claude の履歴に積まれる。
-            // **ただし会話が残っているときだけ。** 最初の待受プロンプトを踏む前に倒れた在庫は
-            // 会話が保存されておらず、resume は即終了する(「No conversation found」)。指名を
-            // 残したままだと、終了 → 5秒後に同じ resume、が止まらない(2026-09-18 に発覚、
-            // あるマシンで8月2日から続いていた)。新規で起こせば下で指名し直される
+            // If a session is reserved, **resume it** — cutting a new ID would pile up a throwaway
+            // session in claude's history every time the pool is rebuilt.
+            // **But only while a conversation exists.** A pool agent that died before its first idle
+            // prompt has no saved conversation, and resume exits at once ("No conversation found"). Keeping
+            // the reservation loops exit → same resume 5s later, forever (found 2026-09-18; it had run on
+            // one machine since August 2). Starting fresh re-reserves below
             let nominated = self
                 .pools
                 .session_of(&cwd)
@@ -694,7 +694,7 @@ impl Bridge {
                 "launching"
             };
             ctx.info("bridge", &format!("pool: {how} {} (key={key})", cwd));
-            // 以後は「どの worker の話か」だけが要る。スレッドはまだ無いので thread_key は None
+            // From here on only "which agent" matters. There is no thread yet, so thread_key is None
             let ctx = LogCtx {
                 session_id: Some(sid.clone()),
                 thread_key: None,
@@ -702,15 +702,15 @@ impl Bridge {
             let Some(mcp) = self.write_mcp(&sid, &ctx) else {
                 continue;
             };
-            // 窓名はプールも割当済みも同じ規則— 引き当てで改名しない
+            // Pool and assigned agents follow the same window-name rule — no rename on claim
             let window_id = match self.deps.agent.spawn(&SpawnReq {
                 session_id: sid.clone().into(),
                 cwd: cwd.clone(),
-                // 配達待ちの本文を持たない = 実体の待受プロンプトで起動する
+                // No body waiting for delivery = start on the agent's idle prompt
                 prompt: None,
                 resume_from: nominated.clone().map(SessionId::from),
                 window: SessionId::from(sid.clone()).window_name(),
-                // ここに来た時点で在庫は居ない = 窓も無い
+                // Reaching here means no pool entry = no window either
                 state: crate::agent::WorkerState::Absent,
                 hooks_file: self.hooks_file.clone(),
                 mcp_config: mcp,
@@ -724,14 +724,14 @@ impl Bridge {
                     continue;
                 }
             };
-            // 新規で切った ID はここで指名する(次の起動が resume で拾えるように)
+            // Reserve a freshly cut ID here (so the next startup can pick it up with resume)
             if nominated.is_none() {
                 self.pools.nominate(&cwd, &sid);
                 self.save_pools(&ctx);
             }
-            // 窓はスレッドワーカーと同じ場所に置く — 引き当てで持ち替えが要らなくなる
+            // Put the window in the same place as thread agents — no move needed on claim
             self.workers.warm_mut(&sid).window_id = window_id;
-            // 在庫も待受プロンプトを1回踏むまでは起動中(踏んだ時点で引き当ての対象になる)
+            // A pool agent is starting until it passes its idle prompt once (then it becomes claimable)
             self.workers.mark_starting(&sid);
             self.workers.insert_pool(
                 key,
@@ -745,16 +745,16 @@ impl Bridge {
         }
     }
 
-    /// 指名表(pools.json)を書き出す。失敗しても走り続ける — 失うのは「次の起動で resume できる」
-    /// だけで、その場合は新規 ID で在庫が立つ(現行と同じ挙動に落ちる)。
+    /// Writes the reservation table (pools.json). Keeps running on failure — all that is lost is
+    /// "resume on next startup", in which case the pool comes up with fresh IDs.
     fn save_pools(&self, ctx: &LogCtx) {
         if let Err(e) = self.pools.save() {
             ctx.error("bridge", &format!("pools.json save failed: {e}"));
         }
     }
 
-    /// 在庫1本を実体ごと畳む。窓名は `w-<session_id>`、pid 指名 kill → 窓を閉じる、の順序は
-    /// `terminate` と揃える。`why` はログの頭に出る文脈語(logout / restart / pool give-up)。
+    /// Tears down one pool entry with its process. Window name is `w-<session_id>`; kill by pid → close the window,
+    /// in the same order as `terminate`. `why` is the context word at the head of the log (logout / restart / pool give-up).
     async fn teardown_pool(&mut self, key: &PoolKey, p: &worker::PoolWorker, why: &str) {
         let sid = &p.session_id;
         let ctx = LogCtx {
@@ -788,9 +788,9 @@ impl Bridge {
         self.workers.forget(sid);
     }
 
-    /// 生きているワーカーを**全部**畳む。ドレインはしない — 走らせるターンには行き先が無い
-    /// (teardownAllWorkers)。`logout`(認証が外れた)と
-    /// `shutdown`(孤児を残さない)の両方から呼ぶ。`detail` は行末に足す補足で、無いときは空文字。
+    /// Tears down **all** live agents. No drain — the turns they would run have nowhere to go.
+    /// Called from both `logout` (auth was lost) and
+    /// `shutdown` (leave no orphans). `detail` is extra text appended to the line; empty when none.
     pub(super) async fn teardown_all_workers(&mut self, why: &str, detail: &str, ctx: &LogCtx) {
         let live: Vec<(ThreadKey, String, Pid)> = self
             .threads
@@ -804,7 +804,7 @@ impl Bridge {
                 Some((ThreadKey::new(ch, tts), sid.to_string(), pid))
             })
             .collect();
-        // 在庫の pid も一緒に集める(下の teardown_pools が畳む相手)
+        // Collect the pool pids too (the ones teardown_pools below tears down)
         let pool_pids: Vec<Pid> = self
             .workers
             .pool_pid_rows()
@@ -818,42 +818,42 @@ impl Bridge {
             "bridge",
             &format!("{why}: tearing down {} live worker(s){detail}", live.len()),
         );
-        // **先に全員へ SIGTERM を撃つ。** 下の teardown は1本ずつ直列に待つので、先撃ちしないと
-        // 猶予(1本あたり最悪 TERM 1.5s + KILL 1.5s)が N 本ぶん積み上がり、shutdown の5秒
-        // バックストップに切られて生き残りが出る(実機で実際に4本残した)。先に撃って
-        // おけば猶予は**重なって**消化される。Bun は teardown 自体を並列化して同じ問題を解いた
-        // ponytail: SIGKILL 側の待ちは直列のまま。claude は SIGTERM で降りるので実測上これで足りる。
-        //           足りなくなったら terminate ごと JoinSet で並列化する
+        // **SIGTERM everyone first.** The teardown below waits one at a time, so without firing first
+        // the grace periods (worst case TERM 1.5s + KILL 1.5s each) add up N times, the 5s shutdown
+        // backstop cuts in and survivors remain (it really left 4 behind on a real machine). Firing
+        // first lets the grace periods **overlap**. Parallelizing teardown itself would solve the same problem
+        // ponytail: the SIGKILL wait stays serial. claude exits on SIGTERM, so in practice this is enough.
+        //           If it stops being enough, parallelize terminate itself with a JoinSet
         for (_, _, pid) in &live {
             pid.term();
         }
         for pid in &pool_pids {
             pid.term();
         }
-        // run_drains の「1 tick に1本」と非対称に、ここは直列で全部殺す — 待たせる
-        // 相手は今まさに殺しているワーカー自身なので、Stop 契約の5秒枠を割っても
-        // 困る者が居ない(そのワーカーはもう答えない)
+        // Unlike run_drains' "one per tick", kill them all serially here — the ones kept
+        // waiting are the very agents being killed, so breaking the Stop contract's 5s window
+        // hurts nobody (that agent will not answer anymore)
         for (key, sid, _) in &live {
             self.terminate(key, Some(sid.as_str()), None).await;
         }
-        // 在庫は `terminate` に載らない(まだどのスレッドのものでもない)
+        // The pool is not covered by `terminate` (it does not belong to any thread yet)
         self.teardown_pools(why).await;
     }
 
-    /// 在庫を空にして全部畳む。`logout`(認証が外れた)と `shutdown`(孤児を残さない)から。
-    /// **restart からは呼ばない** — あちらは在庫を生かしたまま降りて後継に継承させる。
+    /// Empties the pool and tears everything down. From `logout` (auth was lost) and `shutdown` (leave no orphans).
+    /// **Not called from restart** — restart exits with the pool alive for the successor to inherit.
     ///
-    /// 畳むのは実体だけで、pools.json の**指名は残す**。次の起動が同じ session_id を
-    /// `--resume` で起こすので、停止をまたいでもセッションは増えない。
+    /// Only the processes go; the **reservations** in pools.json stay. The next startup starts the same
+    /// session_id with `--resume`, so sessions do not multiply across stops.
     async fn teardown_pools(&mut self, why: &str) {
         for (key, p) in self.workers.take_pools() {
             self.teardown_pool(&key, &p, why).await;
         }
     }
 
-    /// MCP を上げられないまま猶予を過ぎた在庫を諦める。諦め方は Bun 版と同型
-    /// 鍵を `gave_up_pool_keys` に記録し、**実体を畳んで在庫から消す**。
-    /// 記録が再 spawn の止め金、削除が「存在しない在庫を status が数える」の防ぎ
+    /// Gives up on pool entries that passed the grace period without bringing up MCP:
+    /// record the key in `gave_up_pool_keys` and **tear down the process and remove it from the pool**.
+    /// The record stops respawns; the removal keeps status from counting a pool entry that does not exist
     pub(super) async fn give_up_stale_pools(&mut self, ctx: &LogCtx) {
         let now = self.deps.clock.now_ms();
         let stale: Vec<PoolKey> = self
@@ -878,9 +878,9 @@ impl Bridge {
                 session_id: Some(p.session_id.clone()),
                 thread_key: ctx.thread_key.clone(),
             };
-            // resume で起こした在庫が暖まらないのは「セッションが消えた/壊れた」が第一候補。
-            // ここで諦め札を立てると、指名が腐ったせいでそのプールが二度と作られなくなる。
-            // 指名だけ捨てて、新規 ID の1回に賭け直す(それも暖まらなければ下の札が立つ)
+            // A pool agent started with resume that never warms up most likely has a gone/broken session.
+            // Setting the give-up marker here would mean that pool is never built again because of a stale reservation.
+            // Drop only the reservation and bet once more on a fresh ID (if that fails too, the marker below is set)
             if p.resumed {
                 self.pools.release(&p.cwd);
                 self.save_pools(&ctx);
@@ -907,9 +907,9 @@ impl Bridge {
         }
     }
 
-    /// 定期的に在庫を数え直す。死んだ在庫は `session_end` と引き当て時の生存確認が登録簿から
-    /// 落とすので、ここは「空いた枠を埋める」だけ(Bun の `missing(targetKeys)` 収束と同じ役)。
-    /// **間引きは必須** — tick は 500ms 刻みで、素通しすると毎回 tmux に問い合わせに行く。
+    /// Recounts the pool periodically. Dead entries are dropped from the registry by `session_end` and by the
+    /// liveness check at claim time, so this only "fills empty slots" (converging on the missing target keys).
+    /// **Throttling is required** — the tick runs every 500ms, and unthrottled it would query tmux every time.
     pub(super) fn sweep_pools(&mut self, ctx: &LogCtx) {
         let now = self.deps.clock.now_ms();
         if !self.workers.sweep_due(now) {
@@ -918,17 +918,17 @@ impl Bridge {
         self.start_missing_pool_workers(ctx);
     }
 
-    /// 冷えたワーカーを畳む(現行`cleanup.run` に相当)。60秒に1回。
+    /// Tears down cold agents. Once every 60 seconds.
     ///
-    /// 見るのは**スレッドに紐づいたワーカーだけ**。在庫は `threads.json` に載っていないので
-    /// ここには最初から出てこない(畳むのは `sweep_pools` 側の仕事)。
+    /// Only **agents bound to a thread** are considered. The pool is not in `threads.json`, so it
+    /// never shows up here (tearing it down is `sweep_pools`' job).
     ///
-    /// **threads.json は触らない** — セッションの紐付けが残るので、畳んだスレッドに次の
-    /// メッセージが来れば `--resume` で続きから起き直る。人から見ると何も起きていない。
+    /// **Does not touch threads.json** — the session binding stays, so when the next message comes to
+    /// a torn-down thread it wakes up again with `--resume`. From a human's view nothing happened.
     ///
-    /// ponytail: 1回につき1本しか畳まない。kill は最悪3秒 main ループを止めるので、
-    /// `run_drains` と同じ理由で同一 tick に2本入れない。60秒で1本ずつ減る速さで足りなく
-    /// なったら、kill を spawn に逃がす。
+    /// ponytail: tears down only one per round. kill can stall the main loop up to 3s, so
+    /// for the same reason as `run_drains` never two in one tick. If one per 60s is too slow,
+    /// move the kill into a spawned task.
     pub(super) async fn cleanup_workers(&mut self) {
         if !self.workers.cleanup_due(self.deps.clock.now_ms()) {
             return;
@@ -937,38 +937,38 @@ impl Bridge {
         self.evict_idle_worker().await;
     }
 
-    /// 誰のものでもない窓を閉じる(現行EMPTY と 2389 の ORPHAN)。
+    /// Closes windows that belong to nobody (empty and orphaned windows).
     ///
-    /// **tmux の窓一覧が権威**。Bridge の記憶は再起動で消えるが窓は残るので、窓名に焼かれた
-    /// `w-<session_id>` から持ち主を引き直す。持ち主が居ない = 誰も配達できず、誰も畳まない。
+    /// **The tmux window list is the authority.** The Bridge's memory is lost on restart but windows stay, so
+    /// the owner is looked up again from the `w-<session_id>` baked into the window name. No owner = nobody can deliver to it and nobody tears it down.
     ///
-    /// 触らないもの: ワーカーの窓でないもの(アンカー窓・人が開いた窓)と、**立ち上げ中**
-    /// (`starting`)。spawn は窓を作った直後・同じ関数の中で掛け金を立てるので、
-    /// 起こしたばかりのワーカーが「まだ誰のものでもない」に見える隙間は無い。
-    /// 掃除してよい回か。**担当が1人も居ないのにワーカーの窓がある**なら、記憶を失って
-    /// いる側を疑う(窓を疑わない)。窓が無ければ掃除しても何も起きないので通してよい。
+    /// Left alone: windows that are not agent windows (the anchor window, windows a human opened) and those **starting up**
+    /// (`starting`). spawn sets the latch right after creating the window, inside the same function, so there is
+    /// no gap where a just-started agent looks "owned by nobody yet".
+    /// Whether this round may clean up: **if agent windows exist while nobody is assigned**, suspect the side
+    /// that lost its memory (not the windows). If there are no windows, cleaning does nothing, so let it through.
     pub(super) fn safe_to_reap(owned: &HashSet<String>, rows: &[tmux_mod::WindowRow]) -> bool {
         !owned.is_empty() || !rows.iter().any(|r| r.session_id().is_some())
     }
 
     async fn reap_stray_windows(&mut self) {
-        // スレッドと在庫が握っている session_id = 持ち主の居る窓
+        // session_ids held by threads and the pool = windows that have an owner
         let owned: HashSet<String> = self
             .threads
             .entries
             .values()
             .filter_map(|e| e.agent_id.clone())
             .chain(self.workers.pool_pid_rows().into_iter().map(|(sid, _)| sid))
-            // pools.json の**指名**も持ち主として数える。在庫はまだ立っていなくても、
-            // 指名されたセッションの窓は「これから引き当てられる在庫」なので litter ではない
+            // pools.json **reservations** count as owners too. Even before the pool entry is up,
+            // a reserved session's window is "a pool entry about to be claimed", not litter
             .chain(self.pools.sessions().map(str::to_string))
             .collect();
         let rows = self.deps.agent.windows();
-        // **持ち主が1人も居ないのにワーカーの窓がある = 窓がゴミなのではなく、こちらが
-        // 担当を見失っている**(threads.json が読めなかった等)。そのまま下の判定に落ちると
-        // 「全部の窓が持ち主不明」= 全部閉じる、になる。2026-08-03 に実機で動いている
-        // ワーカーを3本閉じた道がこれ。**この回は何もしない** — 本物のゴミ窓なら、担当表が
-        // 正常な回(60秒ごと)に普通に閉じられる。
+        // **Agent windows exist while nobody owns anything = not garbage windows, but we lost
+        // track of assignments** (threads.json could not be read, etc.). Falling through to the check below
+        // would make "every window ownerless" = close them all. On 2026-08-03 this path closed
+        // 3 running agents on a real machine. **Do nothing this round** — real garbage windows get
+        // closed normally in a round where the assignment table is healthy (every 60s).
         if !Self::safe_to_reap(&owned, &rows) {
             LogCtx::default().error(
                 "bridge",
@@ -979,7 +979,7 @@ impl Bridge {
         }
         for row in rows {
             let Some(sid) = row.session_id().map(str::to_string) else {
-                continue; // ワーカーの窓ではない
+                continue; // not an agent window
             };
             if self.workers.is_starting(&sid) {
                 continue;
@@ -1002,23 +1002,23 @@ impl Bridge {
                     row.id, row.command
                 ),
             );
-            // 殻でないなら claude が生きている可能性がある。窓だけ閉じると孤児として
-            // 残るので、**pid 指名で落としてから**閉じる(terminate と同じ順序)
+            // If it is not an empty shell, claude may be alive. Closing only the window leaves it
+            // as an orphan, so **kill by pid first**, then close (same order as terminate)
             row.pid.kill_graceful(tmux_mod::KILL_GRACE_MS).await;
             if let Err(e) = self.deps.agent.terminate(&Window::of(&row.id)) {
                 ctx.debug("bridge", &format!("cleanup: kill-window failed: {e}"));
             }
             self.workers.forget(&sid);
-            return; // 1回につき1つ(kill の待ちで main ループを止めすぎない)
+            return; // one per round (do not stall the main loop too long on kill waits)
         }
     }
 
-    /// 冷えたスレッドのワーカーを1本畳む。
+    /// Tears down one cold thread agent.
     async fn evict_idle_worker(&mut self) {
         let now = self.deps.clock.now_ms();
         let mut snaps: Vec<worker::IdleSnapshot> = Vec::new();
         let mut sid_of: HashMap<ThreadKey, String> = HashMap::new();
-        // 人のクリックを待っているスレッド(perm_pending は reqId 引きなので鍵に直す)
+        // Threads waiting for a human click (perm_pending is keyed by reqId, so convert to the thread key)
         let waiting: HashSet<ThreadKey> = self
             .perm_pending
             .values()
@@ -1029,7 +1029,7 @@ impl Bridge {
             else {
                 continue;
             };
-            // 生死は tmux の pid が唯一の答え(記憶ではなく実物 — status と同じ流儀)
+            // The tmux pid is the only answer for liveness (the real thing, not memory — same approach as status)
             let h = self.workers.warm(sid);
             let window = SessionId::from(sid.to_string()).window_name();
             if self
@@ -1040,8 +1040,8 @@ impl Bridge {
                 continue;
             }
             let key = ThreadKey::new(channel_id, tts);
-            // idle の基準は transcript の mtime = 最後に**本当に働いた**時刻。ナレーションや
-            // reply の時刻より広く、黙って考えている / 長いツールを回している最中も更新される
+            // Idle is measured from the transcript's mtime = when it last **actually worked**. Broader than
+            // narration or reply times; it also updates while thinking silently or running a long tool
             let last = self
                 .deps.agent
                 .last_activity_ms(h.and_then(|h| h.transcript_path.as_deref()), sid);
@@ -1062,12 +1062,12 @@ impl Bridge {
         if evict.is_empty() {
             return;
         }
-        // 一番冷えたものから1本(select は冷えている順に積む)
+        // One, coldest first (select stacks them coldest first)
         let key = evict.remove(0);
         let sid = sid_of.get(&key).cloned();
-        // **畳んだ理由はそのスレッドのログに残す**(呼び手の ctx は素なので plugin-debug.log
-        // 行き = 雑多なログに埋もれる)。後から「ワーカーが消えている」を追う人が最初に開くのは
-        // by-thread の bridge.log で、直後の `exit: terminating …` もそこに出る
+        // **Log the teardown reason to that thread's log** (the caller's ctx is plain, so it would go to
+        // plugin-debug.log and get buried). Anyone later chasing "the agent is gone" first opens
+        // the by-thread bridge.log, where the following `exit: terminating …` also appears
         let ctx = LogCtx {
             session_id: sid.clone(),
             thread_key: Some(key.clone()),
@@ -1084,14 +1084,14 @@ impl Bridge {
         self.terminate(&key, sid.as_deref(), None).await;
     }
 
-    /// この session_id の在庫を登録簿から**落とすだけ**(Bun の `PoolRegistry.remove`。
-    /// の `clearForSession` から呼ばれるのと同じ役)。実体は既に死んでいる
-    /// 前提なので窓は畳まない。`gave_up_pool_keys` には**入れない** — 死は「諦めた」ではなく、
-    /// 次のスイープで立て直してよい枠だから。
+    /// **Only drops** this session_id's pool entry from the registry (called from the per-session
+    /// cleanup). The process is assumed to be dead already, so the window is not closed.
+    /// It is **not** added to `gave_up_pool_keys` — dying is not "giving up";
+    /// the next sweep may rebuild the slot.
     ///
-    /// pools.json の**指名も外さない**。立て直しは同じ session_id の `--resume` でやりたい
-    /// (新規 ID を切ると、在庫が死ぬたびにセッションが増える)。resume できないほど壊れて
-    /// いたときの逃げ道は `give_up_stale_pools` 側にある。
+    /// The pools.json **reservation stays too**. We want to rebuild with `--resume` of the same session_id
+    /// (cutting a new ID would add a session every time a pool agent dies). The escape hatch for a session
+    /// too broken to resume lives in `give_up_stale_pools`.
     pub(super) fn drop_pool_worker(&mut self, sid: &str, why: &str, ctx: &LogCtx) {
         let Some(key) = self.workers.drop_pool_of_session(sid) else {
             return;
@@ -1102,11 +1102,11 @@ impl Bridge {
         );
     }
 
-    /// 在庫から1本抜き取る。抜けるのは Bun の `claimReadyWorker` と同じ **push-ready**
-    /// (mcp_initialized ∧ 最初の user_prompt ∧ 未終了)で、かつ**実プロセスが生きている**もの
-    /// だけ。生きていない在庫は引き当てず登録簿からも消す — 残すと補充もされず、次の新規
-    /// スレッドがまた死体を引いて配達ごと失う(E2E で実測)。
-    /// 抜いた時点でそれはもう在庫ではない — 補充は次の `start_missing_pool_workers` に任せる。
+    /// Takes one agent out of the pool. Only **push-ready** ones qualify
+    /// (mcp_initialized ∧ first user_prompt ∧ not ended), and only if **the real process is alive**.
+    /// Dead pool entries are not claimed and are removed from the registry — kept, they are never refilled, and the next new
+    /// thread claims the corpse again and loses the delivery with it (measured in E2E).
+    /// Once taken it is no longer in the pool — refilling is left to the next `start_missing_pool_workers`.
     pub(super) fn claim_pool_worker(&mut self, pool_key: &PoolKey) -> Option<worker::PoolWorker> {
         let p = self.workers.pool(pool_key)?;
         let sid = p.session_id.clone();
@@ -1116,11 +1116,11 @@ impl Bridge {
                 .warm(&sid)
                 .is_some_and(|h| h.mcp_ready && !h.ended);
         if !push_ready {
-            // まだ暖まっていないだけかもしれない — 触らず置いておく(give-up が期限を見る)
+            // Maybe it just has not warmed up yet — leave it alone (give-up watches the deadline)
             return None;
         }
-        // connector の無い Rust では tmux の claude pid が唯一の生存証明
-        // (session_end の飛ばない kill -9 で死んだ在庫はここでしか気付けない)
+        // Without a connector, the claude pid in tmux is the only proof of life
+        // (a pool agent killed by kill -9, which sends no session_end, can only be noticed here)
         if self
             .deps.agent
             .pid_of(
@@ -1142,10 +1142,10 @@ impl Bridge {
         self.workers.remove_pool(pool_key)
     }
 
-    /// 引き当てた worker をスレッドに縛り、封筒を配達し、抜いた分を補充する
-    /// 窓は再利用 — スレッドキーだけが後から付く。
-    /// **`milestone()` は呼ばない** — プールが既に spawn / mcp_initialized を出している。
-    /// この `pool: assigned` の1行だけが「割当」の記録。
+    /// Binds the claimed agent to the thread, delivers the envelope, and refills what was taken.
+    /// The window is reused — only the thread key is attached afterward.
+    /// **Does not call `milestone()`** — the pool already emitted spawn / mcp_initialized.
+    /// This single `pool: assigned` line is the only record of the assignment.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn assign_pool_worker(
         &mut self,
@@ -1175,13 +1175,13 @@ impl Bridge {
         if let Err(err) = self.threads.save() {
             ctx.error("bridge", &format!("threads.json save failed: {err}"));
         }
-        // 在庫の卒業 — このセッションは以後このスレッドのもの。指名を外さないと、
-        // 補充がスレッドの持ち物を `--resume` で二重に起こしにいく
+        // Graduating from the pool — this session belongs to this thread from now on. Without dropping the reservation,
+        // the refill would start the thread's session a second time with `--resume`
         self.pools.release(&claimed.cwd);
         self.save_pools(&ctx);
 
-        // 掛け金には入れない — 在庫は引き当ての条件として既に最初のターンを踏んでいる。
-        // 窓は起動時から self.hooked にある(在庫は写しを持たない)
+        // Not put in the latch — being claimable already required the pool agent to pass its first turn.
+        // The window has been in self.hooked since startup (the pool holds no copy)
         ctx.info(
             "bridge",
             &format!("pool: assigned {key} to pool worker session={sid}"),
@@ -1192,8 +1192,8 @@ impl Bridge {
             .window_of(&sid)
             .unwrap_or_else(|| SessionId::from(sid.clone()).window_name());
         let delivered = match self.deps.agent.deliver(&Window::of(&target), envelope) {
-            // Dispatch::Deliver と同型の配達記録。
-            // このパスは新規スレッドの割当てなので new は常に true
+            // Same delivery record as Dispatch::Deliver.
+            // This path assigns a new thread, so new is always true
             Ok(()) => {
                 ctx.info(
                     "bridge",
@@ -1202,18 +1202,18 @@ impl Bridge {
                          thread={root_ts} new=true -> worker {channel}"
                     ),
                 );
-                // Dispatch::Deliver と同じ — 渡した瞬間に shimmer を出す
+                // Same as Dispatch::Deliver — show the shimmer the moment it is handed over
                 self.touch_thread(key, slack::TYPING_STATUS);
                 Ok(())
             }
-            // 渡せなかった1通は呼び手が持ち直す(元のメッセージを持っているのは呼び手)
+            // The caller takes back the one message it could not hand over (the caller holds the original)
             Err(e) => {
                 ctx.error("bridge", &format!("delivery failed: {e} — queued for retry"));
                 Err(e)
             }
         };
 
-        // 補充で起動するのは別セッション — 割当てた session_id を引きずらせない
+        // The refill starts a different session — do not let it carry the assigned session_id
         self.start_missing_pool_workers(&LogCtx {
             session_id: None,
             thread_key: ctx.thread_key.clone(),
@@ -1221,8 +1221,8 @@ impl Bridge {
         delivered
     }
 
-    /// 起動直後の窓を見張る背景タスクを起こす。**spawn した直後に必ず呼ぶ** —
-    /// これが唯一の答え手で、立ち上がりの期限は他に無い(`Claude::watch_spawn_screens`)。
+    /// Starts a background task watching the window right after startup. **Always call right after spawn** —
+    /// this is the only responder, and there is no other startup deadline (`Claude::watch_spawn_screens`).
     fn start_spawn_screen_watch(&self, w: &Window, what: String, ctx: &LogCtx) {
         let (tx, w, ctx) = (self.cmd_tx.clone(), w.clone(), ctx.clone());
         let agent = self.deps.agent.clone();
@@ -1230,7 +1230,7 @@ impl Bridge {
             let out = agent
                 .watch_spawn_screens(&w, SPAWN_SCREEN_BUDGET_MS, SPAWN_SCREEN_POLL_MS, &ctx)
                 .await;
-            // 普通に立ち上がった窓は毎回ここに来る — main を起こす価値があるのは拒絶だけ
+            // Windows that start normally come here every time — only a rejection is worth waking main for
             if matches!(
                 out,
                 SpawnOutcome::LoginRequired | SpawnOutcome::UsageLimited
@@ -1245,9 +1245,9 @@ impl Bridge {
             Ok(window) => {
                 self.start_spawn_screen_watch(&window, format!("thread={key}"), ctx);
                 let id = window.as_str().to_string();
-                // 窓名は改名されうるので、以後はこの window_id で追う
+                // Window names can be renamed, so track by this window_id from now on
                 self.workers.warm_mut(sid).window_id = Some(id.clone());
-                // 起こした = 最初のターンまでは配達を待たせる(TUI がまだキーを取れない)
+                // Just started = hold deliveries until the first turn (the TUI cannot take keys yet)
                 self.workers.mark_starting(sid);
                 ctx.debug("bridge", &format!("spawned window={id}"));
                 self.milestone(Some(key), "spawn", ctx);
@@ -1263,11 +1263,11 @@ mod tests {
     use crate::agent::claude::Claude;
     use crate::agent::tmux::Tmux;
 
-    // ── 冷えたワーカーの回収 ────────────────────────────────────────────────
+    // ── Reclaiming cold agents ───────────────────────────────────────────────
 
     const MIN: u64 = 60_000;
 
-    /// 実機の決裁値(30分 / 5本 / 60分 / 10本)。
+    /// The values decided for real use (30 min / 5 / 60 min / 10).
     const P: CleanupPolicy = CleanupPolicy {
         idle_ttl_ms: 30 * MIN,
         idle_slots: 5,
@@ -1275,7 +1275,7 @@ mod tests {
         max_concurrent: 10,
     };
 
-    /// `idle_min` 分だけ冷えた、落としてよいスレッド。
+    /// A thread that has been cold for `idle_min` minutes and may be dropped.
     fn snap(n: u32, idle_min: u64) -> IdleSnapshot {
         IdleSnapshot {
             key: ThreadKey::new("C1", &n.to_string()),
@@ -1288,16 +1288,16 @@ mod tests {
         v.into_iter().map(|k| k.as_str().to_string()).collect()
     }
 
-    /// 席が余っていて、冷えたものも枠の内なら何も畳まない。
+    /// With free seats and cold ones within the cap, nothing is torn down.
     #[test]
     fn nothing_is_evicted_while_within_every_limit() {
-        // 5本冷えている(枠ちょうど)+ 温かいのが4本 = 9本(上限10の内)
+        // 5 cold (exactly the cap) + 4 warm = 9 (within the cap of 10)
         let mut v: Vec<IdleSnapshot> = (0..5).map(|n| snap(n, 45)).collect();
         v.extend((5..9).map(|n| snap(n, 1)));
         assert!(select_cleanup_keys(v, &P).is_empty());
     }
 
-    /// 放置の絶対上限は席の空きに関係しない — 1本だけでも畳む。
+    /// The absolute idle limit ignores free seats — even a single one is torn down.
     #[test]
     fn a_thread_past_the_hard_idle_ceiling_goes_even_with_seats_to_spare() {
         assert_eq!(
@@ -1311,38 +1311,38 @@ mod tests {
         );
     }
 
-    /// 冷えたものの枠(5本)を超えた分だけ、**冷えている順に**畳む。
+    /// Only the cold ones beyond the cold cap (5) are torn down, **coldest first**.
     #[test]
     fn only_the_coldest_surplus_leaves_the_idle_slots() {
-        // 冷えたのが7本(31〜37分)。枠は5なので2本落ちる — 落ちるのは冷えている方
+        // 7 cold (31–37 min). The cap is 5, so 2 go — the colder ones
         let v: Vec<IdleSnapshot> = (1..=7).map(|n| snap(n, 30 + n as u64)).collect();
         assert_eq!(keys(select_cleanup_keys(v, &P)), ["C1:7", "C1:6"]);
     }
 
-    /// 同時上限を超えたら、冷えていなくても一番冷えたものから畳む。
+    /// Above the concurrency cap, the coldest go first even if not cold.
     #[test]
     fn the_concurrency_cap_evicts_even_warm_threads() {
-        // 12本すべて温かい(TTL 未満)= 冷えた枠は使っていない。上限10なので2本落ちる
+        // All 12 warm (under TTL) = the cold cap is unused. Cap is 10, so 2 go
         let v: Vec<IdleSnapshot> = (1..=12).map(|n| snap(n, n as u64)).collect();
         assert_eq!(keys(select_cleanup_keys(v, &P)), ["C1:12", "C1:11"]);
     }
 
-    /// 触ってはいけないものは、どの規則でも畳まれない(上限に戻れなくても諦める)。
+    /// What must not be touched is never torn down by any rule (give up on getting back under the cap).
     #[test]
     fn ineligible_threads_are_never_evicted() {
         let ineligible = |n: u32, idle_min: u64| IdleSnapshot {
             eligible: false,
             ..snap(n, idle_min)
         };
-        // 3時間放置でも、返事待ち・起動中・クリック待ちなら残る
+        // Even after 3 hours idle, they stay if waiting for a reply, starting, or waiting for a click
         assert!(select_cleanup_keys(vec![ineligible(1, 180)], &P).is_empty());
-        // 上限超過の巻き添えにもしない — 落ちるのは eligible な中で一番冷えたもの
+        // Not collateral for exceeding the cap either — what goes is the coldest eligible one
         let mut v: Vec<IdleSnapshot> = (1..=10).map(|n| snap(n, n as u64)).collect();
         v.push(ineligible(99, 200));
         assert_eq!(keys(select_cleanup_keys(v, &P)), ["C1:10"]);
     }
 
-    /// 窓は生きている(pane_pid が返る)fake tmux。
+    /// Fake tmux where the window is alive (returns a pane_pid).
     fn live_agent() -> Claude {
         Claude::new(Tmux {
             run: Box::new(|args: &[&str]| {
@@ -1355,7 +1355,7 @@ mod tests {
         })
     }
 
-    /// 窓が無い fake tmux。
+    /// Fake tmux with no window.
     fn dead_agent() -> Claude {
         Claude::new(Tmux {
             run: Box::new(|_args: &[&str]| Ok(String::new())),
@@ -1370,8 +1370,8 @@ mod tests {
         }
     }
 
-    /// 掛け金の一生: spawn で入り、最初のターンで外れる。**外れるのは1回だけ** —
-    /// queue を流すのはその1回でよい。
+    /// The latch lifecycle: set on spawn, cleared on the first turn. **It clears only once** —
+    /// flushing the queue on that one time is enough.
     #[test]
     fn the_latch_goes_on_at_spawn_and_comes_off_at_the_first_turn() {
         let entry = entry_of("sid-1");
@@ -1392,8 +1392,8 @@ mod tests {
         );
     }
 
-    /// **前の Bridge から継承したワーカーは、推測なしで Ready。** 掛け金はこのプロセスが
-    /// 起こしたときにしか入らないので、入っていない = 前世代が起こしきった = 渡してよい。
+    /// **Agents inherited from the previous Bridge are Ready without guessing.** The latch is only set
+    /// when this process starts an agent, so not set = fully started by the previous generation = safe to hand work.
     #[test]
     fn a_worker_inherited_from_a_previous_bridge_is_ready_not_starting() {
         let entry = entry_of("sid-1");
@@ -1412,15 +1412,15 @@ mod tests {
         assert!(gone.is_empty(), "死んだ窓に暖機印を付けてはいけない");
     }
 
-    /// hook が席を触っても掛け金は動かない。**session_start は compact / clear でも飛ぶ**ので、
-    /// あれで「起動中」に戻すと、動いているワーカー宛の配達が queue に詰まったまま
-    /// 二度と流れない(2026-08-01 実機。前身は `started_here` をここで立てていた)。
+    /// Hooks touching the seat do not move the latch. **session_start also fires on compact / clear**, so
+    /// flipping back to "starting" there would leave deliveries to a running agent stuck in the queue
+    /// forever (real machine, 2026-08-01. The predecessor set `started_here` here).
     #[test]
     fn a_hook_touching_the_seat_never_puts_the_worker_back_into_starting() {
         let entry = entry_of("sid-1");
         let mut w = Workers::default();
 
-        // compact 明けの session_start が通る道(ended を戻し、transcript を覚え直す)
+        // The path session_start takes after a compact (resets ended, re-learns the transcript)
         let h = w.warm_mut("sid-1");
         h.ended = false;
         h.transcript_path = Some("/tmp/sid-1.jsonl".into());
@@ -1439,7 +1439,7 @@ mod tests {
         assert!(!w.sweep_due(POOL_SWEEP_INTERVAL_MS + 1), "間隔内は間引く");
         assert!(w.sweep_due(2 * POOL_SWEEP_INTERVAL_MS + 1));
     }
-    /// 在庫の ready は在庫側に**持たない** — 同じ session の `mcp_ready` がそのまま出る。
+    /// The pool does **not** hold its own ready flag — the same session's `mcp_ready` shows through.
     #[test]
     fn a_pool_worker_is_ready_exactly_when_its_session_took_mcp() {
         let mut w = Workers::default();
@@ -1461,7 +1461,7 @@ mod tests {
         assert_eq!(w.pool_summary(), vec![("/repo/a".to_string(), true)]);
         assert!(w.pool_rows()[0].3);
 
-        // 窓も同じ場所から引く(在庫側に写しを置かない)
+        // The window is looked up from the same place too (no copy on the pool side)
         w.warm_mut("sid-1").window_id = Some("@7".into());
         assert_eq!(
             w.pool_pid_rows(),
@@ -1491,12 +1491,12 @@ mod tests {
             Workers::state_from(&facts(Some(1), false, false)),
             WorkerState::Ready
         );
-        // pid が消えたら、過去に働いていても居ない
+        // Once the pid is gone, it is gone even if it worked in the past
         assert_eq!(
             Workers::state_from(&facts(None, false, false)),
             WorkerState::Absent
         );
-        // session_end のあとは pid が残っていても居ない
+        // After session_end it is gone even if the pid remains
         assert_eq!(
             Workers::state_from(&facts(Some(1), false, true)),
             WorkerState::Absent

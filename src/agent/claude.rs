@@ -1,11 +1,11 @@
-//! claude 実体 — 起動行 / 生存判定 / サインイン用セッション / 画面と出力の読み取り。
-//! **claude という語が出てよいのはこのファイルだけ。**
+//! The claude process — launch line / liveness / sign-in session / reading the screen and output.
+//! **This is the only file where the word claude may appear.**
 //!
-//! hooks / mcp の設定ファイルは spawn ごとに Bridge が書き出す — この型は道具(tmux)しか
-//! 持たず、パスは [`SpawnReq`] で受け取る(現行の受け渡しをそのまま型に閉じた形)。
+//! The hooks / mcp settings files are written by the Bridge on every spawn — this type only holds
+//! its tool (tmux) and receives the paths through [`SpawnReq`].
 //!
-//! transcript(`Transcript`)の読み取りもここ。画面(`Pane`)・モデル id(`ModelId`)は `screen.rs`。
-//! **Slack へ出す文面は1つも持たない** — 描くのは Bridge の仕事(`command.rs`)。
+//! Reading the transcript (`Transcript`) lives here too. The screen (`Pane`) and model id (`ModelId`) are in `screen.rs`.
+//! **It holds no Slack-facing text at all** — rendering is the Bridge's job (`command.rs`).
 
 use super::screen::{Pane, SpawnOutcome, SpawnScreen, strip_modal_decoration};
 use super::tmux::{Pid, Tmux, Window, WindowRow};
@@ -14,7 +14,7 @@ use crate::agent::WorkerState;
 use crate::bridge::state::{LogCtx, StateDir, ThreadKey, WallClock};
 use std::time::Duration;
 
-/// spawn ごとに新規 ID。使用済み ID での起動は claude に拒否される(スパイク実測)。
+/// A fresh ID per spawn. claude refuses to start with an ID that was already used (measured in the spike).
 pub enum SessionMode {
     New(String),
     Resume(String),
@@ -35,38 +35,38 @@ impl SessionMode {
     }
 }
 
-/// 本番 Bun 版の `slack-login` と衝突させない dev 名。切替時に戻す。
+/// Session name that does not collide with the old `slack-login`.
 const LOGIN_SESSION: &str = "slack-login-rs";
 
-/// NEW スレッドの向き付け。原文コピー — 1字も変えない。
+/// Orientation for a NEW thread. Verbatim copy — do not change a single character.
 const NEW_PENDING_PREFIX: &str = "This is a NEW Slack thread; the message(s) below are the first you have received — \
      treat them as one burst (a single reply may cover several; a later one may correct an \
      earlier). Reply to them now, then wait for pushed messages; do not poll.";
 
-/// RESUME の向き付け。原文コピー — 1字も変えない。
+/// Orientation for RESUME. Verbatim copy — do not change a single character.
 const RESUME_PENDING_PREFIX: &str = "You are RESUMING this Slack thread; the previous worker process was replaced and your \
      bridge/MCP is freshly reconnected, so agentgw tools work NOW. The message(s) below \
      arrived while the thread was down and are the ones to handle now — treat them as one burst \
      (a single reply may cover several; a later one may correct an earlier). Reply to them now, \
      then wait for pushed messages; do not poll.";
 
-/// backlog が空のまま起動する worker の待受プロンプト。原文コピー — 1字も変えない。
+/// Idle prompt for an agent started with an empty backlog. Verbatim copy — do not change a single character.
 const WORKER_STARTUP_PROMPT: &str = "You are a Slack thread worker. There is no message waiting right now — wait for messages \
      to be pushed to you and reply when they arrive. Do not poll and do not call any startup tool.";
 
-/// 配達した本文が入力欄に残っていたとき、Enter を押し直す回数と、その間の一拍。
-/// スラッシュコマンドの `SUBMIT_RETRY_CAP` と同じ考えで、対象が本文になっただけ。
+/// How many times to press Enter again when the delivered body is still in the input box, and the pause between.
+/// Same idea as the slash commands' `SUBMIT_RETRY_CAP`, only the target is the body.
 const DELIVER_SUBMIT_RETRIES: u32 = 4;
 const DELIVER_SUBMIT_POLL: Duration = Duration::from_millis(200);
 
-/// `/effort` が受け取る level(2026-07-17 実機確認: スライダの5段 + `ultracode` / `auto`)。
+/// Levels `/effort` accepts (checked on a real machine 2026-07-17: the slider's 5 steps + `ultracode` / `auto`).
 const EFFORT_LEVELS: [&str; 7] = ["low", "medium", "high", "xhigh", "max", "ultracode", "auto"];
 
-/// `mode` が受け取る権限モード。shift+tab の巡回で行ける4つだけを引数にする —
-/// `bypass` / `don't ask` は設定でしか入らず、Slack から踏ませたいものでもない。
+/// Permission modes `mode` accepts. Only the 4 reachable by cycling shift+tab are arguments —
+/// `bypass` / `don't ask` are only entered through settings, and nothing we want Slack to trigger.
 const MODE_NAMES: [&str; 4] = ["manual", "plan", "edit", "auto"];
 
-/// claude を tmux の窓で飼う実体。
+/// Keeps claude in a tmux window.
 pub struct Claude {
     tmux: Tmux,
 }
@@ -81,14 +81,14 @@ impl Claude {
         Self::new(Tmux::real())
     }
 
-    /// 同ファイルの argv 固定テスト専用。**本番の経路はここを通らない** — 窓を叩くのは
-    /// `Claude` のメソッド(`deliver` / `capture` / `login_*` / `drive` …)だけ。
+    /// Only for the argv-pinning tests in this file. **The production path never goes through here** — only
+    /// `Claude`'s methods (`deliver` / `capture` / `login_*` / `drive` …) poke the window.
     #[cfg(test)]
     fn tmux(&self) -> &Tmux {
         &self.tmux
     }
 
-    /// spawn する claude の起動行。
+    /// The launch line of the claude to spawn.
     fn launch_line(
         &self,
         mode: &SessionMode,
@@ -97,7 +97,7 @@ impl Claude {
         prompt: &str,
     ) -> String {
         format!(
-            // --strict-mcp-config: 本番プラグイン由来の MCP を載せない(dev ワーカーの隔離)
+            // --strict-mcp-config: do not load MCP from the production plugin (isolates dev agents)
             "AGENTGW_SESSION_ID={} claude --settings {hooks_file} --mcp-config {mcp_config} \
              --strict-mcp-config {} {}",
             mode.session_id(),
@@ -106,13 +106,13 @@ impl Claude {
         )
     }
 
-    /// シェルのシングルクォート括り。中の `'` は `'\''` で閉じ直す。
+    /// Shell single-quoting. A `'` inside is closed and reopened as `'\''`.
     fn single_quote(s: &str) -> String {
         format!("'{}'", s.replace('\'', r"'\''"))
     }
 
-    /// 最初の1通を spawn プロンプトに同梱する(配達レースを構造的に避ける)。
-    /// 封筒どうしは空行1つ(`\n\n`)で区切ってつなぐ。
+    /// Bundles the first message into the spawn prompt (structurally avoids the delivery race).
+    /// Envelopes are joined with one blank line (`\n\n`).
     fn spawn_prompt(&self, envelope: &str, mode: &SessionMode) -> String {
         let prefix = match mode {
             SessionMode::New(_) => NEW_PENDING_PREFIX,
@@ -121,13 +121,13 @@ impl Claude {
         format!("{prefix}\n\n{envelope}")
     }
 
-    /// プール worker は配達待ちの本文を持たない — 常に待受プロンプトで起動する。
+    /// A pool agent has no body waiting for delivery — it always starts on the idle prompt.
     fn pool_prompt(&self) -> &'static str {
         WORKER_STARTUP_PROMPT
     }
 
-    /// 窓に claude を建てる。**Absent のときだけ** — spawn を kill にしない。
-    /// 返すのは window_id(`@N`)。窓名は claude の画面タイトルで改名されるので当てにしない。
+    /// Starts claude in a window. **Only when Absent** — spawn never kills.
+    /// Returns the window_id (`@N`). The window name gets renamed by claude's screen title, so it is not relied on.
     pub fn spawn(&self, req: &SpawnReq) -> Result<Window, String> {
         if req.state != WorkerState::Absent {
             return Err(format!(
@@ -139,14 +139,14 @@ impl Claude {
             Some(id) => SessionMode::Resume(id.as_str().to_string()),
             None => SessionMode::New(req.session_id.as_str().to_string()),
         };
-        // 本文が無い(= プールの空焚き)なら待受プロンプト、あれば向き付けを頭に付けた封筒
+        // No body (= warming a pool agent) uses the idle prompt; otherwise an envelope with the orientation prepended
         let prompt = match &req.prompt {
             Some(envelope) => self.spawn_prompt(envelope, &mode),
             None => self.pool_prompt().to_string(),
         };
         let line = self.launch_line(&mode, &req.hooks_file, &req.mcp_config, &prompt);
-        // 信頼の確認を画面で答えずに済ませる(公式の方法)。書けなくても起動は止めない —
-        // 確認が出れば起動画面の見張りが答える
+        // Settle the trust confirmation without answering on screen (the official way). Failing to write does not stop startup —
+        // if the confirmation appears, the startup-screen watcher answers it
         match Self::pre_trust(&req.cwd) {
             Ok(Some(key)) => LogCtx::default().info(
                 "spawn",
@@ -216,21 +216,21 @@ impl Claude {
         Some(updated)
     }
 
-    /// 押し込むのは tmux の仕事。**送信されたことを確かめるのはこちら** — 入力欄(`❯`)を
-    /// 知っているのはこのファイルだけだから。
+    /// Pushing the keys in is tmux's job. **Confirming it was submitted is ours** — only this file
+    /// knows the input box (`❯`).
     ///
-    /// `Tmux::deliver` の一拍は 1.3KB で実測した 200ms で、**長い封筒では足りない**
-    /// (2026-08-02 実機: 4017B / 76行 で Enter が取り込み中の TUI に飲まれ、本文末尾の改行に
-    /// なって入力欄に残った)。送信されていないので UserPromptSubmit も飛ばず、Bridge は
-    /// send-keys の成功を配達成功と記録したまま40分沈黙した。
+    /// The pause in `Tmux::deliver` is 200ms, measured with 1.3KB, and **not enough for long envelopes**
+    /// (real machine 2026-08-02: at 4017B / 76 lines the Enter was swallowed by the TUI still ingesting,
+    /// became a trailing newline of the body and stayed in the input box). Nothing was submitted, so
+    /// UserPromptSubmit never fired, and the Bridge recorded send-keys success as delivery success and went silent for 40 minutes.
     ///
-    /// 一拍を伸ばしても当て推量にしかならない — 詰まるのは TUI の描画で、長さと負荷で変わる。
-    /// **入力欄が空くまで Enter を押し直す**のが唯一確かめられる形(`send_command` と同じ)。
+    /// Lengthening the pause is only guesswork — what stalls is the TUI's rendering, which varies with length and load.
+    /// **Pressing Enter again until the input box is empty** is the only verifiable form (same as `send_command`).
     pub fn deliver(&self, w: &Window, text: &str) -> Result<(), String> {
-        // **打つ前に、キーを取れる相手か確かめる。** モーダルが出ている窓に send-keys すると、
-        // 届かないだけでなく本文がそのまま操作になる — 選択肢リストでは本文中の数字が選択、
-        // 続く Enter が確定。押し直し(tick の再配達)まで含めると、人が答える前に勝手に選ばれる。
-        // 画面が読めないときは進む(読めない = モーダルの証拠ではない。従来どおり)。
+        // **Before typing, make sure the window can take keys.** send-keys into a window showing a modal
+        // not only fails to arrive, the body becomes input to the modal — in a choice list, digits in the body select,
+        // and the following Enter confirms. Counting the retries (the tick's redelivery), it picks before a human answers.
+        // If the screen cannot be read, proceed (unreadable is not evidence of a modal; as before).
         if let Ok(pane) = self.tmux.capture(w)
             && let Some(why) = Self::not_accepting_keys(&pane)
         {
@@ -239,12 +239,12 @@ impl Claude {
         self.tmux.deliver(w, text)?;
         for attempt in 0..=DELIVER_SUBMIT_RETRIES {
             std::thread::sleep(DELIVER_SUBMIT_POLL);
-            // 画面が読めないなら押さない — 見えていない窓に余計な Enter を落とす方が危ない
+            // If the screen cannot be read, do not press — dropping a stray Enter into a window we cannot see is riskier
             let Ok(pane) = self.tmux.capture(w) else {
                 return Ok(());
             };
-            // 送っている最中に出たモーダルもここで捕まえる。押し直しは**ダイアログの確定**に
-            // なるので、1発も撃たずに降りる
+            // A modal that appears mid-send is caught here too. Pressing again would **confirm the dialog**,
+            // so back out without firing a single key
             if let Some(why) = Self::not_accepting_keys(&pane) {
                 return Err(format!("{w}: {why}"));
             }
@@ -261,22 +261,22 @@ impl Claude {
         ))
     }
 
-    /// この窓は打ち込みを受け取れる状態か。受け取れないなら**人に見せられる理由**を返す。
+    /// Whether this window can accept typing. If not, returns **a reason a human can be shown**.
     ///
-    /// **`❯` の有無では決まらない。** 2026-08-18 に実物3枚で確かめた TUI の形:
+    /// **The presence of `❯` does not decide it.** TUI shapes checked against 3 real screens on 2026-08-18:
     ///
-    /// | 画面 | 最後の `❯` 行 | `Esc to cancel` |
+    /// | Screen | Last `❯` line | `Esc to cancel` |
     /// |---|---|---|
-    /// | 通常(待機中) | `❯ `(空) | 無し |
-    /// | auto mode オンボーディング | `❯ `(空 — **箱は生きたまま**モーダルが前に出る) | あり |
-    /// | `/model` セレクタ | `❯ 2. Opus …`(**`❯` を選択カーソルに奪われる**) | あり |
+    /// | Normal (idle) | `❯ ` (empty) | none |
+    /// | auto mode onboarding | `❯ ` (empty — the modal comes up **with the box still alive**) | present |
+    /// | `/model` selector | `❯ 2. Opus …` (**`❯` is taken over by the selection cursor**) | present |
     ///
-    /// 最初の実装は「`❯` の行が消える」を前提にしていて、**どちらのモーダルでも発火しなかった**。
-    /// しかも `/model` 型は `input_box_empty()` が「本文が残っている」と読むので、押し直しの
-    /// Enter がダイアログの確定になる。両方に共通するのは取り消しの案内行だけ — 走行中の
-    /// `esc to interrupt` とは別の文字列なので、これで割れる。
+    /// The first implementation assumed "the `❯` line disappears" and **fired for neither modal**.
+    /// Worse, for the `/model` kind `input_box_empty()` reads "body still there", so the retry
+    /// Enter confirms the dialog. The only thing both share is the cancel hint line — a different string
+    /// from the running `esc to interrupt`, so it tells them apart.
     ///
-    /// `❯` が1本も無い画面も断る。箱が見えない以上「送れた」とは言えない(未知のモーダル)。
+    /// A screen with no `❯` at all is refused too. Without a visible box we cannot say it was sent (an unknown modal).
     fn not_accepting_keys(pane: &str) -> Option<String> {
         let p = Pane::new(pane);
         if let Some(footer) = p.modal_footer() {
@@ -290,10 +290,10 @@ impl Claude {
             .then(|| "no input box on screen".to_string())
     }
 
-    /// ⚠️ に載せる1行。既知の文言表([`Pane::spawn_screen`])は使わない — 未知のモーダルこそが
-    /// 詰まりの正体なので、画面が自分で書いた見出しをそのまま借りる。案内行の**手前**だけを
-    /// 遡って問いかけの行(`?`)を探し、無ければ案内行そのもの(それでも「ダイアログだ」は伝わる)。
-    /// pane 全体から `?` を拾うと、スクロールバックに残った人の発言を掴む。
+    /// The one line shown with ⚠️. The known-text table ([`Pane::spawn_screen`]) is not used — unknown modals
+    /// are exactly what gets stuck, so borrow the heading the screen wrote itself. Walk back only **before** the
+    /// hint line looking for a question line (`?`); if none, use the hint line itself (it still says "this is a dialog").
+    /// Picking a `?` from the whole pane would grab something a human said that is still in the scrollback.
     fn dialog_title<'a>(pane: &'a str, footer: &'a str) -> &'a str {
         const LOOK_BACK: usize = 30;
         let lines: Vec<&str> = pane.split('\n').collect();
@@ -310,14 +310,14 @@ impl Claude {
         self.tmux.kill_window(w)
     }
 
-    /// ワーカー本体のプロセス。**唯一の生存証明** — connector の無い Rust では、
-    /// session_end の飛ばない `kill -9` で死んだワーカーはここでしか気付けない。
+    /// The agent's own process. **The only proof of life** — without a connector, an agent
+    /// killed by `kill -9`, which sends no session_end, can only be noticed here.
     pub fn pid_of(&self, window_id: Option<&str>, window_name: &str) -> Option<Pid> {
         self.tmux.pid_of(window_id, window_name)
     }
 
-    /// pane を1枚。取れなければログして空文字 — 現行も capture の失敗を握って判定を続ける
-    /// (一度の取りこぼしでコマンドを諦めない)。
+    /// Captures one pane. On failure, logs and returns an empty string — a capture failure is swallowed
+    /// and the check continues (do not give up a command over one miss).
     fn capture(&self, w: &Window, label: &str, ctx: &LogCtx) -> String {
         self.tmux.capture(w).unwrap_or_else(|e| {
             ctx.error("bridge", &format!("{label}: capture-pane {w} failed: {e}"));
@@ -325,13 +325,13 @@ impl Claude {
         })
     }
 
-    /// サインイン用セッションのターゲット。ワーカーセッションの窓ではないので修飾しない。
+    /// Target of the sign-in session. It is not an agent-session window, so it is not qualified.
     fn login_window(&self) -> Window {
         Window::raw(LOGIN_SESSION)
     }
 
-    /// サインイン用のセッション。`-x 400` の幅広ペインは、認証 URL を1行で印字させるため
-    /// (折り返すと URL が拾えない)。
+    /// The sign-in session. The wide `-x 400` pane makes the auth URL print on one line
+    /// (wrapped, the URL cannot be picked up).
     fn login_start(&self, cwd: &str) -> Result<(), String> {
         (self.tmux.run)(&[
             "new-session",
@@ -348,21 +348,21 @@ impl Claude {
         .map(|_| ())
     }
 
-    /// 掃除。無ければ tmux が非0で返すだけ — それは「掃除するものが無かった」なので黙る。
+    /// Cleanup. If absent tmux just exits non-zero — that means "nothing to clean", so stay quiet.
     pub fn login_kill(&self) {
         let _ = (self.tmux.run)(&["kill-session", "-t", LOGIN_SESSION]);
     }
 
-    /// TUI に1行打ち込んで、効いたことを画面で確かめる。
+    /// Types one line into the TUI and confirms on screen that it took effect.
     ///
-    /// 訊き方を2つとも間違えると毎コマンド 20 秒の空振りになる、というのが現行の学び:
-    /// 「まだ入力欄に居るか」は pane 全体ではなく**入力ボックス**に訊く(送信済みのコマンドは
-    /// echo として画面に残り続ける)。「確認が出たか」は新しさを問わず、**頼んだ相手を名指しする
-    /// 行が画面にあるか**だけを訊く(古い行が同じ相手を名乗っているなら、ワーカーは既にそこに居る)。
+    /// Lesson learned: getting both questions wrong costs a 20-second miss per command.
+    /// Ask "is it still in the input?" of the **input box**, not the whole pane (a submitted command
+    /// stays on screen as echo). For "did the confirmation appear?", ignore freshness and ask only **whether a line
+    /// naming the requested target is on screen** (if an old line already names that target, the agent is already there).
     ///
-    /// **移植元との差分**(2026-07-29 実機): 現行 TUI は `/effort <level>` の前に確認ダイアログを
-    /// 挟むことがある(履歴のあるセッション)。Enter で確定するまで待っても何も出ないので、
-    /// ここで押す。移植元の Bun は 2026-07-17 時点の TUI で、この画面を知らない。
+    /// **TUI drift** (real machine 2026-07-29): the TUI may insert a confirmation dialog before `/effort <level>`
+    /// (sessions with history). Waiting shows nothing until Enter confirms it,
+    /// so it is pressed here. TUIs as of 2026-07-17 did not have this screen.
     async fn drive(
         &self,
         target: &Window,
@@ -375,8 +375,8 @@ impl Claude {
         const MAX_MS: u64 = 20_000;
         const POLL: Duration = Duration::from_millis(400);
         const SUBMIT_RETRY_CAP: u32 = 4;
-        /// ダイアログの Enter は submit リトライとは別勘定 — 押しているのは入力欄ではなくボタンで、
-        /// 確定後の再描画で1回空振りする分だけ余裕を持たせる。
+        /// Enter on a dialog is counted separately from submit retries — it presses a button, not the input,
+        /// with slack for the one miss during the redraw after confirming.
         const DIALOG_CONFIRM_CAP: u32 = 2;
         let tmux = &self.tmux;
         ctx.info(
@@ -390,12 +390,12 @@ impl Claude {
             );
             return false;
         }
-        // 入力ボックスに残るなら残るのはこの語 — `/effort`
+        // If anything stays in the input box, it is this word — `/effort`
         let word = cmd.split(' ').next().unwrap_or(cmd);
         let started = std::time::Instant::now();
         let mut retries = 0;
         let mut dialog_confirms = 0;
-        // send_command が既に送った Enter を TUI が処理し終える前に判定しない
+        // Do not check before the TUI has finished processing the Enter send_command already sent
         tokio::time::sleep(Duration::from_millis(800)).await;
         while started.elapsed().as_millis() as u64 <= MAX_MS {
             let pane = self.capture(target, label, ctx);
@@ -428,9 +428,9 @@ impl Claude {
             } else if Pane::new(&pane).effort_confirm_dialog_open()
                 && dialog_confirms < DIALOG_CONFIRM_CAP
             {
-                // 確認ダイアログ(2026-07-29 実機)。既定の選択肢が「Yes」なので Enter で確定する。
-                // ここに来る時 `unsubmitted` は必ず false — 入力欄はもう空で、`❯` の行は選択肢
-                // (`/model` は今のところダイアログを出さないが、出したら同じ場所で拾える)
+                // Confirmation dialog (real machine 2026-07-29). The default choice is "Yes", so Enter confirms.
+                // When we get here `unsubmitted` is always false — the input is already empty and the `❯` line is a choice
+                // (`/model` does not show a dialog for now, but if it does it is caught in the same place)
                 dialog_confirms += 1;
                 ctx.info(
                     "bridge",
@@ -448,8 +448,8 @@ impl Claude {
             }
             tokio::time::sleep(POLL).await;
         }
-        // 諦める前に画面を元に戻す — 打ちかけのコマンドや開いたままのダイアログを残すと、
-        // 次に届くメッセージが選択肢に食われる
+        // Restore the screen before giving up — leaving a half-typed command or an open dialog
+        // lets the next message get eaten by the choices
         if let Err(e) = tmux.send_escape(target) {
             ctx.debug(
                 "bridge",
@@ -465,16 +465,16 @@ impl Claude {
         false
     }
 
-    /// 起動直後の窓を見張って、答えられる画面に答える。
+    /// Watches a freshly started window and answers the screens it can answer.
     ///
-    /// **これが唯一の答え手。** 立ち上がりの期限は他に無く(`starting` の掛け金を外すのは
-    /// user_prompt hook だけ)、画面の前で止まった窓は永久に「起動中」のまま配達を queue に
-    /// 溜める。2026-08-02 に実機で: trust ダイアログの後ろにメッセージが積まれ、
-    /// Bridge は沈黙した。
+    /// **This is the only responder.** There is no other startup deadline (only the user_prompt hook
+    /// clears the `starting` latch), so a window stopped in front of a screen stays "starting" forever and
+    /// piles deliveries into the queue. On a real machine on 2026-08-02: messages piled up behind the trust dialog and
+    /// the Bridge went silent.
     ///
-    /// 期限まで**見続ける**のは、画面が遅れて出ることがあるから(現行の
-    /// linger と同じ理由)。現行は spawn 枠を握る都合で 30 秒の同期待ち + 120 秒の背景見張りに
-    /// 割っているが、こちらは最初から背景タスクなので1本にまとめてある。
+    /// It **keeps watching** until the deadline because screens sometimes appear late
+    /// (the reason for the linger). This runs as a background task from the start,
+    /// so a single watch covers what could otherwise be split into a sync wait and a background watch.
     pub async fn watch_spawn_screens(
         &self,
         w: &Window,
@@ -485,15 +485,15 @@ impl Claude {
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
         let mut answered = false;
         let mut trust_answered = false;
-        // 下キーで Yes に移した回数。画面の並びがまた変わっても選び続けないための上限
+        // How many times Down moved to Yes. A cap so we do not keep selecting if the screen layout changes again
         let mut trust_moves = 0;
-        // **confirm にも掛け金が要る。** 現行は confirm に答えた時点で見張りを畳むので
-        // 掛け金を持たない。こちらは畳まないので、掛け金が無いと
-        // 画面が消えるまで毎秒 Enter を撃ち続ける
+        // **confirm needs a latch too.** The watch is not folded up after answering confirm,
+        // so without a latch it would keep firing Enter every second
+        // until the screen goes away
         let mut confirm_answered = false;
         while std::time::Instant::now() < deadline {
-            // **読めない窓は見張らない。** 窓が消えた(エージェントが終了した)なら、もう答える画面は
-            // 出ない。読み続けると1回ごとにエラーが1行ずつ積もる
+            // **Do not watch a window we cannot read.** If the window is gone (the agent exited), no screen to answer
+            // will appear. Reading on would pile up one error line per round
             let pane = match self.tmux.capture(w) {
                 Ok(pane) => pane,
                 Err(e) => {
@@ -502,7 +502,7 @@ impl Claude {
                 }
             };
             match Pane::new(&pane).spawn_screen() {
-                // 撃っても消えない画面。撃てば入力欄の中身を送ることになるので、撃たずに降りる
+                // A screen that firing does not clear. Firing would send the input box's contents, so back out without firing
                 SpawnScreen::LoginRequired => {
                     ctx.error(
                         "spawn",
@@ -523,9 +523,9 @@ impl Claude {
                     );
                     return SpawnOutcome::UsageLimited;
                 }
-                // 同じ画面が続く間に何度も撃たない(現行)。
-                // **Enter の前に、選ばれているのが Yes か確かめる** — 2.1.276 は No を先頭で選んだ
-                // 状態で出すので、Enter だけでは終了を選ぶ(2026-09-18、あるマシンで毎回すぐ終了していた)
+                // Do not fire repeatedly while the same screen stays.
+                // **Before Enter, confirm Yes is the one selected** — 2.1.276 shows it with No selected first,
+                // so Enter alone chooses exit (2026-09-18: on one machine it exited immediately every time)
                 SpawnScreen::Trust if !trust_answered => {
                     match Pane::new(&pane).trust_selected_is_yes() {
                         Some(false) if trust_moves < TRUST_MOVES_MAX => {
@@ -577,7 +577,7 @@ impl Claude {
         }
     }
 
-    /// `/model <名前>` を打ち込む。返すのは「頼んだモデルに居ると画面が言ったか」。
+    /// Types `/model <name>`. Returns whether the screen said it is on the requested model.
     pub async fn set_model(
         &self,
         target: &Window,
@@ -596,11 +596,11 @@ impl Claude {
         .await
     }
 
-    /// `/effort <level>` を打ち込む。
+    /// Types `/effort <level>`.
     ///
-    /// ダイアログを挟んだ経路(履歴のあるセッション)は確定しても `Set effort level to …` を
-    /// 出さない — 出るのは状態行だけなので、その行が頼んだ level を名乗っていれば効いたと読む
-    /// (2026-07-29 実機)。
+    /// The path through the dialog (sessions with history) does not print `Set effort level to …` after
+    /// confirming — only the status line appears, so if that line names the requested level we read it as applied
+    /// (real machine 2026-07-29).
     pub async fn set_effort(
         &self,
         target: &Window,
@@ -622,15 +622,15 @@ impl Claude {
         .await
     }
 
-    /// いまの権限モード。フッタを1回読むだけ — キーは撃たないので走行中でも安全。
+    /// The current permission mode. Reads the footer once — fires no keys, so safe mid-turn.
     pub fn mode(&self, target: &Window, ctx: &LogCtx) -> &'static str {
         Pane::new(&self.capture(target, "mode", ctx)).mode_status()
     }
 
-    /// shift+tab(tmux の `BTab`)を目当てのモードに着くまで押す。
+    /// Presses shift+tab (tmux `BTab`) until reaching the target mode.
     ///
-    /// 巡回の**順番は当てにしない** — 何段あるかは設定次第(bypass / don't ask は
-    /// 出たり出なかったりする)。1発押しては読む、を1周ぶん繰り返すだけ。
+    /// **Do not rely on the cycle's order** — how many steps there are depends on settings (bypass / don't ask
+    /// come and go). Just press once and read, for one full cycle.
     pub async fn set_mode(
         &self,
         target: &Window,
@@ -638,7 +638,7 @@ impl Claude {
         key: &ThreadKey,
         ctx: &LogCtx,
     ) -> bool {
-        /// 巡回は最大6段(manual/plan/edit/auto/bypass/don't ask)— 1周して戻れば打ち止め。
+        /// The cycle has at most 6 steps (manual/plan/edit/auto/bypass/don't ask) — stop after one full round.
         const MAX_PRESSES: u32 = 6;
         const SETTLE: Duration = Duration::from_millis(400);
         for i in 0..=MAX_PRESSES {
@@ -672,10 +672,10 @@ impl Claude {
         unreachable!("the loop always returns at i == MAX_PRESSES")
     }
 
-    /// `/compact` を打ち込み、pane のスピナーを `progress` に1つずつ送る
+    /// Types `/compact` and forwards the pane's spinner to `progress` one by one
     ///
-    /// **Slack へは何も出さない** — 付箋を作るか編集するか、どんな文面にするかは Bridge の判断。
-    /// ここが返すのは結末だけ。最長6分かかるので呼び手は select ループの外で回す。
+    /// **Posts nothing to Slack** — whether to create or edit a progress message, and its text, is the Bridge's call.
+    /// This returns only the outcome. It can take up to 6 minutes, so the caller runs it outside the select loop.
     ///
     /// The sender is dropped when this returns, which ends the caller's receiving loop.
     pub async fn compact(
@@ -685,7 +685,7 @@ impl Claude {
         sid: &str,
         progress: tokio::sync::mpsc::Sender<CompactProgress>,
     ) -> CompactOutcome {
-        const MAX_MS: u64 = 6 * 60_000; // 詰まった圧縮が永遠にポーリングしないための天井
+        const MAX_MS: u64 = 6 * 60_000; // ceiling so a stuck compaction does not poll forever
         const POLL: Duration = Duration::from_millis(800);
         const SUBMIT_RETRY_CAP: u32 = 4;
         let ctx = LogCtx {
@@ -694,8 +694,8 @@ impl Claude {
         };
         let tmux = &self.tmux;
         let short: String = sid.chars().take(8).collect();
-        // 前回の圧縮が残した `Compacted (ctrl+o …)` は画面に居座る — 先に控えて、**新しい**印だけを
-        // 完了と読む
+        // A `Compacted (ctrl+o …)` left by an earlier compaction stays on screen — note it first and only read a **new**
+        // marker as completion
         let baseline = tmux.capture(target).unwrap_or_default();
         let stale_done = baseline.to_lowercase().contains("compacted (ctrl+o");
         ctx.info(
@@ -735,15 +735,14 @@ impl Claude {
             let st = Pane::new(&pane).compact_progress();
             if st.active {
                 seen = true;
-                // 現行 Bun はここで shimmer を秒数付きに張り直す。
-                // Rust 版は compact に専用 status を持たないので何もしない — 進捗は呼び手の
-                // sticky が見せる(user_compact のコメント参照。意図的逸脱)
+                // Nothing to do here: compact has no dedicated status, and progress
+                // is shown by the caller's progress message (see the user_compact comment; deliberate).
                 // A receiver that went away only stops the drawing, not the compaction
                 let _ = progress.send(st).await;
             } else if seen || (lower.contains("compacted (ctrl+o") && !stale_done) {
-                // 終わりを名乗るのは**肯定的な合図**だけ: スピナーが消えるのを見届けたか、
-                // 新しい `Compacted` の印が出たか(速すぎてスピナーを1度も捉えられなかった時)。
-                // 「まだスピナーが出ていない」で閉じない — 出遅れた圧縮の途中でバーを畳んだバグ
+                // Only **positive signals** announce the end: we saw the spinner disappear, or
+                // a new `Compacted` marker appeared (when it was too fast to ever catch the spinner).
+                // Do not close on "no spinner yet" — that bug folded the bar in the middle of a late-starting compaction
                 ctx.info(
                     "bridge",
                     &format!(
@@ -758,7 +757,7 @@ impl Claude {
                 );
                 break CompactOutcome::Done;
             } else if Pane::new(&pane).still_has_command("/compact") && retries < SUBMIT_RETRY_CAP {
-                // スラッシュコマンドの補完メニューが submit の Enter を食うことがある
+                // The slash-command completion menu can eat the submit Enter
                 retries += 1;
                 ctx.info(
                     "bridge",
@@ -778,10 +777,10 @@ impl Claude {
         }
     }
 
-    /// いまの effort level を TUI に訊く。level はどこにも記録が無いので、
-    /// 唯一の正は TUI 自身: `/effort` でスライダを開き、Escape で閉じ、その時 TUI が入力欄の上に
-    /// 出す状態行(`● high · /effort`)を読む。スライダそのものは解釈しない。
-    /// 読めなければ None(断りの文面は呼び手が決める)。
+    /// Asks the TUI for the current effort level. The level is recorded nowhere, so
+    /// the only source of truth is the TUI itself: open the slider with `/effort`, close it with Escape, and read the status
+    /// line the TUI then prints above the input box (`● high · /effort`). The slider itself is not parsed.
+    /// None if it cannot be read (the caller decides the refusal text).
     pub async fn effort(
         &self,
         target: &Window,
@@ -814,7 +813,7 @@ impl Claude {
         tokio::time::sleep(Duration::from_millis(800)).await;
         let started = std::time::Instant::now();
         let mut retries = 0;
-        // 第1幕: スライダが開くのを待つ(補完メニューに Enter を食われている間は押し直す)
+        // Act 1: wait for the slider to open (press again while the completion menu eats the Enter)
         let mut slider_seen = false;
         while started.elapsed().as_millis() as u64 <= MAX_MS {
             let pane = self.capture(target, "effort", &ctx);
@@ -841,7 +840,7 @@ impl Claude {
             tokio::time::sleep(POLL).await;
         }
         if !slider_seen {
-            // 打ちかけを入力欄に残さず片付けてから諦める
+            // Clear the half-typed input from the input box before giving up
             if let Err(e) = tmux.send_escape(target) {
                 ctx.debug(
                     "bridge",
@@ -856,7 +855,7 @@ impl Claude {
             );
             return None;
         }
-        // 第2幕: スライダを閉じる — TUI が現在の level を名乗る状態行で答える
+        // Act 2: close the slider — the TUI answers with a status line naming the current level
         if let Err(e) = tmux.send_escape(target) {
             ctx.error(
                 "bridge",
@@ -876,8 +875,8 @@ impl Claude {
             }
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
-        // 状態行は一過性の通知 — 別の通知(「Plugins updated」など)にその枠を取られると読めない。
-        // 実機で観測済み。取り直しは Owner の一言の再試行に任せる
+        // The status line is a transient notice — if another notice ("Plugins updated", etc.) takes its slot it cannot be read.
+        // Observed on a real machine. Retrying is left to the Owner sending the message again
         ctx.error(
             "bridge",
             &format!(
@@ -887,12 +886,12 @@ impl Claude {
         None
     }
 
-    /// headless の `claude` を1回だけ回して stdout を返す(`probe`)。
+    /// Runs headless `claude` once and returns stdout (`probe`).
     ///
-    /// `AGENTGW_SESSION_ID` を外すのが肝 — これが残っていると子プロセスの hook が自分をワーカーだと
-    /// 名乗り、probe が本物のセッションとして扱われる。stderr は捨てる。
-    /// `kill_on_drop` はタイムアウトの後始末 — 現行が `proc.kill()` でやっていること。
-    /// `/context` を訊く argv(`--fork-session` で本体のセッションを汚さない)。
+    /// Removing `AGENTGW_SESSION_ID` is the key — if it stays, the child process's hooks claim to be the agent
+    /// and the probe is treated as the real session. stderr is discarded.
+    /// `kill_on_drop` cleans up after a timeout.
+    /// argv asking for `/context` (`--fork-session` keeps the main session clean).
     pub fn context_argv(session_id: &str) -> Vec<String> {
         [
             "claude",
@@ -906,14 +905,14 @@ impl Claude {
         .to_vec()
     }
 
-    /// `/usage` を訊く argv。アカウント全体の話なのでセッションは要らない。
+    /// argv asking for `/usage`. It is about the whole account, so no session is needed.
     pub fn usage_argv() -> Vec<String> {
         ["claude", "-p", "/usage"].map(str::to_string).to_vec()
     }
 
-    /// サインインを始める。**URL が出るまで**は呼び手が [`Claude::login_url`] で待つ。
+    /// Starts sign-in. The caller waits with [`Claude::login_url`] **until the URL appears**.
     pub fn login_begin(&self, cwd: &str) -> Result<(), String> {
-        // 毎回まっさらに — 残骸を落としてから幅広 pane で起こす(URL を1行で印字させる)
+        // Start clean every time — drop leftovers, then start in a wide pane (so the URL prints on one line)
         self.login_kill();
         self.login_start(cwd).and_then(|()| {
             self.tmux
@@ -921,7 +920,7 @@ impl Claude {
         })
     }
 
-    /// 認証 URL が画面に出ていれば返す。
+    /// Returns the auth URL if it is on screen.
     pub fn login_url(&self) -> Option<String> {
         self.tmux
             .capture(&self.login_window())
@@ -929,13 +928,13 @@ impl Claude {
             .and_then(|pane| Pane::new(&pane).auth_login_url())
     }
 
-    /// 貼られたコードを送り込む。
+    /// Sends in the pasted code.
     pub fn login_submit_code(&self, code: &str) -> Result<(), String> {
         self.tmux.send_command(&self.login_window(), code)
     }
 
-    /// サインインの結末。scrollback ごと読む: "Login successful." を出した直後に CLI は
-    /// シェルへ戻り、次のポーリングまでに印が画面外へ流れる。
+    /// The outcome of sign-in. Reads the whole scrollback: right after printing "Login successful." the CLI
+    /// returns to the shell, and the marker scrolls off screen before the next poll.
     pub fn login_outcome(&self) -> LoginOutcome {
         let pane = self
             .tmux
@@ -944,8 +943,8 @@ impl Claude {
         Pane::new(&pane).login_outcome()
     }
 
-    /// サインアウト。実体のコマンドを1回叩くだけ。`Failed` は非0終了(中身は終了状態の
-    /// 説明)、`Errored` は起動そのものの失敗 — 呼び手はこの2つで別の文面を出す。
+    /// Signs out. Runs the real command once. `Failed` is a non-zero exit (its content describes the
+    /// exit status), `Errored` is a failure to launch at all — the caller shows different text for each.
     pub async fn logout(&self) -> Result<(), ProbeErr> {
         let run = tokio::process::Command::new("claude")
             .args(["auth", "logout"])
@@ -973,7 +972,7 @@ impl Claude {
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
             .output();
-        // 見張りは Bridge の select ループの中で呼ばれる — 固まっても長く止めない(普段は1秒未満)
+        // The watcher is called inside the Bridge's select loop — if it hangs, do not stall long (normally under 1 second)
         let out = tokio::time::timeout(AUTH_STATUS_TIMEOUT, run).await.ok()?.ok()?;
         Self::auth_status_signed_in(&String::from_utf8_lossy(&out.stdout))
     }
@@ -1000,7 +999,7 @@ impl Claude {
                 "probe timed out after {}ms",
                 PROBE_TIMEOUT.as_millis()
             ))),
-            // spawn そのものの失敗(claude が無い / cwd が無い)は再試行しても同じ
+            // A failure of spawn itself (no claude / no cwd) would be the same on retry
             Ok(Err(e)) => Err(ProbeErr::Errored(format!(
                 "probe could not start in {cwd}: {e}"
             ))),
@@ -1149,7 +1148,7 @@ impl crate::agent::Agent for Claude {
         &MODE_NAMES
     }
 
-    /// 大小文字は不問。`sonet` は `sonnet` の綴り間違いとして受ける。
+    /// Case-insensitive. `sonet` is accepted as a misspelling of `sonnet`.
     fn canonical_model(&self, typed: &str) -> Option<String> {
         let name = match typed.to_lowercase().as_str() {
             "sonet" => "sonnet".to_string(),
@@ -1160,8 +1159,8 @@ impl crate::agent::Agent for Claude {
             .then_some(name)
     }
 
-    /// cwd は id と同じくらい大事 — claude は cwd ごとに履歴を仕舞うので、違う場所で
-    /// --resume すると見つからない。
+    /// The cwd matters as much as the id — claude stores history per cwd, so
+    /// --resume from a different place cannot find it.
     fn resume_command(&self, cwd: Option<&str>, session_id: &str) -> String {
         match cwd {
             Some(cwd) => format!("cd {cwd} && claude --resume {session_id}"),
@@ -1219,25 +1218,25 @@ impl crate::agent::Agent for Claude {
     }
 }
 
-/// headless probe を諦める時刻(`ms = 60_000`)。
+/// Deadline for giving up on the headless probe (`ms = 60_000`).
 /// Down presses allowed on the trust dialog before giving up (No, then Yes, has needed one).
 const TRUST_MOVES_MAX: u32 = 3;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 /// `claude auth status` is a local check; it answers in well under a second.
 const AUTH_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// ワーカーの `.jsonl` と、そこまで読んだ位置。
+/// The agent's `.jsonl` and how far we have read it.
 ///
-/// hook payload が毎回パスを運んでくるので、ファイルが移動しても自動で追従する(ファイルを探し回る処理は要らない)。
+/// Every hook payload carries the path, so it follows the file automatically if it moves (no need to search for the file).
 pub struct Transcript {
     path: String,
-    /// 前回どこまで読んだか。`new_lines` が進める。
+    /// Where the last read stopped. `new_lines` advances it.
     offset: u64,
 }
 
 impl Transcript {
-    /// hook が運んできたパスを第一候補に、無ければ session id から総当たりで探す
-    /// (resume / model / status が同じ解決順を使う)。**外から開く道はこれだけ。**
+    /// The path the hook carried is the first candidate; otherwise search exhaustively by session id
+    /// (resume / model / status use the same resolution order). **This is the only way to open one from outside.**
     pub fn locate(remembered: Option<&str>, session_id: &str) -> Option<Self> {
         remembered
             .filter(|p| std::path::Path::new(p).is_file())
@@ -1245,8 +1244,8 @@ impl Transcript {
             .or_else(|| Self::find(session_id))
     }
 
-    /// 前回位置を引き継いで開く。offset は台帳(`Hooked`)が持っているので、
-    /// 続きを読む側はそれを預けて開く。
+    /// Opens carrying over the previous position. The offset is held by the ledger (`Hooked`), so
+    /// whoever reads on hands it in when opening.
     pub fn at_offset(path: String, offset: u64) -> Self {
         Self { path, offset }
     }
@@ -1255,8 +1254,8 @@ impl Transcript {
         Self { path, offset: 0 }
     }
 
-    /// `~/.claude/projects/<プロジェクト>/<sid>.jsonl` の総当たり探索。
-    /// プロジェクトの階層は1段だけなので readdir 2回で足りる。
+    /// Exhaustive search of `~/.claude/projects/<project>/<sid>.jsonl`.
+    /// Projects are only one level deep, so two readdirs are enough.
     fn find(sid: &str) -> Option<Self> {
         let root = std::path::Path::new(&std::env::var("HOME").ok()?).join(".claude/projects");
         for e in std::fs::read_dir(root).ok()? {
@@ -1273,15 +1272,15 @@ impl Transcript {
         self.offset
     }
 
-    /// `offset` 以降の**完全な行だけ**を読み、offset を進める。半端な行は次回に回す
-    /// (途中で切れた id を読み落とさないため)。読めないファイルは debug で握る — 受信確認は
-    /// 観測シグナルであって台帳ではない。
+    /// Reads **only complete lines** after `offset` and advances the offset. A partial line waits for next time
+    /// (so an id cut in half is not missed). Unreadable files are swallowed at debug — the receipt check is
+    /// an observation signal, not a ledger.
     pub fn new_lines(&mut self, ctx: &LogCtx) -> Option<String> {
         use std::io::{Read, Seek, SeekFrom};
         let mut f = std::fs::File::open(&self.path)
             .inspect_err(|e| ctx.debug("bridge", &format!("transcript open failed: {e}")))
             .ok()?;
-        // 短くなっていたら別物に置き換わっている — 頭から読み直す
+        // If it got shorter it was replaced by something else — read again from the start
         let start = if f.metadata().ok()?.len() < self.offset {
             0
         } else {
@@ -1295,8 +1294,8 @@ impl Transcript {
         Some(String::from_utf8_lossy(&buf[..end]).into_owned())
     }
 
-    /// **先頭行**が持つ `cwd` = ワーカーが実際に立っていた場所。先頭行だけ読むのは
-    /// この JSONL が数 MB になるから(main ループを止めない)。
+    /// The `cwd` in the **first line** = where the agent actually ran. Only the first line is read because
+    /// this JSONL grows to several MB (do not stall the main loop).
     pub fn cwd(&self) -> Option<String> {
         use std::io::BufRead;
         let mut line = String::new();
@@ -1308,7 +1307,7 @@ impl Transcript {
             .map(str::to_string)
     }
 
-    /// 更新時刻(epoch ms)。読めなければ None。
+    /// Modification time (epoch ms). None if unreadable.
     pub fn mtime_ms(&self) -> Option<u64> {
         std::fs::metadata(&self.path)
             .and_then(|m| m.modified())
@@ -1318,13 +1317,13 @@ impl Transcript {
             .map(|d| d.as_millis() as u64)
     }
 
-    /// 末尾 `n` バイトが名乗る**最後の**モデル id。`Ok(None)` = 読めたが id が無い。
+    /// The **last** model id named in the final `n` bytes. `Ok(None)` = readable but no id.
     pub fn model_id(&self, n: u64) -> std::io::Result<Option<String>> {
         Ok(Pane::new(&self.tail(n)?).last_model_id())
     }
 
-    /// 末尾 `n` バイトが名乗る**最後の**上限エラー(`limitErrorForSession`)。
-    /// 呼ばれるのは「ターンが既に失敗した」稀な道だけなので、末尾読み1回で足りる。
+    /// The **last** limit error named in the final `n` bytes (`limitErrorForSession`).
+    /// Only called on the rare path where "the turn already failed", so one tail read is enough.
     pub fn limit_error(
         &self,
         n: u64,
@@ -1336,8 +1335,8 @@ impl Transcript {
         ))
     }
 
-    /// ファイル末尾 `n` バイト。長いセッションの transcript は数十 MB あり、
-    /// 答えはいつも末尾にある。
+    /// The final `n` bytes of the file. A long session's transcript runs to tens of MB, and
+    /// the answer is always at the end.
     fn tail(&self, n: u64) -> std::io::Result<String> {
         use std::io::{Read, Seek, SeekFrom};
         let mut f = std::fs::File::open(&self.path)?;
@@ -1350,11 +1349,11 @@ impl Transcript {
 
     // ── usage limit recorded in the transcript ──
 
-    /// 履歴の末尾から**上限のエラーだけ**を拾う(`limitErrorInTranscriptTail`)。
+    /// Picks **only limit errors** from the end of the history (`limitErrorInTranscriptTail`).
     ///
-    /// 後から来た無関係な api-error(混雑の一時障害)が、まだ効いている上限を隠してはいけないので
-    /// 上限の記録だけを残す。読めないリセット時刻はエラー時刻 +1時間として**保守的に**縛り、
-    /// それも過ぎていれば窓は既に開いた = ただの履歴なので `None`。
+    /// An unrelated api-error that came later (a transient overload) must not hide a limit that is still in effect, so
+    /// only limit records are kept. An unreadable reset time is bound **conservatively** to the error time + 1 hour;
+    /// if even that has passed, the window has already reopened = mere history, so `None`.
     /// The `error_type` the **last** API error in `tail` stands for, when Claude Code wrote the
     /// error but sent no type with the turn failure. Only what we recognise; the rest is `None`.
     pub fn failure_type(tail: &str) -> Option<&'static str> {
@@ -1373,7 +1372,7 @@ impl Transcript {
                 _ => String::new(),
             })
             .last()?;
-        // 実機で見た文面(2026-09-18): `Login expired · Please run /login`
+        // Text seen on a real machine (2026-09-18): `Login expired · Please run /login`
         (text.contains("Login expired") || text.contains("run /login"))
             .then_some("authentication_failed")
     }
@@ -1381,11 +1380,11 @@ impl Transcript {
     pub fn limit_hit(tail: &str, now_ms: u64) -> Option<LimitHit> {
         let mut latest: Option<(String, u64)> = None;
         for line in tail.lines() {
-            // 安い前段の網 — 256KB を JSON にするのが高い。この旗は滅多に立たない
+            // A cheap first-pass filter — parsing 256KB as JSON is expensive. This flag is rarely set
             if !line.contains("\"isApiErrorMessage\"") {
                 continue;
             }
-            // 末尾スライスは行の途中から始まるし、いま書かれかけの行は半端 — どちらも飛ばす
+            // The tail slice starts mid-line, and the line being written is partial — skip both
             let Ok(rec) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
             };
@@ -1414,12 +1413,12 @@ impl Transcript {
         (reset_ms > now_ms).then_some(LimitHit { detail, reset_ms })
     }
 
-    /// 現行 `LIMIT_MODAL_PROMPTS` の**アンカー無しの部分一致**と等価な literal 群。
-    /// 先頭の `(?:…)?` は「空でもよい」ので部分一致テストの結果を変えない — だから落とせる。
+    /// Literals equivalent to an **unanchored substring match** of `LIMIT_MODAL_PROMPTS`.
+    /// The leading `(?:…)?` may be empty, so it does not change the substring-match result — hence it can be dropped.
     ///
-    /// ⚠️ **pane 検出に流用しないこと。** 現行は同じ表を**行頭アンカー付き**でも使う
-    /// (`paneShowsPrompt` — 画面は自分のプロンプトを行として印字するので、文の途中に同じ語が
-    /// 出てくる「内容」と区別できる)。その検出を移植するときは還元をやり直す必要がある。
+    /// ⚠️ **Do not reuse this for pane detection.** The same table is also used **anchored at line start**
+    /// (`paneShowsPrompt` — the screen prints its own prompts as lines, which tells them apart from
+    /// "content" that mentions the same words mid-sentence). Porting that detection means redoing the reduction.
     fn says_limit_reached(text: &str) -> bool {
         let t = text.to_ascii_lowercase();
         if t.contains("wait for limit to reset") || t.contains("wait for the limit to reset") {
@@ -1434,7 +1433,7 @@ impl Transcript {
     }
 }
 
-// ─── hook の受け口 ─────────────────────────────────────────────────────────
+// ─── Hook endpoint ─────────────────────────────────────────────────────────
 
 use crate::agent::HookEvent;
 use axum::{
@@ -1444,26 +1443,26 @@ use axum::{
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
-/// hook の口が axum に持たせる共有状態。
+/// Shared state the hook endpoint gives axum.
 ///
-/// `token` は起動ごとに切る合言葉で、ワーカー以外からの POST を弾く(口は 127.0.0.1 に閉じているが、同じマシンの
-/// 別プロセスは叩けてしまうため)。
+/// `token` is a password cut per startup that rejects POSTs from anything but agents (the endpoint is bound to 127.0.0.1, but
+/// other processes on the same machine could still hit it).
 #[derive(Clone)]
 struct HookState {
     tx: mpsc::Sender<HookEvent>,
     token: String,
 }
 
-/// claude の hook を受ける HTTP の口。
+/// The HTTP endpoint that receives claude's hooks.
 ///
-/// **UserPromptSubmit はターン中のステアリング消費では発火しない**ので、受信確認は
-/// payload の `transcript_path` を使った transcript スキャン併用で成り立っている。
-/// ここを触るときはその前提を壊さない。
+/// **UserPromptSubmit does not fire when steering input is consumed mid-turn**, so the receipt check
+/// relies on also scanning the transcript via the payload's `transcript_path`.
+/// Do not break that assumption when touching this.
 pub struct HookIntake;
 
 impl HookIntake {
-    /// 答えを待つ hook の上限(現行)。
-    /// perm は Slack の人間を待つので長い。stop はターン終了を吊らせないので短い。
+    /// Upper bound for hooks that wait for an answer.
+    /// perm waits for a human in Slack, so it is long. stop must not hang the end of a turn, so it is short.
     fn decision_cap(kind: &str) -> Option<Duration> {
         match kind {
             "perm" => Some(Duration::from_secs(120)),
@@ -1472,8 +1471,8 @@ impl HookIntake {
         }
     }
 
-    /// 受け口を上げ、`(port, token)` を返す。ポートは記憶して再利用する —
-    /// ワーカーは URL を焼き込むので Bridge 再起動をまたぐ。
+    /// Brings up the endpoint and returns `(port, token)`. The port is remembered and reused —
+    /// agents bake the URL in, so it has to survive a Bridge restart.
     pub async fn serve(
         state_dir: &StateDir,
         tx: mpsc::Sender<HookEvent>,
@@ -1496,7 +1495,7 @@ impl HookIntake {
         Ok((port, token))
     }
 
-    /// 現行 bridge/hook-endpoint.ts の buildWorkerHooksSettings を移植。
+    /// Builds the hooks settings for an agent.
     pub fn settings_json(port: u16, token: &str) -> serde_json::Value {
         let base = format!("http://127.0.0.1:{port}/hook");
         let http_ = |kind: &str, timeout: u32| {
@@ -1504,17 +1503,17 @@ impl HookIntake {
                 "type": "http",
                 "url": format!("{base}/{kind}"),
                 "timeout": timeout,
-                // Claude Code は宣言した変数だけ ${VAR} を展開する
+                // Claude Code expands ${VAR} only for declared variables
                 "headers": { "x-agentgw-token": token, "x-agentgw-session": "${AGENTGW_SESSION_ID}" },
                 "allowedEnvVars": ["AGENTGW_SESSION_ID"],
             }]}])
         };
         serde_json::json!({
-            // ワーカーは Slack 駆動のセッション。--settings は1つしか効かないのでここに同居させる。
+            // Agents are Slack-driven sessions. Only one --settings takes effect, so it lives here too.
             "disableRemoteControl": true,
             "hooks": {
-                // SessionStart だけ Claude Code が http を無視するので curl。ヘッダは運ばれない
-                // ので session_id は body から取る(スパイク実測)。
+                // Only SessionStart has Claude Code ignore http, so it uses curl. Headers are not carried,
+                // so session_id is taken from the body (measured in the spike).
                 "SessionStart": [{ "matcher": "", "hooks": [{
                     "type": "command",
                     "timeout": 10,
@@ -1524,17 +1523,17 @@ impl HookIntake {
                     ),
                 }]}],
                 "UserPromptSubmit": http_("user_prompt", 5),
-                // 報告系は短い timeout — 遅い Bridge がワーカーのターンを止めないため。
+                // Reporting hooks get a short timeout — so a slow Bridge does not stall the agent's turn.
                 "PreToolUse": http_("progress", 3),
                 "PostToolUse": http_("progress", 3),
                 "MessageDisplay": http_("narration", 3),
-                // ターン失敗の理由(`error_type`)。**決定 hook ではない** — 報告を受けて
-                // 人に伝えるだけなので即 `{}` を返す。
+                // Why the turn failed (`error_type`). **Not a decision hook** — it only takes the report and
+                // tells the human, so it returns `{}` right away.
                 "StopFailure": http_("error", 5),
-                // SessionEnd は既定 1500ms しか貰えない。30s 宣言で中断枠も広げる。
+                // SessionEnd only gets 1500ms by default. Declaring 30s widens the interruption window too.
                 "SessionEnd": http_("session_end", 30),
-                // 答えなければならない2つ。perm は Slack の人間を待ち、stop はターン終了を
-                // 絶対に吊らせない。125s は Bridge 側の 120s 待ちより少し広く取る
+                // The two that must answer. perm waits for a human in Slack, and stop must never hang
+                // the end of a turn. 125s is a bit wider than the Bridge's 120s wait
                 "PermissionRequest": http_("perm", 125),
                 "Stop": http_("stop", 15),
             }
@@ -1542,16 +1541,16 @@ impl HookIntake {
     }
 
     pub fn write_settings(dir: &StateDir, port: u16, token: &str) -> std::io::Result<PathBuf> {
-        // 生成物なので state ではなく一時領域へ([`StateDir::runtime_dir`])
+        // Generated files, so they go to a temporary area, not state ([`StateDir::runtime_dir`])
         dir.write_runtime_json("worker-hooks.json", &Self::settings_json(port, token))
     }
 
-    /// hook 応答は本文が JSON — 現行のsend() が全応答に付けている。
+    /// Hook responses have a JSON body.
     fn json_body(body: String) -> impl axum::response::IntoResponse {
         ([(CONTENT_TYPE, "application/json")], body)
     }
 
-    /// 受け手に投げて答えを待つ。答えが無い・遅い・受け手が落ちた、はすべて `{}`(= 辞退)。
+    /// Hands off to the receiver and waits for the answer. No answer, too slow, or the receiver gone all mean `{}` (= abstain).
     async fn decide_or_default(
         tx: &mpsc::Sender<HookEvent>,
         mut ev: HookEvent,
@@ -1580,7 +1579,7 @@ impl HookIntake {
         }
         let payload: serde_json::Value =
             serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
-        // SessionStart は curl なのでヘッダを運ばない — body の session_id を使う(スパイク実測)
+        // SessionStart uses curl and carries no headers — use session_id from the body (measured in the spike)
         let session_id = headers
             .get("x-agentgw-session")
             .and_then(|v| v.to_str().ok())
@@ -1602,7 +1601,7 @@ impl HookIntake {
             payload,
             respond: None,
         };
-        // perm と stop は答えが要る。他は報告なので即 `{}` を返し、ターンを待たせない。
+        // perm and stop need an answer. The rest are reports, so return `{}` at once and do not hold the turn.
         if let Some(cap) = Self::decision_cap(&ev.kind) {
             return Ok(Self::json_body(
                 Self::decide_or_default(&st.tx, ev, cap).await,
@@ -1627,7 +1626,7 @@ mod tests {
         Claude::new(Tmux { run: Box::new(run) })
     }
 
-    /// 起動行とプロンプトは tmux を叩かない — 黙って成功する fake で十分。
+    /// The launch line and prompts do not touch tmux — a fake that quietly succeeds is enough.
     fn quiet() -> Claude {
         claude_with(|_| Ok(String::new()))
     }
@@ -1650,7 +1649,7 @@ mod tests {
         let p = quiet().pool_prompt();
         assert_eq!(p, WORKER_STARTUP_PROMPT);
         assert!(!p.is_empty());
-        // 継続行の結合部が二重空白/無空白になっていないこと(原文の一字一句性)
+        // No double space / missing space where continuation lines join (the text is verbatim)
         assert!(p.contains("right now — wait for messages to be pushed to you and reply"));
         assert!(!p.contains("  "));
     }
@@ -1691,7 +1690,7 @@ mod tests {
         let new = c.spawn_prompt(env, &SessionMode::New("s".into()));
         assert!(new.starts_with("This is a NEW Slack thread;"), "{new}");
         assert!(new.contains(env), "{new}");
-        // prefix と封筒は空行1つで結合
+        // prefix and envelope joined with one blank line
         assert!(new.ends_with(&format!("\n\n{env}")), "{new}");
         let res = c.spawn_prompt(env, &SessionMode::Resume("s".into()));
         assert!(
@@ -1701,9 +1700,9 @@ mod tests {
         assert!(res.contains(env), "{res}");
     }
 
-    /// `SpawnReq` から組み上がる起動行は、旧 `src/worker.rs` の spawn が tmux に渡していた
-    /// 文字列と同じ形。
-    /// `resume_from` があれば `--resume`、無ければ `--session-id`(使い捨て ID の性質)。
+    /// The launch line built from `SpawnReq` has the same shape as the string the old `src/worker.rs`
+    /// spawn passed to tmux.
+    /// `--resume` if `resume_from` is set, otherwise `--session-id` (IDs are single-use).
     #[test]
     fn spawn_hands_tmux_the_launch_line() {
         let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -1731,7 +1730,7 @@ mod tests {
             "{got}"
         );
         assert!(got.ends_with("<channel …>x</channel>'"), "{got}");
-        // 本文なし = プールの空焚き — 待受プロンプトで起動する
+        // No body = warming a pool agent — start on the idle prompt
         let mut pool = req("sid-2", None, WorkerState::Absent);
         pool.resume_from = Some(SessionId::from("sid-2".to_string()));
         c.spawn(&pool).unwrap();
@@ -1773,7 +1772,7 @@ mod tests {
             got[5],
             "new-session -d -s slack-login-rs -x 400 -y 50 -c /home"
         );
-        // 成功マーカーはシェルに戻った拍子にスクロールで消える — scrollback ごと読む
+        // The success marker scrolls away when it drops back to the shell — read the whole scrollback
         assert_eq!(got[6], "capture-pane -p -S -200 -t slack-login-rs");
         assert_eq!(got[7], "send-keys -t slack-login-rs Enter");
         assert_eq!(got[8], "kill-session -t slack-login-rs");
@@ -1781,7 +1780,7 @@ mod tests {
 
     #[test]
     fn login_session_kill_is_silent_when_there_is_no_session() {
-        // has-session 相当の非0(= 無い)で騒がない — 起動時の掃除が毎回エラーを吐かないように
+        // Do not complain about a has-session-style non-zero (= absent) — so startup cleanup does not log an error every time
         claude_with(|_| Err("no such session".into())).login_kill();
     }
 
@@ -1796,7 +1795,7 @@ mod tests {
         );
     }
 
-    /// `model_id` と同じ「末尾 n バイトを読んで純関数に渡す」形であること。
+    /// Same "read the final n bytes and hand them to a pure function" shape as `model_id`.
     #[test]
     fn transcript_limit_error_reads_the_tail() {
         let dir = std::env::temp_dir().join(format!("scr-limit-{}", std::process::id()));
@@ -1809,40 +1808,40 @@ mod tests {
         });
         std::fs::write(&path, format!("{rec}\n")).unwrap();
         let t = Transcript::at_offset(path.to_string_lossy().into_owned(), 0);
-        let now = 1_785_387_600_000u64; // 2026-07-30T05:00:00Z = 30日 14:00 JST
+        let now = 1_785_387_600_000u64; // 2026-07-30T05:00:00Z = 14:00 JST on the 30th
         let hit = t.limit_error(256 * 1024, now).unwrap().expect("limit hit");
         assert!(hit.detail.contains("usage limit reached"), "{hit:?}");
-        assert_eq!(hit.reset_ms, 1_785_420_000_000); // 30日 23:00 JST
+        assert_eq!(hit.reset_ms, 1_785_420_000_000); // 23:00 JST on the 30th
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn an_empty_input_box_means_the_text_was_submitted() {
-        // 空の箱の実物: `❯` の後ろは U+00A0(2026-08-02 実機の capture-pane)
+        // What an empty box really looks like: after `❯` comes U+00A0 (capture-pane on a real machine, 2026-08-02)
         assert!(Pane::new("← U012ABC3DEF: やって\n❯ \u{a0}").input_box_empty());
-        assert!(Pane::new("dialog with no prompt line").input_box_empty()); // `❯` が無い = 叩かない
-        // 送信されずに残った本文。箱は折り返され、`❯` の行には見えている先頭行が乗る
+        assert!(Pane::new("dialog with no prompt line").input_box_empty()); // no `❯` = do not type
+        // Body left unsubmitted. The box wraps and the `❯` line shows the visible first line
         assert!(!Pane::new("❯ ==> 状態\n  </channel>\n").input_box_empty());
 
-        // **罠の現物**: auto mode のモーダルは箱を生かしたまま前に出るので、ここは「空」=
-        // 「送信された」と読める。この関数だけでは配達の可否を決められない
-        // ([`Claude::not_accepting_keys`] が案内行で割る)。2026-08-18 に18分沈黙した形。
+        // **The trap itself**: the auto mode modal comes up with the box still alive, so this reads "empty" =
+        // "submitted". This function alone cannot decide whether delivery is possible
+        // ([`Claude::not_accepting_keys`] tells them apart by the hint line). The shape of the 18-minute silence on 2026-08-18.
         let (_, onboarding, _) = REAL_MODALS[0];
         assert!(Pane::new(onboarding).input_box_empty());
         assert!(Pane::new(onboarding).modal_footer().is_some());
-        // `/model` 型は逆に `❯` を選択カーソルに奪われるので「本文が残っている」に見える —
-        // 押し直しの Enter がダイアログの確定になる側の罠
+        // The `/model` kind conversely has `❯` taken by the selection cursor, so it looks like "body still there" —
+        // the trap where the retry Enter confirms the dialog
         let (_, selector, _) = REAL_MODALS[1];
         assert!(!Pane::new(selector).input_box_empty());
         assert!(Pane::new(selector).modal_footer().is_some());
     }
 
-    /// **実物**の pane(2026-08-18、`slack-workers-rs` で採取)。飾りも折り返しもそのまま。
-    /// ここを推測で書き換えないこと — 最初の修正が効かなかったのは、`❯` の振る舞いを
-    /// 実物を見ずに決め打ちしたからだった。
+    /// **Real** panes (2026-08-18, captured in `slack-workers-rs`). Decorations and wrapping kept as is.
+    /// Do not rewrite these by guesswork — the first fix did not work because the behavior of `❯` was
+    /// assumed without looking at the real thing.
     ///
-    /// 1枚目: auto mode オンボーディング。**入力欄(`❯`)が生きたまま**モーダルが前に出る。
-    /// 2枚目: `/model` セレクタ。**`❯` が選択カーソルに奪われる**(箱の行は消える)。
+    /// 1st: auto mode onboarding. The modal comes up **with the input box (`❯`) still alive**.
+    /// 2nd: `/model` selector. **`❯` is taken over by the selection cursor** (the box line disappears).
     const REAL_MODALS: &[(&str, &str, &str)] = &[
         (
             "auto mode onboarding",
@@ -1878,7 +1877,7 @@ mod tests {
         ),
     ];
 
-    /// 待機中の実物(同日、同じセッション)。`❯` の行は空で、案内行は出ていない。
+    /// The real idle screen (same day, same session). The `❯` line is empty and no hint line is shown.
     const IDLE_PANE: &str = "\u{2726} Cooked for 2s\n\
                              \n\
                              \u{2500}\u{2500}\u{2500}\u{2500}\n\
@@ -1887,7 +1886,7 @@ mod tests {
                              \u{a0} ~  ctx:4%  17:54  Opus 5 (1M context)\n\
                              \u{23f5}\u{23f5} auto mode on (shift+tab to cycle) \u{b7} \u{2190} 1 agent\n";
 
-    /// 本文と Enter を送る fake。`capture-pane` には `panes` を頭から1枚ずつ返す。
+    /// A fake that sends body and Enter. `capture-pane` returns `panes` one at a time from the front.
     fn deliver_probe(
         panes: Vec<&'static str>,
     ) -> (std::sync::Arc<std::sync::Mutex<Vec<String>>>, Claude) {
@@ -1913,8 +1912,8 @@ mod tests {
 
     #[test]
     fn deliver_presses_enter_again_while_the_box_still_holds_the_text() {
-        // 4KB の封筒で Enter が取り込み中の TUI に飲まれた形(2026-08-02)。押し直しで通る
-        // 1枚目は打つ前の在処確認が食う(箱はある = 打ってよい)
+        // The shape where Enter was swallowed by the ingesting TUI with a 4KB envelope (2026-08-02). Pressing again gets it through
+        // The 1st pane is consumed by the pre-typing check (the box is there = OK to type)
         let (calls, c) = deliver_probe(vec!["❯ \u{a0}", "❯ </channel>\n", "❯ \u{a0}"]);
         c.deliver(&Window::of("@42"), "hello").unwrap();
         assert_eq!(enters(&calls.lock().unwrap()), 2, "最初の1発 + 押し直し1回");
@@ -1922,7 +1921,7 @@ mod tests {
 
     #[test]
     fn deliver_gives_up_loudly_instead_of_pressing_enter_forever() {
-        let (calls, c) = deliver_probe(vec!["❯ </channel>\n"]); // 永遠に残ったまま
+        let (calls, c) = deliver_probe(vec!["❯ </channel>\n"]); // stays there forever
         let err = c.deliver(&Window::of("@42"), "hello").unwrap_err();
         assert!(err.contains("never submitted"), "{err}");
         assert_eq!(
@@ -1932,20 +1931,20 @@ mod tests {
         );
     }
 
-    /// 2026-08-18 実機の詰まり。`❯` を覆うモーダルは `input_box_empty()` では**空**に見えるが、
-    /// 打鍵はモーダルに食われて消えている。ここが `Ok` を返していた18分、Bridge は配達成功を
-    /// 記録したまま2スレッドが沈黙した。
+    /// The stall seen on a real machine on 2026-08-18. A modal covering `❯` looks **empty** to `input_box_empty()`,
+    /// but the keystrokes are eaten by the modal. For the 18 minutes this returned `Ok`, the Bridge recorded
+    /// delivery success while 2 threads went silent.
     ///
-    /// **1文字も送らない**のが要 — 選択肢リストに本文を打つと、中の数字が選択、続く Enter が
-    /// 確定になる。tick が押し直す(`Bridge::retry_pending`)ので、ここが漏れると人が答える前に
-    /// 勝手に選ばれる。
+    /// The key is **sending not a single character** — typing the body into a choice list makes its digits select and the following Enter
+    /// confirm. The tick presses again (`Bridge::retry_pending`), so a leak here picks an option
+    /// before a human answers.
     #[test]
     fn deliver_refuses_to_call_a_covered_input_box_a_delivery() {
         for (label, modal, want) in REAL_MODALS {
             let (calls, c) = deliver_probe(vec![modal]);
             let err = c.deliver(&Window::of("@42"), "hello").unwrap_err();
             assert!(err.contains("a dialog has the keyboard"), "{label}: {err}");
-            // 何が止めているかを人に言える — Slack の ⚠️ に載る1行
+            // We can tell a human what is blocking — the one line shown with Slack's ⚠️
             assert!(err.contains(want), "{label}: {err}");
             let calls = calls.lock().unwrap();
             assert_eq!(enters(&calls), 0, "{label}: Enter を撃たない");
@@ -1958,8 +1957,8 @@ mod tests {
         }
     }
 
-    /// 待機中の窓は素通し。ここが誤爆すると**全部の配達が止まる**ので、モーダル判定と
-    /// 同じテストで押さえる(`esc to interrupt` は走行中の語で、モーダルではない)。
+    /// An idle window passes straight through. A false positive here **stops every delivery**, so it is pinned
+    /// by the same tests as the modal check (`esc to interrupt` is the running word, not a modal).
     #[test]
     fn an_idle_worker_is_not_mistaken_for_a_dialog() {
         for (label, pane) in [
@@ -1981,15 +1980,15 @@ mod tests {
         }
     }
 
-    /// **本物の tmux と本物の claude を相手にした実弾**。単体テストは私が採った pane を
-    /// 固定するだけなので、「capture して判定して打たない」の一気通貫はここでしか確かめられない
-    /// (0.17.3 は単体テスト green のまま実機で効いていなかった)。
+    /// **Against real tmux and a real claude**. Unit tests only pin panes I captured, so the end-to-end
+    /// "capture, judge, do not type" can only be checked here
+    /// (0.17.3 was green in unit tests yet did not work on a real machine).
     ///
-    /// 走らせ方: `cargo test -- --ignored real_tmux`。claude を1つ起こすので既定では回さない。
+    /// How to run: `cargo test -- --ignored real_tmux`. It starts a claude, so it does not run by default.
     #[test]
     #[ignore = "本物の tmux と claude を起こす"]
     fn real_tmux_deliver_refuses_a_live_claude_dialog() {
-        // 本番セッション `agentgw-workers` に前方一致しない名前にする(2026-08-18 に踏んだ罠)
+        // Use a name that is not a prefix match for the production session `agentgw-workers` (a trap hit on 2026-08-18)
         const SESSION: &str = "deliver-probe-rs";
         let t = Tmux::real();
         let sh = |args: &[&str]| (t.run)(args);
@@ -2025,11 +2024,11 @@ mod tests {
         };
 
         wait("入力欄", &|p| !Pane::new(p).input_line().is_empty());
-        // 待機中の窓は素通し = 誤爆しない(ここが落ちると全部の配達が止まる)
+        // An idle window passes straight through = no false positive (if this fails, every delivery stops)
         assert!(Pane::new(&pane()).modal_footer().is_none(), "{}", pane());
         c.deliver(&w, "say ok").expect("待機中の窓には配達できる");
 
-        // `/model` は**一度だけ**。待ちの中で送り直すと、開いたダイアログに打ち込むことになる
+        // `/model` **only once**. Resending inside the wait would type into the open dialog
         wait("入力欄(応答後)", &|p| Pane::new(p).input_box_empty());
         sh(&["send-keys", "-t", SESSION, "-l", "--", "/model"]).expect("send /model");
         std::thread::sleep(Duration::from_millis(400));
@@ -2049,7 +2048,7 @@ mod tests {
         let _ = sh(&["kill-session", "-t", SESSION]);
 
         assert!(err.contains("a dialog has the keyboard"), "{err}");
-        // 打っていない = ダイアログは開いたまま、選択も動いていない
+        // Nothing typed = the dialog is still open and the selection has not moved
         assert!(
             Pane::new(&after).modal_footer().is_some(),
             "ダイアログが閉じた(= Enter を撃った):\n{after}"
@@ -2075,9 +2074,9 @@ mod tests {
     #[test]
     fn worker_hooks_has_the_load_bearing_shape() {
         let v = HookIntake::settings_json(8791, "tok");
-        // --settings は1つしか効かない → disableRemoteControl は同居必須
+        // Only one --settings takes effect → disableRemoteControl must live alongside
         assert_eq!(v["disableRemoteControl"], true);
-        // SessionStart は http が無視されるので curl コマンド
+        // SessionStart ignores http, so it is a curl command
         let ss = &v["hooks"]["SessionStart"][0]["hooks"][0];
         assert_eq!(ss["type"], "command");
         assert!(
@@ -2090,7 +2089,7 @@ mod tests {
                 .unwrap()
                 .contains("x-agentgw-token: tok")
         );
-        // UserPromptSubmit / SessionEnd は http + session ヘッダ
+        // UserPromptSubmit / SessionEnd use http + session header
         for kind in ["UserPromptSubmit", "SessionEnd"] {
             let h = &v["hooks"][kind][0]["hooks"][0];
             assert_eq!(h["type"], "http", "{kind}");
@@ -2129,7 +2128,7 @@ mod tests {
             );
             assert_eq!(h["timeout"], timeout, "{claude_name}");
         }
-        // 最初からある3つの hook はそのまま残っていること
+        // The three hooks present from the start stay as they are
         assert!(v["hooks"]["SessionStart"][0]["hooks"][0]["command"].is_string());
         assert_eq!(
             v["hooks"]["UserPromptSubmit"][0]["hooks"][0]["url"],
@@ -2140,7 +2139,7 @@ mod tests {
     #[tokio::test]
     async fn stop_decision_answers_or_declines() {
         use std::time::Duration;
-        // main ループ役が block を返すケース
+        // The case where the main-loop stand-in returns block
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         tokio::spawn(async move {
             let ev: HookEvent = rx.recv().await.unwrap();
@@ -2157,7 +2156,7 @@ mod tests {
         };
         let body = HookIntake::decide_or_default(&tx, ev, Duration::from_secs(1)).await;
         assert_eq!(body, r#"{"decision":"block"}"#);
-        // 受け口ごと閉じている(main が落ちた)→ 送れないので {} で辞退
+        // The endpoint itself is closed (main went down) → cannot send, so abstain with {}
         let (tx2, rx2) = tokio::sync::mpsc::channel(1);
         drop(rx2);
         let ev = HookEvent {
@@ -2170,8 +2169,8 @@ mod tests {
         assert_eq!(body, "{}");
     }
 
-    /// 受け取った側が respond を送らずに捨てた場合。oneshot が即 Err になるので、
-    /// 上限の5秒を待たずに辞退できることが要件(ターンを吊らせない)。
+    /// When the receiver drops it without sending a respond. The oneshot errors at once, so the
+    /// requirement is abstaining without waiting out the 5-second cap (do not hang the turn).
     #[tokio::test]
     async fn stop_declines_at_once_when_the_answer_is_dropped() {
         use std::time::Duration;
@@ -2217,7 +2216,7 @@ mod tests {
         );
     }
 
-    /// 画面を1回ごとに差し替えられる `Claude` と、送ったキーの記録。
+    /// A `Claude` whose screen can be swapped per call, and a record of the keys sent.
     fn claude_showing(
         panes: Vec<&'static str>,
     ) -> (std::sync::Arc<std::sync::Mutex<Vec<String>>>, Claude) {
@@ -2289,7 +2288,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_trust_dialog_is_answered_once_and_the_watch_keeps_going() {
-        // 同じ画面が2回続いても Enter は1回だけ(現行trustAnswered)
+        // Even if the same screen shows twice, Enter only once
         let (keys, c) = claude_showing(vec![TRUST_PANE, TRUST_PANE, ""]);
         let out = c
             .watch_spawn_screens(&Window::of("1-1"), 30, 1, &LogCtx::default())
@@ -2310,7 +2309,7 @@ mod tests {
             .watch_spawn_screens(&Window::of("1-1"), 30, 1, &LogCtx::default())
             .await;
         assert_eq!(out, SpawnOutcome::LoginRequired);
-        // Enter では消えない画面 — 撃つと入力欄の中身を送ることになるので撃たない
+        // A screen Enter does not clear — firing would send the input box's contents, so do not fire
         let keys = keys.lock().unwrap();
         assert!(keys.is_empty(), "拒絶画面にはキーを送らない: {keys:?}");
     }
@@ -2357,7 +2356,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_confirm_screen_is_answered_but_the_watch_does_not_stop() {
-        // confirm に答えても「起動できた」ではない。掛け金を外すのは user_prompt
+        // Answering confirm does not mean "started". The latch is cleared by user_prompt
         let (keys, c) = claude_showing(vec!["Yes, proceed with local development", TRUST_PANE, ""]);
         let out = c
             .watch_spawn_screens(&Window::of("1-1"), 30, 1, &LogCtx::default())
@@ -2394,14 +2393,14 @@ mod tests {
         };
         let login = line("Login expired · Please run /login");
         assert_eq!(Transcript::failure_type(&login), Some("authentication_failed"));
-        // 見るのは**最後の**エラーだけ
+        // Only the **last** error is looked at
         let later = format!("{login}{}", line("API Error: overloaded_error"));
         assert_eq!(Transcript::failure_type(&later), None);
         assert_eq!(Transcript::failure_type(""), None);
     }
 
-    /// 現行 LIMIT_MODAL_PROMPTS をアンカー無しの literal に還元したもの。
-    /// 「上限」以外の api-error は拾わない(混雑の一時エラーで壁を立てない)。
+    /// LIMIT_MODAL_PROMPTS reduced to unanchored literals.
+    /// api-errors other than "limit" are not picked up (no wall over a transient overload error).
     #[test]
     fn limit_error_is_read_from_the_transcript_tail() {
         let now = 1_785_000_000_000u64;
@@ -2423,15 +2422,15 @@ mod tests {
         assert!(hit.detail.contains("usage limit reached"), "{hit:?}");
         assert!(hit.reset_ms > now);
 
-        // 上限でない api-error は拾わない
+        // api-errors that are not limits are not picked up
         let other = line("2026-07-30T14:00:00.000Z", "API Error: overloaded_error");
         assert!(Transcript::limit_hit(&other, now).is_none());
 
-        // 末尾スライスは行の途中から始まる — 半端な行で落ちも止まりもしないこと
+        // The tail slice starts mid-line — a partial line must neither crash nor stop it
         let sliced = format!("Message\",\"isApiErrorMessage\":true}}\n{tail}");
         assert!(Transcript::limit_hit(&sliced, now).is_some());
 
-        // リセット時刻が読めなければエラー時刻 +1h。それも過ぎていれば履歴なので None
+        // If the reset time is unreadable, error time + 1h. If even that has passed it is history, so None
         let at = 1_785_420_000_000u64; // 2026-07-30T14:00:00Z
         let no_time = line("2026-07-30T14:00:00.000Z", "Claude usage limit reached.");
         assert_eq!(
