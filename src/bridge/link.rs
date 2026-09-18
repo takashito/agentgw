@@ -1377,7 +1377,7 @@ mod tests {
             "user": "U1",
             "text": "<@U_BOT> hello"
         });
-        let msg = crate::slack::inbound_from_relay("message", &event).expect("読めること");
+        let msg = crate::chat::slack::inbound_from_relay("message", &event).expect("読めること");
         assert_eq!(msg.channel, "C1");
         assert_eq!(msg.user.as_deref(), Some("U1"));
         assert_eq!(msg.text, "<@U_BOT> hello");
@@ -1386,9 +1386,9 @@ mod tests {
 
     #[test]
     fn an_event_the_relay_could_not_encode_is_dropped_not_guessed() {
-        assert!(crate::slack::inbound_from_relay("message", &serde_json::json!({})).is_none());
+        assert!(crate::chat::slack::inbound_from_relay("message", &serde_json::json!({})).is_none());
         assert!(
-            crate::slack::inbound_from_relay("app_mention", &serde_json::json!({"channel": "C1"}))
+            crate::chat::slack::inbound_from_relay("app_mention", &serde_json::json!({"channel": "C1"}))
                 .is_none()
         );
     }
@@ -1396,7 +1396,7 @@ mod tests {
     /// ボタンは `perm:<動作>:<reqId>` のものだけ拾う。それ以外は Bridge の関心事ではない。
     #[test]
     fn a_forwarded_button_becomes_a_perm_click() {
-        let click = crate::slack::perm_click_from_relay(
+        let click = crate::chat::slack::perm_click_from_relay(
             &serde_json::json!({"action_id": "perm:allow-channel:req-7"}),
             &serde_json::json!({"user": {"id": "U_OWNER"}}),
         )
@@ -1407,7 +1407,7 @@ mod tests {
 
         for other in ["something_else", "perm", "perm:allow"] {
             assert!(
-                crate::slack::perm_click_from_relay(
+                crate::chat::slack::perm_click_from_relay(
                     &serde_json::json!({ "action_id": other }),
                     &serde_json::json!({})
                 )

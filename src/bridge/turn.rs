@@ -7,7 +7,7 @@ use crate::agent::tmux::Window;
 use crate::agent::{HookEvent, ProbeErr, SessionId};
 use crate::bridge::state as bridge;
 use crate::bridge::state::{Disposition, LogCtx, ThreadKey};
-use crate::slack;
+use crate::chat::slack;
 
 const NARRATION_CAP: usize = 600;
 

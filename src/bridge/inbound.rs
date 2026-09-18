@@ -11,7 +11,7 @@ use crate::agent::{Envelope, SessionId, SpawnReq, WorkerState};
 use crate::bridge::state as bridge;
 use crate::bridge::state::{Access, LogCtx, ThreadEntry, ThreadKey};
 use crate::bridge::{inbound, worker};
-use crate::slack;
+use crate::chat::slack;
 use slack_morphism::prelude::*;
 
 /// ドレインを諦めてでも殺す上限。現行は受信確認のタイムアウトを流用する

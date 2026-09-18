@@ -1,5 +1,5 @@
 //! Bridge — Slack とエージェントの間に座る本体。このファイルは**組み立ての起点**だけを持つ:
-//! `Bridge` の構造体、外の世界を受け取る [`Deps`](Slack・エージェント・時計 — [`crate::ports`])、
+//! `Bridge` の構造体、外の世界を受け取る [`Deps`](Slack・エージェント・時計 — [`crate::chat::Chat`]・[`crate::agent::Agent`]・[`state::Clock`])、
 //! `run()`(配線と select ループ)、起動・停止・再起動。
 //!
 //! 機能ごとの `impl Bridge` は子モジュールに1つずつ:
@@ -25,7 +25,8 @@ use crate::bridge::state as bridge;
 use crate::bridge::inbound::InboundMsg;
 use crate::bridge::state::{LogCtx, ThreadKey};
 use crate::bridge::turn::{PermPending, Stall};
-use crate::{mcp, slack};
+use crate::chat::slack;
+use crate::mcp;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;

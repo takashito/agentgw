@@ -1467,7 +1467,7 @@ pub fn format_fleet(
 use crate::bridge::link as link_watch;
 use crate::bridge::inbound::InboundMsg;
 use crate::bridge::state::{Access, StateDir, now_ms};
-use crate::slack::{FleetEvent, PermClick};
+use crate::chat::slack::{FleetEvent, PermClick};
 use axum::Router;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -1648,7 +1648,7 @@ impl Fleet {
                 if let Some(ch) = channel {
                     self.cooldown.lock().await.delivered(ch);
                 }
-                if let Some(msg) = crate::slack::inbound_from_relay(name, raw) {
+                if let Some(msg) = crate::chat::slack::inbound_from_relay(name, raw) {
                     let _ = self.msg_tx.send(msg).await;
                 }
             }
@@ -1926,7 +1926,7 @@ impl Fleet {
         }) {
             Delivery::Local => {
                 rlog("debug", &format!("action chan={channel:?} → local"));
-                if let Some(click) = crate::slack::perm_click_from_relay(&action, &body) {
+                if let Some(click) = crate::chat::slack::perm_click_from_relay(&action, &body) {
                     let _ = self.click_tx.send(click).await;
                 }
             }
@@ -2471,7 +2471,7 @@ impl Cli {
         let Some(bot) = env.get("SLACK_BOT_TOKEN") else {
             return names;
         };
-        let Ok(api) = crate::slack::Api::new(bot) else {
+        let Ok(api) = crate::chat::slack::Api::new(bot) else {
             return names;
         };
         // home も route と同じチャンネル。owner だけが人なので users.info の側で引く

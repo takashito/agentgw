@@ -10,342 +10,7 @@ use crate::chat::Chat;
 use slack_morphism::prelude::*;
 use std::sync::Arc;
 
-/// 親が引き取る Slack の生イベント。**子へそのまま転送できる形**で持つ
-/// (どのマシンの担当かを決めるのは `bridge::gateway` の仕事で、ここは運ぶだけ)。
-#[derive(Debug, Clone)]
-pub enum FleetEvent {
-    Event {
-        name: String,
-        event: serde_json::Value,
-    },
-    Action {
-        action: serde_json::Value,
-        body: serde_json::Value,
-    },
-}
-
-/// 親が子へ転送するイベント。**Bridge が扱いを知っているものだけ** — ここに無い種類は
-/// 名前が付かず、そのまま落ちる(この match が購読表そのもの)。
-fn fleet_event_of(ev: &SlackEventCallbackBody) -> Option<FleetEvent> {
-    let (name, value) = match ev {
-        SlackEventCallbackBody::Message(e) => ("message", serde_json::to_value(e)),
-        SlackEventCallbackBody::ReactionAdded(e) => ("reaction_added", serde_json::to_value(e)),
-        SlackEventCallbackBody::ReactionRemoved(e) => ("reaction_removed", serde_json::to_value(e)),
-        SlackEventCallbackBody::MemberJoinedChannel(e) => {
-            ("member_joined_channel", serde_json::to_value(e))
-        }
-        _ => return None,
-    };
-    Some(FleetEvent::Event {
-        name: name.to_string(),
-        event: value.ok()?,
-    })
-}
-
-/// 押された承認ボタン1つ。`action_id` は `perm:<動作>:<reqId>`。
-#[derive(Debug, Clone)]
-pub struct PermClick {
-    pub req_id: String,
-    /// `allow` / `deny` / `allow-thread` / `allow-channel`
-    pub action: String,
-    /// 押した人(監査とログ用)。
-    pub by: String,
-}
-
-/// Block Kit のボタン。**押した事実だけ**を main ループへ渡し、判断はしない
-/// (Slack のイベント処理は3秒で返さないと Slack が再送する)。
-/// Slack は接続のたびに `hello` を投げ、そこに**その app がいま張っている接続の本数**が入る
-/// (`num_connections`)。Web API には本数を返す口が無いので、これが唯一の手がかり。
-///
-/// **健全な状態でも 2 本ある。** slack-morphism は既定で2本張る
-/// (`SlackClientSocketModeConfig::DEFAULT_CONNECTIONS_COUNT = 2`。Slack が定期的に投げる
-/// 張り直しの間、もう1本が受け続けるための冗長で、同じプロセスの中なので取りこぼさない)。
-/// 実機の起動ログでも hello が2回来て `1` → `2` と数えた(2026-08-01 実測)。
-///
-/// **3本目からが事故。** それは別のプロセスが同じ app トークンで繋いでいるということで、
-/// Slack はイベントを複製せず**半分ずつ振り分ける**。この設計は Slack に繋がるのが
-/// 常に1台であることに乗っている。**誰が繋いでいるかは分からない** — 分かるのは本数だけだが、
-/// 黙って半分消えるよりはるかにましだから出す。
-///
-/// > `SlackSocketModeHelloEvent` は slack-morphism 2.24.0 から**名前で参照できない**
-/// > (`models` が private で、glob 再輸出が同名の module に隠される)。だから型を書かず、
-/// > 引数の型が推論されるクロージャで受ける。
-/// このプロセスが自分で張る本数。これを超えた分は**他人**。
-const OWN_CONNECTIONS: u32 = 2;
-
-/// **純関数** — 自分の本数を超えていたら言うことを返す。
-pub fn connection_warning(num_connections: u32) -> Option<String> {
-    (num_connections > OWN_CONNECTIONS).then(|| {
-        format!(
-            "socket mode: this Slack app has {num_connections} live connections but this Bridge \
-         opens {OWN_CONNECTIONS} — someone else is consuming events. Slack SPLITS them at \
-         random between consumers (it does not copy), so half of them land nowhere. \
-         Another Bridge, or a dev/production token mix-up."
-        )
-    })
-}
-
-async fn on_interaction_event(
-    event: SlackInteractionEvent,
-    _client: Arc<SlackHyperClient>,
-    state: SlackClientEventsUserState,
-) -> UserCallbackResult<()> {
-    // **届いた事実そのもの**を残す。Slack アプリで Interactivity が無効だとここに1行も
-    // 出ない — 「押しても無反応」が設定側かこちら側かを、この1行で切り分ける
-    let SlackInteractionEvent::BlockActions(ev) = event else {
-        LogCtx::default().debug("slack", "interaction (not block_actions) — ignored");
-        return Ok(());
-    };
-    let by = ev
-        .user
-        .as_ref()
-        .map(|u| u.id.to_string())
-        .unwrap_or_default();
-    let actions: Vec<_> = ev.actions.clone().into_iter().flatten().collect();
-    {
-        let guard = state.read().await;
-        if let Some(fleet) = guard.get_user_state::<tokio::sync::mpsc::Sender<FleetEvent>>() {
-            let body = serde_json::to_value(SlackInteractionBlockActionsEvent {
-                actions: Some(actions.clone()),
-                ..ev.clone()
-            })
-            .unwrap_or(serde_json::Value::Null);
-            for a in &actions {
-                let action = serde_json::to_value(a).unwrap_or(serde_json::Value::Null);
-                if let Err(e) = fleet
-                    .send(FleetEvent::Action {
-                        action,
-                        body: body.clone(),
-                    })
-                    .await
-                {
-                    LogCtx::default().error("slack", &format!("fleet queue closed: {e}"));
-                }
-            }
-            return Ok(());
-        }
-    }
-    LogCtx::default().debug(
-        "slack",
-        &format!(
-            "interaction block_actions by={by} actions={}",
-            actions.len()
-        ),
-    );
-    for a in actions {
-        let id = a.action_id.to_string();
-        // `perm:<動作>:<reqId>` — reqId 自体に `:` は入らないので3分割で足りる
-        let mut parts = id.splitn(3, ':');
-        if parts.next() != Some("perm") {
-            continue;
-        }
-        let (Some(action), Some(req_id)) = (parts.next(), parts.next()) else {
-            continue;
-        };
-        let click = PermClick {
-            req_id: req_id.to_string(),
-            action: action.to_string(),
-            by: by.clone(),
-        };
-        let guard = state.read().await;
-        match guard.get_user_state::<tokio::sync::mpsc::Sender<PermClick>>() {
-            Some(tx) => {
-                if let Err(e) = tx.send(click).await {
-                    LogCtx::default().error("slack", &format!("perm click dropped: {e}"));
-                }
-            }
-            None => LogCtx::default().error("slack", "no perm-click channel in listener state"),
-        }
-    }
-    Ok(())
-}
-
-/// slack-morphism が**イベントを読めずに落とした**ときの受け皿。既定のハンドラは
-/// `tracing` にしか書かないので、こちらのログには何も残らない — 「Slack が送っていない」と
-/// 「こちらが読めなかった」が区別できなくなる(2026-07-31 の削除の調査がこれで長引いた)。
-///
-/// 読めない筋は実在する: メッセージの種類(`subtype`)を slack-morphism が**固定の一覧**で
-/// 持っていて、そこに無い種類が来ると `SlackMessageEvent` ごと落ちる。Slack が新しい種類を
-/// 足した日に静かに取りこぼすので、せめて1行残す。
-fn on_listener_error(
-    err: Box<dyn std::error::Error + Send + Sync>,
-    _client: Arc<SlackHyperClient>,
-    _state: SlackClientEventsUserState,
-) -> HttpStatusCode {
-    LogCtx::default().error("slack", &format!("listener dropped an event: {err}"));
-    HttpStatusCode::BAD_REQUEST
-}
-
-async fn on_push_event(
-    event: SlackPushEventCallback,
-    _client: Arc<SlackHyperClient>,
-    state: SlackClientEventsUserState,
-) -> UserCallbackResult<()> {
-    let guard = state.read().await;
-    // 親(子を持つ Bridge)は、誰の担当かを決める前に畳まない
-    if let Some(fleet) = guard.get_user_state::<tokio::sync::mpsc::Sender<FleetEvent>>() {
-        if let Some(item) = fleet_event_of(&event.event)
-            && let Err(e) = fleet.send(item).await
-        {
-            LogCtx::default().error("slack", &format!("fleet queue closed: {e}"));
-        }
-        return Ok(());
-    }
-    let Some(msg) = inbound_of(event.event) else {
-        return Ok(());
-    };
-    let Some(tx) = guard.get_user_state::<tokio::sync::mpsc::Sender<InboundMsg>>() else {
-        LogCtx::default().error("slack", "no inbound channel in listener state");
-        return Ok(());
-    };
-    if let Err(e) = tx.send(msg).await {
-        LogCtx::default().error("slack", &format!("inbound queue closed: {e}"));
-    }
-    Ok(())
-}
-
-/// Slack のイベント1つを、Bridge が扱う形に畳む。**直結でも Relay 経由でもここを通る** —
-/// 2本目を書くと、門番の判断が経路によっていつか食い違う。
-fn inbound_of(event: SlackEventCallbackBody) -> Option<InboundMsg> {
-    let msg = match event {
-        // 削除は「取り消し」。本文が無いので from_event では拾えない別の道
-        SlackEventCallbackBody::Message(ev) if ev.deleted_ts.is_some() => {
-            match InboundMsg::from_deletion(&ev) {
-                Some(msg) => msg,
-                // 黙って落とすと「届いていない」と「落とした」が区別できない。削除は
-                // 経路が長い(Slack → 台帳の読み替え → 取り消し配達)ので1行だけ残す
-                None => {
-                    LogCtx::default().debug(
-                        "slack",
-                        &format!(
-                            "message_deleted ignored ts={:?} sender={:?}",
-                            ev.deleted_ts,
-                            ev.previous_message
-                                .as_ref()
-                                .map(|p| (p.sender.user.clone(), p.sender.bot_id.clone()))
-                        ),
-                    );
-                    return None;
-                }
-            }
-        }
-        // 書き換え。新しい本文は `message` に入っていて、元のイベントの
-        // `content` には無い(from_event では拾えない)
-        SlackEventCallbackBody::Message(ev)
-            if ev.subtype.as_ref() == Some(&SlackMessageEventType::MessageChanged) =>
-        {
-            match InboundMsg::from_edit(&ev) {
-                Some(msg) => msg,
-                None => {
-                    // 削除と同じ理由で1行残す。ただし **bot 自身の編集は書かない** —
-                    // 付箋の描き直しが毎秒これを撃つので、書くとログが埋まって使えなくなる
-                    if !ev
-                        .message
-                        .as_ref()
-                        .is_some_and(|m| m.sender.bot_id.is_some())
-                    {
-                        LogCtx::default().debug(
-                            "slack",
-                            &format!(
-                                "message_changed ignored ts={:?} sender={:?}",
-                                ev.message.as_ref().map(|m| m.ts.to_string()),
-                                ev.message.as_ref().and_then(|m| m.sender.user.clone())
-                            ),
-                        );
-                    }
-                    return None;
-                }
-            }
-        }
-        SlackEventCallbackBody::Message(ev) => match InboundMsg::from_event(&ev) {
-            Some(msg) => msg,
-            None => {
-                LogCtx::default().debug(
-                    "slack",
-                    &format!("dropped unanswerable message subtype={:?}", ev.subtype),
-                );
-                return None;
-            }
-        },
-        // リアクションも受ける。stop 絵文字の判定と、ワーカーへの合成テキストは
-        // Bridge 側(付箋の ts と bot の id を知っているのはあちら)
-        SlackEventCallbackBody::ReactionAdded(ev) => {
-            match InboundMsg::from_reaction(&ev.item, &ev.user.to_string(), ev.reaction.0, true) {
-                Some(msg) => msg,
-                None => return None,
-            }
-        }
-        SlackEventCallbackBody::ReactionRemoved(ev) => {
-            match InboundMsg::from_reaction(&ev.item, &ev.user.to_string(), ev.reaction.0, false) {
-                Some(msg) => msg,
-                None => return None,
-            }
-        }
-        _ => return None, // AppMention 含め、他のイベントは使わない
-    };
-    Some(msg)
-}
-
-/// Relay が転送してきた生の JSON を、直結と**同じ** [`InboundMsg`] にする。
-///
-/// Relay 側は slack-morphism の型を `to_value` して載せているので、ここは同じ serde 実装で
-/// 戻すだけ。戻せなかったら1行残して捨てる — 黙って落とすと「Relay が送っていない」と
-/// 「こちらが読めなかった」が区別できなくなる。
-pub fn inbound_from_relay(name: &str, event: &serde_json::Value) -> Option<InboundMsg> {
-    let body = match name {
-        "message" => serde_json::from_value(event.clone()).map(SlackEventCallbackBody::Message),
-        "reaction_added" => {
-            serde_json::from_value(event.clone()).map(SlackEventCallbackBody::ReactionAdded)
-        }
-        "reaction_removed" => {
-            serde_json::from_value(event.clone()).map(SlackEventCallbackBody::ReactionRemoved)
-        }
-        "member_joined_channel" => {
-            serde_json::from_value(event.clone()).map(SlackEventCallbackBody::MemberJoinedChannel)
-        }
-        other => {
-            LogCtx::default().debug(
-                "slack",
-                &format!("relay sent a \"{other}\" we do not handle"),
-            );
-            return None;
-        }
-    };
-    match body {
-        Ok(body) => inbound_of(body),
-        Err(e) => {
-            LogCtx::default().error(
-                "slack",
-                &format!("could not read a \"{name}\" the relay forwarded: {e}"),
-            );
-            None
-        }
-    }
-}
-
-/// Relay が転送してきたボタン押しを [`PermClick`] にする。判断はしない — 押された事実だけ。
-pub fn perm_click_from_relay(
-    action: &serde_json::Value,
-    body: &serde_json::Value,
-) -> Option<PermClick> {
-    let id = action.get("action_id")?.as_str()?;
-    // `perm:<動作>:<reqId>` — reqId 自体に `:` は入らないので3分割で足りる
-    let mut parts = id.splitn(3, ':');
-    if parts.next() != Some("perm") {
-        return None;
-    }
-    let (action_name, req_id) = (parts.next()?, parts.next()?);
-    Some(PermClick {
-        req_id: req_id.to_string(),
-        action: action_name.to_string(),
-        by: body
-            .get("user")
-            .and_then(|u| u.get("id"))
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string(),
-    })
-}
+// ── the Slack Web API ──────────────────────────────────────────────────────
 
 /// Slack Web API。呼び出し側に slack-morphism の型を見せない。
 pub struct Api {
@@ -1130,157 +795,6 @@ impl dyn Chat {
 /// curl の `--max-time` と、受信時の先読み全体の締切の両方に使う。
 pub const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-// ─── ワーカーの MCP ツール実行 ───────────────────────────────────────────────
-
-/// 1ファイルあたりの上限(reply ツールスキーマの "max 50MB each" と同じ数値 — `endpoints.rs:130`)。
-pub const MAX_ATTACHMENT_BYTES: u64 = 50 * 1024 * 1024;
-
-/// inbox に置いた添付をどれだけ残すか(7日)。
-/// 掃除はダウンロードの後ろに相乗りする — Bridge に専用のタイマーを増やさない。
-pub const INBOX_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
-
-/// 1投稿あたりの本文の上限。これを超える返信は分けて投げる
-/// Slack は長すぎる本文を弾くので、分けないと**返信ごと落ちる**。
-pub const MAX_CHUNK_LIMIT: usize = 3900;
-
-/// 返信を Slack に収まる長さに割る。
-///
-/// `newline` は段落 → 行 → 単語の順に切れ目を探す。ただし**上限の半分より手前では切らない** —
-/// 早すぎる切れ目でぶつ切りにするより、上限で断ち切る方がまし。`length` は上限で断ち切る。
-///
-/// 数えるのは**文字**(Rust の `len()` はバイトなので、日本語だと途中で割れる)。
-pub fn chunk(text: &str, limit: usize, newline_mode: bool) -> Vec<String> {
-    let limit = limit.max(1);
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= limit {
-        return vec![text.to_string()];
-    }
-    let rfind = |from: usize, pat: &[char]| -> Option<usize> {
-        chars[..from.min(chars.len())]
-            .windows(pat.len())
-            .rposition(|w| w == pat)
-    };
-    let mut out = Vec::new();
-    let mut start = 0usize;
-    while chars.len() - start > limit {
-        let window_end = start + limit;
-        let rel = |abs: Option<usize>| abs.map(|i| i - start);
-        let mut cut = limit;
-        if newline_mode {
-            let para = rel(rfind(window_end, &['\n', '\n']).filter(|&i| i > start));
-            let line = rel(rfind(window_end, &['\n']).filter(|&i| i > start));
-            let space = rel(rfind(window_end, &[' ']).filter(|&i| i > start));
-            cut = match (para, line, space) {
-                (Some(p), _, _) if p > limit / 2 => p,
-                (_, Some(l), _) if l > limit / 2 => l,
-                (_, _, Some(s)) if s > 0 => s,
-                _ => limit,
-            };
-        }
-        out.push(chars[start..start + cut].iter().collect());
-        start += cut;
-        // 切れ目の直後の改行は次の断片の頭に持ち越さない
-        while chars.get(start) == Some(&'\n') {
-            start += 1;
-        }
-    }
-    if start < chars.len() {
-        out.push(chars[start..].iter().collect());
-    }
-    out
-}
-
-// ── assistant ステータスの文言。現行 Bun の原文をそのまま持ってくる(`tests` で固定)。
-// 空文字はどれでもクリアなので、ここに「クリア用の定数」は置かない。
-
-/// 配達直後 / スレッド復帰。
-pub const TYPING_STATUS: &str = "is typing…";
-/// ターンが無音のまま [`SILENCE_MS`] 過ぎたとき(`THINKING_STATUS`)。
-pub const THINKING_STATUS: &str = "is thinking…";
-/// 無音と見なすまでの間。現行 Bun の `deps.silenceMs` 既定値は 5s だが、
-/// **Rust 版は 3s**(2026-07-31 ユーザー判断 — ツール実行後に思考中が戻るまでが遅い)。
-pub const SILENCE_MS: u64 = 3_000;
-/// Slack's "…ing" status line. Use as `thinking.set(&Status::Login.text())`.
-///
-/// `compact` の専用ステータスは**意図的に持たない**(Bun からの逸脱 — ユーザー判断)。
-/// 以前の実装は compact の間 `コンテキストを圧縮中…` を張り、tick ごとに `… {n}s` 付きへ
-/// 張り直していた。Rust 版はこれを持たない — compact は進捗チェックリスト(sticky)を
-/// 投稿して編集し続けるので、shimmer と二重で冗長だという判断(**移植漏れではない**)。
-/// 配達の `is typing…` と無音の `is thinking…` は compact 実行中も従来どおり出る。
-#[derive(Clone, Copy, Debug)]
-pub enum Status {
-    /// `status`。
-    Gathering,
-    /// `context`。
-    Context,
-    /// `usage`。
-    Usage,
-    /// `model`。
-    Model,
-    /// `effort <level>`。
-    Effort,
-    /// `mode <名前>` の間だけ出す shimmer。
-    Mode,
-    /// `login` — 現行 Bun に原文が無い。上の語調に合わせて新規に決めたもの。
-    Login,
-    /// `logout` — 同上(新規)。
-    Logout,
-    /// `resume` — 同上(新規)。
-    Resume,
-    /// `restart` — 同上(新規)。
-    Restart,
-}
-
-impl Status {
-    pub fn text(self) -> String {
-        match self {
-            Status::Gathering => crate::t!("Gathering…", "集計中…"),
-            Status::Context => crate::t!("Checking the context…", "コンテキストを確認中…"),
-            Status::Usage => crate::t!("Checking usage…", "使用状況を確認中…"),
-            Status::Model => crate::t!("Switching the model…", "モデルを切り替え中…"),
-            Status::Effort => crate::t!("Setting the effort level…", "effort を設定中…"),
-            Status::Mode => crate::t!("Switching the permission mode…", "権限モードを切り替え中…"),
-            Status::Login => crate::t!("Signing in…", "サインイン中…"),
-            Status::Logout => crate::t!("Signing out…", "サインアウト中…"),
-            Status::Resume => crate::t!("Resuming the thread…", "スレッドを再開中…"),
-            Status::Restart => crate::t!("Restarting…", "再起動中…"),
-        }
-    }
-}
-
-/// disposition を main の台帳へ流す。満杯なら待つ(落とすと台帳が消えないまま残る)。
-async fn notify(
-    dispo: &tokio::sync::mpsc::Sender<bridge_state::Disposition>,
-    d: bridge_state::Disposition,
-    ctx: &LogCtx,
-) {
-    if let Err(e) = dispo.send(d).await {
-        ctx.error("bridge", &format!("disposition channel closed: {e}"));
-    }
-}
-
-/// MCP 受け口に差す実体。
-pub struct ToolExec {
-    pub slack: crate::chat::ChatRef,
-    pub state_dir: std::path::PathBuf,
-    /// disposition の通知先(受けて台帳を消すのは main)。
-    pub dispo: tokio::sync::mpsc::Sender<bridge_state::Disposition>,
-}
-
-impl crate::mcp::ToolExecutor for ToolExec {
-    fn execute(
-        &self,
-        session_id: String,
-        tool: String,
-        args: serde_json::Value,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
-        let (slack, dir, dispo) = (self.slack.clone(), self.state_dir.clone(), self.dispo.clone());
-        Box::pin(async move {
-            execute_tool(slack.as_ref(), &dir, &session_id, &tool, &args, &dispo).await
-        })
-    }
-}
-
 #[async_trait::async_trait]
 impl crate::chat::Chat for Api {
     async fn post_message(
@@ -1404,6 +918,403 @@ impl crate::chat::Chat for Api {
     }
 }
 
+// ── reading what Slack sends (Socket Mode events, button clicks) ────────────
+
+/// 親が引き取る Slack の生イベント。**子へそのまま転送できる形**で持つ
+/// (どのマシンの担当かを決めるのは `bridge::gateway` の仕事で、ここは運ぶだけ)。
+#[derive(Debug, Clone)]
+pub enum FleetEvent {
+    Event {
+        name: String,
+        event: serde_json::Value,
+    },
+    Action {
+        action: serde_json::Value,
+        body: serde_json::Value,
+    },
+}
+
+/// 親が子へ転送するイベント。**Bridge が扱いを知っているものだけ** — ここに無い種類は
+/// 名前が付かず、そのまま落ちる(この match が購読表そのもの)。
+fn fleet_event_of(ev: &SlackEventCallbackBody) -> Option<FleetEvent> {
+    let (name, value) = match ev {
+        SlackEventCallbackBody::Message(e) => ("message", serde_json::to_value(e)),
+        SlackEventCallbackBody::ReactionAdded(e) => ("reaction_added", serde_json::to_value(e)),
+        SlackEventCallbackBody::ReactionRemoved(e) => ("reaction_removed", serde_json::to_value(e)),
+        SlackEventCallbackBody::MemberJoinedChannel(e) => {
+            ("member_joined_channel", serde_json::to_value(e))
+        }
+        _ => return None,
+    };
+    Some(FleetEvent::Event {
+        name: name.to_string(),
+        event: value.ok()?,
+    })
+}
+
+/// 押された承認ボタン1つ。`action_id` は `perm:<動作>:<reqId>`。
+#[derive(Debug, Clone)]
+pub struct PermClick {
+    pub req_id: String,
+    /// `allow` / `deny` / `allow-thread` / `allow-channel`
+    pub action: String,
+    /// 押した人(監査とログ用)。
+    pub by: String,
+}
+
+/// Block Kit のボタン。**押した事実だけ**を main ループへ渡し、判断はしない
+/// (Slack のイベント処理は3秒で返さないと Slack が再送する)。
+/// Slack は接続のたびに `hello` を投げ、そこに**その app がいま張っている接続の本数**が入る
+/// (`num_connections`)。Web API には本数を返す口が無いので、これが唯一の手がかり。
+///
+/// **健全な状態でも 2 本ある。** slack-morphism は既定で2本張る
+/// (`SlackClientSocketModeConfig::DEFAULT_CONNECTIONS_COUNT = 2`。Slack が定期的に投げる
+/// 張り直しの間、もう1本が受け続けるための冗長で、同じプロセスの中なので取りこぼさない)。
+/// 実機の起動ログでも hello が2回来て `1` → `2` と数えた(2026-08-01 実測)。
+///
+/// **3本目からが事故。** それは別のプロセスが同じ app トークンで繋いでいるということで、
+/// Slack はイベントを複製せず**半分ずつ振り分ける**。この設計は Slack に繋がるのが
+/// 常に1台であることに乗っている。**誰が繋いでいるかは分からない** — 分かるのは本数だけだが、
+/// 黙って半分消えるよりはるかにましだから出す。
+///
+/// > `SlackSocketModeHelloEvent` は slack-morphism 2.24.0 から**名前で参照できない**
+/// > (`models` が private で、glob 再輸出が同名の module に隠される)。だから型を書かず、
+/// > 引数の型が推論されるクロージャで受ける。
+/// このプロセスが自分で張る本数。これを超えた分は**他人**。
+const OWN_CONNECTIONS: u32 = 2;
+
+/// **純関数** — 自分の本数を超えていたら言うことを返す。
+pub fn connection_warning(num_connections: u32) -> Option<String> {
+    (num_connections > OWN_CONNECTIONS).then(|| {
+        format!(
+            "socket mode: this Slack app has {num_connections} live connections but this Bridge \
+         opens {OWN_CONNECTIONS} — someone else is consuming events. Slack SPLITS them at \
+         random between consumers (it does not copy), so half of them land nowhere. \
+         Another Bridge, or a dev/production token mix-up."
+        )
+    })
+}
+
+async fn on_interaction_event(
+    event: SlackInteractionEvent,
+    _client: Arc<SlackHyperClient>,
+    state: SlackClientEventsUserState,
+) -> UserCallbackResult<()> {
+    // **届いた事実そのもの**を残す。Slack アプリで Interactivity が無効だとここに1行も
+    // 出ない — 「押しても無反応」が設定側かこちら側かを、この1行で切り分ける
+    let SlackInteractionEvent::BlockActions(ev) = event else {
+        LogCtx::default().debug("slack", "interaction (not block_actions) — ignored");
+        return Ok(());
+    };
+    let by = ev
+        .user
+        .as_ref()
+        .map(|u| u.id.to_string())
+        .unwrap_or_default();
+    let actions: Vec<_> = ev.actions.clone().into_iter().flatten().collect();
+    {
+        let guard = state.read().await;
+        if let Some(fleet) = guard.get_user_state::<tokio::sync::mpsc::Sender<FleetEvent>>() {
+            let body = serde_json::to_value(SlackInteractionBlockActionsEvent {
+                actions: Some(actions.clone()),
+                ..ev.clone()
+            })
+            .unwrap_or(serde_json::Value::Null);
+            for a in &actions {
+                let action = serde_json::to_value(a).unwrap_or(serde_json::Value::Null);
+                if let Err(e) = fleet
+                    .send(FleetEvent::Action {
+                        action,
+                        body: body.clone(),
+                    })
+                    .await
+                {
+                    LogCtx::default().error("slack", &format!("fleet queue closed: {e}"));
+                }
+            }
+            return Ok(());
+        }
+    }
+    LogCtx::default().debug(
+        "slack",
+        &format!(
+            "interaction block_actions by={by} actions={}",
+            actions.len()
+        ),
+    );
+    for a in actions {
+        let id = a.action_id.to_string();
+        // `perm:<動作>:<reqId>` — reqId 自体に `:` は入らないので3分割で足りる
+        let mut parts = id.splitn(3, ':');
+        if parts.next() != Some("perm") {
+            continue;
+        }
+        let (Some(action), Some(req_id)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let click = PermClick {
+            req_id: req_id.to_string(),
+            action: action.to_string(),
+            by: by.clone(),
+        };
+        let guard = state.read().await;
+        match guard.get_user_state::<tokio::sync::mpsc::Sender<PermClick>>() {
+            Some(tx) => {
+                if let Err(e) = tx.send(click).await {
+                    LogCtx::default().error("slack", &format!("perm click dropped: {e}"));
+                }
+            }
+            None => LogCtx::default().error("slack", "no perm-click channel in listener state"),
+        }
+    }
+    Ok(())
+}
+
+/// slack-morphism が**イベントを読めずに落とした**ときの受け皿。既定のハンドラは
+/// `tracing` にしか書かないので、こちらのログには何も残らない — 「Slack が送っていない」と
+/// 「こちらが読めなかった」が区別できなくなる(2026-07-31 の削除の調査がこれで長引いた)。
+///
+/// 読めない筋は実在する: メッセージの種類(`subtype`)を slack-morphism が**固定の一覧**で
+/// 持っていて、そこに無い種類が来ると `SlackMessageEvent` ごと落ちる。Slack が新しい種類を
+/// 足した日に静かに取りこぼすので、せめて1行残す。
+fn on_listener_error(
+    err: Box<dyn std::error::Error + Send + Sync>,
+    _client: Arc<SlackHyperClient>,
+    _state: SlackClientEventsUserState,
+) -> HttpStatusCode {
+    LogCtx::default().error("slack", &format!("listener dropped an event: {err}"));
+    HttpStatusCode::BAD_REQUEST
+}
+
+async fn on_push_event(
+    event: SlackPushEventCallback,
+    _client: Arc<SlackHyperClient>,
+    state: SlackClientEventsUserState,
+) -> UserCallbackResult<()> {
+    let guard = state.read().await;
+    // 親(子を持つ Bridge)は、誰の担当かを決める前に畳まない
+    if let Some(fleet) = guard.get_user_state::<tokio::sync::mpsc::Sender<FleetEvent>>() {
+        if let Some(item) = fleet_event_of(&event.event)
+            && let Err(e) = fleet.send(item).await
+        {
+            LogCtx::default().error("slack", &format!("fleet queue closed: {e}"));
+        }
+        return Ok(());
+    }
+    let Some(msg) = inbound_of(event.event) else {
+        return Ok(());
+    };
+    let Some(tx) = guard.get_user_state::<tokio::sync::mpsc::Sender<InboundMsg>>() else {
+        LogCtx::default().error("slack", "no inbound channel in listener state");
+        return Ok(());
+    };
+    if let Err(e) = tx.send(msg).await {
+        LogCtx::default().error("slack", &format!("inbound queue closed: {e}"));
+    }
+    Ok(())
+}
+
+/// Slack のイベント1つを、Bridge が扱う形に畳む。**直結でも Relay 経由でもここを通る** —
+/// 2本目を書くと、門番の判断が経路によっていつか食い違う。
+fn inbound_of(event: SlackEventCallbackBody) -> Option<InboundMsg> {
+    let msg = match event {
+        // 削除は「取り消し」。本文が無いので from_event では拾えない別の道
+        SlackEventCallbackBody::Message(ev) if ev.deleted_ts.is_some() => {
+            match InboundMsg::from_deletion(&ev) {
+                Some(msg) => msg,
+                // 黙って落とすと「届いていない」と「落とした」が区別できない。削除は
+                // 経路が長い(Slack → 台帳の読み替え → 取り消し配達)ので1行だけ残す
+                None => {
+                    LogCtx::default().debug(
+                        "slack",
+                        &format!(
+                            "message_deleted ignored ts={:?} sender={:?}",
+                            ev.deleted_ts,
+                            ev.previous_message
+                                .as_ref()
+                                .map(|p| (p.sender.user.clone(), p.sender.bot_id.clone()))
+                        ),
+                    );
+                    return None;
+                }
+            }
+        }
+        // 書き換え。新しい本文は `message` に入っていて、元のイベントの
+        // `content` には無い(from_event では拾えない)
+        SlackEventCallbackBody::Message(ev)
+            if ev.subtype.as_ref() == Some(&SlackMessageEventType::MessageChanged) =>
+        {
+            match InboundMsg::from_edit(&ev) {
+                Some(msg) => msg,
+                None => {
+                    // 削除と同じ理由で1行残す。ただし **bot 自身の編集は書かない** —
+                    // 付箋の描き直しが毎秒これを撃つので、書くとログが埋まって使えなくなる
+                    if !ev
+                        .message
+                        .as_ref()
+                        .is_some_and(|m| m.sender.bot_id.is_some())
+                    {
+                        LogCtx::default().debug(
+                            "slack",
+                            &format!(
+                                "message_changed ignored ts={:?} sender={:?}",
+                                ev.message.as_ref().map(|m| m.ts.to_string()),
+                                ev.message.as_ref().and_then(|m| m.sender.user.clone())
+                            ),
+                        );
+                    }
+                    return None;
+                }
+            }
+        }
+        SlackEventCallbackBody::Message(ev) => match InboundMsg::from_event(&ev) {
+            Some(msg) => msg,
+            None => {
+                LogCtx::default().debug(
+                    "slack",
+                    &format!("dropped unanswerable message subtype={:?}", ev.subtype),
+                );
+                return None;
+            }
+        },
+        // リアクションも受ける。stop 絵文字の判定と、ワーカーへの合成テキストは
+        // Bridge 側(付箋の ts と bot の id を知っているのはあちら)
+        SlackEventCallbackBody::ReactionAdded(ev) => {
+            match InboundMsg::from_reaction(&ev.item, &ev.user.to_string(), ev.reaction.0, true) {
+                Some(msg) => msg,
+                None => return None,
+            }
+        }
+        SlackEventCallbackBody::ReactionRemoved(ev) => {
+            match InboundMsg::from_reaction(&ev.item, &ev.user.to_string(), ev.reaction.0, false) {
+                Some(msg) => msg,
+                None => return None,
+            }
+        }
+        _ => return None, // AppMention 含め、他のイベントは使わない
+    };
+    Some(msg)
+}
+
+/// Relay が転送してきた生の JSON を、直結と**同じ** [`InboundMsg`] にする。
+///
+/// Relay 側は slack-morphism の型を `to_value` して載せているので、ここは同じ serde 実装で
+/// 戻すだけ。戻せなかったら1行残して捨てる — 黙って落とすと「Relay が送っていない」と
+/// 「こちらが読めなかった」が区別できなくなる。
+pub fn inbound_from_relay(name: &str, event: &serde_json::Value) -> Option<InboundMsg> {
+    let body = match name {
+        "message" => serde_json::from_value(event.clone()).map(SlackEventCallbackBody::Message),
+        "reaction_added" => {
+            serde_json::from_value(event.clone()).map(SlackEventCallbackBody::ReactionAdded)
+        }
+        "reaction_removed" => {
+            serde_json::from_value(event.clone()).map(SlackEventCallbackBody::ReactionRemoved)
+        }
+        "member_joined_channel" => {
+            serde_json::from_value(event.clone()).map(SlackEventCallbackBody::MemberJoinedChannel)
+        }
+        other => {
+            LogCtx::default().debug(
+                "slack",
+                &format!("relay sent a \"{other}\" we do not handle"),
+            );
+            return None;
+        }
+    };
+    match body {
+        Ok(body) => inbound_of(body),
+        Err(e) => {
+            LogCtx::default().error(
+                "slack",
+                &format!("could not read a \"{name}\" the relay forwarded: {e}"),
+            );
+            None
+        }
+    }
+}
+
+/// Relay が転送してきたボタン押しを [`PermClick`] にする。判断はしない — 押された事実だけ。
+pub fn perm_click_from_relay(
+    action: &serde_json::Value,
+    body: &serde_json::Value,
+) -> Option<PermClick> {
+    let id = action.get("action_id")?.as_str()?;
+    // `perm:<動作>:<reqId>` — reqId 自体に `:` は入らないので3分割で足りる
+    let mut parts = id.splitn(3, ':');
+    if parts.next() != Some("perm") {
+        return None;
+    }
+    let (action_name, req_id) = (parts.next()?, parts.next()?);
+    Some(PermClick {
+        req_id: req_id.to_string(),
+        action: action_name.to_string(),
+        by: body
+            .get("user")
+            .and_then(|u| u.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+    })
+}
+
+// ── assistant ステータスの文言。現行 Bun の原文をそのまま持ってくる(`tests` で固定)。
+// 空文字はどれでもクリアなので、ここに「クリア用の定数」は置かない。
+
+/// 配達直後 / スレッド復帰。
+pub const TYPING_STATUS: &str = "is typing…";
+/// ターンが無音のまま [`SILENCE_MS`] 過ぎたとき(`THINKING_STATUS`)。
+pub const THINKING_STATUS: &str = "is thinking…";
+/// 無音と見なすまでの間。現行 Bun の `deps.silenceMs` 既定値は 5s だが、
+/// **Rust 版は 3s**(2026-07-31 ユーザー判断 — ツール実行後に思考中が戻るまでが遅い)。
+pub const SILENCE_MS: u64 = 3_000;
+/// Slack's "…ing" status line. Use as `thinking.set(&Status::Login.text())`.
+///
+/// `compact` の専用ステータスは**意図的に持たない**(Bun からの逸脱 — ユーザー判断)。
+/// 以前の実装は compact の間 `コンテキストを圧縮中…` を張り、tick ごとに `… {n}s` 付きへ
+/// 張り直していた。Rust 版はこれを持たない — compact は進捗チェックリスト(sticky)を
+/// 投稿して編集し続けるので、shimmer と二重で冗長だという判断(**移植漏れではない**)。
+/// 配達の `is typing…` と無音の `is thinking…` は compact 実行中も従来どおり出る。
+#[derive(Clone, Copy, Debug)]
+pub enum Status {
+    /// `status`。
+    Gathering,
+    /// `context`。
+    Context,
+    /// `usage`。
+    Usage,
+    /// `model`。
+    Model,
+    /// `effort <level>`。
+    Effort,
+    /// `mode <名前>` の間だけ出す shimmer。
+    Mode,
+    /// `login` — 現行 Bun に原文が無い。上の語調に合わせて新規に決めたもの。
+    Login,
+    /// `logout` — 同上(新規)。
+    Logout,
+    /// `resume` — 同上(新規)。
+    Resume,
+    /// `restart` — 同上(新規)。
+    Restart,
+}
+
+impl Status {
+    pub fn text(self) -> String {
+        match self {
+            Status::Gathering => crate::t!("Gathering…", "集計中…"),
+            Status::Context => crate::t!("Checking the context…", "コンテキストを確認中…"),
+            Status::Usage => crate::t!("Checking usage…", "使用状況を確認中…"),
+            Status::Model => crate::t!("Switching the model…", "モデルを切り替え中…"),
+            Status::Effort => crate::t!("Setting the effort level…", "effort を設定中…"),
+            Status::Mode => crate::t!("Switching the permission mode…", "権限モードを切り替え中…"),
+            Status::Login => crate::t!("Signing in…", "サインイン中…"),
+            Status::Logout => crate::t!("Signing out…", "サインアウト中…"),
+            Status::Resume => crate::t!("Resuming the thread…", "スレッドを再開中…"),
+            Status::Restart => crate::t!("Restarting…", "再起動中…"),
+        }
+    }
+}
+
 // ── 処理中ステータス(shimmer)— Bridge が「考え中」を張る口 ─────────────────
 
 /// 処理中のあいだ張っておく assistant ステータス(`is thinking…` などの shimmer)。
@@ -1452,6 +1363,99 @@ impl Thinking {
 impl Drop for Thinking {
     fn drop(&mut self) {
         self.set(""); // 空文字 = クリア。送るだけ — 直列タスクが順番どおりに投げる
+    }
+}
+
+// ─── ワーカーの MCP ツール実行 ───────────────────────────────────────────────
+
+/// 1ファイルあたりの上限(reply ツールスキーマの "max 50MB each" と同じ数値 — `endpoints.rs:130`)。
+pub const MAX_ATTACHMENT_BYTES: u64 = 50 * 1024 * 1024;
+
+/// inbox に置いた添付をどれだけ残すか(7日)。
+/// 掃除はダウンロードの後ろに相乗りする — Bridge に専用のタイマーを増やさない。
+pub const INBOX_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+/// 1投稿あたりの本文の上限。これを超える返信は分けて投げる
+/// Slack は長すぎる本文を弾くので、分けないと**返信ごと落ちる**。
+pub const MAX_CHUNK_LIMIT: usize = 3900;
+
+/// 返信を Slack に収まる長さに割る。
+///
+/// `newline` は段落 → 行 → 単語の順に切れ目を探す。ただし**上限の半分より手前では切らない** —
+/// 早すぎる切れ目でぶつ切りにするより、上限で断ち切る方がまし。`length` は上限で断ち切る。
+///
+/// 数えるのは**文字**(Rust の `len()` はバイトなので、日本語だと途中で割れる)。
+pub fn chunk(text: &str, limit: usize, newline_mode: bool) -> Vec<String> {
+    let limit = limit.max(1);
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= limit {
+        return vec![text.to_string()];
+    }
+    let rfind = |from: usize, pat: &[char]| -> Option<usize> {
+        chars[..from.min(chars.len())]
+            .windows(pat.len())
+            .rposition(|w| w == pat)
+    };
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    while chars.len() - start > limit {
+        let window_end = start + limit;
+        let rel = |abs: Option<usize>| abs.map(|i| i - start);
+        let mut cut = limit;
+        if newline_mode {
+            let para = rel(rfind(window_end, &['\n', '\n']).filter(|&i| i > start));
+            let line = rel(rfind(window_end, &['\n']).filter(|&i| i > start));
+            let space = rel(rfind(window_end, &[' ']).filter(|&i| i > start));
+            cut = match (para, line, space) {
+                (Some(p), _, _) if p > limit / 2 => p,
+                (_, Some(l), _) if l > limit / 2 => l,
+                (_, _, Some(s)) if s > 0 => s,
+                _ => limit,
+            };
+        }
+        out.push(chars[start..start + cut].iter().collect());
+        start += cut;
+        // 切れ目の直後の改行は次の断片の頭に持ち越さない
+        while chars.get(start) == Some(&'\n') {
+            start += 1;
+        }
+    }
+    if start < chars.len() {
+        out.push(chars[start..].iter().collect());
+    }
+    out
+}
+
+/// disposition を main の台帳へ流す。満杯なら待つ(落とすと台帳が消えないまま残る)。
+async fn notify(
+    dispo: &tokio::sync::mpsc::Sender<bridge_state::Disposition>,
+    d: bridge_state::Disposition,
+    ctx: &LogCtx,
+) {
+    if let Err(e) = dispo.send(d).await {
+        ctx.error("bridge", &format!("disposition channel closed: {e}"));
+    }
+}
+
+/// MCP 受け口に差す実体。
+pub struct ToolExec {
+    pub slack: crate::chat::ChatRef,
+    pub state_dir: std::path::PathBuf,
+    /// disposition の通知先(受けて台帳を消すのは main)。
+    pub dispo: tokio::sync::mpsc::Sender<bridge_state::Disposition>,
+}
+
+impl crate::mcp::ToolExecutor for ToolExec {
+    fn execute(
+        &self,
+        session_id: String,
+        tool: String,
+        args: serde_json::Value,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
+        let (slack, dir, dispo) = (self.slack.clone(), self.state_dir.clone(), self.dispo.clone());
+        Box::pin(async move {
+            execute_tool(slack.as_ref(), &dir, &session_id, &tool, &args, &dispo).await
+        })
     }
 }
 

@@ -13,7 +13,8 @@ use crate::bridge::worker;
 use crate::bridge::state as bridge;
 use crate::bridge::state::LogCtx;
 use crate::bridge::{Bridge, CmdFx, Host};
-use crate::{mcp, slack};
+use crate::chat::slack;
+use crate::mcp;
 use crate::agent::Agent;
 use crate::agent::WorkerState;
 use crate::bridge::state::{PoolKey, ThreadEntry, ThreadKey};
@@ -445,7 +446,7 @@ pub struct DrainJob {
     pub farewell: Option<(String, String)>,
     /// ドレイン中ずっと出しておく shimmer(`resume` だけが預ける)。job を drains から
     /// 取り出した時点で Drop = クリア。待っているのはこの予約なので、guard もここに置く。
-    pub thinking: Option<crate::slack::Thinking>,
+    pub thinking: Option<crate::chat::slack::Thinking>,
 }
 
 // ── starting, pooling and reaping agents ──

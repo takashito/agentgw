@@ -33,7 +33,7 @@ use crate::agent::screen::SpawnOutcome;
 use crate::agent::tmux::Window;
 use crate::agent::{CompactOutcome, CompactProgress, LoginOutcome, ProbeErr, SessionId};
 use crate::bridge::inbound;
-use crate::slack;
+use crate::chat::slack;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 

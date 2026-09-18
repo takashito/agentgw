@@ -4,6 +4,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
+pub mod slack;
+
 use async_trait::async_trait;
 
 // ── what reads return ──

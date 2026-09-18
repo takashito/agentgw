@@ -5,4 +5,3 @@ pub mod i18n;
 pub mod mcp;
 pub mod chat;
 pub mod service;
-pub mod slack;
