@@ -21,29 +21,27 @@ agentgw is a small service that connects one Slack bot to Claude Code on every m
 
 ## Why agentgw?
 
-### 🖧 Every machine, one bot
+agentgw drives the **official Claude Code CLI** on your own machines. Compared with Claude Code's own Remote Control, it adds:
 
-The agents on your laptop, your NAS, your hypervisor and your build box all answer through **one Slack bot**. Each channel belongs to a machine and a project directory; `route` moves a channel, `status` shows the whole fleet and how each machine is linked, and `add-machine` brings in a new machine with a single command. It's built for a homelab, not a single desk.
+### 🚀 Start a session on any machine, any time
 
-| Channel | Machine | Works in |
-|---|---|---|
-| `#nas` | a storage box in the closet (gateway) | `/srv/compose` |
-| `#laptop` | the Mac you carry | `~/code/app` |
-| `#proxmox` | the hypervisor | `/root/infra` |
-| `#build` | a Linux build box | `~/src/firmware` |
+Post in Slack and a new Claude Code session starts on the machine that handles the channel. Nothing has to be running there beforehand — no `claude remote-control` left open per project. agentgw runs as a service on every connected machine.
 
-### What remote control and multiplexers leave to you
+### ↩️ Pick up any past session
 
-They keep a session you **already started** within reach. The rest is agentgw's job:
+When an agent has gone quiet and been put away, reply in its thread: the same conversation resumes on the same machine, whenever you come back to it.
 
-| | |
-|---|---|
-| 🏠 **Machines you don't sit at** | No terminal is open on the server in the closet, so nothing is waiting there. agentgw runs as a service on each machine and starts an agent — in the right directory — when a thread arrives. It starts again on its own after a reboot (on macOS, once you log in). |
-| 🧭 **Not remembering where things run** | With several machines and several repos on each, the friction is *which box, which directory, which session*. Map a channel once; after that, where you post is all that decides. |
-| 🔔 **Work that already arrives in Slack** | Alerts from monitoring, failures from CI. Let a bot's messages through with `allow-bot`, and its alert can start an investigation — with a guard against two bots answering each other forever. |
-| 📝 **A record where people look** | The request, every tool the agent ran, what you approved and what it concluded stay in the thread, searchable in Slack. |
+### 🔎 Every session, searchable and linkable
 
-It drives the **official Claude Code CLI**, on your hardware. Nothing is proxied through a third-party service.
+Every session on every machine lives in one Slack workspace. Find past work across all of them with Slack search, and hand another session's result to the agent you're talking to by pasting the thread or message link — even when it ran on a different machine.
+
+### 💬 Slack is the interface
+
+One place for every agent on every machine, so there's no juggling terminals with cmux or herdr. Interrupt an agent with a 🛑 reaction, edit a message to revise the request or delete it to take it back, and send files either way.
+
+### ⚡ Agents that are ready, and tidy up after themselves
+
+A warm agent waits for each project, so a new thread gets an answer right away. Agents that sit idle are put away on their own.
 
 ## Features
 
@@ -86,7 +84,7 @@ One message per turn, updated as tools run — files read, commands run, edits m
 <td valign="top">
 
 **🔐 Approvals as buttons**<br>
-In `manual` mode each tool call asks first: **Allow**, allow for the thread or the channel, or **Deny**.
+In `manual` mode each tool call asks first, with **Allow** and **Deny** buttons in the thread.
 
 </td>
 </tr>
@@ -101,6 +99,20 @@ Model, effort and permission mode; compact; usage; stop with a 🛑 reaction; `r
 
 **📦 One static binary**<br>
 A single Rust binary per machine, running as a `launchd` agent or a `systemd` user unit. Nothing else to install or babysit.
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+**🔔 Bots can start work**<br>
+Let a bot's messages through with `allow-bot`, and an alert from monitoring or CI can start an investigation — with a guard against two bots answering each other forever.
+
+</td>
+<td valign="top">
+
+**🔑 Sign-in per machine**<br>
+Each machine checks its own Claude Code sign-in and tells you when it lapses; send `login` in a channel that machine handles to sign in again.
 
 </td>
 </tr>
@@ -280,6 +292,7 @@ Every machine uses the same layout.
 - **Agents run as the user that installed agentgw** and can do anything that user can. Install under a dedicated account (e.g. `agentgw add-machine agent@host`) rather than `root`.
 - **Tokens stay local**, in `.env` with mode 600. Other machines never get the app token; they hold the bot token in memory only.
 - **The link secret is a password.** Whoever has it can join as a machine and receive that machine's messages. `add-machine` sends it over ssh stdin, never on a command line.
+- **Tool calls can ask first.** In `manual` mode each call waits for you in Slack; approve it once, for the rest of the thread, or for the channel, or deny it.
 - **Machines open no ports.** The gateway's listener binds `0.0.0.0:8787` by default without TLS — keep it behind Tailscale or an ssh tunnel, or set `AGENTGW_LINK_LISTEN=127.0.0.1:8787`.
 - **macOS signing.** Run from a terminal, the installer creates a self-signed code-signing identity once, so macOS permission grants survive upgrades.
 
