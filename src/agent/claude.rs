@@ -7,8 +7,10 @@
 //! Reading the transcript (`Transcript`) lives here too. The screen (`Pane`) and model id (`ModelId`) are in `screen.rs`.
 //! **It holds no Slack-facing text at all** — rendering is the Bridge's job (`command.rs`).
 
-use super::screen::{Pane, SpawnOutcome, SpawnScreen, strip_modal_decoration};
-use super::tmux::{Pid, Tmux, Window, WindowRow};
+use super::SpawnOutcome;
+use super::screen::{Pane, SpawnScreen, strip_modal_decoration};
+use super::tmux::Tmux;
+use super::{Pid, Window, WindowRow};
 use super::{CompactOutcome, CompactProgress, LimitHit, LoginOutcome, ProbeErr, SpawnReq};
 use crate::agent::WorkerState;
 use crate::log::LogCtx;

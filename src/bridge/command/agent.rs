@@ -5,10 +5,9 @@
 //! `CompactProgress`, `UsageRow`): how they look in Slack is this file's concern.
 
 use super::CmdFx;
-use crate::agent::screen::SpawnOutcome;
-use crate::agent::tmux::Window;
+use crate::agent::SpawnOutcome;
+use crate::agent::Window;
 use crate::agent::Agent;
-use crate::agent::screen::ModelId;
 use crate::agent::{
     CompactOutcome, CompactProgress, ContextCategory, ContextReport, LoginOutcome, ProbeErr,
     SessionId, UsageRow,
@@ -1314,7 +1313,7 @@ impl ContextReport {
         let r = self;
         let mut lines = vec![
             "📊 *Context Usage*".to_string(),
-            ModelId::new(&r.model).friendly(&r.total),
+            r.model_label.clone(),
         ];
 
         let free_pct = r

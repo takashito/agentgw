@@ -7,7 +7,7 @@
 
 use super::{Bridge, Host};
 use crate::bridge::turn::Stall;
-use crate::agent::tmux::Window;
+use crate::agent::Window;
 use crate::agent::{Envelope, SessionId, SpawnReq, WorkerState};
 use crate::bridge::state as bridge;
 use crate::bridge::state::{Access, ThreadEntry};

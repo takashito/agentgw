@@ -34,7 +34,7 @@ use crate::chat::InboundMsg;
 use crate::log::LogCtx;
 use crate::chat::ThreadKey;
 use crate::chat::slack::SlackId;
-use crate::agent::screen::SpawnOutcome;
+use crate::agent::SpawnOutcome;
 use std::collections::HashMap;
 
 // ── Section 1: reading the body ──────────────────────────────────────────────

@@ -6,8 +6,8 @@
 //! Nothing that posts to Slack or writes threads.json lives here — that is "read the
 //! ledger, then instruct Slack and the agent", which is the Bridge's job.
 
-use crate::agent::screen::SpawnOutcome;
-use crate::agent::tmux::{self as tmux_mod, Pid, Window};
+use crate::agent::SpawnOutcome;
+use crate::agent::{KILL_GRACE_MS, Pid, Window, WindowRow};
 use crate::agent::{SessionId, SpawnReq};
 use crate::bridge::worker;
 use crate::bridge::state as bridge;
@@ -484,7 +484,7 @@ impl Bridge {
                              window key={key}"
                         ),
                     );
-                    pid.kill_graceful(tmux_mod::KILL_GRACE_MS).await;
+                    pid.kill_graceful(KILL_GRACE_MS).await;
                 }
                 None => ctx.info(
                     "bridge",
@@ -772,7 +772,7 @@ impl Bridge {
                         "{why}: tearing down pool worker session={sid} by pid [{pid}] (key={key})"
                     ),
                 );
-                pid.kill_graceful(tmux_mod::KILL_GRACE_MS).await;
+                pid.kill_graceful(KILL_GRACE_MS).await;
             }
             None => ctx.info(
                 "bridge",
@@ -948,7 +948,7 @@ impl Bridge {
     /// no gap where a just-started agent looks "owned by nobody yet".
     /// Whether this round may clean up: **if agent windows exist while nobody is assigned**, suspect the side
     /// that lost its memory (not the windows). If there are no windows, cleaning does nothing, so let it through.
-    pub(super) fn safe_to_reap(owned: &HashSet<String>, rows: &[tmux_mod::WindowRow]) -> bool {
+    pub(super) fn safe_to_reap(owned: &HashSet<String>, rows: &[WindowRow]) -> bool {
         !owned.is_empty() || !rows.iter().any(|r| r.session_id().is_some())
     }
 
@@ -1005,7 +1005,7 @@ impl Bridge {
             );
             // If it is not an empty shell, claude may be alive. Closing only the window leaves it
             // as an orphan, so **kill by pid first**, then close (same order as terminate)
-            row.pid.kill_graceful(tmux_mod::KILL_GRACE_MS).await;
+            row.pid.kill_graceful(KILL_GRACE_MS).await;
             if let Err(e) = self.deps.agent.terminate(&Window::of(&row.id)) {
                 ctx.debug("bridge", &format!("cleanup: kill-window failed: {e}"));
             }

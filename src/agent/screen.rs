@@ -108,20 +108,6 @@ pub enum SpawnScreen {
     None_,
 }
 
-/// How the watch ended. **This is not "started successfully"**: that is expressed by the first
-/// user_prompt releasing the `starting` latch, so this only says whether the screens that
-/// needed an answer got one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SpawnOutcome {
-    /// Answered a screen that could be answered (or answered and kept watching until the deadline)
-    Answered,
-    /// Sign-in screen. **Nobody here can answer it**; the only option is to tell the Owner
-    LoginRequired,
-    /// Usage-limit modal. Same as above (confirming it is the caller's job)
-    UsageLimited,
-    /// Nothing showed up before the deadline. **Not a failure**: a window that started normally looks like this
-    NoScreen,
-}
 
 /// "Optional prefix" × "stem": a way to express the patterns without `regex`
 /// (`(?:…)?` also allows empty, hence the `""` prefix).
@@ -224,6 +210,7 @@ impl<'a> Pane<'a> {
             categories.push((name.to_string(), tokens.to_string(), pct.to_string()));
         }
         Some(ContextReport {
+            model_label: ModelId::new(&model).friendly(&total),
             model,
             used,
             total,

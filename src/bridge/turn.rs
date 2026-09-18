@@ -3,7 +3,7 @@
 //! and writing the progress message.
 
 use super::{Bridge, Host};
-use crate::agent::tmux::Window;
+use crate::agent::Window;
 use crate::agent::{HookEvent, ProbeErr, SessionId};
 use crate::bridge::state as bridge;
 use crate::bridge::state::Disposition;

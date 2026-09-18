@@ -1,6 +1,8 @@
 //! Tools for keeping processes in tmux. **The word claude does not appear here** —
 //! every agent implementation creates and feeds its windows the same way.
 
+use super::{Pid, Window, WindowRow};
+
 /// The tmux session the agents live in. **tmux resolves names by prefix**, so type the
 /// full name by hand too (`-t agentgw` hits `agentgw-workers`).
 pub const TMUX_SESSION: &str = "agentgw-workers";
@@ -19,120 +21,18 @@ pub const TMUX_SESSION: &str = "agentgw-workers";
 /// When the reader is idle, CR arrives on its own even without a pause — the race only
 /// happens while the TUI is busy drawing a text larger than the pty buffer (1022B), so short
 /// envelopes don't reproduce it.
+/// A raw window (`@N` or a window name) as `-t` wants it. `@N` (window_id) is used as is —
+/// unlike a window name it doesn't move on rename. Window names get qualified with the
+/// session (a bare name makes tmux pick "the current session").
+pub(crate) fn target(window: &str) -> String {
+    if window.starts_with('@') {
+        window.to_string()
+    } else {
+        format!("{TMUX_SESSION}:{window}")
+    }
+}
+
 const SETTLE_BEFORE_ENTER: std::time::Duration = std::time::Duration::from_millis(200);
-
-/// A window already resolved to a form `-t` accepts.
-///
-/// Handling raw window names (`1-1`) and resolved targets (`agentgw-workers:1-1`) as the
-/// same `&str` bred mix-ups — a raw name passed to `capture-pane -t` doesn't error, it reads
-/// "the window of that name in the current session". Going through this type makes that unwritable.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Window(String);
-
-impl Window {
-    /// From a raw window (`@N` or a window name). `@N` (window_id) can be used as is — unlike
-    /// a window name it doesn't move on rename. Only window names get qualified with the
-    /// session (a bare name makes tmux pick "the current session").
-    pub fn of(window: &str) -> Self {
-        if window.starts_with('@') {
-            Window(window.to_string())
-        } else {
-            Window(format!("{TMUX_SESSION}:{window}"))
-        }
-    }
-
-    /// From a string that can already go straight to `-t` (the sign-in session and other
-    /// things that aren't windows in the agent session).
-    pub(crate) fn raw(target: impl Into<String>) -> Self {
-        Window(target.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// So it can be embedded in log lines as is — the logs print the resolved target.
-impl std::fmt::Display for Window {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// `WORKER_KILL_GRACE_MS` / `WORKER_KILL_HARD_MS` = 1500ms,
-/// polling interval 100ms (`pollMs`).
-pub const KILL_GRACE_MS: u64 = 1_500;
-const KILL_HARD_MS: u64 = 1_500;
-const KILL_POLL_MS: u64 = 100;
-
-/// The agent's own process.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Pid(pub u32);
-
-/// So it can be embedded in log lines as is — the logs print the bare pid.
-impl std::fmt::Display for Pid {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl Pid {
-    /// Kill by pid. **Never kill by pattern (pkill -f): it takes production agents with it.**
-    /// TERM → poll for liveness up to grace_ms → -9 if still there → another 1500ms.
-    /// Returns whether a live pid was actually taken down. Already gone, or surviving -9, are both false.
-    pub async fn kill_graceful(&self, grace_ms: u64) -> bool {
-        let pid = self.0;
-        if !self.alive() {
-            return false;
-        }
-        self.signal("-TERM");
-        if self.wait_until_gone(grace_ms).await {
-            return true;
-        }
-        crate::log::LogCtx::default().info(
-            "worker",
-            &format!("SIGKILL pid {pid} — survived SIGTERM within {grace_ms}ms"),
-        );
-        self.signal("-9");
-        let gone = self.wait_until_gone(KILL_HARD_MS).await;
-        if !gone {
-            crate::log::LogCtx::default()
-                .error("worker", &format!("pid {pid} still alive after SIGKILL"));
-        }
-        gone
-    }
-
-    /// Sends SIGTERM only and **does not wait**. A pre-shot for tearing down several agents,
-    /// so `kill_graceful`'s grace periods don't pile up in series (running `kill_graceful`
-    /// afterwards lets the grace periods overlap).
-    pub fn term(&self) -> bool {
-        self.signal("-TERM")
-    }
-
-    /// Looks only at `kill`'s exit code. `output()` keeps `-0`'s "No such process" out of
-    /// the log.
-    fn signal(&self, sig: &str) -> bool {
-        std::process::Command::new("kill")
-            .args([sig, &self.0.to_string()])
-            .output()
-            .is_ok_and(|o| o.status.success())
-    }
-
-    /// `kill -0` = liveness probe (no signal is sent).
-    fn alive(&self) -> bool {
-        self.signal("-0")
-    }
-
-    async fn wait_until_gone(&self, budget_ms: u64) -> bool {
-        for _ in 0..budget_ms.div_ceil(KILL_POLL_MS).max(1) {
-            tokio::time::sleep(std::time::Duration::from_millis(KILL_POLL_MS)).await;
-            if !self.alive() {
-                return true;
-            }
-        }
-        false
-    }
-}
 
 /// Injection point for running tmux. Tests use a fake, real runs the real thing.
 pub struct Tmux {
@@ -301,32 +201,6 @@ impl Tmux {
     }
 }
 
-/// One window seen in the inventory.
-#[derive(Clone)]
-pub struct WindowRow {
-    pub id: String,
-    pub pid: Pid,
-    /// The command running in the pane **right now** (`claude` / `zsh` …).
-    pub command: String,
-    pub name: String,
-}
-
-impl WindowRow {
-    /// The session_id of the agent this window holds (`w-<sid>`).
-    /// `None` = not an agent window (the anchor window, a window a person opened) → **don't touch it**.
-    pub fn session_id(&self) -> Option<&str> {
-        self.name.strip_prefix("w-").filter(|s| !s.is_empty())
-    }
-
-    /// Whether this is a husk where claude is gone and only the shell is left.
-    /// Login shells carry a leading `-`, like `-zsh`.
-    pub fn is_empty_shell(&self) -> bool {
-        matches!(
-            self.command.trim().trim_start_matches('-'),
-            "zsh" | "bash" | "sh" | "fish" | "dash" | "ksh"
-        )
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -473,17 +347,4 @@ mod tests {
         assert!(!Pid(4_000_000).kill_graceful(100).await);
     }
 
-    #[tokio::test]
-    async fn kill_pid_graceful_kills_a_live_process() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("60")
-            .spawn()
-            .unwrap();
-        let pid = Pid(child.id());
-        // A dead child stays in the pid table as a zombie until waited on and answers `kill -0`. In real runs
-        // claude is tmux's child (not ours), so this doesn't happen — the test reaps it itself.
-        let reaper = std::thread::spawn(move || child.wait().unwrap());
-        assert!(pid.kill_graceful(KILL_GRACE_MS).await);
-        reaper.join().unwrap();
-    }
 }

@@ -1082,7 +1082,7 @@ fn offline_notice(label: &str, version: &str, reason: &str) -> String {
 mod tests {
     use super::*;
     use crate::agent::HookEvent;
-    use crate::agent::tmux as tmux_mod;
+    use crate::agent::{Pid, WindowRow};
     use std::collections::HashSet;
     use crate::bridge::inbound::{ForeignReaction, dedup_key, foreign_reaction, is_own_reaction};
 
@@ -1240,9 +1240,9 @@ mod tests {
     /// window looks "ownerless" and gets closed**. A round with zero owners + agent windows is left untouched.
     #[test]
     fn the_sweeper_does_not_run_when_it_knows_no_owner_but_worker_windows_exist() {
-        let row = |name: &str| tmux_mod::WindowRow {
+        let row = |name: &str| WindowRow {
             id: "@1".into(),
-            pid: crate::agent::tmux::Pid(1),
+            pid: Pid(1),
             command: "claude".into(),
             name: name.into(),
         };
