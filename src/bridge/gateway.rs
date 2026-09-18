@@ -1465,7 +1465,8 @@ pub fn format_fleet(
 // ここから下は I/O。上の節(1〜6)が決めたことを配線して回すだけで、判断は1つも持たない。
 
 use crate::bridge::link as link_watch;
-use crate::bridge::state::{Access, InboundMsg, StateDir, now_ms};
+use crate::bridge::inbound::InboundMsg;
+use crate::bridge::state::{Access, StateDir, now_ms};
 use crate::slack::{FleetEvent, PermClick};
 use axum::Router;
 use axum::extract::State;

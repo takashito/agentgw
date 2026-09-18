@@ -88,7 +88,7 @@ pub struct SpawnReq {
     /// `WorkerState` は `bridge` の型 — 依存の向きの**唯一の例外**。座席チェックの
     /// エラー文言が `{state:?}` を含むので型を伏せると文面が変わる(`bridge/state.rs` の
     /// `WorkerState` の doc に同じ規約が書いてある)。
-    pub state: crate::bridge::state::WorkerState,
+    pub state: crate::bridge::inbound::WorkerState,
     /// 実体に渡す hook 設定ファイルの絶対パス。
     pub hooks_file: String,
     /// このセッション用に書き出した MCP 設定ファイルの絶対パス。

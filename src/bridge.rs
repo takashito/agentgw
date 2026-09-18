@@ -8,6 +8,7 @@
 pub mod command;
 pub mod link;
 pub mod gateway;
+pub mod inbound;
 pub mod state;
 pub mod worker;
 
@@ -19,9 +20,8 @@ use crate::agent::{
 };
 use crate::bridge::command::{Cmd, PwdMode, RestartPhase};
 use crate::bridge::state as bridge;
-use crate::bridge::state::{
-    Dispatch, Disposition, GateVerdict, InboundMsg, LogCtx, PoolKey, ThreadKey,
-};
+use crate::bridge::inbound::{Dispatch, GateVerdict, InboundMsg};
+use crate::bridge::state::{Disposition, LogCtx, PoolKey, ThreadKey};
 use crate::slack::SlackOps;
 use crate::{mcp, slack};
 use std::collections::{HashMap, HashSet};
@@ -154,7 +154,7 @@ pub struct Bridge {
     /// cwd → 在庫に指名したセッション(pools.json)。**実体ではなく指名**なので Bridge を
     /// またいで残る。在庫を起こすときはここを見て `--resume` / 新規を決める。
     pools: bridge::Pools,
-    dedup: bridge::RecentDeliveries,
+    dedup: inbound::RecentDeliveries,
     /// 生きているワーカーと在庫の台帳。
     workers: worker::Workers,
     /// 配達待ち(まだワーカーが暖まっていないスレッドの queue)。台帳ではないので Bridge 側。
@@ -262,7 +262,7 @@ enum ForeignReaction {
 }
 
 fn foreign_reaction(
-    r: &bridge::Reaction,
+    r: &inbound::Reaction,
     reactor: Option<&str>,
     author: Option<&str>,
     owner: &str,
@@ -314,8 +314,8 @@ impl Bridge {
                 msg.ts,
                 msg.channel,
                 match msg.channel_kind {
-                    bridge::ChannelKind::Dm => "im",
-                    bridge::ChannelKind::Channel => "channel",
+                    inbound::ChannelKind::Dm => "im",
+                    inbound::ChannelKind::Channel => "channel",
                 },
                 msg.files.len(),
                 paths.len(),
@@ -436,7 +436,7 @@ impl Bridge {
 
         // チャンネルでは**名指しか、もう動いているスレッド**でないと入れない
         // (DM は名指し扱い)。登録済みかどうかは見ない — 判断材料はこの2つだけ
-        let dm = msg.channel_kind == bridge::ChannelKind::Dm;
+        let dm = msg.channel_kind == inbound::ChannelKind::Dm;
         let is_mention = dm
             || crate::bridge::command::Message::new(&msg.text, self.bot_user_id.as_deref())
                 .mentions_bot();
@@ -666,7 +666,7 @@ impl Bridge {
         // 配達できたら沈黙見張りを起こす。`entry` の借用が生きているうちは `&mut self` を
         // 取れないので、match の外まで持ち出す
         let mut delivered = false;
-        match bridge::Dispatch::decide(entry.as_ref(), state) {
+        match Dispatch::decide(entry.as_ref(), state) {
             Dispatch::SpawnNew => {
                 let sid = SessionId::new().as_str().to_string();
                 let mut e = entry.unwrap_or_default();
@@ -815,7 +815,7 @@ impl Bridge {
             );
             return true;
         }
-        let dm = msg.channel_kind == bridge::ChannelKind::Dm;
+        let dm = msg.channel_kind == inbound::ChannelKind::Dm;
 
         match cmd {
             // stop。ESC は tmux を通るので
@@ -1070,7 +1070,7 @@ impl Bridge {
             && pending.iter().all(|id| num(id) <= num(edited_ts));
 
         let mut notice = msg.clone();
-        notice.text = crate::bridge::state::edit_notice(
+        notice.text = crate::bridge::inbound::edit_notice(
             edited_ts,
             &msg.text,
             !msg.files.is_empty(),
@@ -2342,7 +2342,7 @@ impl Bridge {
     ///   • Owner が route したチャンネル — 受けるのは**貼り付けコードだけ**、しかも
     ///     そのサインインを始めた本人からのものだけ(相席の第三者にコードプロンプトを触らせない)
     fn login_carve_out(&mut self, msg: &InboundMsg) -> bool {
-        let dm = msg.channel_kind == bridge::ChannelKind::Dm;
+        let dm = msg.channel_kind == inbound::ChannelKind::Dm;
         let sender = msg.user.as_deref().unwrap_or("");
         let pending = self.login_pending.get(&msg.channel).cloned();
         if !dm && pending.as_deref() != Some(sender) {
@@ -3160,7 +3160,7 @@ impl Bridge {
                 resume_from: nominated.clone().map(SessionId::from),
                 window: SessionId::from(sid.clone()).window_name(),
                 // ここに来た時点で在庫は居ない = 窓も無い
-                state: bridge::WorkerState::Absent,
+                state: inbound::WorkerState::Absent,
                 hooks_file: self.hooks_file.clone(),
                 mcp_config: mcp,
             }) {
@@ -3985,7 +3985,7 @@ impl Bridge {
             .map(|s| SessionId::from(s.to_string()).window_name())
             .unwrap_or_default();
         let state = self.workers.state_of(entry.as_ref(), &window, &self.agent);
-        if state != bridge::WorkerState::Ready {
+        if state != inbound::WorkerState::Ready {
             ctx.info(
                 "bridge",
                 &format!(
@@ -4408,7 +4408,7 @@ impl Bridge {
             let window = SessionId::from(sid.clone()).window_name();
             // 聞こえる相手にだけ押す。Starting の分は user_prompt が流す道が生きている
             if self.workers.state_of(entry.as_ref(), &window, &self.agent)
-                != bridge::WorkerState::Ready
+                != inbound::WorkerState::Ready
             {
                 continue;
             }
@@ -5431,7 +5431,7 @@ impl Bridge {
             dir,
             api,
             access,
-            dedup: bridge::RecentDeliveries::new(),
+            dedup: inbound::RecentDeliveries::new(),
             workers: worker::Workers::default(),
             pending: HashMap::new(),
             lifecycle: bridge::Lifecycle::new(),
@@ -5665,7 +5665,7 @@ mod tests {
     fn dedup_key_separates_a_deletion_from_the_message_it_removes() {
         let base = InboundMsg {
             channel: "C1".into(),
-            channel_kind: bridge::ChannelKind::Channel,
+            channel_kind: inbound::ChannelKind::Channel,
             ts: "1.1".into(),
             thread_ts: None,
             user: Some("U1".into()),
@@ -5689,7 +5689,7 @@ mod tests {
         // 自分が付けた印だけ捨てる。人が付けたものは今までどおり通す(stop の ✋ が死ぬ)
         let react = |by: &str| InboundMsg {
             user: Some(by.into()),
-            reaction: Some(bridge::Reaction {
+            reaction: Some(inbound::Reaction {
                 emoji: "eyes".into(),
                 item_ts: "1.1".into(),
                 added: true,
@@ -5706,7 +5706,7 @@ mod tests {
     /// 自分が書いたのではない投稿への stop は、**Owner が自分の依頼に付けたときだけ**通す。
     #[test]
     fn only_the_owner_stopping_their_own_request_counts() {
-        let r = |emoji: &str| bridge::Reaction {
+        let r = |emoji: &str| inbound::Reaction {
             emoji: emoji.into(),
             item_ts: "1.1".into(),
             added: true,
@@ -5738,7 +5738,7 @@ mod tests {
             "Owner がまだ居ない"
         );
         // 外したときは止めない(`is_stop` は added のときだけ真)
-        let removed = bridge::Reaction {
+        let removed = inbound::Reaction {
             added: false,
             ..r("raised_hand")
         };

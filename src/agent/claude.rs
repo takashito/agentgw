@@ -11,7 +11,8 @@ use super::tmux::{Pid, Tmux, Window};
 use super::{
     CompactOutcome, CompactProgress, ContextReport, LoginOutcome, ProbeErr, SpawnReq, UsageRow,
 };
-use crate::bridge::state::{LogCtx, StateDir, ThreadKey, WorkerState};
+use crate::bridge::inbound::WorkerState;
+use crate::bridge::state::{LogCtx, StateDir, ThreadKey};
 use std::time::Duration;
 
 /// spawn ごとに新規 ID。使用済み ID での起動は claude に拒否される(スパイク実測)。

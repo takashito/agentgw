@@ -7,7 +7,8 @@
 //! Slack と agent に指示を出す」ので Bridge の仕事。
 
 use crate::agent::Agent;
-use crate::bridge::state::{PoolKey, ThreadEntry, ThreadKey, WorkerState};
+use crate::bridge::inbound::WorkerState;
+use crate::bridge::state::{PoolKey, ThreadEntry, ThreadKey};
 use std::collections::{HashMap, HashSet};
 
 /// 在庫を数え直す間隔。tick は 500ms 刻みなので、ここでスイープを間引く。
