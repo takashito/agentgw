@@ -5,7 +5,7 @@
 //! Slack is a presentation concern, and keeping every message's wording in one file makes
 //! the English and Japanese text reviewable side by side.
 
-use super::command::WallClock;
+use super::state::WallClock;
 use crate::agent::screen::ModelId;
 use crate::agent::{CompactProgress, ContextCategory, ContextReport, UsageRow};
 

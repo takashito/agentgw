@@ -15,9 +15,43 @@ use crate::agent::tmux::{Pid, Window, WindowRow};
 use crate::agent::{
     CompactOutcome, CompactProgress, ContextReport, LoginOutcome, ProbeErr, SpawnReq, UsageRow,
 };
-use crate::bridge::command::LimitHit;
+use crate::agent::LimitHit;
 use crate::bridge::state::{LogCtx, ThreadKey};
-use crate::slack::{FetchedMsg, MessageAt};
+
+// ── what Slack reads return ──
+
+/// 既にある1件の投稿について、**イベントからは分からないこと**だけ。
+/// [`SlackPort::message_at`] が返す。
+pub struct MessageAt {
+    /// 書き手(bot が投げたものには入らないことがある)。
+    pub user: Option<String>,
+    /// bot が投げたもの。
+    pub is_bot: bool,
+    /// 属するスレッドの根。返信でなければ自分自身の ts。
+    pub thread_ts: String,
+}
+
+/// history/replies の1行。
+#[derive(Clone)]
+pub struct FetchedMsg {
+    pub ts: String,
+    pub user: String,
+    pub text: String,
+    /// スレッドの根。返信なら親の ts、根自身なら自分の ts、スレッド外なら None。
+    pub thread_ts: Option<String>,
+}
+
+impl FetchedMsg {
+    /// oldest-first の `[ts] user: text`。
+    pub fn render_all(msgs: &[FetchedMsg]) -> String {
+        let mut rows: Vec<&FetchedMsg> = msgs.iter().collect();
+        rows.sort_by(|a, b| a.ts.cmp(&b.ts));
+        rows.iter()
+            .map(|m| format!("[{}] {}: {}", m.ts, m.user, m.text))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
 
 /// Writing to and reading from Slack. Implemented by `slack::Api`.
 #[async_trait]

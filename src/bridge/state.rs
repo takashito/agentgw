@@ -1,5 +1,6 @@
 //! Bridge が自分で覚え・自分で決めること。I/O は状態ファイルのみ。
 
+use chrono::{DateTime, Datelike, Local, Month, NaiveDate, NaiveDateTime, TimeDelta, Timelike};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1619,6 +1620,219 @@ impl Disposition {
 /// アクションは要確認)を明示的に打ち消す。**原文コピー** —。
 pub const STOP_BLOCK_REASON: &str = "You ended your turn without delivering. Your prose streams to Slack live, but it is not the delivered answer — dispose the received message with `reply` (answer), `react` (emoji ack), or `no_reply` (nothing). A reply is your answer, not an outward action: do NOT ask whether to send it. Call reply/react/no_reply (with the message_id) now.";
 
+// ── 壁時計 ─────────────────────────────────────────────────────────────
+// Bridge も TUI も同じホストの同じゾーンで動くので、ゾーン変換は要らず「同じ壁時計どうしの
+// 引き算」で足りる(現行 Bun 版と同じ前提)。暦そのものは `chrono` に任せ、ここに置くのは
+// 「`/usage` の書き方をどう読むか」だけ。
+
+/// タイムゾーンを持たない壁時計(分まで — 秒は持たない)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct WallClock(NaiveDateTime);
+
+impl WallClock {
+    /// タイムゾーンは **Asia/Tokyo 固定**。表示側([`Notice::Limited`])が既にそうなっており
+    /// (文面に「（Asia/Tokyo）」と書いてある)、Bridge も TUI も同じホストの同じゾーンで動く。
+    /// 他ゾーンへ移すならこの2箇所を一緒に直す。
+    const TOKYO_OFFSET_MS: i64 = 9 * 3_600_000;
+
+    /// 分までの壁時計を1つ。存在しない日付(2月30日など)は None。
+    pub fn new(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> Option<Self> {
+        NaiveDate::from_ymd_opt(year, month, day)?
+            .and_hms_opt(hour, minute, 0)
+            .map(Self)
+    }
+
+    /// このホストの今。**分まで**に丸める(以下すべて分の粒度で比べる)。
+    pub fn now() -> Self {
+        Self::of(Local::now().naive_local())
+    }
+
+    /// epoch ミリ秒 → 東京の壁時計。ずらしてから素の壁時計として読む(= +9:00 の現地時刻)。
+    /// 表現できない値は epoch に落ちるが、実際の epoch ミリ秒では起きない。
+    pub fn tokyo(ms: u64) -> Self {
+        let shifted = ms as i64 + Self::TOKYO_OFFSET_MS;
+        Self::of(
+            DateTime::from_timestamp_millis(shifted)
+                .unwrap_or_default()
+                .naive_utc(),
+        )
+    }
+
+    /// 秒以下を落として包む。
+    fn of(t: NaiveDateTime) -> Self {
+        Self(
+            t.with_second(0)
+                .and_then(|t| t.with_nanosecond(0))
+                .unwrap_or(t),
+        )
+    }
+
+    /// この東京の壁時計の epoch ミリ秒。
+    fn epoch_ms(&self) -> Option<u64> {
+        u64::try_from(self.0.and_utc().timestamp_millis() - Self::TOKYO_OFFSET_MS).ok()
+    }
+
+    /// N 分後。
+    pub(super) fn plus_minutes(&self, minutes: i64) -> Self {
+        Self(
+            self.0
+                .checked_add_signed(TimeDelta::minutes(minutes))
+                .unwrap_or(self.0),
+        )
+    }
+
+    /// `to` が `from` 以降なら経過分、`to` が前なら None。
+    pub fn minutes_to(from: &WallClock, to: &WallClock) -> Option<i64> {
+        let diff = (to.0 - from.0).num_minutes();
+        (diff >= 0).then_some(diff)
+    }
+
+    /// `/usage` の `resets …` 節を「次に来るその壁時計」に。TUI が出す2形
+    /// (`Jun 28 at 5:30pm (Asia/Tokyo)` と裸の `5pm` / `3:59am`)を扱い、読めなければ None
+    /// (呼び出し側は None を「データ不足」として安全側に倒す)。
+    pub fn parse_reset(reset: &str, now: &WallClock) -> Option<WallClock> {
+        let (hour, minute) = Self::clock_time(reset)?;
+        if let Some((month, day)) = Self::month_day(reset) {
+            // 月日あり: 今年に当て、それが過去なら来年(古い年から見た 12月→1月 の窓)
+            let cand = Self::new(now.year(), month, day, hour, minute)?;
+            return Some(if WallClock::minutes_to(now, &cand).is_some() {
+                cand
+            } else {
+                Self::new(now.year() + 1, month, day, hour, minute)?
+            });
+        }
+        // 時刻のみ: 今日のその時刻、既に過ぎていれば(現行同様ちょうど今も含めて)明日
+        let cand = Self::new(now.year(), now.month(), now.day(), hour, minute)?;
+        Some(
+            if WallClock::minutes_to(now, &cand).is_some_and(|m| m > 0) {
+                cand
+            } else {
+                cand.plus_minutes(24 * 60)
+            },
+        )
+    }
+
+    /// Claude Code が名乗ったリセット時刻を epoch(ms)にする。解釈そのものは `/usage` と
+    /// 同じ [`Self::parse_reset`] に任せる — 同じ TUI の同じ書式なので、2つ持つと必ず
+    /// 片方だけ直されて食い違う。
+    pub fn parse_reset_epoch(text: &str, now_ms: u64) -> Option<u64> {
+        Self::parse_reset(text, &Self::tokyo(now_ms))?.epoch_ms()
+    }
+
+    /// Claude Code が履歴に書く RFC3339(`2026-07-30T14:00:00.000Z`)を epoch ms に。
+    pub(crate) fn parse_iso8601_ms(s: &str) -> Option<u64> {
+        u64::try_from(DateTime::parse_from_rfc3339(s).ok()?.timestamp_millis()).ok()
+    }
+
+    /// `/usage` の `resets …` と同じ体裁(`Jul 1 at 5:00 pm`)。
+    pub(super) fn reset_like(&self) -> String {
+        self.format("%b %-d at %-I:%M %P").to_string()
+    }
+
+    /// `\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b` の手書き版 → 24時間制の `(hour, minute)`。
+    fn clock_time(s: &str) -> Option<(u32, u32)> {
+        let b = s.as_bytes();
+        for i in 0..b.len() {
+            // `\b` — 数字の直前が語構成文字なら、そこは数の途中(regex も開始しない)
+            if !b[i].is_ascii_digit() || (i > 0 && Self::is_word(b[i - 1] as char)) {
+                continue;
+            }
+            let digits = b[i..].iter().take_while(|c| c.is_ascii_digit()).count();
+            if digits > 2 {
+                continue; // `\d{1,2}` の後ろに数字は続けられない
+            }
+            let mut j = i + digits;
+            let mut minute = 0;
+            if b.get(j) == Some(&b':')
+                && b[j + 1..]
+                    .iter()
+                    .take(2)
+                    .filter(|c| c.is_ascii_digit())
+                    .count()
+                    == 2
+            {
+                minute = s[j + 1..j + 3].parse().unwrap_or(0);
+                j += 3;
+            }
+            while b.get(j).is_some_and(u8::is_ascii_whitespace) {
+                j += 1;
+            }
+            let Some(tag) = s.get(j..j + 2) else { continue };
+            let pm = tag.eq_ignore_ascii_case("pm");
+            if !pm && !tag.eq_ignore_ascii_case("am") {
+                continue;
+            }
+            if b.get(j + 2).is_some_and(|c| Self::is_word(*c as char)) {
+                continue; // `spam` の `am` は am ではない
+            }
+            let hour12: u32 = s[i..i + digits].parse().unwrap_or(0);
+            if !(1..=12).contains(&hour12) {
+                return None; // 現行と同じく「壊れた時刻」は諦める(次の候補を探さない)
+            }
+            return Some((
+                match (hour12, pm) {
+                    (12, false) => 0,
+                    (12, true) => 12,
+                    (h, true) => h + 12,
+                    (h, false) => h,
+                },
+                minute,
+            ));
+        }
+        None
+    }
+
+    /// `\b([A-Za-z]{3,})\s+(\d{1,2})\b` の**最初の**一致を月名として読む。現行同様、最初の
+    /// 一致が月名でなければ(`tomorrow 8am`)そこで諦めて「時刻のみ」に落とす。
+    fn month_day(s: &str) -> Option<(u32, u32)> {
+        let b = s.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if !b[i].is_ascii_alphabetic() || (i > 0 && Self::is_word(b[i - 1] as char)) {
+                i += 1;
+                continue;
+            }
+            let word = b[i..]
+                .iter()
+                .take_while(|c| c.is_ascii_alphabetic())
+                .count();
+            let mut j = i + word;
+            if word < 3 || !b.get(j).is_some_and(u8::is_ascii_whitespace) {
+                i += word;
+                continue;
+            }
+            while b.get(j).is_some_and(u8::is_ascii_whitespace) {
+                j += 1;
+            }
+            let digits = b[j..].iter().take_while(|c| c.is_ascii_digit()).count();
+            // `\d{1,2}\b` — 3桁以上、または数字の直後が語構成文字なら一致しない
+            if digits == 0
+                || digits > 2
+                || b.get(j + digits).is_some_and(|c| Self::is_word(*c as char))
+            {
+                i = j;
+                continue;
+            }
+            let month = s[i..i + 3].parse::<Month>().ok()?.number_from_month();
+            return Some((month, s[j..j + digits].parse().ok()?));
+        }
+        None
+    }
+
+    /// regex の `\w`(語構成文字)。`\b` の判定は両側をこれで見る。
+    fn is_word(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '_'
+    }
+}
+
+/// `year()` / `hour()` / `format()` — 暦の読み書きは `chrono` のものをそのまま使う。
+impl std::ops::Deref for WallClock {
+    type Target = NaiveDateTime;
+    fn deref(&self) -> &NaiveDateTime {
+        &self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -2620,5 +2834,136 @@ SPACES = padded ";
             serde_json::json!({"d": true}),
         );
         assert_eq!(v["d"], true);
+    }
+
+    /// 壁時計1つ。テストの主役は年月日ではないので、1行で書けるようにする。
+    fn wc(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> WallClock {
+        WallClock::new(year, month, day, hour, minute).expect("valid wall clock")
+    }
+
+    /// 現行 parseResetToEpoch。時刻だけなら「今日のその時刻、過ぎていれば明日」。
+    /// 月日が付いていればその日。タイムゾーンは Asia/Tokyo 固定(Notice::Limited と同じ前提)。
+    #[test]
+    fn reset_time_is_read_in_tokyo_time() {
+        let now = 1_785_387_600_000u64; // 2026-07-30T05:00:00Z = 30日 14:00 JST
+        // 30日 23:00 JST = 30日 14:00Z
+        assert_eq!(
+            WallClock::parse_reset_epoch("resets at 11pm", now),
+            Some(1_785_420_000_000)
+        );
+        // 既に過ぎた時刻は翌日に回る(13:00 JST < 14:00 JST)
+        assert_eq!(
+            WallClock::parse_reset_epoch("resets at 1pm", now),
+            Some(1_785_470_400_000)
+        );
+        // 月日つき: 2026-08-01 09:30 JST = 2026-08-01T00:30:00Z
+        assert_eq!(
+            WallClock::parse_reset_epoch("resets Aug 1 at 9:30am", now),
+            Some(1_785_544_200_000)
+        );
+        // 12 時制の端。12am = 00:00 — 今日の 0 時は過ぎているので翌日 0 時 JST
+        assert_eq!(
+            WallClock::parse_reset_epoch("resets at 12am", now),
+            Some(1_785_423_600_000)
+        );
+        // `\b` — 語の途中の数字は時刻ではない
+        assert_eq!(WallClock::parse_reset_epoch("at11pm", now), None);
+        assert_eq!(WallClock::parse_reset_epoch("resets soon", now), None);
+    }
+
+    #[test]
+    fn minutes_between_same_day() {
+        let from = wc(2026, 7, 29, 10, 0);
+        let to = wc(2026, 7, 29, 12, 30);
+        assert_eq!(WallClock::minutes_to(&from, &to), Some(150));
+        assert_eq!(WallClock::minutes_to(&to, &from), None); // 過去は None
+    }
+
+    #[test]
+    fn minutes_between_crosses_month_and_year() {
+        let from = wc(2026, 12, 31, 23, 0);
+        let to = wc(2027, 1, 1, 1, 0);
+        assert_eq!(WallClock::minutes_to(&from, &to), Some(120));
+    }
+
+    #[test]
+    fn minutes_between_counts_the_leap_day() {
+        // 2028 はうるう年 — 2/28 → 3/1 は 2 日ぶん(2027 なら 1 日ぶん)
+        let day = 24 * 60;
+        let span = |year| WallClock::minutes_to(&wc(year, 2, 28, 0, 0), &wc(year, 3, 1, 0, 0));
+        assert_eq!(span(2028), Some(2 * day));
+        assert_eq!(span(2027), Some(day));
+        // 100 で割れて 400 で割れない年はうるう年ではない(2100/2 は 28 日)
+        assert_eq!(span(2100), Some(day));
+    }
+
+    #[test]
+    fn parse_reset_clock_bare_time_rolls_to_tomorrow_if_past() {
+        let now = wc(2026, 7, 29, 18, 0);
+        let future_today = WallClock::parse_reset("11:30pm", &now).unwrap();
+        assert_eq!((future_today.day(), future_today.hour()), (29, 23));
+        let past_today = WallClock::parse_reset("5:30pm", &now).unwrap(); // 17:30 は既に過ぎている(now=18:00)
+        assert_eq!(
+            past_today.day(),
+            30,
+            "rolls to tomorrow when the bare time already passed"
+        );
+    }
+
+    #[test]
+    fn parse_reset_clock_bare_time_rolls_over_month_and_year_ends() {
+        let eom = wc(2026, 6, 30, 18, 0);
+        let next = WallClock::parse_reset("5pm", &eom).unwrap();
+        assert_eq!(
+            (next.year(), next.month(), next.day(), next.hour()),
+            (2026, 7, 1, 17)
+        );
+        let eoy = wc(2026, 12, 31, 23, 30);
+        let next = WallClock::parse_reset("11:00pm", &eoy).unwrap();
+        assert_eq!((next.year(), next.month(), next.day()), (2027, 1, 1));
+        // うるう年の 2/28 の翌日は 2/29
+        let leap = wc(2028, 2, 28, 23, 0);
+        let next = WallClock::parse_reset("10pm", &leap).unwrap();
+        assert_eq!((next.month(), next.day()), (2, 29));
+    }
+
+    #[test]
+    fn parse_reset_clock_dated_rolls_to_next_year_if_past() {
+        let now = wc(2026, 7, 29, 0, 0);
+        let past = WallClock::parse_reset("Jun 28 at 5:30pm", &now).unwrap();
+        assert_eq!(
+            past.year(),
+            2027,
+            "Jun 28 already passed this year, so it means next year's Jun 28"
+        );
+        let future = WallClock::parse_reset("Dec 1 at 5:30pm", &now).unwrap();
+        assert_eq!(future.year(), 2026);
+    }
+
+    #[test]
+    fn parse_reset_clock_shapes_and_junk() {
+        let now = wc(2026, 7, 29, 9, 0);
+        // 現物の全文(タイムゾーン注記つき)。12am/12pm の折り返しも現行と同じ
+        let full = WallClock::parse_reset("Jul 1 at 5pm (Asia/Tokyo)", &now).unwrap();
+        assert_eq!(
+            (
+                full.year(),
+                full.month(),
+                full.day(),
+                full.hour(),
+                full.minute()
+            ),
+            (2027, 7, 1, 17, 0)
+        );
+        assert_eq!(WallClock::parse_reset("12am", &now).unwrap().hour(), 0);
+        assert_eq!(WallClock::parse_reset("12:15pm", &now).unwrap().hour(), 12);
+        assert_eq!(WallClock::parse_reset("3:59AM", &now).unwrap().minute(), 59);
+        // 月名でない語は「時刻のみ」に落ちる(現行 monthIdx=-1 と同じ)
+        let tomorrow = WallClock::parse_reset("tomorrow 8am", &now).unwrap();
+        assert_eq!((tomorrow.month(), tomorrow.day()), (7, 30));
+        assert_eq!(WallClock::parse_reset("", &now), None);
+        assert_eq!(WallClock::parse_reset("in 5 hours", &now), None);
+        assert_eq!(WallClock::parse_reset("13pm", &now), None); // 1–12 の外
+        assert_eq!(WallClock::parse_reset("5:30 spam", &now), None); // am/pm の語境界
     }
 }

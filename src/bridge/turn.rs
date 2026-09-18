@@ -430,8 +430,8 @@ impl Bridge {
             self.usage_warned_pct = 0;
         }
         // 予測(この先どれくらいで上限に当たるか)。間隔もこれで決まる
-        let w = crate::bridge::command::WallClock::now();
-        let projection = crate::bridge::command::WallClock::parse_reset(&reset_text, &w)
+        let w = crate::bridge::state::WallClock::now();
+        let projection = crate::bridge::state::WallClock::parse_reset(&reset_text, &w)
             .map(|reset| crate::bridge::render::UsageProjection::of(pct, &reset, &w, 300));
         self.usage_at_risk = projection
             .as_ref()

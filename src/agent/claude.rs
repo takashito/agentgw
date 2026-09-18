@@ -9,9 +9,9 @@
 
 use super::screen::{Pane, SpawnOutcome, SpawnScreen, strip_modal_decoration};
 use super::tmux::{Pid, Tmux, Window, WindowRow};
-use super::{CompactOutcome, CompactProgress, LoginOutcome, ProbeErr, SpawnReq};
+use super::{CompactOutcome, CompactProgress, LimitHit, LoginOutcome, ProbeErr, SpawnReq};
 use crate::bridge::inbound::WorkerState;
-use crate::bridge::state::{LogCtx, StateDir, ThreadKey};
+use crate::bridge::state::{LogCtx, StateDir, ThreadKey, WallClock};
 use std::time::Duration;
 
 /// spawn ごとに新規 ID。使用済み ID での起動は claude に拒否される(スパイク実測)。
@@ -999,7 +999,7 @@ impl crate::ports::AgentPort for Claude {
         remembered: Option<&str>,
         session_id: &str,
         now_ms: u64,
-    ) -> Option<std::io::Result<Option<crate::bridge::command::LimitHit>>> {
+    ) -> Option<std::io::Result<Option<crate::agent::LimitHit>>> {
         Transcript::locate(remembered, session_id).map(|t| t.limit_error(256 * 1024, now_ms))
     }
 
@@ -1159,8 +1159,8 @@ impl Transcript {
         &self,
         n: u64,
         now_ms: u64,
-    ) -> std::io::Result<Option<crate::bridge::command::LimitHit>> {
-        Ok(crate::bridge::command::LimitHit::in_transcript_tail(
+    ) -> std::io::Result<Option<crate::agent::LimitHit>> {
+        Ok(Transcript::limit_hit(
             &self.tail(n)?,
             now_ms,
         ))
@@ -1176,6 +1176,68 @@ impl Transcript {
         let mut buf = Vec::new();
         f.read_to_end(&mut buf)?;
         Ok(String::from_utf8_lossy(&buf).into_owned())
+    }
+
+    // ── usage limit recorded in the transcript ──
+
+    /// 履歴の末尾から**上限のエラーだけ**を拾う(`limitErrorInTranscriptTail`)。
+    ///
+    /// 後から来た無関係な api-error(混雑の一時障害)が、まだ効いている上限を隠してはいけないので
+    /// 上限の記録だけを残す。読めないリセット時刻はエラー時刻 +1時間として**保守的に**縛り、
+    /// それも過ぎていれば窓は既に開いた = ただの履歴なので `None`。
+    pub fn limit_hit(tail: &str, now_ms: u64) -> Option<LimitHit> {
+        let mut latest: Option<(String, u64)> = None;
+        for line in tail.lines() {
+            // 安い前段の網 — 256KB を JSON にするのが高い。この旗は滅多に立たない
+            if !line.contains("\"isApiErrorMessage\"") {
+                continue;
+            }
+            // 末尾スライスは行の途中から始まるし、いま書かれかけの行は半端 — どちらも飛ばす
+            let Ok(rec) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if rec["isApiErrorMessage"] != serde_json::Value::Bool(true) {
+                continue;
+            }
+            let text = match &rec["message"]["content"] {
+                serde_json::Value::Array(a) => a
+                    .iter()
+                    .filter_map(|c| c["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                serde_json::Value::String(s) => s.clone(),
+                _ => String::new(),
+            };
+            if !Self::says_limit_reached(&text) {
+                continue;
+            }
+            let at = rec["timestamp"]
+                .as_str()
+                .and_then(WallClock::parse_iso8601_ms);
+            latest = Some((text, at.unwrap_or(now_ms)));
+        }
+        let (detail, at) = latest?;
+        let reset_ms = WallClock::parse_reset_epoch(&detail, at).unwrap_or(at + 3_600_000);
+        (reset_ms > now_ms).then_some(LimitHit { detail, reset_ms })
+    }
+
+    /// 現行 `LIMIT_MODAL_PROMPTS` の**アンカー無しの部分一致**と等価な literal 群。
+    /// 先頭の `(?:…)?` は「空でもよい」ので部分一致テストの結果を変えない — だから落とせる。
+    ///
+    /// ⚠️ **pane 検出に流用しないこと。** 現行は同じ表を**行頭アンカー付き**でも使う
+    /// (`paneShowsPrompt` — 画面は自分のプロンプトを行として印字するので、文の途中に同じ語が
+    /// 出てくる「内容」と区別できる)。その検出を移植するときは還元をやり直す必要がある。
+    fn says_limit_reached(text: &str) -> bool {
+        let t = text.to_ascii_lowercase();
+        if t.contains("wait for limit to reset") || t.contains("wait for the limit to reset") {
+            return true;
+        }
+        ["session", "usage", "weekly"].iter().any(|w| {
+            t.contains(&format!("hit your {w} limit"))
+                || t.contains(&format!("{w} limit reached"))
+                || t.contains(&format!("you've reached your {w} limit"))
+                || t.contains(&format!("youve reached your {w} limit"))
+        })
     }
 }
 
@@ -2045,5 +2107,46 @@ mod tests {
             2,
             "confirm と trust に1回ずつ: {keys:?}"
         );
+    }
+
+    /// 現行 LIMIT_MODAL_PROMPTS をアンカー無しの literal に還元したもの。
+    /// 「上限」以外の api-error は拾わない(混雑の一時エラーで壁を立てない)。
+    #[test]
+    fn limit_error_is_read_from_the_transcript_tail() {
+        let now = 1_785_000_000_000u64;
+        let line = |ts: &str, text: &str| {
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "isApiErrorMessage": true,
+                    "timestamp": ts,
+                    "message": { "content": [{ "text": text }] },
+                })
+            )
+        };
+        let tail = line(
+            "2026-07-30T14:00:00.000Z",
+            "Claude usage limit reached. Your limit will reset at 11pm",
+        );
+        let hit = Transcript::limit_hit(&tail, now).expect("limit hit");
+        assert!(hit.detail.contains("usage limit reached"), "{hit:?}");
+        assert!(hit.reset_ms > now);
+
+        // 上限でない api-error は拾わない
+        let other = line("2026-07-30T14:00:00.000Z", "API Error: overloaded_error");
+        assert!(Transcript::limit_hit(&other, now).is_none());
+
+        // 末尾スライスは行の途中から始まる — 半端な行で落ちも止まりもしないこと
+        let sliced = format!("Message\",\"isApiErrorMessage\":true}}\n{tail}");
+        assert!(Transcript::limit_hit(&sliced, now).is_some());
+
+        // リセット時刻が読めなければエラー時刻 +1h。それも過ぎていれば履歴なので None
+        let at = 1_785_420_000_000u64; // 2026-07-30T14:00:00Z
+        let no_time = line("2026-07-30T14:00:00.000Z", "Claude usage limit reached.");
+        assert_eq!(
+            Transcript::limit_hit(&no_time, at + 1_800_000).map(|h| h.reset_ms),
+            Some(at + 3_600_000)
+        );
+        assert!(Transcript::limit_hit(&no_time, at + 2 * 3_600_000).is_none());
     }
 }

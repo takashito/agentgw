@@ -220,6 +220,15 @@ pub struct ContextReport {
     pub categories: Vec<ContextCategory>,
 }
 
+/// Claude Code 自身が「上限に当たった」と書いた記録。
+#[derive(Debug, PartialEq, Eq)]
+pub struct LimitHit {
+    /// 記録の本文(ログにそのまま出す — 何を読んで判断したかが残る)。
+    pub detail: String,
+    /// 壁が解ける時刻(epoch ms)。
+    pub reset_ms: u64,
+}
+
 /// `/usage` の上限行1本(例 `Current week (all models): 66% used · resets Jul 1 at 5pm`)。
 #[derive(Debug)]
 pub struct UsageRow {
