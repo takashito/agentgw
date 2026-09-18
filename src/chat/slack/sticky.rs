@@ -19,7 +19,7 @@ pub enum ToolStatus {
 
 impl ToolStatus {
     /// hook イベント → ツールの状態。PostToolUse 以外はまだ走っている(Pending)。
-    /// 失敗のうち権限拒否は 💥 でなく 🚫 に振り分ける(結果テキストで判定 — 現行と同じ語)。
+    /// 失敗のうち権限拒否は 💥 でなく 🚫 に振り分ける(結果テキストで判定)。
     pub fn of(hook_event_name: &str, is_error: bool, result_text: &str) -> ToolStatus {
         if hook_event_name != "PostToolUse" {
             return ToolStatus::Pending;
@@ -335,10 +335,10 @@ pub struct StickyBoard {
 
 impl StickyBoard {
     /// 行を組んで予算で打ち切る。切ったことは `…(N more)` で必ず見せる(黙って切らない)。
-    /// item 1つを1行に(Bun の `renderItemLine`)。
+    /// item 1つを1行に。
     /// `lead_blank` は `Interrupted` が先行行を持つときに前へ空行を入れるかどうか。
     /// `with_diff` は編集系の差分ブロックを行の下に付けるかどうか。main セッションの行だけ
-    /// true — 畳んだ subagent の窓は1行のままにする(`renderItemLine` の `opts.diff` と同じ)。
+    /// true — 畳んだ subagent の窓は1行のままにする。
     fn render_item_line(it: &RenderItem, lead_blank: bool, with_diff: bool) -> String {
         match it {
             RenderItem::Narration { text } => format!("{NARR_GLYPH} {text}"),
@@ -373,22 +373,15 @@ impl StickyBoard {
             0 => {}
             1 => lines.push(Self::render_item_line(run[0], !lines.is_empty(), true)),
             _ => {
-                let (mut reads, mut searches, mut cmds) = (0usize, 0usize, 0usize);
-                for it in run.iter() {
-                    let RenderItem::Tool { name, summary, .. } = it else {
-                        continue;
-                    };
-                    if FOLD_READ.contains(&name.as_str()) {
-                        reads += 1;
-                    } else if FOLD_SEARCH.contains(&name.as_str()) {
-                        searches += 1;
-                    } else if Self::bash_is_search(summary) {
-                        searches += 1;
-                    } else {
-                        cmds += 1;
-                    }
-                }
-                lines.push(Self::fold_summary_line(reads, searches, cmds));
+                let pairs: Vec<(&str, &str)> = run
+                    .iter()
+                    .filter_map(|it| match it {
+                        RenderItem::Tool { name, summary, .. } => Some((name.as_str(), summary.as_str())),
+                        _ => None,
+                    })
+                    .collect();
+                // `•` の後の**空白2つ**は、畳まれていない `•` 行と桁を揃えるため
+                lines.push(format!("{TOOL_INDENT}•  {}", Self::tool_breakdown(&pairs)));
             }
         }
         run.clear();
@@ -502,8 +495,8 @@ impl StickyBoard {
     ///
     /// 返り値は「この行を描いてよいか」。
     /// `by_tool` = この行がツールか。**沈黙で決着したラウンドはツールでだけ再開する** —
-    /// no_reply / react の後に本物の仕事が動いたなら記録は要る(現行 `wipeRound` の後に
-    /// `onProgress` が新しい付箋を出すのと同じ)。ナレーションだけでは起こさない。
+    /// no_reply / react の後に本物の仕事が動いたなら記録は要る。
+    /// ナレーションだけでは起こさない。
     fn open_after_answer(&mut self, key: &ThreadKey, by_tool: bool) -> bool {
         match self.settled.get(key) {
             None => true, // まだ決着していない — 普段どおり
@@ -533,7 +526,7 @@ impl StickyBoard {
     }
 
     /// ターンが終わった。ここまで誰も出さなかった控えは**締めの一言だった**
-    /// ということなので捨てる(Bun の `onTurnEnd`)。次の発言が
+    /// ということなので捨てる。次の発言が
     /// 来るまで持ち続けると、二度と発言の来ないスレッドのぶんが残りっぱなしになる。
     pub fn on_turn_end(&mut self, key: &ThreadKey) {
         self.held.remove(key);
@@ -605,7 +598,7 @@ impl StickyBoard {
         // ツールが動けば「仕事が続いている」証拠なので `open_after_answer` がまとめて出す。
         // 何も動かないままターンが終われば締めの一言だったということで、次の
         // `on_turn_start` が捨てる。これが無いと「● Slack に返信しました。」だけの
-        // 付箋が返事の下に生えて誰も消さない(実機で毎ターン再現)
+        // 付箋が返事の下に生えて誰も消さない
         if self.settled.get(key) == Some(&true) {
             self.held
                 .entry(key.clone())
@@ -629,7 +622,7 @@ impl StickyBoard {
     ///
     /// **止まったツール行は触らない**(◌ のまま)。別 upsert で ⚠️ に落とすと
     /// **行が二重になる** — perm フレームの tool_use_id は PreToolUse の行の鍵と
-    /// 一致するとは限らないため(現行が実測で戻した判断)。
+    /// 一致するとは限らないため。
     /// 足すのはインデント付きの注記1行だけ。
     pub fn on_perm_timeout(&mut self, key: &ThreadKey) {
         if self.settled(key) {
@@ -683,7 +676,7 @@ impl StickyBoard {
     }
 
     /// このスレッドで**いま出ている進捗付箋**の ts。stop 絵文字が付いたのが
-    /// 付箋かどうかを見分けるのに使う(`stickyMessageTs`)。
+    /// 付箋かどうかを見分けるのに使う。
     pub fn sticky_ts(&self, key: &ThreadKey) -> Option<String> {
         self.stickies.get(key).and_then(|s| s.posted_ts.clone())
     }
@@ -830,38 +823,12 @@ impl StickyBoard {
         SEARCH_CMDS.contains(&base) || (base == "git" && tokens.next() == Some("grep"))
     }
 
-    /// 畳んだ run の1行。
-    /// 0 件の節は落ちるので、Read だけの run は "Read 3 files" になる。
-    /// `•` の後の**空白2つ**は、畳まれていない `•` 行と桁を揃えるため。
-    pub fn fold_summary_line(reads: usize, searches: usize, cmds: usize) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        if reads > 0 {
-            parts.push(format!(
-                "Read {reads} {}",
-                if reads == 1 { "file" } else { "files" }
-            ));
-        }
-        if searches > 0 {
-            parts.push(format!(
-                "Searched for {searches} {}",
-                if searches == 1 { "pattern" } else { "patterns" }
-            ));
-        }
-        if cmds > 0 {
-            parts.push(format!(
-                "Ran {cmds} {}",
-                if cmds == 1 { "command" } else { "commands" }
-            ));
-        }
-        format!("{TOOL_INDENT}•  {}", parts.join(", "))
-    }
-
     /// subagent が走らせたツールの内訳。畳んだセクションの
     /// 見出しに出して「何をした agent か」を一目で分かるようにする。**全ステータスを数える**ので、
     /// 各節の合計は総数に一致する。分類に載らないものはツール名ごとに束ねる("WebFetch 2")。
     ///
-    /// 受けるのは `(ツール名, summary)`。Bun は生の input を見るが、Bash の判定は先頭トークンしか
-    /// 使わないので 70 字クリップ済みの summary で足りる。
+    /// 受けるのは `(ツール名, summary)`。Bash の判定は先頭トークンしか使わないので、
+    /// 70 字にクリップ済みの summary で足りる。
     pub fn tool_breakdown(items: &[(&str, &str)]) -> String {
         let (mut reads, mut searches, mut cmds, mut edits) = (0usize, 0usize, 0usize, 0usize);
         // 出現順を保つ(HashMap だと "WebFetch 2, Skill 1" の順が不定になる)
@@ -887,29 +854,15 @@ impl StickyBoard {
             }
         }
         let mut parts: Vec<String> = Vec::new();
-        if reads > 0 {
-            parts.push(format!(
-                "Read {reads} {}",
-                if reads == 1 { "file" } else { "files" }
-            ));
-        }
-        if searches > 0 {
-            parts.push(format!(
-                "Searched for {searches} {}",
-                if searches == 1 { "pattern" } else { "patterns" }
-            ));
-        }
-        if cmds > 0 {
-            parts.push(format!(
-                "Ran {cmds} {}",
-                if cmds == 1 { "command" } else { "commands" }
-            ));
-        }
-        if edits > 0 {
-            parts.push(format!(
-                "Edited {edits} {}",
-                if edits == 1 { "file" } else { "files" }
-            ));
+        for (n, verb, one, many) in [
+            (reads, "Read", "file", "files"),
+            (searches, "Searched for", "pattern", "patterns"),
+            (cmds, "Ran", "command", "commands"),
+            (edits, "Edited", "file", "files"),
+        ] {
+            if n > 0 {
+                parts.push(format!("{verb} {n} {}", if n == 1 { one } else { many }));
+            }
         }
         for (name, n) in other {
             parts.push(format!("{name} {n}"));
@@ -1039,11 +992,6 @@ impl StickyBoard {
         lines
     }
 
-    /// 1ページ目だけを描く(ページ繰りの要らない呼び手とテスト用)。
-    pub fn render_with(items: &[RenderItem], perm_timed_out: bool) -> String {
-        let lines = Self::lines_of(items, perm_timed_out);
-        Self::page(&lines, 0, false).0
-    }
 }
 
 #[cfg(test)]
@@ -1051,6 +999,16 @@ mod tests {
     use super::*;
 
     impl StickyBoard {
+        /// テスト用 — 本体のエージェントの行を、既定のスレッド `k` に。
+        fn tool(&mut self, tool_use_id: &str, name: &str, summary: &str, status: ToolStatus) {
+            self.tool_at(&ThreadKey::parse("k"), tool_use_id, name, summary, status);
+        }
+
+        /// テスト用 — 本体のエージェントの行を、指定したスレッドに。
+        fn tool_at(&mut self, key: &ThreadKey, tool_use_id: &str, name: &str, summary: &str, status: ToolStatus) {
+            self.upsert_tool_t(key, tool_use_id, name, summary, status, &AgentRef::default());
+        }
+
         /// テスト用 — 差分の要らない行(input を見ない)。
         fn upsert_tool_t(
             &mut self,
@@ -1075,21 +1033,25 @@ mod tests {
 
     #[test]
     fn a_bash_row_that_is_really_a_search_counts_as_one() {
-        // 素の検索コマンド
-        assert!(StickyBoard::bash_is_search("grep -rn foo src/"));
-        assert!(StickyBoard::bash_is_search("rg --hidden pattern"));
-        assert!(StickyBoard::bash_is_search("git grep TODO"));
-        // 先頭の環境変数代入は読み飛ばす
-        assert!(StickyBoard::bash_is_search("LC_ALL=C grep x file"));
-        assert!(StickyBoard::bash_is_search("A=1 B=2 rg x"));
-        // 絶対パスでも基底名で判定
-        assert!(StickyBoard::bash_is_search("/usr/bin/grep x file"));
-        // パイプの**フィルタ**として使う grep は検索ではない(主コマンドは ps)
-        assert!(!StickyBoard::bash_is_search("ps ax | grep x"));
-        assert!(!StickyBoard::bash_is_search("cargo test"));
-        assert!(!StickyBoard::bash_is_search(""));
-        // git の別サブコマンドは検索ではない
-        assert!(!StickyBoard::bash_is_search("git log --oneline"));
+        for (command, is_search) in [
+            // 素の検索コマンド
+            ("grep -rn foo src/", true),
+            ("rg --hidden pattern", true),
+            ("git grep TODO", true),
+            // 先頭の環境変数代入は読み飛ばす
+            ("LC_ALL=C grep x file", true),
+            ("A=1 B=2 rg x", true),
+            // 絶対パスでも基底名で判定
+            ("/usr/bin/grep x file", true),
+            // パイプの**フィルタ**として使う grep は検索ではない(主コマンドは ps)
+            ("ps ax | grep x", false),
+            ("cargo test", false),
+            ("", false),
+            // git の別サブコマンドは検索ではない
+            ("git log --oneline", false),
+        ] {
+            assert_eq!(StickyBoard::bash_is_search(command), is_search, "{command:?}");
+        }
     }
 
     /// 何が変わったかを git 風の diff で出す。カウント・文脈の畳み・
@@ -1273,14 +1235,7 @@ mod tests {
     fn an_agent_row_without_a_linked_group_renders_as_a_plain_row() {
         // まだ subagent のツールが1つも届いていない間は普通の行のまま
         let mut b = StickyBoard::default();
-        b.upsert_tool_t(
-            &ThreadKey::parse("k"),
-            "t0",
-            "Agent",
-            "調査",
-            ToolStatus::Pending,
-            &AgentRef::default(),
-        );
+        b.tool("t0", "Agent", "調査", ToolStatus::Pending);
         let body = b.take_dirty(10_000).pop().unwrap().2;
         assert_eq!(body, format!("{TOOL_INDENT}◌ Agent `調査`"), "{body}");
     }
@@ -1422,16 +1377,15 @@ mod tests {
     /// 空名の行が1つでも混ざると畳み込みが壊れることを固定する(実際に壊れていた退行)。
     /// 満期と Deny は**別の道**。
     /// 満期は止まったツール行を触らず注記1行だけ足す(別 upsert で ⚠️ に落とすと、
-    /// perm フレームの tool_use_id が Pre の行の鍵と一致せず**行が二重になる**
-    /// — 現行が実測で戻した判断)。Deny はその行だけ 🚫 にして注記は出さない。
+    /// perm フレームの tool_use_id が Pre の行の鍵と一致せず**行が二重になる**)。
+    /// Deny はその行だけ 🚫 にして注記は出さない。
     #[test]
     fn perm_timeout_annotates_without_touching_the_row_and_deny_marks_only_the_row() {
-        let a = AgentRef::default();
         let k = ThreadKey::parse("k");
 
         // 満期: 行は ◌ のまま、下に注記
         let mut timed = StickyBoard::default();
-        timed.upsert_tool_t(&k, "t1", "Bash", "rm -rf /tmp/x", ToolStatus::Pending, &a);
+        timed.tool_at(&k, "t1", "Bash", "rm -rf /tmp/x", ToolStatus::Pending);
         timed.on_perm_timeout(&k);
         let (_, out) = timed.take_final(&k).expect("付箋が出ていない");
         assert!(out.contains("⚠️ No answer to the permission request — timed out"), "{out}");
@@ -1448,7 +1402,7 @@ mod tests {
 
         // Deny: その行だけ 🚫。注記は出さない
         let mut denied = StickyBoard::default();
-        denied.upsert_tool_t(&k, "t1", "Bash", "rm -rf /tmp/x", ToolStatus::Pending, &a);
+        denied.tool_at(&k, "t1", "Bash", "rm -rf /tmp/x", ToolStatus::Pending);
         denied.on_perm_denied(&k, "t1");
         let (_, out) = denied.take_final(&k).expect("付箋が出ていない");
         assert!(out.contains("🚫 Bash"), "{out}");
@@ -1457,10 +1411,9 @@ mod tests {
 
     #[test]
     fn an_empty_named_row_would_split_a_fold_run() {
-        let a = AgentRef::default();
         let k = ThreadKey::parse("k");
         let read = |b: &mut StickyBoard, id: &str, path: &str| {
-            b.upsert_tool_t(&k, id, "Read", path, ToolStatus::Done, &a);
+            b.tool_at(&k, id, "Read", path, ToolStatus::Done);
         };
 
         // 素直に3連続 → 1行に畳まれる
@@ -1474,7 +1427,7 @@ mod tests {
         // 真ん中に空名の行が入ると run が割れて畳めない = 行にしてはいけない証拠
         let mut split = StickyBoard::default();
         read(&mut split, "t1", "/a.rs");
-        split.upsert_tool_t(&k, "ping", "", "", ToolStatus::Done, &a);
+        split.tool_at(&k, "ping", "", "", ToolStatus::Done);
         read(&mut split, "t3", "/c.rs");
         let (_, out) = split.take_final(&k).expect("付箋が出ていない");
         assert!(
@@ -1486,31 +1439,9 @@ mod tests {
     #[test]
     fn a_run_of_finished_reads_folds_into_one_line() {
         let mut b = StickyBoard::default();
-        let a = AgentRef::default();
-        b.upsert_tool_t(
-            &ThreadKey::parse("k"),
-            "t1",
-            "Read",
-            "/a.rs",
-            ToolStatus::Done,
-            &a,
-        );
-        b.upsert_tool_t(
-            &ThreadKey::parse("k"),
-            "t2",
-            "Read",
-            "/b.rs",
-            ToolStatus::Done,
-            &a,
-        );
-        b.upsert_tool_t(
-            &ThreadKey::parse("k"),
-            "t3",
-            "Grep",
-            "foo",
-            ToolStatus::Done,
-            &a,
-        );
+        b.tool("t1", "Read", "/a.rs", ToolStatus::Done);
+        b.tool("t2", "Read", "/b.rs", ToolStatus::Done);
+        b.tool("t3", "Grep", "foo", ToolStatus::Done);
         let body = b.take_dirty(10_000).pop().unwrap().2;
         assert_eq!(
             body,
@@ -1523,14 +1454,7 @@ mod tests {
     fn a_lone_finished_row_stays_expanded() {
         // 1本を畳んでも行は減らず、パスだけ見えなくなる — 畳むのは2本以上から
         let mut b = StickyBoard::default();
-        b.upsert_tool_t(
-            &ThreadKey::parse("k"),
-            "t1",
-            "Read",
-            "/a.rs",
-            ToolStatus::Done,
-            &AgentRef::default(),
-        );
+        b.tool("t1", "Read", "/a.rs", ToolStatus::Done);
         let body = b.take_dirty(10_000).pop().unwrap().2;
         assert_eq!(body, format!("{TOOL_INDENT}• Read `/a.rs`"), "{body}");
     }
@@ -1538,31 +1462,9 @@ mod tests {
     #[test]
     fn a_running_or_failed_row_is_never_folded() {
         let mut b = StickyBoard::default();
-        let a = AgentRef::default();
-        b.upsert_tool_t(
-            &ThreadKey::parse("k"),
-            "t1",
-            "Read",
-            "/a.rs",
-            ToolStatus::Done,
-            &a,
-        );
-        b.upsert_tool_t(
-            &ThreadKey::parse("k"),
-            "t2",
-            "Read",
-            "/b.rs",
-            ToolStatus::Pending,
-            &a,
-        ); // 走行中
-        b.upsert_tool_t(
-            &ThreadKey::parse("k"),
-            "t3",
-            "Read",
-            "/c.rs",
-            ToolStatus::Error,
-            &a,
-        ); // 失敗
+        b.tool("t1", "Read", "/a.rs", ToolStatus::Done);
+        b.tool("t2", "Read", "/b.rs", ToolStatus::Pending); // 走行中
+        b.tool("t3", "Read", "/c.rs", ToolStatus::Error); // 失敗
         let body = b.take_dirty(10_000).pop().unwrap().2;
         // 完了1本だけの run は畳まれず、走行中と失敗はそれぞれ自分の行を保つ
         assert!(body.contains("`/a.rs`"), "{body}");
@@ -1574,40 +1476,11 @@ mod tests {
     #[test]
     fn a_narration_breaks_the_run_in_two() {
         let mut b = StickyBoard::default();
-        let a = AgentRef::default();
-        b.upsert_tool_t(
-            &ThreadKey::parse("k"),
-            "t1",
-            "Read",
-            "/a.rs",
-            ToolStatus::Done,
-            &a,
-        );
-        b.upsert_tool_t(
-            &ThreadKey::parse("k"),
-            "t2",
-            "Read",
-            "/b.rs",
-            ToolStatus::Done,
-            &a,
-        );
+        b.tool("t1", "Read", "/a.rs", ToolStatus::Done);
+        b.tool("t2", "Read", "/b.rs", ToolStatus::Done);
         b.push_narration(&ThreadKey::parse("k"), "次を調べます");
-        b.upsert_tool_t(
-            &ThreadKey::parse("k"),
-            "t3",
-            "Bash",
-            "cargo test",
-            ToolStatus::Done,
-            &a,
-        );
-        b.upsert_tool_t(
-            &ThreadKey::parse("k"),
-            "t4",
-            "Bash",
-            "cargo fmt",
-            ToolStatus::Done,
-            &a,
-        );
+        b.tool("t3", "Bash", "cargo test", ToolStatus::Done);
+        b.tool("t4", "Bash", "cargo fmt", ToolStatus::Done);
         let body = b.take_dirty(10_000).pop().unwrap().2;
         assert!(body.contains("Read 2 files"), "{body}");
         assert!(body.contains("● 次を調べます"), "{body}");
@@ -1617,23 +1490,8 @@ mod tests {
     #[test]
     fn a_grep_through_bash_counts_as_a_search_not_a_command() {
         let mut b = StickyBoard::default();
-        let a = AgentRef::default();
-        b.upsert_tool_t(
-            &ThreadKey::parse("k"),
-            "t1",
-            "Bash",
-            "rg foo src/",
-            ToolStatus::Done,
-            &a,
-        );
-        b.upsert_tool_t(
-            &ThreadKey::parse("k"),
-            "t2",
-            "Bash",
-            "cargo test",
-            ToolStatus::Done,
-            &a,
-        );
+        b.tool("t1", "Bash", "rg foo src/", ToolStatus::Done);
+        b.tool("t2", "Bash", "cargo test", ToolStatus::Done);
         let body = b.take_dirty(10_000).pop().unwrap().2;
         assert_eq!(
             body,
@@ -1644,7 +1502,7 @@ mod tests {
 
     #[test]
     fn the_breakdown_groups_by_category_then_falls_back_to_the_tool_name() {
-        // 原文。Read / 検索 / コマンド / 編集 の順、残りはツール名ごと
+        // Read / 検索 / コマンド / 編集 の順、残りはツール名ごと
         let items = [
             ("Read", "/a.rs"),
             ("Grep", "foo"),
@@ -1667,74 +1525,51 @@ mod tests {
     }
 
     #[test]
-    fn the_fold_summary_drops_zero_clauses_and_matches_the_bun_wording() {
-        // 原文。単複も現行どおり
-        assert_eq!(
-            StickyBoard::fold_summary_line(3, 0, 0),
-            format!("{TOOL_INDENT}•  Read 3 files")
-        );
-        assert_eq!(
-            StickyBoard::fold_summary_line(1, 0, 0),
-            format!("{TOOL_INDENT}•  Read 1 file")
-        );
-        assert_eq!(
-            StickyBoard::fold_summary_line(0, 2, 0),
-            format!("{TOOL_INDENT}•  Searched for 2 patterns")
-        );
-        assert_eq!(
-            StickyBoard::fold_summary_line(0, 1, 0),
-            format!("{TOOL_INDENT}•  Searched for 1 pattern")
-        );
-        assert_eq!(
-            StickyBoard::fold_summary_line(0, 0, 1),
-            format!("{TOOL_INDENT}•  Ran 1 command")
-        );
-        // 3種そろうとカンマ区切り。順序は Read → Searched → Ran で固定
-        assert_eq!(
-            StickyBoard::fold_summary_line(1, 2, 3),
-            format!("{TOOL_INDENT}•  Read 1 file, Searched for 2 patterns, Ran 3 commands")
-        );
+    fn the_fold_summary_drops_zero_clauses() {
+        // 0 件の節は落ち、単複を言い分け、順序は Read → Searched → Ran で固定
+        let read = ("Read", "a.rs");
+        let search = ("Grep", "fn main");
+        let cmd = ("Bash", "cargo test");
+        for (items, want) in [
+            (vec![read; 3], "Read 3 files"),
+            (vec![read], "Read 1 file"),
+            (vec![search; 2], "Searched for 2 patterns"),
+            (vec![search], "Searched for 1 pattern"),
+            (vec![cmd], "Ran 1 command"),
+            (
+                vec![read, search, search, cmd, cmd, cmd],
+                "Read 1 file, Searched for 2 patterns, Ran 3 commands",
+            ),
+        ] {
+            assert_eq!(StickyBoard::tool_breakdown(&items), want);
+        }
     }
 
     #[test]
     fn summarize_picks_salient_arg() {
-        assert_eq!(
-            StickyBoard::summarize("Bash", &serde_json::json!({"command": "cargo test"})),
-            "cargo test"
-        );
-        assert_eq!(
-            StickyBoard::summarize("Read", &serde_json::json!({"file_path": "/a/b.rs"})),
-            "/a/b.rs"
-        );
-        assert_eq!(
-            StickyBoard::summarize("Grep", &serde_json::json!({"pattern": "foo"})),
-            "foo"
-        );
-        let long = "x".repeat(80);
-        assert_eq!(
-            StickyBoard::summarize("Bash", &serde_json::json!({"command": long}))
-                .chars()
-                .count(),
-            71
-        ); // 70 + …
-        assert_eq!(
-            StickyBoard::summarize("Bash", &serde_json::json!({"command": "a`b`\nc"})),
-            "ab c"
-        );
+        for (name, input, want) in [
+            ("Bash", serde_json::json!({"command": "cargo test"}), "cargo test"),
+            ("Read", serde_json::json!({"file_path": "/a/b.rs"}), "/a/b.rs"),
+            ("Grep", serde_json::json!({"pattern": "foo"}), "foo"),
+            ("Bash", serde_json::json!({"command": "a`b`\nc"}), "ab c"),
+        ] {
+            assert_eq!(StickyBoard::summarize(name, &input), want);
+        }
+        // 70 字 + …
+        let long = serde_json::json!({"command": "x".repeat(80)});
+        assert_eq!(StickyBoard::summarize("Bash", &long).chars().count(), 71);
     }
 
     #[test]
     fn tool_status_classification() {
-        assert_eq!(ToolStatus::of("PreToolUse", false, ""), ToolStatus::Pending);
-        assert_eq!(ToolStatus::of("PostToolUse", false, ""), ToolStatus::Done);
-        assert_eq!(
-            ToolStatus::of("PostToolUse", true, "permission denied"),
-            ToolStatus::Deny
-        );
-        assert_eq!(
-            ToolStatus::of("PostToolUse", true, "boom"),
-            ToolStatus::Error
-        );
+        for (event, is_error, text, want) in [
+            ("PreToolUse", false, "", ToolStatus::Pending),
+            ("PostToolUse", false, "", ToolStatus::Done),
+            ("PostToolUse", true, "permission denied", ToolStatus::Deny),
+            ("PostToolUse", true, "boom", ToolStatus::Error),
+        ] {
+            assert_eq!(ToolStatus::of(event, is_error, text), want);
+        }
     }
 
     #[test]
@@ -1745,22 +1580,8 @@ mod tests {
         // 呼び手が漏らしても board が行にしない
         let mut b = StickyBoard::default();
         b.on_turn_start(&ThreadKey::parse("k"));
-        b.upsert_tool_t(
-            &ThreadKey::parse("k"),
-            "t",
-            "TodoWrite",
-            "x",
-            ToolStatus::Done,
-            &AgentRef::default(),
-        );
-        b.upsert_tool_t(
-            &ThreadKey::parse("k"),
-            "t2",
-            "mcp__agentgw__reply",
-            "hi",
-            ToolStatus::Done,
-            &AgentRef::default(),
-        );
+        b.tool("t", "TodoWrite", "x", ToolStatus::Done);
+        b.tool("t2", "mcp__agentgw__reply", "hi", ToolStatus::Done);
         assert!(
             b.take_dirty(1_000).is_empty(),
             "denied tool must not even dirty the board"
@@ -1771,22 +1592,8 @@ mod tests {
     fn board_upserts_and_settles() {
         let mut b = StickyBoard::default();
         b.on_turn_start(&ThreadKey::parse("k"));
-        b.upsert_tool_t(
-            &ThreadKey::parse("k"),
-            "t1",
-            "Bash",
-            "cargo test",
-            ToolStatus::Pending,
-            &AgentRef::default(),
-        );
-        b.upsert_tool_t(
-            &ThreadKey::parse("k"),
-            "t1",
-            "Bash",
-            "cargo test",
-            ToolStatus::Done,
-            &AgentRef::default(),
-        );
+        b.tool("t1", "Bash", "cargo test", ToolStatus::Pending);
+        b.tool("t1", "Bash", "cargo test", ToolStatus::Done);
         b.push_narration(&ThreadKey::parse("k"), "ビルドを確認します");
         let dirty = b.take_dirty(10_000);
         assert_eq!(dirty.len(), 1);
@@ -1802,14 +1609,7 @@ mod tests {
             StickyAction::Keep
         ));
         b.on_turn_start(&ThreadKey::parse("k"));
-        b.upsert_tool_t(
-            &ThreadKey::parse("k"),
-            "t2",
-            "Read",
-            "/x",
-            ToolStatus::Done,
-            &AgentRef::default(),
-        );
+        b.tool("t2", "Read", "/x", ToolStatus::Done);
         b.set_posted(&ThreadKey::parse("k"), "999.2");
         assert!(
             matches!(b.settle(&ThreadKey::parse("k"), "no_reply"), StickyAction::Delete(ts) if ts == "999.2")
@@ -1892,7 +1692,7 @@ mod tests {
             agent: AgentRef::default(),
             diff: None,
         }));
-        let out = StickyBoard::render_with(&items, false);
+        let out = StickyBoard::page(&StickyBoard::lines_of(&items, false), 0, false).0;
         assert!(out.len() <= STICKY_BUDGET + 32, "len={}", out.len());
         assert!(
             out.starts_with("● あああ"),
@@ -1913,26 +1713,12 @@ mod tests {
         let k = ThreadKey::parse("k");
         let mut b = StickyBoard::default();
         b.on_turn_start(&k);
-        b.upsert_tool_t(
-            &k,
-            "t1",
-            "Bash",
-            "cargo test",
-            ToolStatus::Done,
-            &AgentRef::default(),
-        );
+        b.tool_at(&k, "t1", "Bash", "cargo test", ToolStatus::Done);
         b.set_posted(&k, "999.1");
         assert!(matches!(b.settle(&k, "reply"), StickyAction::Keep));
 
         b.push_narration(&k, "ついでに調べました");
-        b.upsert_tool_t(
-            &k,
-            "t2",
-            "Read",
-            "/x",
-            ToolStatus::Done,
-            &AgentRef::default(),
-        );
+        b.tool_at(&k, "t2", "Read", "/x", ToolStatus::Done);
         let dirty = b.take_dirty(99_000);
         assert_eq!(dirty.len(), 1);
         assert_eq!(dirty[0].1, None, "返事の下に**新しく**出す(編集ではない)");
@@ -1960,17 +1746,10 @@ mod tests {
         );
 
         // 締めの一言だけ(後に**ツールが動かない**)なら付箋は生えない。
-        // 「● Slack に返信しました。」が返事の下に residue として残っていた実機の再現
+        // (「● Slack に返信しました。」だけの付箋が返事の下に残らないこと)
         let mut r = StickyBoard::default();
         r.on_turn_start(&k);
-        r.upsert_tool_t(
-            &k,
-            "t1",
-            "Bash",
-            "ls",
-            ToolStatus::Done,
-            &AgentRef::default(),
-        );
+        r.tool_at(&k, "t1", "Bash", "ls", ToolStatus::Done);
         r.set_posted(&k, "999.3");
         assert!(matches!(r.settle(&k, "reply"), StickyAction::Keep));
         r.push_narration(&k, "Slack に返信しました。");
@@ -1982,14 +1761,7 @@ mod tests {
         // 捨てるのは**ターンの終わり**。次の発言が来ないスレッドで残りっぱなしにしない
         // (`on_turn_start` を待つと、二度と喋られないスレッドのぶんが残る)
         r.on_turn_end(&k);
-        r.upsert_tool_t(
-            &k,
-            "t2",
-            "Read",
-            "/x",
-            ToolStatus::Done,
-            &AgentRef::default(),
-        );
+        r.tool_at(&k, "t2", "Read", "/x", ToolStatus::Done);
         let dirty = r.take_dirty(100_000);
         assert_eq!(dirty.len(), 1);
         assert!(
@@ -2001,14 +1773,7 @@ mod tests {
         // 黙ると決めたラウンド — 決着後の行は付箋を生まない(沈黙が発言に見える事故を防ぐ)
         let mut q = StickyBoard::default();
         q.on_turn_start(&k);
-        q.upsert_tool_t(
-            &k,
-            "t1",
-            "Bash",
-            "ls",
-            ToolStatus::Done,
-            &AgentRef::default(),
-        );
+        q.tool_at(&k, "t1", "Bash", "ls", ToolStatus::Done);
         q.set_posted(&k, "999.2");
         assert!(matches!(
             q.settle(&k, "no_reply"),
@@ -2019,15 +1784,8 @@ mod tests {
             q.take_dirty(99_000).is_empty(),
             "沈黙のあとのナレーションだけでは何も出さない"
         );
-        // ただし**本物の仕事が動いたら**記録は出す(現行と同じ — 沈黙しても作業は残す)
-        q.upsert_tool_t(
-            &k,
-            "t2",
-            "Edit",
-            "/x.rs",
-            ToolStatus::Done,
-            &AgentRef::default(),
-        );
+        // ただし**本物の仕事が動いたら**記録は出す(沈黙しても作業は残す)
+        q.tool_at(&k, "t2", "Edit", "/x.rs", ToolStatus::Done);
         let after = q.take_dirty(99_000);
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].1, None, "消した付箋を編集せず、新しく出す");
@@ -2039,14 +1797,7 @@ mod tests {
     fn interrupted_appends_notice_and_settles() {
         let mut b = StickyBoard::default();
         b.on_turn_start(&ThreadKey::parse("k"));
-        b.upsert_tool_t(
-            &ThreadKey::parse("k"),
-            "t1",
-            "Bash",
-            "x",
-            ToolStatus::Pending,
-            &AgentRef::default(),
-        );
+        b.tool("t1", "Bash", "x", ToolStatus::Pending);
         b.on_interrupted(&ThreadKey::parse("k"));
         let dirty = b.take_dirty(10_000);
         assert_eq!(dirty.len(), 1);
@@ -2075,23 +1826,9 @@ mod tests {
     fn final_flush_ignores_the_throttle() {
         let mut b = StickyBoard::default();
         b.on_turn_start(&ThreadKey::parse("k"));
-        b.upsert_tool_t(
-            &ThreadKey::parse("k"),
-            "t1",
-            "Bash",
-            "cargo test",
-            ToolStatus::Pending,
-            &AgentRef::default(),
-        );
+        b.tool("t1", "Bash", "cargo test", ToolStatus::Pending);
         assert_eq!(b.take_dirty(10_000).len(), 1);
-        b.upsert_tool_t(
-            &ThreadKey::parse("k"),
-            "t1",
-            "Bash",
-            "cargo test",
-            ToolStatus::Done,
-            &AgentRef::default(),
-        );
+        b.tool("t1", "Bash", "cargo test", ToolStatus::Done);
         // スロットル内でも決着直前の最終描画は出る(◌ のまま固まらない)
         assert!(
             b.take_dirty(10_100).is_empty(),
