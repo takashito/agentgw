@@ -203,6 +203,7 @@ impl Bridge {
         // `rate_limit` は混雑にも使われる)ので、ワーカー自身の履歴に訊く。上限への再送は
         // **唯一絶対に効かない答え**で、しかも人が必要としている1文を沈黙に置き換える
         if !ev.session_id.is_empty() && self.turn_hit_usage_limit(&ev.session_id, key, ctx) {
+            self.settle_told(key);
             return;
         }
         // retry 級は「もう一度配達する」で晴れるもの。配達できたら何も投稿しない —
@@ -212,7 +213,17 @@ impl Bridge {
         {
             return;
         }
+        self.settle_told(key);
         self.post_error_frame(channel, thread_ts, text);
+    }
+
+    /// The person was told why this turn produced no reply — that is the thread's answer.
+    /// Settle it: otherwise the unanswered messages keep the silence watchdog armed and
+    /// "is thinking…" stays up on a turn that is already over.
+    fn settle_told(&mut self, key: &ThreadKey) {
+        // Dropping the entry clears the status (slack::Thinking's Drop)
+        self.stall.remove(key);
+        self.ledger.dispose_all(key);
     }
 
     /// このターンは「上限に当たった」で死んだのか(`turnHitUsageLimit`)。再送の**手前**で訊く —

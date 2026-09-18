@@ -1610,7 +1610,7 @@ mod tests {
     /// says the sign-in expired, re-sending can't help: say so instead of "send it again".
     #[tokio::test]
     async fn a_signed_out_agent_is_reported_not_retried() {
-        let (d, slack, agent, _clock) = flow_deps("signed-out");
+        let (d, slack, agent, clock) = flow_deps("signed-out");
         let (mut b, _fx) = Bridge::for_test(d);
         let sid = running_thread(&mut b, &agent).await;
         *agent.failure_type.lock().unwrap() = Some("authentication_failed");
@@ -1636,6 +1636,17 @@ mod tests {
             "{:?}",
             slack.calls()
         );
+        // Telling the person is the answer: the thread settles, and the silence watchdog
+        // doesn't put "is thinking…" back on a turn that is already over
+        assert!(b.ledger.pending(&ThreadKey::new("C1", ROOT)).is_empty());
+        clock.advance(slack::SILENCE_MS + 1);
+        b.stall_tick();
+        settle().await;
+        let thinking = format!("status C1 {ROOT} {}", slack::THINKING_STATUS);
+        assert!(!slack.calls().contains(&thinking), "{:?}", slack.calls());
+        // …and the status that was up ("is typing…" from the delivery) is cleared
+        let last_status = slack.calls().into_iter().rev().find(|c| c.starts_with("status C1"));
+        assert_eq!(last_status, Some(format!("status C1 {ROOT} ")), "{:?}", slack.calls());
     }
 
     #[tokio::test]
