@@ -20,7 +20,7 @@ use crate::agent::{
 use crate::bridge::command::{Cmd, PwdMode, RestartPhase};
 use crate::bridge::state as bridge;
 use crate::bridge::state::{
-    Action, Disposition, GateVerdict, InboundMsg, LogCtx, PoolKey, ThreadKey,
+    Dispatch, Disposition, GateVerdict, InboundMsg, LogCtx, PoolKey, ThreadKey,
 };
 use crate::slack::SlackOps;
 use crate::{mcp, slack};
@@ -666,8 +666,8 @@ impl Bridge {
         // 配達できたら沈黙見張りを起こす。`entry` の借用が生きているうちは `&mut self` を
         // 取れないので、match の外まで持ち出す
         let mut delivered = false;
-        match bridge::Action::decide(entry.as_ref(), state) {
-            Action::SpawnNew => {
+        match bridge::Dispatch::decide(entry.as_ref(), state) {
+            Dispatch::SpawnNew => {
                 let sid = SessionId::new().as_str().to_string();
                 let mut e = entry.unwrap_or_default();
                 e.agent_id = Some(sid.clone());
@@ -697,7 +697,7 @@ impl Bridge {
                 };
                 self.spawn_worker(&req, &key, &ctx(Some(&sid)), &sid);
             }
-            Action::SpawnResume(sid) => {
+            Dispatch::SpawnResume(sid) => {
                 let Some(mcp) = self.write_mcp(&sid, &ctx(Some(&sid))) else {
                     return;
                 };
@@ -714,7 +714,7 @@ impl Bridge {
                 };
                 self.spawn_worker(&req, &key, &ctx(Some(&sid)), &sid);
             }
-            Action::Deliver => {
+            Dispatch::Deliver => {
                 let sid = entry.as_ref().and_then(|e| e.agent_id.clone());
                 // 暖まっているワーカーには prefix 抜きの素の封筒(push と同じ形)
                 match self.tmux.deliver(&Window::of(&target), &envelope) {
@@ -754,7 +754,7 @@ impl Bridge {
                     }
                 }
             }
-            Action::Queue => {
+            Dispatch::Queue => {
                 self.pending
                     .entry(root_ts.clone())
                     .or_default()
@@ -3692,7 +3692,7 @@ impl Bridge {
             .window_of(&sid)
             .unwrap_or_else(|| SessionId::from(sid.clone()).window_name());
         match self.tmux.deliver(&Window::of(&target), envelope) {
-            // Action::Deliver と同型の配達記録。
+            // Dispatch::Deliver と同型の配達記録。
             // このパスは新規スレッドの割当てなので new は常に true
             Ok(()) => {
                 ctx.info(
@@ -3702,7 +3702,7 @@ impl Bridge {
                          thread={root_ts} new=true -> worker {channel}"
                     ),
                 );
-                // Action::Deliver と同じ — 渡した瞬間に shimmer を出す
+                // Dispatch::Deliver と同じ — 渡した瞬間に shimmer を出す
                 self.touch_thread(key, slack::TYPING_STATUS);
             }
             Err(e) => ctx.error("bridge", &format!("delivery failed: {e}")),
@@ -4007,7 +4007,7 @@ impl Bridge {
             );
             return false;
         }
-        // 配達先は window_id を優先(窓名は改名されうる)— Action::Deliver と同じ引き方
+        // 配達先は window_id を優先(窓名は改名されうる)— Dispatch::Deliver と同じ引き方
         let target = sid
             .as_deref()
             .and_then(|s| self.workers.warm(s))

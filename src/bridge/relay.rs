@@ -18,7 +18,7 @@
 //! grep で確かめられたが、同じモジュールに入った今は、この並びとテストの回り方が代わりの担保。
 
 // ── 節1: プロトコル ─────────────────────────────────────
-pub mod link {
+pub mod wire {
     //! Relay ⇄ Bridge の link プロトコル — WebSocket に載るフレームと、どこへ dial すればいいかを
     //! 伝える接続文字列。純データだけで I/O を持たない(Relay と Bridge の**両方**が読む契約なので、
     //! どちらかの都合を1行でも混ぜたら二枚舌になる)。
@@ -440,7 +440,7 @@ pub mod link {
 }
 
 use crate::bridge::state::LogCtx;
-use link::LINK_SUBPROTOCOL;
+use wire::LINK_SUBPROTOCOL;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
@@ -527,10 +527,10 @@ impl Admit {
             return Admit::Unauthorized;
         }
         // ③ ここでようやく名前を読む。到達確認は名前を名乗らない(専用のパス)。
-        if path == link::PROBE_PATH {
+        if path == wire::PROBE_PATH {
             return Admit::Probe;
         }
-        match link::bridge_id_of_path(path) {
+        match wire::bridge_id_of_path(path) {
             Some(id) => Admit::Ok(id.to_string()),
             None => Admit::BadPath,
         }
@@ -565,8 +565,8 @@ impl Conn {
     }
 
     /// フレームを1本投げる。`false` = その link はもう死んでいる(受け手が落ちた)。
-    pub fn send(&self, frame: &link::LinkFrame) -> bool {
-        self.0.send(link::encode(frame)).is_ok()
+    pub fn send(&self, frame: &wire::LinkFrame) -> bool {
+        self.0.send(wire::encode(frame)).is_ok()
     }
 
     /// **同じ link か**(中身の等値ではなく同一性)。古い link の後始末が新しい登録を
@@ -670,7 +670,7 @@ impl LinkServer {
 
     /// 1本のマシンへフレームを投げる。`false` = そこには居なかった(表を引いてから投げるまでの
     /// 間に落ちた場合も含む)。**届いたふりをしない。**
-    pub fn send_to(&self, bridge_id: &str, frame: &link::LinkFrame) -> bool {
+    pub fn send_to(&self, bridge_id: &str, frame: &wire::LinkFrame) -> bool {
         let conn = self.bridges.lock().unwrap().get(bridge_id).cloned();
         conn.is_some_and(|c| c.send(frame))
     }
@@ -858,7 +858,7 @@ pub const NOTICE_COOLDOWN_MS: u64 = 60_000;
 
 /// 「いま言ってよいか」と「前に言ってから何本呑み込んだか」。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Notice {
+pub struct NoticeDecision {
     pub say: bool,
     pub swallowed: u32,
 }
@@ -876,19 +876,19 @@ impl NoticeCooldown {
         Self::default()
     }
 
-    pub fn take(&mut self, channel_id: &str, now_ms: u64) -> Notice {
+    pub fn take(&mut self, channel_id: &str, now_ms: u64) -> NoticeDecision {
         if let Some(last) = self.said_at.get(channel_id) {
             if now_ms.saturating_sub(*last) < NOTICE_COOLDOWN_MS {
                 let swallowed = self.held.entry(channel_id.to_string()).or_insert(0);
                 *swallowed += 1;
-                return Notice {
+                return NoticeDecision {
                     say: false,
                     swallowed: *swallowed,
                 };
             }
         }
         self.said_at.insert(channel_id.to_string(), now_ms);
-        Notice {
+        NoticeDecision {
             say: true,
             swallowed: self.held.remove(channel_id).unwrap_or(0),
         }
@@ -1226,7 +1226,7 @@ impl DmOnboardingCtx<'_> {
             None
         } else {
             Some(
-                link::decode_connection(text).is_ok_and(|c| secret_eq(&c.api_token, ctx.api_token)),
+                wire::decode_connection(text).is_ok_and(|c| secret_eq(&c.api_token, ctx.api_token)),
             )
         };
 
@@ -1563,7 +1563,7 @@ impl Fleet {
             self.presence.lock().await.on_connect(bridge_id);
         }
         // 受理の1本目 — bot トークンと、いまの home
-        let _ = conn.send(&link::LinkFrame::Ready {
+        let _ = conn.send(&wire::LinkFrame::Ready {
             bot_token: self.bot_token.clone(),
             home: self.home(),
         });
@@ -1779,7 +1779,7 @@ async fn bind_link_port(addr: std::net::SocketAddr, what: &str) -> Option<tokio:
 async fn serve_children_on(fleet: Arc<Fleet>, listener: tokio::net::TcpListener) {
     let app = Router::new()
         .route("/status", get(on_status))
-        .route(link::PROBE_PATH, get(on_upgrade))
+        .route(wire::PROBE_PATH, get(on_upgrade))
         .route("/bridge/{id}", get(on_upgrade))
         .with_state(fleet);
     if let Err(e) = axum::serve(listener, app).await {
@@ -1841,7 +1841,7 @@ impl Fleet {
                 }
             }
             Delivery::Forward(bridge_id) => {
-                let frame = link::LinkFrame::Event {
+                let frame = wire::LinkFrame::Event {
                     name: name.to_string(),
                     event: raw.clone(),
                 };
@@ -2038,7 +2038,7 @@ impl Fleet {
             SetHomeOutcome::Set(reply) => {
                 let home = channel.to_string();
                 self.edit_access(move |a| a.home_channel = Some(home)).await;
-                let frame = link::LinkFrame::Event {
+                let frame = wire::LinkFrame::Event {
                     name: "message".to_string(),
                     event: ev.raw.clone(),
                 };
@@ -2086,7 +2086,7 @@ impl Fleet {
         };
         let sent = self.links.send_to(
             bridge_id,
-            &link::LinkFrame::Linked {
+            &wire::LinkFrame::Linked {
                 owner_user_id: owner,
                 channel: channel.to_string(),
                 thread_ts: thread_ts.to_string(),
@@ -2121,7 +2121,7 @@ impl Fleet {
             Delivery::Forward(bridge_id) => {
                 let ok = self
                     .links
-                    .send_to(&bridge_id, &link::LinkFrame::Action { action, body });
+                    .send_to(&bridge_id, &wire::LinkFrame::Action { action, body });
                 rlog(
                     if ok { "debug" } else { "info" },
                     &format!(
@@ -2208,7 +2208,7 @@ impl Fleet {
     async fn dial_child_once(&self, bridge_id: &str, url: &str) -> Result<bool, &'static str> {
         use futures_util::SinkExt;
         // **鍵は1本。** どちらから dial しても同じ `AGENTGW_LINK_TOKEN` を見せる
-        let target = format!("{url}{}", link::path_for(&self.self_id));
+        let target = format!("{url}{}", wire::path_for(&self.self_id));
         let request = match crate::bridge::link::build_request(&target, &self.token) {
             Ok(r) => r,
             Err(e) => {
@@ -2322,7 +2322,7 @@ async fn on_parent_socket(inlet: Arc<Inlet>, parent_id: String, mut socket: WebS
                 break;
             }
         };
-        let Some(frame) = link::decode(&raw) else {
+        let Some(frame) = wire::decode(&raw) else {
             rlog("info", "dropped an unrecognised frame from the parent");
             continue;
         };
@@ -2338,7 +2338,7 @@ impl Inlet {
     /// 親を迎える口を開ける。**戻ってこない。**
     pub async fn serve(self: Arc<Self>, addr: std::net::SocketAddr) {
         let app = Router::new()
-            .route(link::PROBE_PATH, get(on_parent_upgrade))
+            .route(wire::PROBE_PATH, get(on_parent_upgrade))
             .route("/bridge/{id}", get(on_parent_upgrade))
             .with_state(self);
         let Some(listener) = bind_link_port(addr, "parent").await else {
@@ -2698,12 +2698,12 @@ mod tests {
     /// 到達確認は**通るが名乗らない**。認証は他と同じく通す必要がある。
     #[test]
     fn the_probe_path_is_admitted_without_a_name() {
-        assert_eq!(ok_admit(link::PROBE_PATH), Admit::Probe);
-        assert_eq!(ok_admit(link::PROBE_PATH).status(), None);
+        assert_eq!(ok_admit(wire::PROBE_PATH), Admit::Probe);
+        assert_eq!(ok_admit(wire::PROBE_PATH).status(), None);
         // 認証は素通しではない
         assert_eq!(
             Admit::of(
-                link::PROBE_PATH,
+                wire::PROBE_PATH,
                 Some("Bearer wrong"),
                 Some(LINK_SUBPROTOCOL),
                 TOKEN
@@ -2766,8 +2766,8 @@ mod tests {
         (Conn::new(tx), rx)
     }
 
-    fn ready() -> link::LinkFrame {
-        link::LinkFrame::Ready {
+    fn ready() -> wire::LinkFrame {
+        wire::LinkFrame::Ready {
             bot_token: "xoxb-1".into(),
             home: None,
         }
@@ -3071,21 +3071,21 @@ mod tests {
         let mut c = NoticeCooldown::new();
         assert_eq!(
             c.take("C1", 0),
-            Notice {
+            NoticeDecision {
                 say: true,
                 swallowed: 0
             }
         );
         assert_eq!(
             c.take("C1", 1_000),
-            Notice {
+            NoticeDecision {
                 say: false,
                 swallowed: 1
             }
         );
         assert_eq!(
             c.take("C1", 2_000),
-            Notice {
+            NoticeDecision {
                 say: false,
                 swallowed: 2
             }
@@ -3093,14 +3093,14 @@ mod tests {
         // 1分の境目
         assert_eq!(
             c.take("C1", 59_999),
-            Notice {
+            NoticeDecision {
                 say: false,
                 swallowed: 3
             }
         );
         assert_eq!(
             c.take("C1", 60_000),
-            Notice {
+            NoticeDecision {
                 say: true,
                 swallowed: 3
             }
@@ -3108,7 +3108,7 @@ mod tests {
         // 報告したら数え直し
         assert_eq!(
             c.take("C1", 120_000),
-            Notice {
+            NoticeDecision {
                 say: true,
                 swallowed: 0
             }
@@ -3132,7 +3132,7 @@ mod tests {
         c.delivered("C1");
         assert_eq!(
             c.take("C1", 200),
-            Notice {
+            NoticeDecision {
                 say: true,
                 swallowed: 0
             }
@@ -3472,7 +3472,7 @@ mod tests {
     // ── DM の名乗り ─────────────────────────────────────────────────────────
 
     fn conn_string() -> String {
-        link::encode_connection(&link::Invite {
+        wire::encode_connection(&wire::Invite {
             url: "wss://relay.example".into(),
             api_token: TOKEN.into(),
         })
@@ -3568,7 +3568,7 @@ mod tests {
 
     #[test]
     fn a_string_for_another_bot_is_refused() {
-        let other = link::encode_connection(&link::Invite {
+        let other = wire::encode_connection(&wire::Invite {
             url: "wss://relay.example".into(),
             api_token: "a-different-secret".into(),
         });

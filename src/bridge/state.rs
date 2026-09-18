@@ -1478,7 +1478,7 @@ pub enum WorkerState {
 ///
 /// スレッドの記録とワーカーの生死だけで決まる([`Action::decide`])。
 #[derive(PartialEq, Eq, Debug)]
-pub enum Action {
+pub enum Dispatch {
     SpawnNew,
     SpawnResume(String),
     Deliver,
@@ -1601,18 +1601,18 @@ impl RecentDeliveries {
 }
 
 /// entry 無し → SpawnNew / Ready → Deliver / Starting → Queue / Absent → SpawnResume。
-impl Action {
-    pub fn decide(entry: Option<&ThreadEntry>, worker: WorkerState) -> Action {
+impl Dispatch {
+    pub fn decide(entry: Option<&ThreadEntry>, worker: WorkerState) -> Dispatch {
         let Some(entry) = entry else {
-            return Action::SpawnNew;
+            return Dispatch::SpawnNew;
         };
         match worker {
-            WorkerState::Ready => Action::Deliver,
-            WorkerState::Starting => Action::Queue,
+            WorkerState::Ready => Dispatch::Deliver,
+            WorkerState::Starting => Dispatch::Queue,
             // 過去のセッションを知らない entry は再開できない → 新規で建てる
             WorkerState::Absent => match entry.agent_id.as_deref() {
-                Some(sid) => Action::SpawnResume(sid.to_string()),
-                None => Action::SpawnNew,
+                Some(sid) => Dispatch::SpawnResume(sid.to_string()),
+                None => Dispatch::SpawnNew,
             },
         }
     }
@@ -2350,18 +2350,18 @@ mod tests {
     #[test]
     fn decide_table() {
         let entry = ThreadEntry::new("C1", "sid-1");
-        assert_eq!(Action::decide(None, WorkerState::Absent), Action::SpawnNew);
+        assert_eq!(Dispatch::decide(None, WorkerState::Absent), Dispatch::SpawnNew);
         assert_eq!(
-            Action::decide(Some(&entry), WorkerState::Ready),
-            Action::Deliver
+            Dispatch::decide(Some(&entry), WorkerState::Ready),
+            Dispatch::Deliver
         );
         assert_eq!(
-            Action::decide(Some(&entry), WorkerState::Starting),
-            Action::Queue
+            Dispatch::decide(Some(&entry), WorkerState::Starting),
+            Dispatch::Queue
         );
         assert_eq!(
-            Action::decide(Some(&entry), WorkerState::Absent),
-            Action::SpawnResume("sid-1".into())
+            Dispatch::decide(Some(&entry), WorkerState::Absent),
+            Dispatch::SpawnResume("sid-1".into())
         );
     }
 
@@ -2369,8 +2369,8 @@ mod tests {
     fn decide_spawns_new_when_entry_has_no_session() {
         let entry = ThreadEntry::default();
         assert_eq!(
-            Action::decide(Some(&entry), WorkerState::Absent),
-            Action::SpawnNew
+            Dispatch::decide(Some(&entry), WorkerState::Absent),
+            Dispatch::SpawnNew
         );
     }
 

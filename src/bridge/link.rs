@@ -16,7 +16,7 @@
 //! 子がこれで5時間15分止まった。デプロイ中の一瞬の 401 で子が恒久的に上がってこなくなる。
 //! 直らない断りでも間を空けて繋ぎ直し続け、直された瞬間に自力で戻る。
 
-use crate::bridge::relay::link::{self, LinkFrame};
+use crate::bridge::relay::wire::{self, LinkFrame};
 use crate::bridge::state::LogCtx;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -208,9 +208,9 @@ pub enum FromRelay {
 
 /// 親から届いたフレームは、そのまま上流の知らせになる。**dial した側でも迎えられた側でも
 /// 同じ受け皿**に流すための橋(`Fatal` だけはこちら側の事情なので `From` に無い)。
-impl From<crate::bridge::relay::link::LinkFrame> for FromRelay {
-    fn from(frame: crate::bridge::relay::link::LinkFrame) -> Self {
-        use crate::bridge::relay::link::LinkFrame as F;
+impl From<crate::bridge::relay::wire::LinkFrame> for FromRelay {
+    fn from(frame: crate::bridge::relay::wire::LinkFrame) -> Self {
+        use crate::bridge::relay::wire::LinkFrame as F;
         match frame {
             F::Ready { bot_token, home } => FromRelay::Ready { bot_token, home },
             F::Event { name, event } => FromRelay::Event { name, event },
@@ -280,7 +280,7 @@ impl RelayLink {
 
     /// 1回の接続。`Ok(true)` = 握手まで通った(その後切れた)、`Ok(false)` = 繋がらなかった。
     async fn connect_once(&self, tx: &tokio::sync::mpsc::Sender<FromRelay>) -> Result<bool, Fatal> {
-        let target = format!("{}{}", self.url, link::path_for(&self.bridge_id));
+        let target = format!("{}{}", self.url, wire::path_for(&self.bridge_id));
         LogCtx::default().info(
             "bridge",
             &format!(
@@ -333,7 +333,7 @@ impl RelayLink {
                     break;
                 }
             };
-            let Some(frame) = link::decode(&raw) else {
+            let Some(frame) = wire::decode(&raw) else {
                 LogCtx::default().info(
                     "bridge",
                     &format!("remote link: dropped an unrecognised frame: {}", {
@@ -404,7 +404,7 @@ pub(crate) fn build_request(
     );
     headers.insert(
         "sec-websocket-protocol",
-        link::LINK_SUBPROTOCOL
+        wire::LINK_SUBPROTOCOL
             .parse()
             .map_err(|_| "the subprotocol can't go in a header".to_string())?,
     );
@@ -681,7 +681,7 @@ pub fn child_urls(raw: &str) -> Vec<(String, String)> {
 /// 3つを手で書かせるのは、間違いを作る機会が3回あるということ。接続文字列1本から起こす。
 /// `SLACK_APP_TOKEN` をコメントアウトするのが要 — 残っていると [`Mode::resolve`] が
 /// 起動を拒否する(そしてそれは正しい)。
-pub fn apply_connection(env_text: &str, conn: &link::Invite, bridge_id: &str) -> String {
+pub fn apply_connection(env_text: &str, conn: &wire::Invite, bridge_id: &str) -> String {
     // 直結の口を閉じる。**消さずにコメントにする** — 戻したくなる日のために
     let folded: Vec<String> = env_text
         .lines()
@@ -774,7 +774,7 @@ pub fn cli(args: &[String], dir: &crate::bridge::state::StateDir) -> i32 {
             return 2;
         }
     };
-    let conn = match link::decode_connection(&raw) {
+    let conn = match wire::decode_connection(&raw) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("link: {e}");
@@ -972,7 +972,7 @@ mod tests {
         assert_eq!(req.headers().get("authorization").unwrap(), "Bearer s3cret");
         assert_eq!(
             req.headers().get("sec-websocket-protocol").unwrap(),
-            link::LINK_SUBPROTOCOL
+            wire::LINK_SUBPROTOCOL
         );
     }
 
@@ -1204,8 +1204,8 @@ mod tests {
 
     // ── .env の書き換え ─────────────────────────────────────────────────────
 
-    fn conn() -> link::Invite {
-        link::Invite {
+    fn conn() -> wire::Invite {
+        wire::Invite {
             url: "wss://relay.example".into(),
             api_token: "s3cret".into(),
         }
@@ -1237,7 +1237,7 @@ mod tests {
         let once = apply_connection("", &conn(), "desktop");
         let twice = apply_connection(
             &once,
-            &link::Invite {
+            &wire::Invite {
                 url: "wss://new".into(),
                 api_token: "new".into(),
             },
@@ -1331,7 +1331,7 @@ mod tests {
         let l = RelayLink::new("wss://relay.example/", "tok", "desktop");
         assert_eq!(l.url, "wss://relay.example");
         assert_eq!(
-            format!("{}{}", l.url, link::path_for(&l.bridge_id)),
+            format!("{}{}", l.url, wire::path_for(&l.bridge_id)),
             "wss://relay.example/bridge/desktop"
         );
     }

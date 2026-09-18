@@ -164,7 +164,7 @@ pub fn tunnels_with(raw: &str, child: &str, target: Option<&str>) -> String {
 pub mod remote;
 
 use crate::bridge::relay::Cli as RelayCli;
-use crate::bridge::relay::link;
+use crate::bridge::relay::wire;
 use crate::bridge::state::StateDir;
 
 /// 子に送るブートストラップ。**バイナリに焼き込む** — release から入れた親には
@@ -172,7 +172,7 @@ use crate::bridge::state::StateDir;
 const INSTALL_SH: &str = include_str!("../scripts/install.sh");
 
 /// 親の口と鍵。無ければ作って `.env` に書き、鍵を新しく作ったときだけ restart する。
-pub struct Inlet {
+pub struct Listener {
     pub listen: String,
     pub token: String,
     pub name: String,
@@ -393,7 +393,7 @@ async fn add_child(target: &str, name: Option<&str>, from: Option<&str>) -> Resu
 
 /// 親の口と鍵。無ければ作って `.env` に書き、**鍵を新しく作ったときだけ**起こし直す
 /// (走っている Bridge は古い鍵を握ったままなので、子が来ても 401 になる)。
-fn ensure_inlet(dir: &StateDir) -> Result<Inlet, String> {
+fn ensure_inlet(dir: &StateDir) -> Result<Listener, String> {
     let env = RelayCli::env_of(dir);
     let listen = env
         .get("AGENTGW_LINK_LISTEN")
@@ -429,7 +429,7 @@ fn ensure_inlet(dir: &StateDir) -> Result<Inlet, String> {
         );
         crate::service::Service::run("restart", &[]);
     }
-    Ok(Inlet {
+    Ok(Listener {
         listen,
         token,
         name,
@@ -441,11 +441,11 @@ fn link_child(
     target: &str,
     child: &str,
     transport: &Transport,
-    inlet: &Inlet,
+    inlet: &Listener,
     state_prefix: &str,
     remote_bin: &str,
 ) -> Result<(), String> {
-    let conn = link::encode_connection(&link::Invite {
+    let conn = wire::encode_connection(&wire::Invite {
         url: dial_url(transport),
         api_token: inlet.token.clone(),
     });
@@ -551,7 +551,7 @@ pub async fn keep_tunnel(
 /// 親の `status` 口に「今つながっている子」を訊いて、名前が出るまで待つ。
 ///
 /// **これが通り道の判定**(probe ではなく本物の link が張れたか)。
-async fn wait_connected(inlet: &Inlet, child: &str) -> bool {
+async fn wait_connected(inlet: &Listener, child: &str) -> bool {
     for i in 0..10 {
         if i > 0 {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
