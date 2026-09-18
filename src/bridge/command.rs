@@ -1,6 +1,6 @@
 //! Bridge が自分だけで答える「本文コマンド」— その解釈と実行。
 //!
-//! 前半(節1〜7)は解釈: 移植元 604-794, 840-890, 1010-1049`(すべて純関数・I/O なし)。
+//! 前半は解釈(すべて純関数・I/O なし)。
 //! 後半(`// ── running commands ──`)は実行: 解釈したコマンドを `impl Bridge` で走らせる
 //! (`handle_command` が入口。サインイン・サインアウトの結末は `CmdFx` で main に戻す)。
 //!
@@ -16,10 +16,9 @@
 //! 1. 本文の読み方   `Message`(mention と不可視文字の除去はここだけ)
 //! 2. Slack の id    `SlackId`
 //! 3. コマンドの検出 `Cmd` / `PwdMode` / `OwnerCmd` — 素のワードの語彙は `Cmd::WORDS` 1枚
-//! 4. 壁時計         `WallClock`(暦の計算・時刻のパースは全部ここ)
-//! 6. 上限の見張り   `UsageWatch` / `LimitHit`
-//! 7. ツール許可     `ToolPermission`
-//! 8. 実行           `impl Bridge`(`handle_command` / `user_*` / `owner_command` / サインイン)
+//! 4. 上限の見張り   `UsageWatch`(時刻の読み書きは `state::WallClock`)
+//! 5. ツール許可     `ToolPermission`
+//! 6. 実行           `SignIn` と `impl Bridge`(`handle_command` / `user_*` / `owner_command` / サインイン)
 
 use crate::bridge::state::WallClock;
 
@@ -452,7 +451,7 @@ const EFFORT_LEVELS: [&str; 7] = ["low", "medium", "high", "xhigh", "max", "ultr
 /// `bypass` / `don't ask` は設定でしか入らず、Slack から踏ませたいものでもない。
 const MODE_NAMES: [&str; 4] = ["manual", "plan", "edit", "auto"];
 
-// ── 節6: 上限の見張り───────────
+// ── 節4: 上限の見張り ──────────────────────────────────────────────────────
 
 /// `/usage` を定期的に読んで、上限が近い/当たったことに気づく側の判断。
 ///
@@ -491,7 +490,7 @@ impl UsageWatch {
 }
 
 
-// ── 節7: ツール許可 — 人に訊く前に効く常設の規則 ─────────
+// ── 節5: ツール許可 — 人に訊く前に効く常設の規則 ─────────
 // 人に訊くべきツールだけを人に訊くための門番。**これが無いと**ワーカーは自分の返信ツール
 // (`reply`)の許可を人に訊きにいく = 「Slack で答えてよいか」を Slack で訊くことになり、
 // 誰も押さないまま止まる。
@@ -565,6 +564,17 @@ impl ToolPermission {
     }
 }
 
+/// サインイン・サインアウトの進行状態。触るのはこのファイルだけ。
+#[derive(Default)]
+pub(super) struct SignIn {
+    /// コード待ちのサインイン: channel → その sign-in を始めた人。**同時に1本だけ**
+    /// (login セッションは1つ — 2本目を通すと後から来たコードで先の人が Owner になる)
+    pending: HashMap<String, String>,
+    /// サインアウトが走っているか。`logout` の2連打で `claude auth logout` が2回走り、
+    /// 2本目の teardown が1本目の後始末と噛み合わなくなるのを防ぐ
+    signing_out: bool,
+}
+
 // ── running commands ─────────────────────────────────────────────────────────
 
 /// セッションの無いスレッドに返す1行(全コマンド共通)。
@@ -579,7 +589,7 @@ fn no_session() -> String {
 ///
 /// サインイン・サインアウトは spawn したタスクの中で何十秒も走る(ブラウザの往復を待つ)ので、
 /// 状態の書換えは main ループに**戻して**やる — tmux とポーリングはタスク、access.json と
-/// login_pending は main、と持ち場を割る(dispo_rx と同じ形)。
+/// サインインの状態(`SignIn`)は main、と持ち場を割る(dispo_rx と同じ形)。
 pub(super) enum CmdFx {
     /// サインインの結末。成否どちらでも login セッションを畳んで pending の席を空ける
     /// (**始まり**は main が同期で登録する — 席取りを spawn に任せると2本目に奪われる)。
@@ -1807,7 +1817,7 @@ impl Bridge {
     pub(super) fn login_carve_out(&mut self, msg: &InboundMsg) -> bool {
         let dm = msg.channel_kind == inbound::ChannelKind::Dm;
         let sender = msg.user.as_deref().unwrap_or("");
-        let pending = self.login_pending.get(&msg.channel).cloned();
+        let pending = self.sign_in.pending.get(&msg.channel).cloned();
         if !dm && pending.as_deref() != Some(sender) {
             return false; // 通りすがりはこの枝の外 — 普通に gate へ落とす
         }
@@ -1869,7 +1879,7 @@ impl Bridge {
         // 別チャンネルの2本目にセッションを作り直させると、1人目のポーリングが2人目の pane を
         // 読み、2人目の成功で**1人目**が Owner になる(他人の認証への相乗り)。同じチャンネルの
         // 撃ち直しは自分の流れをやり直すだけなので通す
-        if let Some(other) = self.login_pending.keys().find(|k| **k != channel) {
+        if let Some(other) = self.sign_in.pending.keys().find(|k| **k != channel) {
             ctx.info(
                 "bridge",
                 &format!(
@@ -1897,7 +1907,7 @@ impl Bridge {
         // 1本目の pane を奪う。席は成否どちらでも LoginFinished が外す。
         // 代償: URL が届くまでの間にこのチャンネルへ来た1通はコード扱いになり失敗の返事になる
         // (Owner は `login` を撃ち直せばよい)
-        self.login_pending.insert(channel.clone(), user.clone());
+        self.sign_in.pending.insert(channel.clone(), user.clone());
         let (api, cmd_tx, home) = (self.deps.slack.clone(), self.cmd_tx.clone(), Host::home());
         // サインインは URL を出してからコードを待つ数十秒 — その間ずっと shimmer を出す
         let thinking = slack::Thinking::new(self.deps.slack.clone(), &channel, &reply_ts, &slack::Status::Login.text());
@@ -2055,7 +2065,7 @@ impl Bridge {
     fn user_logout(&mut self, channel: &str, root_ts: &str) {
         // restart の札と違ってこれは**本当に効く** — user_logout は spawn を撒いてすぐ返るので、
         // `claude auth logout` が走っている数秒の間に2通目の logout が届きうる
-        if self.signing_out {
+        if self.sign_in.signing_out {
             LogCtx {
                 session_id: None,
                 thread_key: Some(ThreadKey::new(channel, root_ts)),
@@ -2063,7 +2073,7 @@ impl Bridge {
             .info("bridge", "logout ignored — already signing out");
             return;
         }
-        self.signing_out = true;
+        self.sign_in.signing_out = true;
         // shimmer は `claude auth logout` が返るまで。この後のワーカー畳みは main 側
         // (CmdFx::LogoutFinished)なので、ここで持たせておけば **必ず** 消える
         let thinking = slack::Thinking::new(self.deps.slack.clone(), channel, root_ts, &slack::Status::Logout.text());
@@ -2114,7 +2124,7 @@ impl Bridge {
         match fx {
             CmdFx::LoginFinished { channel, bound } => {
                 self.deps.agent.login_kill();
-                self.login_pending.remove(&channel);
+                self.sign_in.pending.remove(&channel);
                 let Some(user) = bound else { return };
                 let mut access = self.access.clone();
                 access.owner.clone_from(&user);
@@ -2152,8 +2162,8 @@ impl Bridge {
                 let mut access = self.access.clone();
                 access.owner.clear();
                 self.adopt_access(access, &ctx);
-                self.login_pending.clear();
-                self.signing_out = false;
+                self.sign_in.pending.clear();
+                self.sign_in.signing_out = false;
                 ctx.info(
                     "bridge",
                     "logout: Owner cleared — bot is now Owner-less (login required)",

@@ -81,14 +81,10 @@ pub struct Bridge {
     started_at_ms: u64,
     /// spawn したサインイン・サインアウトが状態変更を戻してくる口。
     cmd_tx: mpsc::Sender<CmdFx>,
-    /// コード待ちのサインイン: channel → その sign-in を始めた人。**同時に1本だけ**
-    /// (login セッションは1つ — 2本目を通すと後から来たコードで先の人が Owner になる)
-    login_pending: HashMap<String, String>,
+    /// 進行中のサインイン・サインアウト([`command::SignIn`])。
+    sign_in: command::SignIn,
     /// 再起動を始めたか。exit(0) までの数百 ms を二重に走らせないための札
     restarting: bool,
-    /// サインアウトが走っているか。`logout` の2連打で `claude auth logout` が2回走り、
-    /// 2本目の teardown が1本目の後始末と噛み合わなくなるのを防ぐ
-    signing_out: bool,
     /// usage 上限のリセット時刻(epoch ms)。いまの時刻がこれを下回る間は新規配達を遮断する。
     /// 0 = ゲート開放。実際に埋めるのは定期ポーリング。
     limited_until_ms: u64,
@@ -151,9 +147,8 @@ impl Bridge {
             bot_user_id: config.bot_user_id,
             started_at_ms: config.started_at_ms,
             cmd_tx: config.cmd_tx,
-            login_pending: HashMap::new(),
+            sign_in: command::SignIn::default(),
             restarting: false,
-            signing_out: false,
             limited_until_ms: 0,
             usage_polled_at_ms: 0,
             usage_at_risk: false,
