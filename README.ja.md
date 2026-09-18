@@ -2,7 +2,7 @@
 
 <h1>agentgw</h1>
 
-<p><b>ホームラボのどのマシンでも、自分の Claude Code エージェントを、1つの Slack ボットから操る。</b></p>
+<p><b>自分のすべてのマシンの Claude Code の入り口を、Slack に。開けておく端末も、行き来する多重化ツールも要らない。</b></p>
 
 [![Release](https://img.shields.io/github/v/release/takashito/agentgw?style=flat-square&labelColor=black)](https://github.com/takashito/agentgw/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square&labelColor=black)](LICENSE)

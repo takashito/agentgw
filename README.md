@@ -2,7 +2,7 @@
 
 <h1>agentgw</h1>
 
-<p><b>Your own Claude Code agents, on every machine in your homelab — driven from one Slack bot.</b></p>
+<p><b>Slack as the front end for Claude Code on every machine you own — no terminals, no multiplexer to juggle.</b></p>
 
 [![Release](https://img.shields.io/github/v/release/takashito/agentgw?style=flat-square&labelColor=black)](https://github.com/takashito/agentgw/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square&labelColor=black)](LICENSE)
