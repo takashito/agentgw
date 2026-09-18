@@ -3,7 +3,7 @@
 //!
 //! 節の並び:
 //!
-//! 1. プロトコル(`mod link`)  フレーム / 接続文字列(`Invite`)/ subprotocol — 純データ
+//! 1. プロトコル(`mod wire`)  フレーム / 接続文字列(`Invite`)/ subprotocol — 純データ
 //! 2. 受け入れの判断           `Admit`
 //! 3. 接続簿                   `Conn` / `LinkServer`
 //! 4. 届いたものの読み方と行き先 `Event` / `Click` / `Delivery` / `NoticeCooldown`
@@ -1464,7 +1464,7 @@ pub fn format_fleet(
 // ── 節7: 親の口 ───────────────────────────────────────
 // ここから下は I/O。上の節(1〜6)が決めたことを配線して回すだけで、判断は1つも持たない。
 
-use crate::bridge::link as link_watch;
+use crate::bridge::machine as link_watch;
 use crate::bridge::inbound::InboundMsg;
 use crate::bridge::state::{Access, StateDir, now_ms};
 use crate::chat::slack::{FleetEvent, PermClick};
@@ -1994,11 +1994,11 @@ impl Fleet {
     /// 繋がったら [`LinkServer`] に登録するので、配達も presence も set-home の一斉配りも
     /// 子から dial された link と1行も変わらない扱いになる。
     async fn dial_child(self: Arc<Self>, bridge_id: String, url: String) {
-        let mut backoff = crate::bridge::link::RECONNECT_MIN_MS;
+        let mut backoff = crate::bridge::machine::RECONNECT_MIN_MS;
         loop {
             match self.dial_child_once(&bridge_id, &url).await {
                 // 握手が通った回。次の再接続は短い待ちから始めてよい
-                Ok(true) => backoff = crate::bridge::link::RECONNECT_MIN_MS,
+                Ok(true) => backoff = crate::bridge::machine::RECONNECT_MIN_MS,
                 Ok(false) => {}
                 Err(why) => {
                     // 話し合いでは解決しない断り。**ループで埋めない** — 1回、大きな声で
@@ -2010,7 +2010,7 @@ impl Fleet {
                 }
             }
             tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
-            backoff = (backoff * 2).min(crate::bridge::link::RECONNECT_MAX_MS);
+            backoff = (backoff * 2).min(crate::bridge::machine::RECONNECT_MAX_MS);
         }
     }
 
@@ -2019,7 +2019,7 @@ impl Fleet {
         use futures_util::SinkExt;
         // **鍵は1本。** どちらから dial しても同じ `AGENTGW_LINK_TOKEN` を見せる
         let target = format!("{url}{}", wire::path_for(&self.self_id));
-        let request = match crate::bridge::link::build_request(&target, &self.token) {
+        let request = match crate::bridge::machine::build_request(&target, &self.token) {
             Ok(r) => r,
             Err(e) => {
                 rlog("error", &format!("dial {bridge_id}: {e}"));
@@ -2405,7 +2405,7 @@ impl Cli {
     /// `Wiring::resolve` が断る設定なら、その理由をそのまま出す — 起動できない Bridge の
     /// 理由をログを開かずに知れる唯一の場所になる。
     pub fn role_line(env: &HashMap<String, String>) -> String {
-        use crate::bridge::link::{Mode, Wiring};
+        use crate::bridge::machine::{Mode, Wiring};
         let wiring = match Wiring::resolve(|k| env.get(k).cloned()) {
             Ok(w) => w,
             Err(why) => {

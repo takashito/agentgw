@@ -118,7 +118,7 @@ pub fn dial_url(t: &Transport) -> String {
 /// **トンネルはゲートウェイの agentgw が自分で張る**(別サービスにしない — agentgw が動いている間だけ
 /// 繋がっていればよい)。起動時にこの一覧を読んで、マシンごとに ssh を1本ずつ見張る。
 pub fn tunnels_with(raw: &str, child: &str, target: Option<&str>) -> String {
-    let mut list: Vec<(String, String)> = crate::bridge::link::child_urls(raw)
+    let mut list: Vec<(String, String)> = crate::bridge::machine::child_urls(raw)
         .into_iter()
         .filter(|(id, _)| id != child)
         .collect();

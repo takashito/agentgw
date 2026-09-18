@@ -389,7 +389,7 @@ pub fn install(mac: bool, job: &Path, rest: &[String]) -> i32 {
 /// `.env` にゲートウェイへつなぐ設定を書き、**直結のトークンを畳む**。
 ///
 /// 3つを手で書かせるのは、間違いを作る機会が3回あるということ。接続文字列1本から起こす。
-/// `SLACK_APP_TOKEN` をコメントアウトするのが要 — 残っていると [`Mode::resolve`](crate::bridge::link::Mode::resolve) が
+/// `SLACK_APP_TOKEN` をコメントアウトするのが要 — 残っていると [`Mode::resolve`](crate::bridge::machine::Mode::resolve) が
 /// 起動を拒否する(そしてそれは正しい)。
 pub fn apply_connection(env_text: &str, conn: &wire::Invite, bridge_id: &str) -> String {
     // 直結の口を閉じる。**消さずにコメントにする** — 戻したくなる日のために
@@ -566,7 +566,7 @@ pub(crate) fn prompt_bridge_id() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::link::Mode;
+    use crate::bridge::machine::Mode;
 
     #[test]
     fn the_slack_app_link_carries_the_whole_manifest() {

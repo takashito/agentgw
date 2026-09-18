@@ -6,10 +6,10 @@
 //! [`inbound`](crate::bridge::inbound)(受信と門)/ [`turn`](crate::bridge::turn)(hook・ターン・許可・沈黙の見張り・進捗)/
 //! [`worker`](crate::bridge::worker)(エージェントの起動・在庫・回収)/ [`command`](crate::bridge::command)(コマンドの解釈と実行)。
 //! Slack に出す文面は [`render`]、ディスクに残る状態とログは [`state`]、
-//! ゲートウェイ側は [`gateway`]、マシン側の接続は [`link`]。
+//! ゲートウェイ側は [`gateway`]、マシン側の接続は [`machine`]。
 
 pub mod command;
-pub mod link;
+pub mod machine;
 pub mod gateway;
 pub mod inbound;
 pub mod render;
@@ -435,7 +435,7 @@ impl Bridge {
         }
         // 上流(直結か親経由か)と下流(子を迎えるか)。**両方揃った設定は起動しない**
         // (黙って両方繋ぐと Slack が負荷分散を始め、split-brain がそのまま戻る)
-        let wiring = link::Wiring::resolve(|k| std::env::var(k).ok())?;
+        let wiring = machine::Wiring::resolve(|k| std::env::var(k).ok())?;
         let mode = wiring.upstream.clone();
         LogCtx::default().info(
             "bridge",
@@ -451,14 +451,14 @@ impl Bridge {
         // Relay 経由では bot トークンが**握手で来る**ので、Api はその後にしか作れない。
         // ここが直結との唯一の順序の違い。
         let (bot_token, link_home, relay_rx) = match &mode {
-            link::Mode::Direct { bot_token, .. } => (bot_token.clone(), None, None),
-            link::Mode::Relay {
+            machine::Mode::Direct { bot_token, .. } => (bot_token.clone(), None, None),
+            machine::Mode::Relay {
                 url,
                 api_token,
                 bridge_id,
             } => {
                 let (tx, mut rx) = mpsc::channel(64);
-                let l = Arc::new(link::RelayLink::new(url, api_token, bridge_id));
+                let l = Arc::new(machine::RelayLink::new(url, api_token, bridge_id));
                 tokio::spawn({
                     let l = l.clone();
                     async move { l.run(tx).await }
@@ -466,7 +466,7 @@ impl Bridge {
                 // 最初の Ready が来るまでは Slack に何も書けない。**待つ**
                 let (token, home) = loop {
                     match rx.recv().await {
-                        Some(link::FromRelay::Ready { bot_token, home }) => {
+                        Some(machine::FromRelay::Ready { bot_token, home }) => {
                             break (bot_token, home);
                         }
                         // **握手を断られても落ちない。** 落ちると supervisor がすぐ起こし直し、
@@ -474,7 +474,7 @@ impl Bridge {
                         // unit を `failed` のまま置き去りにする — デプロイ中の一瞬の 401 で
                         // 子が恒久的に上がってこなくなる(2026-08-03、子が5時間15分停止)。
                         // `RelayLink::run` は間を空けて繋ぎ直し続けるので、ここでは待つ
-                        Some(link::FromRelay::Fatal(f)) => {
+                        Some(machine::FromRelay::Fatal(f)) => {
                             LogCtx::default().error(
                                 "bridge",
                                 &format!("remote link: {} — retrying until it is fixed", f.message()),
@@ -488,19 +488,19 @@ impl Bridge {
                 (token, home, Some(rx))
             }
             // 親が迎えに来る。**待つのは同じ** — 最初の Ready まで Slack には何も書けない
-            link::Mode::AwaitParent => {
+            machine::Mode::AwaitParent => {
                 let Some(listen) = wiring.inlet.clone() else {
                     return Err("AGENTGW_LINK_LISTEN is not set, so the gateway has nowhere to connect".into());
                 };
                 let (tx, mut rx) = mpsc::channel(64);
-                let inlet = Arc::new(link::GatewayInlet {
+                let inlet = Arc::new(machine::GatewayInlet {
                     token: listen.token,
                     tx,
                 });
                 tokio::spawn(inlet.serve(listen.addr));
                 let (token, home) = loop {
                     match rx.recv().await {
-                        Some(link::FromRelay::Ready { bot_token, home }) => {
+                        Some(machine::FromRelay::Ready { bot_token, home }) => {
                             break (bot_token, home);
                         }
                         Some(_) => continue,
@@ -579,7 +579,7 @@ impl Bridge {
         if let Some(fleet) = &fleet
             && let Ok(raw) = std::env::var("AGENTGW_CHILD_URLS")
         {
-            let targets = link::child_urls(&raw);
+            let targets = machine::child_urls(&raw);
             if !targets.is_empty() {
                 LogCtx::default().info(
                     "relay",
@@ -606,7 +606,7 @@ impl Bridge {
                 .ok()
                 .and_then(|l| l.rsplit(':').next().map(str::to_string))
                 .unwrap_or_else(|| "8787".to_string());
-            for (child, target) in link::child_urls(&raw) {
+            for (child, target) in machine::child_urls(&raw) {
                 tokio::spawn(gateway::keep_tunnel(
                     fleet.clone(),
                     child,
@@ -627,7 +627,7 @@ impl Bridge {
         });
 
         match (mode, relay_rx) {
-            (link::Mode::Direct { app_token, .. }, _) => {
+            (machine::Mode::Direct { app_token, .. }, _) => {
                 tokio::spawn(async move {
                     if let Err(e) = slack::Api::listen(&app_token, msg_tx, click_tx, fleet_tx).await
                     {
@@ -637,7 +637,7 @@ impl Bridge {
             }
             // 親経由(こちらから dial / 迎えに来てもらう のどちらでも)。**同じ2本に
             // 流し込む**ので、この下流は1行も変わらない
-            (link::Mode::Relay { .. } | link::Mode::AwaitParent, Some(mut rx)) => {
+            (machine::Mode::Relay { .. } | machine::Mode::AwaitParent, Some(mut rx)) => {
                 let dir2 = dir.clone();
                 let reload = reload_tx.clone();
                 let relink = relink_tx.clone();
@@ -647,7 +647,7 @@ impl Bridge {
                     }
                 });
             }
-            (link::Mode::Relay { .. } | link::Mode::AwaitParent, None) => {
+            (machine::Mode::Relay { .. } | machine::Mode::AwaitParent, None) => {
                 unreachable!("a machine behind a gateway always has a receiver")
             }
         }
@@ -877,7 +877,7 @@ fn adopt_home(dir: &bridge::StateDir, home: Option<String>) -> bool {
 }
 
 async fn pump_relay(
-    item: link::FromRelay,
+    item: machine::FromRelay,
     msg_tx: &mpsc::Sender<InboundMsg>,
     click_tx: &mpsc::Sender<slack::PermClick>,
     dir: &bridge::StateDir,
@@ -885,14 +885,14 @@ async fn pump_relay(
     relink: &mpsc::Sender<()>,
 ) {
     match item {
-        link::FromRelay::Event { name, event } => {
+        machine::FromRelay::Event { name, event } => {
             if let Some(msg) = slack::inbound_from_relay(&name, &event)
                 && msg_tx.send(msg).await.is_err()
             {
                 return;
             }
         }
-        link::FromRelay::Action { action, body } => {
+        machine::FromRelay::Action { action, body } => {
             if let Some(click) = slack::perm_click_from_relay(&action, &body)
                 && click_tx.send(click).await.is_err()
             {
@@ -901,7 +901,7 @@ async fn pump_relay(
         }
         // 握手のたびに来る。Relay が持っている home を、こちらの現在値に反映する
         // (`set-home` を聞き逃していたマシンが、繋ぎ直しで追いつく)
-        link::FromRelay::Ready { home, .. } => {
+        machine::FromRelay::Ready { home, .. } => {
             if adopt_home(dir, home) {
                 let _ = reload.send(()).await;
             }
@@ -911,7 +911,7 @@ async fn pump_relay(
         }
         // Owner がこのマシンを担当に決めた。**Owner を記録する** — Relay 経由の Bridge は
         // これが来るまで Slack 上の自分の身元を何も知らない
-        link::FromRelay::Linked {
+        machine::FromRelay::Linked {
             owner_user_id,
             channel,
             ..
@@ -932,7 +932,7 @@ async fn pump_relay(
         }
         // ここまで来たらリンクは諦めている。**ワーカーには触らない** — 走っているものは
         // 走り続ける。人が設定を直して再起動するまで、新しい Slack メッセージが来ないだけ
-        link::FromRelay::Fatal(f) => {
+        machine::FromRelay::Fatal(f) => {
             LogCtx::default().error("bridge", &format!("remote link: {} — no new messages will arrive (running workers keep going)", f.message()));
         }
     }
@@ -1052,7 +1052,7 @@ mod tests {
         let (relink_tx, _relink_rx) = mpsc::channel(4);
 
         pump_relay(
-            link::FromRelay::Linked {
+            machine::FromRelay::Linked {
                 owner_user_id: "U0OWNER".into(),
                 channel: "C1".into(),
                 thread_ts: "1.1".into(),
