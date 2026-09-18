@@ -152,9 +152,6 @@ const POOL_MCP_INIT_TIMEOUT_MS: u64 = 50_000;
 pub struct Bridge {
     /// The outside world: Slack, the agent, the clock and the state directory.
     deps: Deps,
-    // TODO(Task 12): `slack::Thinking` and `Api::post_now` still want the concrete Api.
-    // Once they take `ports::Slack`, this goes and `deps.slack` does the job.
-    slack_api: Arc<slack::Api>,
     access: bridge::Access,
     threads: bridge::Threads,
     /// cwd → 在庫に指名したセッション(pools.json)。**実体ではなく指名**なので Bridge を
@@ -228,8 +225,6 @@ struct Config {
     started_at_ms: u64,
     fleet: bool,
     cmd_tx: mpsc::Sender<CmdFx>,
-    // TODO(Task 12): goes away with `Bridge::slack_api`.
-    slack_api: Arc<slack::Api>,
 }
 
 impl Bridge {
@@ -243,7 +238,6 @@ impl Bridge {
             pools: bridge::Pools::load(&deps.dir),
             access: bridge::Access::load(&deps.dir),
             deps,
-            slack_api: config.slack_api,
             dedup: inbound::RecentDeliveries::new(),
             workers: worker::Workers::default(),
             pending: HashMap::new(),
@@ -280,7 +274,6 @@ impl Bridge {
             started_at_ms: deps.clock.now_ms(),
             fleet: false,
             cmd_tx,
-            slack_api: Arc::new(slack::Api::new("xoxb-test").expect("slack client")),
         };
         (Bridge::new(deps, config), cmd_rx)
     }
@@ -1475,7 +1468,7 @@ impl Bridge {
             // ここで guard を持っても set と clear が連続して飛ぶだけで一度も描画されない。
             // 実際に待つのは「返事が捌けるか30秒」を待つドレイン側(現行 Bun に原文なし)
             let thinking =
-                slack::Thinking::new(&self.slack_api, &msg.channel, root_ts, &slack::Status::Resume.text()); // TODO(Task 12)
+                slack::Thinking::new(self.deps.slack.clone(), &msg.channel, root_ts, &slack::Status::Resume.text());
             self.push_drain(key, sid, None, Some(thinking), ctx);
         }
     }
@@ -1671,13 +1664,13 @@ impl Bridge {
         );
         let argv = self.deps.agent.context_argv(&sid);
         let (api, channel, root, key) = (
-            self.slack_api.clone(), // TODO(Task 12): post_now
+            self.deps.slack.clone(),
             msg.channel.clone(),
             root_ts.to_string(),
             key.clone(),
         );
         let thinking =
-            slack::Thinking::new(&self.slack_api, &msg.channel, root_ts, &slack::Status::Context.text()); // TODO(Task 12)
+            slack::Thinking::new(self.deps.slack.clone(), &msg.channel, root_ts, &slack::Status::Context.text());
         let agent = self.deps.agent.clone();
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = クリア(probe が失敗しても消える)
@@ -1741,12 +1734,12 @@ impl Bridge {
         ctx.info("bridge", &format!("usage: probing /usage cwd={cwd}"));
         let argv = self.deps.agent.usage_argv();
         let (api, channel, root, key) = (
-            self.slack_api.clone(), // TODO(Task 12): post_now
+            self.deps.slack.clone(),
             msg.channel.clone(),
             root_ts.to_string(),
             key.clone(),
         );
-        let thinking = slack::Thinking::new(&self.slack_api, &msg.channel, root_ts, &slack::Status::Usage.text()); // TODO(Task 12)
+        let thinking = slack::Thinking::new(self.deps.slack.clone(), &msg.channel, root_ts, &slack::Status::Usage.text());
         let agent = self.deps.agent.clone();
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = クリア
@@ -1899,12 +1892,12 @@ impl Bridge {
             }
         };
         let (api, channel, root, key) = (
-            self.slack_api.clone(), // TODO(Task 12): post_now
+            self.deps.slack.clone(),
             msg.channel.clone(),
             root_ts.to_string(),
             key.clone(),
         );
-        let thinking = slack::Thinking::new(&self.slack_api, &msg.channel, root_ts, &slack::Status::Model.text()); // TODO(Task 12)
+        let thinking = slack::Thinking::new(self.deps.slack.clone(), &msg.channel, root_ts, &slack::Status::Model.text());
         let agent = self.deps.agent.clone();
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = クリア(TUI が確定しなくても消える)
@@ -2014,7 +2007,7 @@ impl Bridge {
             }
         };
         let (api, channel, root, key) = (
-            self.slack_api.clone(), // TODO(Task 12): post_now
+            self.deps.slack.clone(),
             msg.channel.clone(),
             root_ts.to_string(),
             key.clone(),
@@ -2032,7 +2025,7 @@ impl Bridge {
             ));
             return;
         };
-        let thinking = slack::Thinking::new(&self.slack_api, &msg.channel, root_ts, &slack::Status::Effort.text()); // TODO(Task 12)
+        let thinking = slack::Thinking::new(self.deps.slack.clone(), &msg.channel, root_ts, &slack::Status::Effort.text());
         let agent = self.deps.agent.clone();
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = クリア
@@ -2087,12 +2080,12 @@ impl Bridge {
             return;
         };
         let (api, channel, root, key) = (
-            self.slack_api.clone(), // TODO(Task 12): post_now
+            self.deps.slack.clone(),
             msg.channel.clone(),
             root_ts.to_string(),
             key.clone(),
         );
-        let thinking = slack::Thinking::new(&self.slack_api, &msg.channel, root_ts, &slack::Status::Mode.text()); // TODO(Task 12)
+        let thinking = slack::Thinking::new(self.deps.slack.clone(), &msg.channel, root_ts, &slack::Status::Mode.text());
         let agent = self.deps.agent.clone();
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = クリア
@@ -2153,7 +2146,7 @@ impl Bridge {
             ),
         );
         let (api, channel, root, key) = (
-            self.slack_api.clone(), // TODO(Task 12): post_now
+            self.deps.slack.clone(),
             msg.channel.clone(),
             root_ts.to_string(),
             key.clone(),
@@ -2172,7 +2165,7 @@ impl Bridge {
             .collect();
         // 集計は permalink とチャンネル名の解決でスレッド数ぶん Slack を叩く — 待つ間の shimmer
         let thinking =
-            slack::Thinking::new(&self.slack_api, &msg.channel, root_ts, &slack::Status::Gathering.text()); // TODO(Task 12)
+            slack::Thinking::new(self.deps.slack.clone(), &msg.channel, root_ts, &slack::Status::Gathering.text());
         let (slack, clock) = (self.deps.slack.clone(), self.deps.clock.clone());
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = クリア。どの経路で抜けても消える
@@ -2526,9 +2519,9 @@ impl Bridge {
         // 代償: URL が届くまでの間にこのチャンネルへ来た1通はコード扱いになり失敗の返事になる
         // (Owner は `login` を撃ち直せばよい)
         self.login_pending.insert(channel.clone(), user.clone());
-        let (api, cmd_tx, home) = (self.slack_api.clone(), self.cmd_tx.clone(), Host::home()); // TODO(Task 12): post_now
+        let (api, cmd_tx, home) = (self.deps.slack.clone(), self.cmd_tx.clone(), Host::home());
         // サインインは URL を出してからコードを待つ数十秒 — その間ずっと shimmer を出す
-        let thinking = slack::Thinking::new(&self.slack_api, &channel, &reply_ts, &slack::Status::Login.text()); // TODO(Task 12)
+        let thinking = slack::Thinking::new(self.deps.slack.clone(), &channel, &reply_ts, &slack::Status::Login.text());
         // `thinking` は本文で触るので async move が丸ごと持っていく(どの経路で抜けても Drop = クリア)
         let agent = self.deps.agent.clone();
         tokio::spawn(async move {
@@ -2607,10 +2600,10 @@ impl Bridge {
             "bridge",
             &format!("login: submitting pasted code for {user} (channel {channel})"),
         );
-        let (api, cmd_tx) = (self.slack_api.clone(), self.cmd_tx.clone()); // TODO(Task 12): post_now
+        let (api, cmd_tx) = (self.deps.slack.clone(), self.cmd_tx.clone());
         // サインインの後半(貼られたコードの判定、最大 CODE_POLL_MAX 秒)も待ち時間 —
         // login_start の guard は URL を出した時点で落ちているので、ここで張り直す
-        let thinking = slack::Thinking::new(&self.slack_api, &channel, &reply_ts, &slack::Status::Login.text()); // TODO(Task 12)
+        let thinking = slack::Thinking::new(self.deps.slack.clone(), &channel, &reply_ts, &slack::Status::Login.text());
         let agent = self.deps.agent.clone();
         tokio::spawn(async move {
             let ctx = LogCtx::default();
@@ -2694,7 +2687,7 @@ impl Bridge {
         self.signing_out = true;
         // shimmer は `claude auth logout` が返るまで。この後のワーカー畳みは main 側
         // (CmdFx::LogoutFinished)なので、ここで持たせておけば **必ず** 消える
-        let thinking = slack::Thinking::new(&self.slack_api, channel, root_ts, &slack::Status::Logout.text()); // TODO(Task 12)
+        let thinking = slack::Thinking::new(self.deps.slack.clone(), channel, root_ts, &slack::Status::Logout.text());
         let (cmd_tx, channel, thread_ts) = (
             self.cmd_tx.clone(),
             channel.to_string(),
@@ -3050,7 +3043,7 @@ impl Bridge {
 
     fn post(&self, channel: &str, thread_ts: &str, text: String, key: &ThreadKey) {
         let (api, channel, thread_ts, key) = (
-            self.slack_api.clone(), // TODO(Task 12): post_now
+            self.deps.slack.clone(),
             channel.to_string(),
             thread_ts.to_string(),
             key.clone(),
@@ -4133,7 +4126,7 @@ impl Bridge {
     /// 通す(消えた根に `thread_ts` 付きで投げると Slack がチャンネル直下に落とす)。
     /// 呼び手は待たない — probe は数秒かかることがあり、main ループを吊ってはならない。
     fn post_error_frame(&self, channel: String, thread_ts: String, text: String) {
-        let api = self.slack_api.clone(); // TODO(Task 12): post_now
+        let api = self.deps.slack.clone();
         tokio::spawn(async move {
             let key = ThreadKey::new(&channel, &thread_ts);
             let ctx = LogCtx {
@@ -4179,7 +4172,7 @@ impl Bridge {
                     last_activity_ms: 0,
                     shown: false,
                     awaiting_perm: false,
-                    thinking: slack::Thinking::new(&self.slack_api, &channel, &ts, ""), // TODO(Task 12)
+                    thinking: slack::Thinking::new(self.deps.slack.clone(), &channel, &ts, ""),
                 })
             }
         };
@@ -5350,14 +5343,14 @@ impl Bridge {
         // 起動通知(online)は最初から親と同じチャンネルに出る
         adopt_home(&dir, link_home);
 
-        let api = Arc::new(slack::Api::new(&bot_token)?);
+        let api: ports::Slack = Arc::new(slack::Api::new(&bot_token)?);
         let (hook_tx, mut hook_rx) = mpsc::channel(64);
         let (dispo_tx, mut dispo_rx) = mpsc::channel(64);
         let (hook_port, hook_token) = HookIntake::serve(&dir, hook_tx.clone()).await?;
         let (mcp_port, mcp_token) = mcp::Mcp::serve(
             &dir,
             Arc::new(slack::ToolExec {
-                api: api.clone(),
+                slack: api.clone(),
                 state_dir: dir.path().to_path_buf(),
                 dispo: dispo_tx,
             }),
@@ -5526,7 +5519,6 @@ impl Bridge {
                 started_at_ms,
                 fleet: fleet.is_some(),
                 cmd_tx,
-                slack_api: api, // TODO(Task 12)
             },
         );
         // 前の Bridge が落ちる前に残した login セッションを掃く
@@ -5678,7 +5670,7 @@ impl Bridge {
     /// 素の `effort`。今の level を TUI に訊くのはエージェント側
     /// (`AgentPort::effort`)。ここは答えを1行にして投げるだけ。
     async fn run_effort_show(
-        api: Arc<slack::Api>, // TODO(Task 12)
+        api: ports::Slack,
         agent: ports::AgentRef,
         channel: String,
         root: String,

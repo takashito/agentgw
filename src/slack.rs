@@ -5,6 +5,7 @@ pub use sticky::{StickyAction, StickyBoard, ToolStatus};
 
 use crate::bridge::inbound::InboundMsg;
 use crate::bridge::state::{self as bridge_state, LogCtx, ThreadKey};
+use crate::ports::SlackPort;
 use slack_morphism::prelude::*;
 use std::sync::Arc;
 
@@ -914,7 +915,7 @@ impl Api {
 
     /// この bot 自身の user id(`U…`)と表示名。id は本文コマンドから自 mention を剥がすのに要り、
     /// 名前は home への起動通知に出す(生の `U…` は人が見て誰だか分からない。以前の実装は
-    /// `authResult.user` を出している)。`SlackApi` trait には載せない — 起動時に1回呼ぶだけ。
+    /// `authResult.user` を出している)。起動時に1回呼ぶだけ。
     pub async fn auth_test(&self) -> Result<(String, Option<String>), String> {
         self.client
             .open_session(&self.token)
@@ -1039,6 +1040,36 @@ impl Api {
         access.ack_reaction.as_deref().unwrap_or("eyes")
     }
 
+    /// TTL を過ぎた inbox のファイルを消す。
+    /// **全部 best-effort** — 読めない・消せない1件で掃除ごと止めない。
+    /// 境界(ちょうど TTL)は残す(現行と同じ厳密な `>`)。
+    pub fn sweep_inbox(inbox: &std::path::Path, now_ms: u64) {
+        let Ok(entries) = std::fs::read_dir(inbox) else {
+            return; // まだ作られていない / 読めない — 掃除するものが無い
+        };
+        let mut swept = 0usize;
+        for e in entries.flatten() {
+            let age = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| now_ms.saturating_sub(d.as_millis() as u64));
+            if age.is_some_and(|a| a > INBOX_TTL_MS) && std::fs::remove_file(e.path()).is_ok() {
+                swept += 1;
+            }
+        }
+        if swept > 0 {
+            LogCtx::default().info(
+                "download",
+                &format!("swept {swept} stale inbox file(s) (ttl {INBOX_TTL_MS}ms)"),
+            );
+        }
+    }
+}
+
+/// Helpers every Slack port gets, real or fake.
+impl dyn SlackPort {
     /// assistant ステータスを1本投げてログに残す。**best-effort, but never silent** —
     /// 成功も失敗も残す。呼び手を待たせないのは呼び手側の責任。
     pub async fn thinking(&self, channel: &str, thread_ts: &str, status: &str) {
@@ -1074,7 +1105,9 @@ impl Api {
             );
         }
     }
+}
 
+impl Api {
     /// 再起動の道中の Slack 1本を5秒で見切る。ここで投げるものはどれも「出れば嬉しい」飾りで、
     /// 1本の hang が marker 書きと exit(0) を止めてはならない(現行が allSettled で束ねているのと
     /// 同じ趣旨)。失敗も時間切れもログして続ける。
@@ -1120,98 +1153,6 @@ impl Api {
 pub const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 // ─── ワーカーの MCP ツール実行 ───────────────────────────────────────────────
-
-/// execute_tool が使う Slack 操作。実体は `Api`、テストは fake。
-pub trait SlackApi: Send + Sync {
-    fn post_message(
-        &self,
-        channel: &str,
-        text: &str,
-        thread_ts: Option<&str>,
-    ) -> impl Future<Output = Result<String, String>> + Send;
-    /// 標準 Markdown で投稿する(`markdown` ブロック)。ワーカーの返信の既定。
-    fn post_markdown(
-        &self,
-        channel: &str,
-        text: &str,
-        thread_ts: Option<&str>,
-    ) -> impl Future<Output = Result<String, String>> + Send;
-    /// 標準 Markdown で書き換える。付箋は通さない(手書き mrkdwn なので)。
-    fn update_markdown(
-        &self,
-        channel: &str,
-        ts: &str,
-        text: &str,
-    ) -> impl Future<Output = Result<(), String>> + Send;
-    fn add_reaction(
-        &self,
-        channel: &str,
-        ts: &str,
-        emoji: &str,
-    ) -> impl Future<Output = Result<(), String>> + Send;
-    fn remove_reaction(
-        &self,
-        channel: &str,
-        ts: &str,
-        emoji: &str,
-    ) -> impl Future<Output = Result<(), String>> + Send;
-    fn delete_message(
-        &self,
-        channel: &str,
-        ts: &str,
-    ) -> impl Future<Output = Result<(), String>> + Send;
-    fn update_message(
-        &self,
-        channel: &str,
-        ts: &str,
-        text: &str,
-    ) -> impl Future<Output = Result<(), String>> + Send;
-    fn history(
-        &self,
-        channel: &str,
-        limit: u16,
-    ) -> impl Future<Output = Result<Vec<FetchedMsg>, String>> + Send;
-    fn replies(
-        &self,
-        channel: &str,
-        thread_ts: &str,
-        limit: u16,
-    ) -> impl Future<Output = Result<Vec<FetchedMsg>, String>> + Send;
-    fn file_info(
-        &self,
-        file_id: &str,
-    ) -> impl Future<Output = Result<(String, String, u64), String>> + Send;
-    fn get_permalink(
-        &self,
-        channel: &str,
-        ts: &str,
-    ) -> impl Future<Output = Result<String, String>> + Send;
-    /// best-effort — 解決できなければ None。
-    fn channel_display_name(&self, channel: &str) -> impl Future<Output = Option<String>> + Send;
-    /// bot なら Some(B…)、人間なら None。
-    fn resolve_bot_id(
-        &self,
-        user_id: &str,
-    ) -> impl Future<Output = Result<Option<String>, String>> + Send;
-    fn download_to(
-        &self,
-        url: &str,
-        dest: &std::path::Path,
-    ) -> impl Future<Output = Result<(), String>> + Send;
-    fn upload_file(
-        &self,
-        channel: &str,
-        thread_ts: Option<&str>,
-        path: &std::path::Path,
-    ) -> impl Future<Output = Result<(), String>> + Send;
-    /// assistant ステータスを張る / 空文字で消す。best-effort — 呼び手は失敗で止まらない。
-    fn set_thinking_status(
-        &self,
-        channel: &str,
-        thread_ts: &str,
-        status: &str,
-    ) -> impl Future<Output = Result<(), String>> + Send;
-}
 
 /// 1ファイルあたりの上限(reply ツールスキーマの "max 50MB each" と同じ数値 — `endpoints.rs:130`)。
 pub const MAX_ATTACHMENT_BYTES: u64 = 50 * 1024 * 1024;
@@ -1342,7 +1283,7 @@ async fn notify(
 
 /// MCP 受け口に差す実体。
 pub struct ToolExec {
-    pub api: Arc<Api>,
+    pub slack: crate::ports::Slack,
     pub state_dir: std::path::PathBuf,
     /// disposition の通知先(受けて台帳を消すのは main)。
     pub dispo: tokio::sync::mpsc::Sender<bridge_state::Disposition>,
@@ -1355,88 +1296,10 @@ impl crate::mcp::ToolExecutor for ToolExec {
         tool: String,
         args: serde_json::Value,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
-        let (api, dir, dispo) = (self.api.clone(), self.state_dir.clone(), self.dispo.clone());
+        let (slack, dir, dispo) = (self.slack.clone(), self.state_dir.clone(), self.dispo.clone());
         Box::pin(async move {
-            api.execute_tool(&dir, &session_id, &tool, &args, &dispo)
-                .await
+            execute_tool(slack.as_ref(), &dir, &session_id, &tool, &args, &dispo).await
         })
-    }
-}
-
-impl SlackApi for Api {
-    async fn post_markdown(
-        &self,
-        channel: &str,
-        text: &str,
-        thread_ts: Option<&str>,
-    ) -> Result<String, String> {
-        Api::post_markdown(self, channel, text, thread_ts).await
-    }
-
-    async fn post_message(
-        &self,
-        channel: &str,
-        text: &str,
-        thread_ts: Option<&str>,
-    ) -> Result<String, String> {
-        Api::post_message(self, channel, text, thread_ts).await
-    }
-    async fn add_reaction(&self, channel: &str, ts: &str, emoji: &str) -> Result<(), String> {
-        Api::add_reaction(self, channel, ts, emoji).await
-    }
-    async fn remove_reaction(&self, channel: &str, ts: &str, emoji: &str) -> Result<(), String> {
-        Api::remove_reaction(self, channel, ts, emoji).await
-    }
-    async fn delete_message(&self, channel: &str, ts: &str) -> Result<(), String> {
-        Api::delete_message(self, channel, ts).await
-    }
-    async fn update_message(&self, channel: &str, ts: &str, text: &str) -> Result<(), String> {
-        Api::update_message(self, channel, ts, text).await
-    }
-    async fn update_markdown(&self, channel: &str, ts: &str, text: &str) -> Result<(), String> {
-        Api::update_markdown(self, channel, ts, text).await
-    }
-    async fn history(&self, channel: &str, limit: u16) -> Result<Vec<FetchedMsg>, String> {
-        Api::history(self, channel, limit).await
-    }
-    async fn replies(
-        &self,
-        channel: &str,
-        thread_ts: &str,
-        limit: u16,
-    ) -> Result<Vec<FetchedMsg>, String> {
-        Api::replies(self, channel, thread_ts, limit).await
-    }
-    async fn file_info(&self, file_id: &str) -> Result<(String, String, u64), String> {
-        Api::file_info(self, file_id).await
-    }
-    async fn get_permalink(&self, channel: &str, ts: &str) -> Result<String, String> {
-        Api::get_permalink(self, channel, ts).await
-    }
-    async fn channel_display_name(&self, channel: &str) -> Option<String> {
-        Api::channel_display_name(self, channel).await
-    }
-    async fn resolve_bot_id(&self, user_id: &str) -> Result<Option<String>, String> {
-        Api::resolve_bot_id(self, user_id).await
-    }
-    async fn download_to(&self, url: &str, dest: &std::path::Path) -> Result<(), String> {
-        Api::download_to(self, url, dest).await
-    }
-    async fn upload_file(
-        &self,
-        channel: &str,
-        thread_ts: Option<&str>,
-        path: &std::path::Path,
-    ) -> Result<(), String> {
-        Api::upload_file(self, channel, thread_ts, path).await
-    }
-    async fn set_thinking_status(
-        &self,
-        channel: &str,
-        thread_ts: &str,
-        status: &str,
-    ) -> Result<(), String> {
-        Api::set_thinking_status(self, channel, thread_ts, status).await
     }
 }
 
@@ -1482,7 +1345,7 @@ impl crate::ports::SlackPort for Api {
         Api::remove_reaction(self, channel, ts, emoji).await
     }
     async fn flip_to_received(&self, channel: &str, message_ts: &str, ack: &str) {
-        SlackOps::flip_to_received(self, channel, message_ts, ack).await
+        flip_to_received(self, channel, message_ts, ack).await
     }
     async fn post_perm_prompt(
         &self,
@@ -1543,7 +1406,7 @@ impl crate::ports::SlackPort for Api {
         file_id: &str,
         state_dir: &std::path::Path,
     ) -> Result<String, String> {
-        SlackOps::download_attachment(self, file_id, state_dir).await
+        download_attachment(self, file_id, state_dir).await
     }
     async fn upload_file(
         &self,
@@ -1584,9 +1447,9 @@ impl crate::ports::SlackPort for Api {
 pub struct Thinking(tokio::sync::mpsc::UnboundedSender<String>);
 
 impl Thinking {
-    pub fn new(api: &Arc<Api>, channel: &str, thread_ts: &str, status: &str) -> Self {
+    pub fn new(api: crate::ports::Slack, channel: &str, thread_ts: &str, status: &str) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let (api, channel, thread_ts) = (api.clone(), channel.to_string(), thread_ts.to_string());
+        let (channel, thread_ts) = (channel.to_string(), thread_ts.to_string());
         tokio::spawn(async move {
             while let Some(s) = rx.recv().await {
                 api.thinking(&channel, &thread_ts, &s).await;
@@ -1614,412 +1477,376 @@ impl Drop for Thinking {
     }
 }
 
-/// `SlackApi` を実装したものが**そのまま**持つ振る舞い。fake api でも同じ道を通る。
-///
-/// `async fn` を trait に置くと呼び手が `Send` を要求できない、という lint が出るが、
-/// ここの実装は具体型(`Api` / テストの fake)しか無く、`tokio::spawn` へ渡す経路
-/// (`ToolExec::execute` の Box<dyn Future + Send>)は実際に Send を満たしてコンパイルが通る。
-/// dyn で使い回す予定も無いので、`Pin<Box<dyn Future>>` の手書きは足さない。
-#[allow(async_fn_in_trait)]
-pub trait SlackOps: SlackApi + Sync {
-    /// 添付を**投稿前に**まとめて検証する。1つでも読めない・
-    /// 大きすぎるものがあれば、テキストも含めて何も投稿しないための門番。
-    fn check_attachment_sizes(paths: &[String], max_bytes: u64) -> Result<(), String> {
-        for p in paths {
-            let meta = std::fs::metadata(p).map_err(|e| format!("file not found: {p} ({e})"))?;
-            if meta.len() > max_bytes {
-                return Err(format!(
-                    "file too large: {p} ({:.1}MB, max {}MB)",
-                    meta.len() as f64 / 1024.0 / 1024.0,
-                    max_bytes / 1024 / 1024
-                ));
-            }
-        }
-        Ok(())
-    }
-    /// 根が消えたスレッドか(`probeThreadRoot`)。判断できないときは「生きている」に倒す —
-    /// 分からないことを理由に返信を握りつぶさない。
-    async fn root_gone(&self, channel: &str, thread_ts: &str) -> bool {
-        match self.replies(channel, thread_ts, 1).await {
-            Ok(msgs) => msgs.is_empty(),
-            Err(e) => e.contains("thread_not_found") || e.contains("message_not_found"),
-        }
-    }
+// ── What the worker's MCP tools do, written once against `SlackPort` ──
 
-    /// 長い本文を分けて投げる。返すのは**最初の**投稿の ts(以後の断片は続きとして並ぶ)。
-    /// 上限と切り方は access.json で変えられる(`textChunkLimit` / `chunkMode`)。
-    async fn post_chunked(
-        &self,
-        state_dir: &std::path::Path,
-        channel: &str,
-        text: &str,
-        thread_ts: Option<&str>,
-        markdown: bool,
-    ) -> Result<String, String> {
-        let a = bridge_state::Access::load(&bridge_state::StateDir::at(state_dir));
-        let limit = a
-            .text_chunk_limit
-            .unwrap_or(MAX_CHUNK_LIMIT)
-            .clamp(1, MAX_CHUNK_LIMIT);
-        let mut first: Option<String> = None;
-        // 分割は Markdown でも同じ。長い表が途中で切れると2通目の頭が表に見えなくなるが、
-        // 分けずに投げると Slack が本文ごと弾く — 弾かれるよりは切れる方がまし
-        for part in chunk(text, limit, a.chunk_mode.as_deref() == Some("newline")) {
-            let ts = if markdown {
-                self.post_markdown(channel, &part, thread_ts).await?
-            } else {
-                self.post_message(channel, &part, thread_ts).await?
-            };
-            first.get_or_insert(ts);
-        }
-        first.ok_or_else(|| "nothing to post".to_string())
-    }
-
-    /// file_id → inbox に落としたローカルパス。MCP の `download_attachment` ツールと、
-    /// 受信時の先読みダウンロードが共有する(保存先の作法と上限判定を1箇所に置くため)。
-    async fn download_attachment(
-        &self,
-        file_id: &str,
-        state_dir: &std::path::Path,
-    ) -> Result<String, String> {
-        let (url, name, size) = self.file_info(file_id).await?;
-        if size > MAX_ATTACHMENT_BYTES {
-            // 文言は原文コピー
+/// 添付を**投稿前に**まとめて検証する。1つでも読めない・
+/// 大きすぎるものがあれば、テキストも含めて何も投稿しないための門番。
+fn check_attachment_sizes(paths: &[String], max_bytes: u64) -> Result<(), String> {
+    for p in paths {
+        let meta = std::fs::metadata(p).map_err(|e| format!("file not found: {p} ({e})"))?;
+        if meta.len() > max_bytes {
             return Err(format!(
-                "file too large: {:.1}MB, max 50MB",
-                size as f64 / 1024.0 / 1024.0
+                "file too large: {p} ({:.1}MB, max {}MB)",
+                meta.len() as f64 / 1024.0 / 1024.0,
+                max_bytes / 1024 / 1024
             ));
         }
-        let dest = state_dir
-            .join("inbox")
-            .join(Api::attachment_file_name(file_id, &name));
-        if let Some(p) = dest.parent() {
-            std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
-        }
-        self.download_to(&url, &dest).await?;
-        // 掃除は**書けた後**に相乗りさせる。専用のタイマーを増やさないためと、
-        // 掃除で落ちてもこのダウンロードには影響させないため(いま書いた物は mtime が今なので
-        // 対象にならない)
-        Api::sweep_inbox(&state_dir.join("inbox"), crate::bridge::Host::now_ms());
-        Ok(dest.to_string_lossy().to_string())
     }
+    Ok(())
+}
+/// 根が消えたスレッドか(`probeThreadRoot`)。判断できないときは「生きている」に倒す —
+/// 分からないことを理由に返信を握りつぶさない。
+pub async fn root_gone(slack: &dyn SlackPort, channel: &str, thread_ts: &str) -> bool {
+    match slack.replies(channel, thread_ts, 1).await {
+        Ok(msgs) => msgs.is_empty(),
+        Err(e) => e.contains("thread_not_found") || e.contains("message_not_found"),
+    }
+}
 
-    /// TTL を過ぎた inbox のファイルを消す。
-    /// **全部 best-effort** — 読めない・消せない1件で掃除ごと止めない。
-    /// 境界(ちょうど TTL)は残す(現行と同じ厳密な `>`)。
-    fn sweep_inbox(inbox: &std::path::Path, now_ms: u64) {
-        let Ok(entries) = std::fs::read_dir(inbox) else {
-            return; // まだ作られていない / 読めない — 掃除するものが無い
+/// 長い本文を分けて投げる。返すのは**最初の**投稿の ts(以後の断片は続きとして並ぶ)。
+/// 上限と切り方は access.json で変えられる(`textChunkLimit` / `chunkMode`)。
+pub async fn post_chunked(
+    slack: &dyn SlackPort,
+    state_dir: &std::path::Path,
+    channel: &str,
+    text: &str,
+    thread_ts: Option<&str>,
+    markdown: bool,
+) -> Result<String, String> {
+    let a = bridge_state::Access::load(&bridge_state::StateDir::at(state_dir));
+    let limit = a
+        .text_chunk_limit
+        .unwrap_or(MAX_CHUNK_LIMIT)
+        .clamp(1, MAX_CHUNK_LIMIT);
+    let mut first: Option<String> = None;
+    // 分割は Markdown でも同じ。長い表が途中で切れると2通目の頭が表に見えなくなるが、
+    // 分けずに投げると Slack が本文ごと弾く — 弾かれるよりは切れる方がまし
+    for part in chunk(text, limit, a.chunk_mode.as_deref() == Some("newline")) {
+        let ts = if markdown {
+            slack.post_markdown(channel, &part, thread_ts).await?
+        } else {
+            slack.post_message(channel, &part, thread_ts).await?
         };
-        let mut swept = 0usize;
-        for e in entries.flatten() {
-            let age = e
-                .metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| now_ms.saturating_sub(d.as_millis() as u64));
-            if age.is_some_and(|a| a > INBOX_TTL_MS) && std::fs::remove_file(e.path()).is_ok() {
-                swept += 1;
-            }
-        }
-        if swept > 0 {
-            LogCtx::default().info(
-                "download",
-                &format!("swept {swept} stale inbox file(s) (ttl {INBOX_TTL_MS}ms)"),
-            );
+        first.get_or_insert(ts);
+    }
+    first.ok_or_else(|| "nothing to post".to_string())
+}
+
+/// file_id → inbox に落としたローカルパス。MCP の `download_attachment` ツールと、
+/// 受信時の先読みダウンロードが共有する(保存先の作法と上限判定を1箇所に置くため)。
+pub async fn download_attachment(
+    slack: &dyn SlackPort,
+    file_id: &str,
+    state_dir: &std::path::Path,
+) -> Result<String, String> {
+    let (url, name, size) = slack.file_info(file_id).await?;
+    if size > MAX_ATTACHMENT_BYTES {
+        // 文言は原文コピー
+        return Err(format!(
+            "file too large: {:.1}MB, max 50MB",
+            size as f64 / 1024.0 / 1024.0
+        ));
+    }
+    let dest = state_dir
+        .join("inbox")
+        .join(Api::attachment_file_name(file_id, &name));
+    if let Some(p) = dest.parent() {
+        std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
+    }
+    slack.download_to(&url, &dest).await?;
+    // 掃除は**書けた後**に相乗りさせる。専用のタイマーを増やさないためと、
+    // 掃除で落ちてもこのダウンロードには影響させないため(いま書いた物は mtime が今なので
+    // 対象にならない)
+    Api::sweep_inbox(&state_dir.join("inbox"), bridge_state::now_ms());
+    Ok(dest.to_string_lossy().to_string())
+}
+
+/// 配達済みの見た目に直す: ack と ⟳ を外して 🤖 を付ける。
+/// 全て best-effort — リアクションは台帳でなく観測シグナルなので、
+/// no_reaction / already_reacted で配達を失敗扱いにはしない。
+pub async fn flip_to_received(slack: &dyn SlackPort, channel: &str, message_ts: &str, ack: &str) {
+    let ctx = LogCtx {
+        session_id: None,
+        thread_key: Some(ThreadKey::new(channel, message_ts)),
+    };
+    for name in [ack, "arrows_counterclockwise"] {
+        if let Err(e) = slack.remove_reaction(channel, message_ts, name).await {
+            let m = format!("received-reaction remove '{name}' failed: {e}");
+            ctx.debug("bridge", &m);
         }
     }
-
-    /// 配達済みの見た目に直す: ack と ⟳ を外して 🤖 を付ける。
-    /// 全て best-effort — リアクションは台帳でなく観測シグナルなので、
-    /// no_reaction / already_reacted で配達を失敗扱いにはしない。
-    async fn flip_to_received(&self, channel: &str, message_ts: &str, ack: &str) {
-        let ctx = LogCtx {
-            session_id: None,
-            thread_key: Some(ThreadKey::new(channel, message_ts)),
-        };
-        for name in [ack, "arrows_counterclockwise"] {
-            if let Err(e) = self.remove_reaction(channel, message_ts, name).await {
-                let m = format!("received-reaction remove '{name}' failed: {e}");
-                ctx.debug("bridge", &m);
-            }
-        }
-        if let Err(e) = self.add_reaction(channel, message_ts, "robot_face").await {
-            ctx.debug("bridge", &format!("received-reaction add failed: {e}"));
-        }
+    if let Err(e) = slack.add_reaction(channel, message_ts, "robot_face").await {
+        ctx.debug("bridge", &format!("received-reaction add failed: {e}"));
     }
+}
 
-    /// ワーカーが呼んだツールを実行する。失敗は文字列で返し、必ずログにも出す。
-    ///
-    /// disposition(reply / react / no_reply / message_ids 付きの edit)は**ログに出して
-    /// `dispo` に流すだけ** — 台帳を消すのは Threads を持つ main 側(現行の
-    /// 「slack-action は通知、tracker は bridge」 同じ分担)。
-    async fn execute_tool(
-        &self,
-        state_dir: &std::path::Path,
-        session_id: &str,
-        tool: &str,
-        args: &serde_json::Value,
-        dispo: &tokio::sync::mpsc::Sender<bridge_state::Disposition>,
-    ) -> Result<String, String> {
-        let ctx = LogCtx {
-            session_id: Some(session_id.to_string()),
-            thread_key: None,
-        };
-        let s = |k: &str| args[k].as_str().unwrap_or_default().to_string();
-        let opt = |k: &str| args[k].as_str().map(str::to_string);
-        // 覆う受信 id。空は異常ではない(reply は UNSPECIFIED として通す)
-        let ids: Vec<String> = args["message_ids"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        // disposition ログの宛先。根が引けないものは session ログに落ちる(現行と同じ振り分け)
-        let dctx = |root: Option<&str>| LogCtx {
-            session_id: Some(session_id.to_string()),
-            thread_key: root.map(|t| ThreadKey::new(&s("channel_id"), t)),
-        };
-        let out = match tool {
-            "reply" => {
-                let files: Vec<String> = args["files"]
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let thread = opt("thread_ts");
-                // 根が消えたスレッドには投稿しない。**黙って捨てず**
-                // 台帳は覆う — 落ちたのではなく「出さないと決めた」記録を残す
-                if let Some(t) = thread.as_deref()
-                    && !s("channel_id").starts_with('D')
-                    && self.root_gone(&s("channel_id"), t).await
-                {
-                    let c = dctx(Some(t));
-                    c.info(
-                        "bridge",
-                        &format!(
-                            "disposition=reply-suppressed thread={t} covers=[{}] \
-                             (thread root deleted)",
-                            ids.join(",")
-                        ),
-                    );
-                    notify(
-                        dispo,
-                        bridge_state::Disposition {
-                            kind: "reply",
-                            channel_id: s("channel_id"),
-                            thread_ts: thread.clone(),
-                            message_ids: ids,
-                            session_id: session_id.to_string(),
-                        },
-                        &c,
-                    )
-                    .await;
-                    return Ok("reply suppressed: the thread root was deleted".to_string());
-                }
-                // 添付の検証はテキスト投稿より**前**— 1つでも
-                // 弾かれたらテキストも投稿しない
-                let posted = match Self::check_attachment_sizes(&files, MAX_ATTACHMENT_BYTES) {
-                    Err(e) => Err(e),
-                    // 長い本文は分けて投げる。分けないと Slack が本文ごと弾く
-                    Ok(()) => {
-                        self.post_chunked(
-                            state_dir,
-                            &s("channel_id"),
-                            &s("text"),
-                            thread.as_deref(),
-                            // **既定が Markdown**。mrkdwn に戻すのは `markdown: false` のときだけ
-                            args["markdown"].as_bool().unwrap_or(true),
-                        )
-                        .await
-                    }
-                };
-                async {
-                    let ts = posted?;
-                    // 1回に1ファイル・順番に(現行 Bun 版もループ)。
-                    // ここで落ちたときテキストだけ残るのは既知 — 現行にもフォールバックは無い
-                    for f in &files {
-                        self.upload_file(
-                            &s("channel_id"),
-                            thread.as_deref(),
-                            std::path::Path::new(f),
-                        )
-                        .await
-                        .map_err(|e| format!("text posted but attachment upload failed: {e}"))?;
-                    }
-                    // 投稿できたときだけ覆う — Slack が受けていない返信で台帳を消さない
-                    let c = dctx(thread.as_deref());
-                    c.info(
-                        "bridge",
-                        &format!(
-                            "disposition=reply thread={} covers=[{}]{}",
-                            thread.as_deref().unwrap_or("-"),
-                            ids.join(","),
-                            if ids.is_empty() { " (UNSPECIFIED)" } else { "" }
-                        ),
-                    );
-                    let d = bridge_state::Disposition {
+/// ワーカーが呼んだツールを実行する。失敗は文字列で返し、必ずログにも出す。
+///
+/// disposition(reply / react / no_reply / message_ids 付きの edit)は**ログに出して
+/// `dispo` に流すだけ** — 台帳を消すのは Threads を持つ main 側(現行の
+/// 「slack-action は通知、tracker は bridge」 同じ分担)。
+pub async fn execute_tool(
+    slack: &dyn SlackPort,
+    state_dir: &std::path::Path,
+    session_id: &str,
+    tool: &str,
+    args: &serde_json::Value,
+    dispo: &tokio::sync::mpsc::Sender<bridge_state::Disposition>,
+) -> Result<String, String> {
+    let ctx = LogCtx {
+        session_id: Some(session_id.to_string()),
+        thread_key: None,
+    };
+    let s = |k: &str| args[k].as_str().unwrap_or_default().to_string();
+    let opt = |k: &str| args[k].as_str().map(str::to_string);
+    // 覆う受信 id。空は異常ではない(reply は UNSPECIFIED として通す)
+    let ids: Vec<String> = args["message_ids"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    // disposition ログの宛先。根が引けないものは session ログに落ちる(現行と同じ振り分け)
+    let dctx = |root: Option<&str>| LogCtx {
+        session_id: Some(session_id.to_string()),
+        thread_key: root.map(|t| ThreadKey::new(&s("channel_id"), t)),
+    };
+    let out = match tool {
+        "reply" => {
+            let files: Vec<String> = args["files"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let thread = opt("thread_ts");
+            // 根が消えたスレッドには投稿しない。**黙って捨てず**
+            // 台帳は覆う — 落ちたのではなく「出さないと決めた」記録を残す
+            if let Some(t) = thread.as_deref()
+                && !s("channel_id").starts_with('D')
+                && root_gone(slack, &s("channel_id"), t).await
+            {
+                let c = dctx(Some(t));
+                c.info(
+                    "bridge",
+                    &format!(
+                        "disposition=reply-suppressed thread={t} covers=[{}] \
+                         (thread root deleted)",
+                        ids.join(",")
+                    ),
+                );
+                notify(
+                    dispo,
+                    bridge_state::Disposition {
                         kind: "reply",
                         channel_id: s("channel_id"),
                         thread_ts: thread.clone(),
                         message_ids: ids,
                         session_id: session_id.to_string(),
-                    };
-                    notify(dispo, d, &c).await;
-                    Ok(format!("posted ts={ts}"))
-                }
-                .await
+                    },
+                    &c,
+                )
+                .await;
+                return Ok("reply suppressed: the thread root was deleted".to_string());
             }
-            "react" => {
-                let (channel, message_ts, emoji) = (s("channel_id"), s("message_ts"), s("emoji"));
-                match self.add_reaction(&channel, &message_ts, &emoji).await {
-                    Err(e) => Err(e),
-                    Ok(()) => {
-                        // react の args は thread を運ばない。台帳の鍵は**配達時の根**なので
-                        // replies で引く。返信の ts で引くと先頭は
-                        // 親とは限らないので、**その ts でなく thread_ts** が根。
-                        // スレッド外(thread_ts 無し)なら message_ts 自身が根
-                        let root = match opt("thread_ts") {
-                            Some(t) => Some(t),
-                            None => match self.replies(&channel, &message_ts, 1).await {
-                                Ok(m) => Some(
-                                    m.first()
-                                        .and_then(|f| f.thread_ts.clone())
-                                        .unwrap_or_else(|| message_ts.clone()),
-                                ),
-                                // 引けなかったときだけ根が不明 — 撃たない
-                                Err(e) => {
-                                    let m = format!("react: thread-root lookup failed: {e}");
-                                    ctx.debug("bridge", &m);
-                                    None
-                                }
-                            },
-                        };
-                        let c = dctx(root.as_deref().or(Some(&message_ts)));
-                        let m = format!("disposition=react message_ts={message_ts} emoji={emoji}");
-                        c.info("bridge", &m);
-                        match root {
-                            Some(t) => {
-                                let d = bridge_state::Disposition {
-                                    kind: "react",
-                                    channel_id: channel,
-                                    thread_ts: Some(t),
-                                    message_ids: vec![message_ts],
-                                    session_id: session_id.to_string(),
-                                };
-                                notify(dispo, d, &c).await;
-                            }
-                            // 根が違えば別スレッドの台帳を誤射する — 撃たずに残す(best-effort)
-                            None => c.debug(
-                                "bridge",
-                                &format!(
-                                    "react: thread root unknown for message_ts={message_ts} \
-                                     — skipping disposition disarm (best-effort)"
-                                ),
-                            ),
-                        }
-                        Ok("reacted".to_string())
-                    }
+            // 添付の検証はテキスト投稿より**前**— 1つでも
+            // 弾かれたらテキストも投稿しない
+            let posted = match check_attachment_sizes(&files, MAX_ATTACHMENT_BYTES) {
+                Err(e) => Err(e),
+                // 長い本文は分けて投げる。分けないと Slack が本文ごと弾く
+                Ok(()) => {
+                    post_chunked(slack, 
+                        state_dir,
+                        &s("channel_id"),
+                        &s("text"),
+                        thread.as_deref(),
+                        // **既定が Markdown**。mrkdwn に戻すのは `markdown: false` のときだけ
+                        args["markdown"].as_bool().unwrap_or(true),
+                    )
+                    .await
                 }
-            }
-            "edit_message" => {
-                // reply と同じ既定にする。答えを「投稿」しても「編集で差し替え」ても
-                // 同じ見え方でなければ、書く側は使い分けを覚えなければならなくなる
-                let md = args["markdown"].as_bool().unwrap_or(true);
-                let edited = if md {
-                    self.update_markdown(&s("channel_id"), &s("message_ts"), &s("text"))
-                        .await
-                } else {
-                    self.update_message(&s("channel_id"), &s("message_ts"), &s("text"))
-                        .await
-                };
-                match edited {
-                    Err(e) => Err(e),
-                    Ok(()) => {
-                        // message_ids 付きの編集だけが「答え」。無ければ進捗編集で、
-                        // 台帳には触らない
-                        if !ids.is_empty() {
-                            let thread = opt("thread_ts");
-                            let c = dctx(thread.as_deref().or(ids.first().map(String::as_str)));
-                            c.info(
-                                "bridge",
-                                &format!(
-                                    "disposition=edit thread={} covers=[{}]",
-                                    thread.as_deref().unwrap_or("-"),
-                                    ids.join(",")
-                                ),
-                            );
-                            let d = bridge_state::Disposition {
-                                kind: "edit",
-                                channel_id: s("channel_id"),
-                                thread_ts: thread,
-                                message_ids: ids,
-                                session_id: session_id.to_string(),
-                            };
-                            notify(dispo, d, &c).await;
-                        }
-                        Ok("edited".to_string())
-                    }
+            };
+            async {
+                let ts = posted?;
+                // 1回に1ファイル・順番に(現行 Bun 版もループ)。
+                // ここで落ちたときテキストだけ残るのは既知 — 現行にもフォールバックは無い
+                for f in &files {
+                    slack.upload_file(
+                        &s("channel_id"),
+                        thread.as_deref(),
+                        std::path::Path::new(f),
+                    )
+                    .await
+                    .map_err(|e| format!("text posted but attachment upload failed: {e}"))?;
                 }
-            }
-            "fetch_messages" => {
-                let limit = args["limit"].as_u64().unwrap_or(20).min(100) as u16;
-                let channel = s("channel");
-                match opt("thread_ts") {
-                    Some(ts) => self.replies(&channel, &ts, limit).await,
-                    None => self.history(&channel, limit).await,
-                }
-                .map(|m| FetchedMsg::render_all(&m))
-            }
-            "download_attachment" => self.download_attachment(&s("file_id"), state_dir).await,
-            "no_reply" => {
-                // Slack には何も出さない。だが沈黙は disposition — 記録して台帳を消す。
-                let thread = opt("thread_ts");
-                let c = dctx(thread.as_deref().or(ids.first().map(String::as_str)));
+                // 投稿できたときだけ覆う — Slack が受けていない返信で台帳を消さない
+                let c = dctx(thread.as_deref());
                 c.info(
                     "bridge",
                     &format!(
-                        "disposition=no_reply thread={} covers=[{}]{}",
+                        "disposition=reply thread={} covers=[{}]{}",
                         thread.as_deref().unwrap_or("-"),
                         ids.join(","),
-                        opt("reason")
-                            .filter(|r| !r.is_empty())
-                            .map(|r| format!(" reason={r}"))
-                            .unwrap_or_default()
+                        if ids.is_empty() { " (UNSPECIFIED)" } else { "" }
                     ),
                 );
                 let d = bridge_state::Disposition {
-                    kind: "no_reply",
+                    kind: "reply",
                     channel_id: s("channel_id"),
-                    thread_ts: thread,
+                    thread_ts: thread.clone(),
                     message_ids: ids,
                     session_id: session_id.to_string(),
                 };
                 notify(dispo, d, &c).await;
-                Ok("recorded — nothing posted".to_string())
+                Ok(format!("posted ts={ts}"))
             }
-            other => Err(format!("unknown tool: {other}")),
-        };
-        match out {
-            Ok(v) => {
-                ctx.info("tools", &format!("{tool} ok"));
-                Ok(v)
+            .await
+        }
+        "react" => {
+            let (channel, message_ts, emoji) = (s("channel_id"), s("message_ts"), s("emoji"));
+            match slack.add_reaction(&channel, &message_ts, &emoji).await {
+                Err(e) => Err(e),
+                Ok(()) => {
+                    // react の args は thread を運ばない。台帳の鍵は**配達時の根**なので
+                    // replies で引く。返信の ts で引くと先頭は
+                    // 親とは限らないので、**その ts でなく thread_ts** が根。
+                    // スレッド外(thread_ts 無し)なら message_ts 自身が根
+                    let root = match opt("thread_ts") {
+                        Some(t) => Some(t),
+                        None => match slack.replies(&channel, &message_ts, 1).await {
+                            Ok(m) => Some(
+                                m.first()
+                                    .and_then(|f| f.thread_ts.clone())
+                                    .unwrap_or_else(|| message_ts.clone()),
+                            ),
+                            // 引けなかったときだけ根が不明 — 撃たない
+                            Err(e) => {
+                                let m = format!("react: thread-root lookup failed: {e}");
+                                ctx.debug("bridge", &m);
+                                None
+                            }
+                        },
+                    };
+                    let c = dctx(root.as_deref().or(Some(&message_ts)));
+                    let m = format!("disposition=react message_ts={message_ts} emoji={emoji}");
+                    c.info("bridge", &m);
+                    match root {
+                        Some(t) => {
+                            let d = bridge_state::Disposition {
+                                kind: "react",
+                                channel_id: channel,
+                                thread_ts: Some(t),
+                                message_ids: vec![message_ts],
+                                session_id: session_id.to_string(),
+                            };
+                            notify(dispo, d, &c).await;
+                        }
+                        // 根が違えば別スレッドの台帳を誤射する — 撃たずに残す(best-effort)
+                        None => c.debug(
+                            "bridge",
+                            &format!(
+                                "react: thread root unknown for message_ts={message_ts} \
+                                 — skipping disposition disarm (best-effort)"
+                            ),
+                        ),
+                    }
+                    Ok("reacted".to_string())
+                }
             }
-            Err(e) => {
-                ctx.error("tools", &format!("{tool} failed: {e}"));
-                Err(e)
+        }
+        "edit_message" => {
+            // reply と同じ既定にする。答えを「投稿」しても「編集で差し替え」ても
+            // 同じ見え方でなければ、書く側は使い分けを覚えなければならなくなる
+            let md = args["markdown"].as_bool().unwrap_or(true);
+            let edited = if md {
+                slack.update_markdown(&s("channel_id"), &s("message_ts"), &s("text"))
+                    .await
+            } else {
+                slack.update_message(&s("channel_id"), &s("message_ts"), &s("text"))
+                    .await
+            };
+            match edited {
+                Err(e) => Err(e),
+                Ok(()) => {
+                    // message_ids 付きの編集だけが「答え」。無ければ進捗編集で、
+                    // 台帳には触らない
+                    if !ids.is_empty() {
+                        let thread = opt("thread_ts");
+                        let c = dctx(thread.as_deref().or(ids.first().map(String::as_str)));
+                        c.info(
+                            "bridge",
+                            &format!(
+                                "disposition=edit thread={} covers=[{}]",
+                                thread.as_deref().unwrap_or("-"),
+                                ids.join(",")
+                            ),
+                        );
+                        let d = bridge_state::Disposition {
+                            kind: "edit",
+                            channel_id: s("channel_id"),
+                            thread_ts: thread,
+                            message_ids: ids,
+                            session_id: session_id.to_string(),
+                        };
+                        notify(dispo, d, &c).await;
+                    }
+                    Ok("edited".to_string())
+                }
             }
+        }
+        "fetch_messages" => {
+            let limit = args["limit"].as_u64().unwrap_or(20).min(100) as u16;
+            let channel = s("channel");
+            match opt("thread_ts") {
+                Some(ts) => slack.replies(&channel, &ts, limit).await,
+                None => slack.history(&channel, limit).await,
+            }
+            .map(|m| FetchedMsg::render_all(&m))
+        }
+        "download_attachment" => download_attachment(slack, &s("file_id"), state_dir).await,
+        "no_reply" => {
+            // Slack には何も出さない。だが沈黙は disposition — 記録して台帳を消す。
+            let thread = opt("thread_ts");
+            let c = dctx(thread.as_deref().or(ids.first().map(String::as_str)));
+            c.info(
+                "bridge",
+                &format!(
+                    "disposition=no_reply thread={} covers=[{}]{}",
+                    thread.as_deref().unwrap_or("-"),
+                    ids.join(","),
+                    opt("reason")
+                        .filter(|r| !r.is_empty())
+                        .map(|r| format!(" reason={r}"))
+                        .unwrap_or_default()
+                ),
+            );
+            let d = bridge_state::Disposition {
+                kind: "no_reply",
+                channel_id: s("channel_id"),
+                thread_ts: thread,
+                message_ids: ids,
+                session_id: session_id.to_string(),
+            };
+            notify(dispo, d, &c).await;
+            Ok("recorded — nothing posted".to_string())
+        }
+        other => Err(format!("unknown tool: {other}")),
+    };
+    match out {
+        Ok(v) => {
+            ctx.info("tools", &format!("{tool} ok"));
+            Ok(v)
+        }
+        Err(e) => {
+            ctx.error("tools", &format!("{tool} failed: {e}"));
+            Err(e)
         }
     }
 }
-
-impl<A: SlackApi + Sync> SlackOps for A {}
 
 impl FetchedMsg {
     /// oldest-first の `[ts] user: text`。
@@ -2063,7 +1890,7 @@ mod tests {
         };
         let (fresh, old, edge) = (write("fresh"), write("old"), write("edge"));
         // mtime は「今」なので、掃除の now を進めて年齢を作る
-        let now = crate::bridge::Host::now_ms();
+        let now = bridge_state::now_ms();
         Api::sweep_inbox(&dir, now); // まだ何も消えない
         assert!(fresh.exists() && old.exists());
 
@@ -2123,179 +1950,42 @@ mod tests {
         assert_eq!(Api::attachment_file_name("F1", "a\"b.png"), "F1-ab.png");
     }
 
-    /// 大きすぎる添付はダウンロードに**入る前に**断る(FakeApi の download_to は
-    /// unimplemented! — 判定が先に返らなければこのテストは panic する)。
+    use crate::ports::fake::FakeSlack;
+
+    /// 大きすぎる添付はダウンロードに**入る前に**断る(FakeSlack の download_to は
+    /// 別の文言で Err を返す — 判定が先に返らなければ文言の比較で落ちる)。
     #[tokio::test]
     async fn oversized_attachment_is_refused_before_downloading() {
-        let api = FakeApi {
-            file_size: MAX_ATTACHMENT_BYTES + 1,
-            ..Default::default()
-        };
-        let err = api
-            .download_attachment("F1", std::path::Path::new("/nonexistent"))
+        let mut api = FakeSlack::default();
+        api.file_size = MAX_ATTACHMENT_BYTES + 1;
+        let err = download_attachment(&api, "F1", std::path::Path::new("/nonexistent"))
             .await
             .unwrap_err();
         assert_eq!(err, "file too large: 50.0MB, max 50MB", "文言は現行の原文");
     }
 
-    /// 呼び出しを 1 行の文字列で記録する fake。 7 でも使う。
-    #[derive(Default)]
-    struct FakeApi {
-        posted: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
-        calls: std::sync::Mutex<Vec<String>>,
-        msgs: Vec<FetchedMsg>,
-        /// file_info が返すバイト数(上限判定のテスト用)。
-        file_size: u64,
-        fail: bool,
-        /// replies だけ落とす(react の根引き失敗を作るため — add_reaction は成功させたい)。
-        replies_fail: bool,
+    /// スレッドの根が**生きている** fake(返信の抑止に掛からない普通の状態)。
+    fn with_live_root() -> FakeSlack {
+        let mut api = FakeSlack::default();
+        api.msgs = vec![FetchedMsg {
+            ts: "1.0".into(),
+            user: "U1".into(),
+            text: "root".into(),
+            thread_ts: None,
+        }];
+        api
     }
 
-    impl FakeApi {
-        /// スレッドの根が**生きている** fake(返信の抑止に掛からない普通の状態)。
-        fn with_live_root() -> Self {
-            Self {
-                msgs: vec![FetchedMsg {
-                    ts: "1.0".into(),
-                    user: "U1".into(),
-                    text: "root".into(),
-                    thread_ts: None,
-                }],
-                ..Default::default()
-            }
-        }
-
-        /// 全ての呼び出しが Err を返す fake。
-        fn failing() -> Self {
-            Self {
-                fail: true,
-                ..Default::default()
-            }
-        }
-        fn calls(&self) -> Vec<String> {
-            self.calls.lock().unwrap().clone()
-        }
-        fn record(&self, call: String) -> Result<(), String> {
-            self.calls.lock().unwrap().push(call);
-            if self.fail {
-                Err("slack said no".into())
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    impl SlackApi for FakeApi {
-        async fn post_message(
-            &self,
-            channel: &str,
-            text: &str,
-            thread_ts: Option<&str>,
-        ) -> Result<String, String> {
-            self.posted.lock().unwrap().push((
-                channel.to_string(),
-                text.to_string(),
-                thread_ts.map(str::to_string),
-            ));
-            self.record(format!("post_message {channel} {text}"))?;
-            Ok("9.9".to_string())
-        }
-        /// **記録の語を変える** — テストが「mrkdwn で出たか Markdown で出たか」を見分けられるように。
-        async fn post_markdown(
-            &self,
-            channel: &str,
-            text: &str,
-            thread_ts: Option<&str>,
-        ) -> Result<String, String> {
-            self.posted.lock().unwrap().push((
-                channel.to_string(),
-                text.to_string(),
-                thread_ts.map(str::to_string),
-            ));
-            self.record(format!("post_markdown {channel} {text}"))?;
-            Ok("9.9".to_string())
-        }
-        async fn add_reaction(&self, c: &str, t: &str, e: &str) -> Result<(), String> {
-            self.record(format!("add_reaction {c} {t} {e}"))
-        }
-        async fn remove_reaction(&self, c: &str, t: &str, e: &str) -> Result<(), String> {
-            self.record(format!("remove_reaction {c} {t} {e}"))
-        }
-        async fn delete_message(&self, c: &str, t: &str) -> Result<(), String> {
-            self.record(format!("delete_message {c} {t}"))
-        }
-        async fn update_markdown(&self, c: &str, t: &str, x: &str) -> Result<(), String> {
-            self.record(format!("update_markdown {c} {t} {x}"))
-        }
-        async fn update_message(&self, _c: &str, _t: &str, _x: &str) -> Result<(), String> {
-            Ok(())
-        }
-        async fn history(&self, _c: &str, _l: u16) -> Result<Vec<FetchedMsg>, String> {
-            Ok(self.msgs.clone())
-        }
-        async fn replies(&self, c: &str, t: &str, _l: u16) -> Result<Vec<FetchedMsg>, String> {
-            self.record(format!("replies {c} {t}"))?;
-            if self.replies_fail {
-                return Err("channel_not_found".into());
-            }
-            Ok(self.msgs.clone())
-        }
-        async fn file_info(&self, _f: &str) -> Result<(String, String, u64), String> {
-            Ok((
-                "https://slack.test/f".into(),
-                "shot.png".into(),
-                self.file_size,
-            ))
-        }
-        async fn get_permalink(&self, c: &str, t: &str) -> Result<String, String> {
-            self.record(format!("get_permalink {c} {t}"))?;
-            Ok(format!(
-                "https://slack.test/archives/{c}/p{}",
-                t.replace('.', "")
-            ))
-        }
-        async fn channel_display_name(&self, c: &str) -> Option<String> {
-            self.record(format!("channel_display_name {c}")).ok()?;
-            Some(format!("#{c}"))
-        }
-        /// `UB…` を bot(→ `B…`)、それ以外を人間として扱う固定ルール。
-        async fn resolve_bot_id(&self, u: &str) -> Result<Option<String>, String> {
-            self.record(format!("resolve_bot_id {u}"))?;
-            Ok(u.strip_prefix("UB").map(|rest| format!("B{rest}")))
-        }
-        async fn download_to(&self, _u: &str, _d: &std::path::Path) -> Result<(), String> {
-            unimplemented!()
-        }
-        async fn upload_file(
-            &self,
-            channel: &str,
-            thread_ts: Option<&str>,
-            path: &std::path::Path,
-        ) -> Result<(), String> {
-            let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            self.record(format!("get_upload_url_external {name} {}", bytes.len()))?;
-            self.record(format!("files_upload_via_url {name}"))?;
-            self.record(format!(
-                "files_complete_upload_external {channel} {}",
-                thread_ts.unwrap_or("-")
-            ))
-        }
-        async fn set_thinking_status(
-            &self,
-            channel: &str,
-            thread_ts: &str,
-            status: &str,
-        ) -> Result<(), String> {
-            self.record(format!(
-                "set_thinking_status {channel} {thread_ts} {status}"
-            ))
-        }
+    /// 全ての呼び出しが Err を返す fake。
+    fn failing() -> FakeSlack {
+        let mut api = FakeSlack::default();
+        api.fail = true;
+        api
     }
 
     /// execute_tool を呼ぶのに要るもの一式(disposition の受信口つき)。
     fn harness() -> (
-        FakeApi,
+        FakeSlack,
         std::path::PathBuf,
         tokio::sync::mpsc::Sender<bridge_state::Disposition>,
         tokio::sync::mpsc::Receiver<bridge_state::Disposition>,
@@ -2303,7 +1993,7 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         // 根は生きている前提(消えたスレッドの抑止は専用のテストで見る)
         (
-            FakeApi::with_live_root(),
+            with_live_root(),
             std::path::PathBuf::from("/tmp"),
             tx,
             rx,
@@ -2311,23 +2001,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upload_file_round_trip_records_all_three_calls() {
-        let api = FakeApi::default();
+    async fn upload_file_round_trip_is_recorded() {
+        let api = FakeSlack::default();
         let path = std::env::temp_dir().join(format!("sc-upload-{}.txt", std::process::id()));
         std::fs::write(&path, b"hello").unwrap();
         api.upload_file("C1", Some("171.002"), &path).await.unwrap();
         let _ = std::fs::remove_file(&path);
-        let calls = api.calls();
-        assert!(
-            calls
-                .iter()
-                .any(|c| c.starts_with("get_upload_url_external "))
-        );
-        assert!(calls.iter().any(|c| c.starts_with("files_upload_via_url ")));
-        assert!(
-            calls
-                .iter()
-                .any(|c| c.starts_with("files_complete_upload_external "))
+        assert_eq!(
+            api.calls(),
+            vec![format!("upload C1 171.002 {}", path.display())]
         );
     }
 
@@ -2336,13 +2018,13 @@ mod tests {
         let path = std::env::temp_dir().join(format!("sc-size-{}.bin", std::process::id()));
         std::fs::write(&path, vec![0u8; 10]).unwrap();
         let paths = vec![path.to_string_lossy().to_string()];
-        let err = FakeApi::check_attachment_sizes(&paths, 5).unwrap_err();
-        let ok = FakeApi::check_attachment_sizes(&paths, MAX_ATTACHMENT_BYTES);
+        let err = check_attachment_sizes(&paths, 5).unwrap_err();
+        let ok = check_attachment_sizes(&paths, MAX_ATTACHMENT_BYTES);
         let _ = std::fs::remove_file(&path);
         assert!(err.contains("too large"), "{err}");
         assert!(ok.is_ok());
         assert!(
-            FakeApi::check_attachment_sizes(&["/nonexistent/nope.bin".to_string()], 5).is_err()
+            check_attachment_sizes(&["/nonexistent/nope.bin".to_string()], 5).is_err()
         );
     }
 
@@ -2351,7 +2033,8 @@ mod tests {
     #[tokio::test]
     async fn reply_uses_a_markdown_block_only_when_asked() {
         let (api, dir, tx, _rx) = harness();
-        api.execute_tool(
+        execute_tool(
+                &api,
             &dir,
             "sid-1",
             "reply",
@@ -2363,7 +2046,7 @@ mod tests {
         assert!(
             api.calls()
                 .iter()
-                .any(|c| c.starts_with("post_markdown C1")),
+                .any(|c| c.starts_with("post_md C1")),
             "{:?}",
             api.calls()
         );
@@ -2373,7 +2056,8 @@ mod tests {
     #[tokio::test]
     async fn reply_defaults_to_standard_markdown() {
         let (api, dir, tx, _rx) = harness();
-        api.execute_tool(
+        execute_tool(
+                &api,
             &dir,
             "sid-1",
             "reply",
@@ -2385,7 +2069,7 @@ mod tests {
         assert!(
             api.calls()
                 .iter()
-                .any(|c| c.starts_with("post_markdown C1")),
+                .any(|c| c.starts_with("post_md C1")),
             "{:?}",
             api.calls()
         );
@@ -2395,7 +2079,8 @@ mod tests {
     #[tokio::test]
     async fn reply_can_fall_back_to_mrkdwn() {
         let (api, dir, tx, _rx) = harness();
-        api.execute_tool(
+        execute_tool(
+                &api,
             &dir,
             "sid-1",
             "reply",
@@ -2405,18 +2090,19 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            api.calls().iter().any(|c| c.starts_with("post_message C1")),
+            api.calls().iter().any(|c| c.starts_with("post C1")),
             "{:?}",
             api.calls()
         );
-        assert!(!api.calls().iter().any(|c| c.starts_with("post_markdown")));
+        assert!(!api.calls().iter().any(|c| c.starts_with("post_md")));
     }
 
     /// `edit_message` も同じ既定 — 投稿と編集で見え方が違うと使い分けを覚える羽目になる。
     #[tokio::test]
     async fn edit_message_defaults_to_standard_markdown_too() {
         let (api, dir, tx, _rx) = harness();
-        api.execute_tool(
+        execute_tool(
+                &api,
             &dir,
             "sid-1",
             "edit_message",
@@ -2428,7 +2114,7 @@ mod tests {
         assert!(
             api.calls()
                 .iter()
-                .any(|c| c.starts_with("update_markdown C1")),
+                .any(|c| c.starts_with("update_md C1")),
             "{:?}",
             api.calls()
         );
@@ -2443,8 +2129,7 @@ mod tests {
             "channel_id": "C1", "text": "hi", "thread_ts": "1.0",
             "files": [path.to_string_lossy()],
         });
-        let out = api
-            .execute_tool(&dir, "sid", "reply", &args, &tx)
+        let out = execute_tool(&api, &dir, "sid", "reply", &args, &tx)
             .await
             .unwrap();
         let _ = std::fs::remove_file(&path);
@@ -2452,11 +2137,11 @@ mod tests {
         let calls = api.calls();
         let post = calls
             .iter()
-            .position(|c| c.starts_with("post_markdown") || c.starts_with("post_message"))
+            .position(|c| c.starts_with("post"))
             .unwrap();
         let upload = calls
             .iter()
-            .position(|c| c.starts_with("get_upload_url_external"))
+            .position(|c| c.starts_with("upload "))
             .unwrap();
         assert!(
             post < upload,
@@ -2465,7 +2150,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "files_complete_upload_external C1 1.0"),
+                .any(|c| c.starts_with("upload C1 1.0 ")),
             "{calls:?}"
         );
     }
@@ -2478,7 +2163,7 @@ mod tests {
             "channel_id": "C1", "text": "hi", "files": ["/nonexistent/nope.bin"],
         });
         assert!(
-            api.execute_tool(&dir, "sid", "reply", &args, &tx)
+            execute_tool(&api, &dir, "sid", "reply", &args, &tx)
                 .await
                 .is_err()
         );
@@ -2491,29 +2176,29 @@ mod tests {
 
     #[tokio::test]
     async fn upload_file_missing_path_is_err() {
-        let api = FakeApi::default();
+        let api = FakeSlack::default();
         let missing = std::path::Path::new("/nonexistent/definitely-not-here.txt");
         assert!(api.upload_file("C1", None, missing).await.is_err());
     }
 
     #[tokio::test]
     async fn flip_removes_ack_and_adds_robot() {
-        let api = FakeApi::default();
-        api.flip_to_received("C1", "171.002", "eyes").await;
+        let api = FakeSlack::default();
+        flip_to_received(&api, "C1", "171.002", "eyes").await;
         assert_eq!(
             api.calls(),
             vec![
-                "remove_reaction C1 171.002 eyes",
-                "remove_reaction C1 171.002 arrows_counterclockwise",
-                "add_reaction C1 171.002 robot_face",
+                "unreact C1 171.002 eyes",
+                "unreact C1 171.002 arrows_counterclockwise",
+                "react C1 171.002 robot_face",
             ]
         );
     }
 
     #[tokio::test]
     async fn flip_swallows_slack_errors() {
-        let api = FakeApi::failing();
-        api.flip_to_received("C1", "171.002", "eyes").await; // panic せず完走すれば良い
+        let api = failing();
+        flip_to_received(&api, "C1", "171.002", "eyes").await; // panic せず完走すれば良い
         assert_eq!(api.calls().len(), 3, "失敗しても3手とも試みる");
     }
 
@@ -2574,13 +2259,10 @@ mod tests {
     /// 根が消えたスレッドには投稿しない。**黙って捨てず**台帳は覆う。
     #[tokio::test]
     async fn a_reply_into_a_deleted_thread_is_suppressed_but_still_disposes() {
-        let (api, dir, tx, mut rx) = harness();
-        let api = FakeApi {
-            msgs: Vec::new(), // 根が引けない = 消えている
-            ..api
-        };
-        let out = api
-            .execute_tool(
+        let (mut api, dir, tx, mut rx) = harness();
+        api.msgs = Vec::new(); // 根が引けない = 消えている
+        let out = execute_tool(
+                &api,
                 &dir,
                 "sid-1",
                 "reply",
@@ -2593,7 +2275,7 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("suppressed"), "{out}");
-        assert!(api.posted.lock().unwrap().is_empty(), "投稿はしない");
+        assert!(!api.calls().iter().any(|c| c.starts_with("post")), "投稿はしない");
         let d = rx.try_recv().unwrap();
         assert_eq!(d.kind, "reply", "台帳は覆う(未応答のまま残さない)");
         assert_eq!(d.message_ids, vec!["1.1"]);
@@ -2602,8 +2284,8 @@ mod tests {
     #[tokio::test]
     async fn reply_posts_to_the_thread() {
         let (api, dir, tx, mut rx) = harness();
-        let out = api
-            .execute_tool(
+        let out = execute_tool(
+                &api,
                 &dir,
                 "sid-1",
                 "reply",
@@ -2612,10 +2294,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(out.contains("9.9"), "{out}");
-        let posted = api.posted.lock().unwrap();
-        assert_eq!(posted[0].0, "C1");
-        assert_eq!(posted[0].2.as_deref(), Some("1.0"));
+        assert!(out.contains("9.0"), "{out}");
+        assert_eq!(api.calls(), vec!["post_md C1 1.0 hi"]);
         // ids 空でも**送る** — 「空 = スレッド全消化」の振り分けは台帳を持つ main の仕事
         assert!(rx.try_recv().unwrap().message_ids.is_empty());
     }
@@ -2623,8 +2303,8 @@ mod tests {
     #[tokio::test]
     async fn no_reply_posts_nothing() {
         let (api, dir, tx, _rx) = harness();
-        let out = api
-            .execute_tool(
+        let out = execute_tool(
+                &api,
                 &dir,
                 "sid-1",
                 "no_reply",
@@ -2634,7 +2314,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            api.posted.lock().unwrap().is_empty(),
+            !api.calls().iter().any(|c| c.starts_with("post")),
             "no_reply must post nothing"
         );
         assert!(!out.is_empty(), "but it must answer the worker: {out}");
@@ -2643,8 +2323,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_tool_is_an_error() {
         let (api, dir, tx, _rx) = harness();
-        let out = api
-            .execute_tool(&dir, "sid-1", "nope", &serde_json::json!({}), &tx)
+        let out = execute_tool(&api, &dir, "sid-1", "nope", &serde_json::json!({}), &tx)
             .await;
         assert!(out.is_err());
     }
@@ -2654,7 +2333,7 @@ mod tests {
         let (api, dir, tx, mut rx) = harness();
         let args = serde_json::json!({"channel_id": "C1", "text": "hi", "thread_ts": "1.0",
             "message_ids": ["1.1", "1.2"]});
-        api.execute_tool(&dir, "sid", "reply", &args, &tx)
+        execute_tool(&api, &dir, "sid", "reply", &args, &tx)
             .await
             .unwrap();
         let d = rx.try_recv().unwrap();
@@ -2665,10 +2344,10 @@ mod tests {
     #[tokio::test]
     async fn a_failed_post_disposes_of_nothing() {
         let (_, dir, tx, mut rx) = harness();
-        let api = FakeApi::failing();
+        let api = failing();
         let args = serde_json::json!({"channel_id": "C1", "text": "hi", "message_ids": ["1.1"]});
         assert!(
-            api.execute_tool(&dir, "sid", "reply", &args, &tx)
+            execute_tool(&api, &dir, "sid", "reply", &args, &tx)
                 .await
                 .is_err()
         );
@@ -2683,7 +2362,7 @@ mod tests {
         let (api, dir, tx, mut rx) = harness();
         let args =
             serde_json::json!({"channel_id": "C1", "message_ids": ["1.1"], "thread_ts": "1.0"});
-        api.execute_tool(&dir, "sid", "no_reply", &args, &tx)
+        execute_tool(&api, &dir, "sid", "no_reply", &args, &tx)
             .await
             .unwrap();
         assert!(api.calls().is_empty()); // Slack には何も出ていない
@@ -2694,7 +2373,7 @@ mod tests {
     async fn edit_without_ids_is_not_a_disposition() {
         let (api, dir, tx, mut rx) = harness();
         let args = serde_json::json!({"channel_id": "C1", "message_ts": "9.9", "text": "v2"});
-        api.execute_tool(&dir, "sid", "edit_message", &args, &tx)
+        execute_tool(&api, &dir, "sid", "edit_message", &args, &tx)
             .await
             .unwrap();
         assert!(rx.try_recv().is_err()); // 進捗編集は台帳に触らない
@@ -2705,7 +2384,7 @@ mod tests {
         let (api, dir, tx, mut rx) = harness();
         let args = serde_json::json!({"channel_id": "C1", "message_ts": "9.9", "text": "v2",
             "thread_ts": "1.0", "message_ids": ["1.1"]});
-        api.execute_tool(&dir, "sid", "edit_message", &args, &tx)
+        execute_tool(&api, &dir, "sid", "edit_message", &args, &tx)
             .await
             .unwrap();
         let d = rx.try_recv().unwrap();
@@ -2723,7 +2402,7 @@ mod tests {
             thread_ts: None,
         }];
         let args = serde_json::json!({"channel_id": "C1", "message_ts": "1.5", "emoji": "eyes"});
-        api.execute_tool(&dir, "sid", "react", &args, &tx)
+        execute_tool(&api, &dir, "sid", "react", &args, &tx)
             .await
             .unwrap();
         let d = rx.try_recv().unwrap();
@@ -2743,7 +2422,7 @@ mod tests {
             thread_ts: Some("1.0".into()),
         }];
         let args = serde_json::json!({"channel_id": "C1", "message_ts": "1.5", "emoji": "eyes"});
-        api.execute_tool(&dir, "sid", "react", &args, &tx)
+        execute_tool(&api, &dir, "sid", "react", &args, &tx)
             .await
             .unwrap();
         let d = rx.try_recv().unwrap();
@@ -2765,7 +2444,7 @@ mod tests {
         let (mut api, dir, tx, mut rx) = harness();
         api.replies_fail = true;
         let args = serde_json::json!({"channel_id": "C1", "message_ts": "1.5", "emoji": "eyes"});
-        api.execute_tool(&dir, "sid", "react", &args, &tx)
+        execute_tool(&api, &dir, "sid", "react", &args, &tx)
             .await
             .unwrap();
         assert!(
@@ -2777,10 +2456,10 @@ mod tests {
     /// status / allow-bot が使う3種を trait 経由で踏む(実 API の形は E2E で確かめる)。
     #[tokio::test]
     async fn lookup_apis_go_through_the_trait() {
-        let api = FakeApi::default();
+        let api = FakeSlack::default();
         assert_eq!(
             api.get_permalink("C1", "17.5").await.unwrap(),
-            "https://slack.test/archives/C1/p175"
+            "https://slack/C1/17.5"
         );
         assert_eq!(api.channel_display_name("C1").await, Some("#C1".into()));
         assert_eq!(
@@ -2791,15 +2470,15 @@ mod tests {
         assert_eq!(
             api.calls(),
             [
-                "get_permalink C1 17.5",
-                "channel_display_name C1",
-                "resolve_bot_id UB42",
-                "resolve_bot_id U9"
+                "permalink C1 17.5",
+                "channel_name C1",
+                "bot_id UB42",
+                "bot_id U9"
             ],
         );
         // 名前解決は best-effort — Slack が落ちても None で返る(Err にしない)
-        assert_eq!(FakeApi::failing().channel_display_name("C1").await, None);
-        assert!(FakeApi::failing().get_permalink("C1", "1").await.is_err());
+        assert_eq!(failing().channel_display_name("C1").await, None);
+        assert!(failing().get_permalink("C1", "1").await.is_err());
     }
 
     /// 文言は現行 Bun の原文をコピーしたもの — 切替日の見た目を変えないための固定。
@@ -2821,10 +2500,10 @@ mod tests {
         assert_eq!(Status::Restart.text(), "Restarting\u{2026}");
     }
 
-    /// 空文字がクリア(Slack の約束)。FakeApi は素通しで記録するだけ。
+    /// 空文字がクリア(Slack の約束)。FakeSlack は素通しで記録するだけ。
     #[tokio::test]
     async fn set_thinking_status_records_set_and_clear() {
-        let api = FakeApi::default();
+        let api = FakeSlack::default();
         api.set_thinking_status("C1", "1.1", THINKING_STATUS)
             .await
             .expect("set");
@@ -2834,15 +2513,15 @@ mod tests {
         assert_eq!(
             api.calls(),
             vec![
-                "set_thinking_status C1 1.1 is thinking\u{2026}".to_string(),
-                "set_thinking_status C1 1.1 ".to_string(),
+                "status C1 1.1 is thinking\u{2026}".to_string(),
+                "status C1 1.1 ".to_string(),
             ]
         );
     }
 
     #[tokio::test]
     async fn set_thinking_status_failure_is_an_err_the_caller_can_log() {
-        let api = FakeApi::failing();
+        let api = failing();
         assert!(
             api.set_thinking_status("C1", "1.1", TYPING_STATUS)
                 .await

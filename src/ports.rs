@@ -204,18 +204,33 @@ pub mod fake {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Every Slack call, in order: `"post C1 1.0 hello"` / `"react C1 1.1 eyes"` / ...
+    ///
+    /// Markdown goes on record as `post_md` / `update_md` so a test can tell it from mrkdwn.
     #[derive(Default)]
     pub struct FakeSlack {
         pub calls: Mutex<Vec<String>>,
         next_ts: AtomicU64,
+        /// What `history` and `replies` answer.
+        pub msgs: Vec<FetchedMsg>,
+        /// Every recorded call fails (after being recorded).
+        pub fail: bool,
+        /// Only `replies` fails.
+        pub replies_fail: bool,
+        /// The size `file_info` reports.
+        pub file_size: u64,
     }
 
     impl FakeSlack {
         pub fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
         }
-        fn record(&self, s: String) {
+        fn record(&self, s: String) -> Result<(), String> {
             self.calls.lock().unwrap().push(s);
+            if self.fail {
+                Err("slack said no".into())
+            } else {
+                Ok(())
+            }
         }
         fn ts(&self) -> String {
             format!("9.{}", self.next_ts.fetch_add(1, Ordering::SeqCst))
@@ -225,7 +240,7 @@ pub mod fake {
     #[async_trait]
     impl SlackPort for FakeSlack {
         async fn post_message(&self, c: &str, t: &str, th: Option<&str>) -> Result<String, String> {
-            self.record(format!("post {c} {} {t}", th.unwrap_or("-")));
+            self.record(format!("post {c} {} {t}", th.unwrap_or("-")))?;
             Ok(self.ts())
         }
         async fn post_message_no_unfurl(
@@ -237,29 +252,26 @@ pub mod fake {
             self.post_message(c, t, th).await
         }
         async fn post_markdown(&self, c: &str, t: &str, th: Option<&str>) -> Result<String, String> {
-            self.post_message(c, t, th).await
+            self.record(format!("post_md {c} {} {t}", th.unwrap_or("-")))?;
+            Ok(self.ts())
         }
         async fn update_message(&self, c: &str, ts: &str, t: &str) -> Result<(), String> {
-            self.record(format!("update {c} {ts} {t}"));
-            Ok(())
+            self.record(format!("update {c} {ts} {t}"))
         }
         async fn update_markdown(&self, c: &str, ts: &str, t: &str) -> Result<(), String> {
-            self.update_message(c, ts, t).await
+            self.record(format!("update_md {c} {ts} {t}"))
         }
         async fn delete_message(&self, c: &str, ts: &str) -> Result<(), String> {
-            self.record(format!("delete {c} {ts}"));
-            Ok(())
+            self.record(format!("delete {c} {ts}"))
         }
         async fn add_reaction(&self, c: &str, ts: &str, e: &str) -> Result<(), String> {
-            self.record(format!("react {c} {ts} {e}"));
-            Ok(())
+            self.record(format!("react {c} {ts} {e}"))
         }
         async fn remove_reaction(&self, c: &str, ts: &str, e: &str) -> Result<(), String> {
-            self.record(format!("unreact {c} {ts} {e}"));
-            Ok(())
+            self.record(format!("unreact {c} {ts} {e}"))
         }
         async fn flip_to_received(&self, c: &str, ts: &str, _ack: &str) {
-            self.record(format!("received {c} {ts}"));
+            let _ = self.record(format!("received {c} {ts}"));
         }
         async fn post_perm_prompt(
             &self,
@@ -269,17 +281,23 @@ pub mod fake {
             tool: &str,
             _i: &serde_json::Value,
         ) -> Result<String, String> {
-            self.record(format!("perm {c} {th} {id} {tool}"));
+            self.record(format!("perm {c} {th} {id} {tool}"))?;
             Ok(self.ts())
         }
         async fn open_dm(&self, u: &str) -> Result<String, String> {
             Ok(format!("D-{u}"))
         }
         async fn history(&self, _c: &str, _l: u16) -> Result<Vec<FetchedMsg>, String> {
-            Ok(vec![])
+            if self.fail {
+                return Err("slack said no".into());
+            }
+            Ok(self.msgs.clone())
         }
         async fn replies(&self, _c: &str, _t: &str, _l: u16) -> Result<Vec<FetchedMsg>, String> {
-            Ok(vec![])
+            if self.fail || self.replies_fail {
+                return Err("channel_not_found".into());
+            }
+            Ok(self.msgs.clone())
         }
         async fn parent_thread_of(&self, _c: &str, _t: &str) -> Option<String> {
             None
@@ -291,9 +309,11 @@ pub mod fake {
             false
         }
         async fn get_permalink(&self, c: &str, ts: &str) -> Result<String, String> {
+            self.record(format!("permalink {c} {ts}"))?;
             Ok(format!("https://slack/{c}/{ts}"))
         }
         async fn channel_display_name(&self, c: &str) -> Option<String> {
+            self.record(format!("channel_name {c}")).ok()?;
             Some(format!("#{c}"))
         }
         async fn user_display_name(&self, u: &str) -> Option<String> {
@@ -302,11 +322,13 @@ pub mod fake {
         async fn auth_test(&self) -> Result<(String, Option<String>), String> {
             Ok(("U_BOT".into(), Some("agentgw".into())))
         }
-        async fn resolve_bot_id(&self, _u: &str) -> Result<Option<String>, String> {
-            Ok(None)
+        /// `UB…` is a bot (→ `B…`); anyone else is a person.
+        async fn resolve_bot_id(&self, u: &str) -> Result<Option<String>, String> {
+            self.record(format!("bot_id {u}"))?;
+            Ok(u.strip_prefix("UB").map(|rest| format!("B{rest}")))
         }
         async fn file_info(&self, _f: &str) -> Result<(String, String, u64), String> {
-            Err("no files in fake".into())
+            Ok(("https://slack/f".into(), "shot.png".into(), self.file_size))
         }
         async fn download_to(&self, _u: &str, _d: &Path) -> Result<(), String> {
             Err("no files in fake".into())
@@ -314,13 +336,13 @@ pub mod fake {
         async fn download_attachment(&self, _f: &str, _d: &Path) -> Result<String, String> {
             Err("no files in fake".into())
         }
-        async fn upload_file(&self, c: &str, _t: Option<&str>, p: &Path) -> Result<(), String> {
-            self.record(format!("upload {c} {}", p.display()));
-            Ok(())
+        /// Fails like the real one when the file can't be read.
+        async fn upload_file(&self, c: &str, th: Option<&str>, p: &Path) -> Result<(), String> {
+            std::fs::metadata(p).map_err(|e| format!("read {}: {e}", p.display()))?;
+            self.record(format!("upload {c} {} {}", th.unwrap_or("-"), p.display()))
         }
         async fn set_thinking_status(&self, c: &str, th: &str, s: &str) -> Result<(), String> {
-            self.record(format!("status {c} {th} {s}"));
-            Ok(())
+            self.record(format!("status {c} {th} {s}"))
         }
     }
 

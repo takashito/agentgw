@@ -1490,7 +1490,7 @@ pub struct Fleet {
     pub self_id: String,
     /// 子へ渡す Slack の bot トークン(`Ready` フレームで配る)。
     pub bot_token: String,
-    pub api: Arc<crate::slack::Api>,
+    pub api: crate::ports::Slack,
     pub dir: StateDir,
     pub cooldown: AsyncMutex<NoticeCooldown>,
     pub presence: AsyncMutex<Presence>,
@@ -2844,7 +2844,7 @@ mod tests {
             token: "s3cret".to_string(),
             self_id: "parent".to_string(),
             bot_token: "xoxb-test".to_string(),
-            api: Arc::new(crate::slack::Api::new("xoxb-test").unwrap()),
+            api: Arc::new(crate::ports::fake::FakeSlack::default()),
             dir,
             cooldown: Default::default(),
             presence: Default::default(),
