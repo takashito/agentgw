@@ -1,11 +1,11 @@
-//! マシンを足すときの判断。**OS を叩かない** — ここは全部テストできる純関数。
+//! Decisions for adding a machine. **Touches no OS** — everything here is a testable pure function.
 //!
-//! ssh / scp / gh / tailscale を呼ぶ層は [`ssh`](crate::setup::ssh)。
+//! The layer that calls ssh / scp / gh / tailscale is [`ssh`](crate::setup::ssh).
 
 use std::path::{Path, PathBuf};
 
-/// 相手の `uname -sm` → rust の triple。知らない組み合わせは `None`
-/// (= 相手のマシンでビルドする枝)。
+/// The remote `uname -sm` → a Rust target triple. An unknown combination is `None`
+/// (= the branch that builds on the remote machine).
 pub fn triple_for(uname_sm: &str) -> Option<&'static str> {
     Some(match uname_sm.trim() {
         "Linux x86_64" => "x86_64-unknown-linux-musl",
@@ -16,10 +16,10 @@ pub fn triple_for(uname_sm: &str) -> Option<&'static str> {
     })
 }
 
-/// 手元で選んだ状態ディレクトリを、相手のシェルに渡す形にする。
+/// Turn the state directory chosen locally into a form to hand to the remote shell.
 ///
-/// **`$HOME` は相手で違う**ので、ホームの下なら `~` 相対に直して向こうのシェルに
-/// 展開させる。付けないと相手は既定の `~/.local/state/agentgw` に落ちる。
+/// **`$HOME` differs on the remote**, so a path under home is rewritten relative to `~` and
+/// the remote shell expands it. Without this the remote falls back to the default `~/.local/state/agentgw`.
 pub fn remote_state_prefix(state_dir: Option<&str>, home: &str) -> String {
     match state_dir {
         None => String::new(),
@@ -30,19 +30,19 @@ pub fn remote_state_prefix(state_dir: Option<&str>, home: &str) -> String {
     }
 }
 
-/// 送る物の出どころ。
+/// Where the shipped binary comes from.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Source {
-    /// GitHub release から落とす(ゲートウェイとマシンの版が自動で揃う)
+    /// Download from a GitHub release (the gateway and machine versions match automatically)
     Release { tag: String },
-    /// `cargo dist` が焼いた手元の成果物
+    /// A local artifact built by `cargo dist`
     Dist(PathBuf),
 }
 
-/// 非公開リポジトリ。**落とすのはゲートウェイだけ** — マシンに gh も認証も要らない。
+/// A private repository. **Only the gateway downloads** — the machine needs neither gh nor credentials.
 pub const REPO: &str = "takashito/agentgw";
 
-/// `gh release download` の引数。**組み立てだけ**(ここでは叩かない)。
+/// Arguments for `gh release download`. **Only builds them** (nothing is run here).
 pub fn gh_download_args(tag: &str, triple: &str, out_dir: &Path) -> Vec<String> {
     [
         "release",
@@ -61,9 +61,9 @@ pub fn gh_download_args(tag: &str, triple: &str, out_dir: &Path) -> Vec<String> 
     .collect()
 }
 
-/// **release が先、手元の成果物が後。** release から落とすとゲートウェイとマシンが必ず同じ版になる。
+/// **Release first, local artifact second.** Downloading from a release guarantees the gateway and machine run the same version.
 ///
-/// `dist` は「その triple の成果物が実在するなら、そのパス」。呼び手が確かめて渡す。
+/// `dist` is "the path of the artifact for that triple, if it exists". The caller checks and passes it.
 pub fn choose_source(has_gh: bool, dist: Option<PathBuf>, version: &str) -> Result<Source, String> {
     if has_gh {
         return Ok(Source::Release {
@@ -80,22 +80,22 @@ pub fn choose_source(has_gh: bool, dist: Option<PathBuf>, version: &str) -> Resu
     })
 }
 
-// ── 通り道 ───────────────────────────────────────────────────────────────────
+// ── Route ────────────────────────────────────────────────────────────────────
 
-/// マシンがゲートウェイにつなぐ通り道。**検出ではなく実測で決める** — マシンを起こして、ゲートウェイの
-/// `ask_connected`(`bridge::gateway::Cli`)に名前が出たかで判定する。
+/// The route a machine uses to reach the gateway. **Decided by measurement, not detection** — start the
+/// machine and check whether its name shows up in the gateway's `ask_connected` (`bridge::gateway::Cli`).
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Transport {
-    /// マシンがゲートウェイの公開名に直接 dial する(tailnet など)
+    /// The machine dials the gateway's public name directly (a tailnet, etc.)
     Direct { url: String },
-    /// ゲートウェイが張る ssh トンネル越しに、マシンが自分の loopback へ dial する
+    /// The machine dials its own loopback, through an ssh tunnel the gateway opens
     Tunnel { remote_port: u16 },
 }
 
-/// 直結を試す候補。`.env` に覚えている URL が最優先、無ければ tailscale の名前。
+/// Candidate for a direct connection. The URL remembered in `.env` wins; otherwise the tailscale name.
 ///
-/// `tailscale status --json` の `Self.DNSName` は**末尾にドットが付く**(実測:
-/// `mac.tail1234.ts.net.`)。落としてから組む。
+/// `Self.DNSName` from `tailscale status --json` **has a trailing dot** (measured:
+/// `mac.tail1234.ts.net.`). Strip it before building the URL.
 pub fn candidate_url(env_url: Option<&str>, tailscale_json: Option<&str>) -> Option<String> {
     if let Some(u) = env_url.map(str::trim).filter(|u| !u.is_empty()) {
         return Some(u.trim_end_matches('/').to_string());
@@ -105,7 +105,7 @@ pub fn candidate_url(env_url: Option<&str>, tailscale_json: Option<&str>) -> Opt
     (!name.is_empty()).then(|| format!("wss://{name}"))
 }
 
-/// マシンの `.env` に書く URL。
+/// The URL written to the machine's `.env`.
 pub fn dial_url(t: &Transport) -> String {
     match t {
         Transport::Direct { url } => url.clone(),
@@ -113,10 +113,10 @@ pub fn dial_url(t: &Transport) -> String {
     }
 }
 
-/// `.env` の `AGENTGW_TUNNELS`(`laptop=me@laptop,desktop=me@desktop`)に、マシン1台分を足す / 外す。
+/// Add or remove one machine in `.env`'s `AGENTGW_TUNNELS` (`laptop=me@laptop,desktop=me@desktop`).
 ///
-/// **トンネルはゲートウェイの agentgw が自分で張る**(別サービスにしない — agentgw が動いている間だけ
-/// 繋がっていればよい)。起動時にこの一覧を読んで、マシンごとに ssh を1本ずつ見張る。
+/// **The gateway's agentgw opens the tunnels itself** (not a separate service — they only need to be
+/// up while agentgw runs). It reads this list at startup and watches one ssh per machine.
 pub fn tunnels_with(raw: &str, child: &str, target: Option<&str>) -> String {
     let mut list: Vec<(String, String)> = crate::bridge::machine::child_urls(raw)
         .into_iter()
@@ -131,8 +131,8 @@ pub fn tunnels_with(raw: &str, child: &str, target: Option<&str>) -> String {
         .join(",")
 }
 
-// ── 実行部 ───────────────────────────────────────────────────────────────────
-// ここは OS と相手のマシンを叩く層。判断は上の純関数が持つ(そちらがテスト済み)。
+// ── Execution ────────────────────────────────────────────────────────────────
+// This layer touches the OS and the remote machine. The decisions live in the pure functions above (which are tested).
 
 use super::ssh;
 use crate::bridge::gateway::TUNNEL_PORT;
@@ -141,18 +141,18 @@ use crate::bridge::gateway::Cli as RelayCli;
 use crate::bridge::gateway::wire;
 use crate::bridge::state::StateDir;
 
-/// マシンに送るブートストラップ。**バイナリに焼き込む** — release から入れたゲートウェイには
-/// repo が無いので、ファイルとして探すと見つからない。
+/// The bootstrap sent to the machine. **Baked into the binary** — a gateway installed from a release
+/// has no repo, so looking for it as a file would fail.
 const INSTALL_SH: &str = include_str!("../../scripts/install.sh");
 
-/// ゲートウェイの口と鍵。無ければ作って `.env` に書き、鍵を新しく作ったときだけ restart する。
+/// The gateway's listener and key. Create them in `.env` if missing; restart only when a new key was made.
 pub struct Listener {
     pub listen: String,
     pub token: String,
     pub name: String,
 }
 
-/// `agentgw add-child <ssh先> [--name <名前>] [--from <パス>]`
+/// `agentgw add-child <ssh-target> [--name <name>] [--from <path>]`
 pub async fn cli(args: &[String]) -> i32 {
     let mut target = None;
     let mut name = None;
@@ -199,18 +199,18 @@ pub async fn cli(args: &[String]) -> i32 {
     }
 }
 
-/// マシンを1台足す。**順番に意味がある** — 詳細は各ステップのコメント。
+/// Add one machine. **The order matters** — see each step's comment.
 async fn add_child(target: &str, name: Option<&str>, from: Option<&str>) -> Result<String, String> {
     let dir = StateDir::resolve();
 
-    // 1. 相手を見る
+    // 1. Look at the remote
     println!("{}", crate::t!("==> Checking {target}", "==> {target} を確認しています"));
     let uname = ssh::ssh_capture(target, "uname -sm")?;
     let triple = triple_for(&uname)
         .ok_or_else(|| crate::t!("There is no prebuilt binary for {uname}. Build and install agentgw there by hand.", "{uname} 用のバイナリは配布していません。そのマシンでビルドして入れてください。"))?;
     println!("  {uname} ({triple})");
 
-    // 名前は明示が最優先。無ければ相手のホスト名を使う(**自動命名の推測はここだけ**)
+    // An explicit name wins. Otherwise use the remote's hostname (**the only place a name is guessed**)
     let child = match name {
         Some(n) => n.trim().to_string(),
         None => ssh::ssh_capture(target, "hostname -s 2>/dev/null || hostname")
@@ -223,7 +223,7 @@ async fn add_child(target: &str, name: Option<&str>, from: Option<&str>) -> Resu
     }
     println!("{}", crate::t!("  Name: {child}", "  名前: {child}"));
 
-    // 2. 送る物を選ぶ(release が先、cargo dist の成果物が後)
+    // 2. Pick what to ship (release first, then the cargo dist artifact)
     let staging = std::env::temp_dir().join(format!("agentgw-add-{}", std::process::id()));
     let binary = match from {
         Some(p) => std::path::PathBuf::from(p),
@@ -247,11 +247,11 @@ async fn add_child(target: &str, name: Option<&str>, from: Option<&str>) -> Resu
         }
     };
 
-    // 3. 届ける(バイナリと install.sh)
+    // 3. Deliver (the binary and install.sh)
     println!("{}", crate::t!("==> Copying agentgw to {target}", "==> {target} に agentgw をコピーしています"));
     let remote_bin = ".local/bin/agentgw";
     ssh::ssh_run(target, "mkdir -p ~/.local/bin")?;
-    // 走っているバイナリは上書きできない。先に退けてから置く
+    // A running binary cannot be overwritten. Move it aside first, then place the new one
     ssh::ssh_run(
         target,
         &format!("[ -e {remote_bin} ] && mv -f {remote_bin} {remote_bin}.old || true"),
@@ -265,10 +265,10 @@ async fn add_child(target: &str, name: Option<&str>, from: Option<&str>) -> Resu
     ssh::ssh_run(target, "chmod 755 .local/bin/agentgw-install.sh")?;
     let _ = std::fs::remove_dir_all(&staging);
 
-    // 4. ゲートウェイの口と鍵を用意する
+    // 4. Prepare the gateway's listener and key
     let inlet = ensure_inlet(&dir)?;
 
-    // 5. 直結を試す。候補が無ければ最初からトンネル
+    // 5. Try a direct connection. With no candidate, start with the tunnel
     let candidate = {
         let env = RelayCli::env_of(&dir);
         candidate_url(
@@ -304,18 +304,18 @@ async fn add_child(target: &str, name: Option<&str>, from: Option<&str>) -> Resu
         remote_bin,
     )?;
 
-    // 6. マシンを起こして、ゲートウェイから見えるかを確かめる
+    // 6. Start the machine and check the gateway can see it
     println!("{}", crate::t!("==> Installing and starting agentgw on {target}", "==> {target} に agentgw をインストールして起動しています"));
     let installed = ssh::ssh_interactive(
         target,
         &format!("{state_prefix}~/.local/bin/agentgw-install.sh --from ~/{remote_bin}"),
     );
-    // 送り込んだ install.sh は使い捨て。**成否に関わらず片付ける**(次の add-child がまた送る)
+    // The shipped install.sh is single-use. **Clean it up whether or not it worked** (the next add-child sends it again)
     let _ = ssh::ssh_run(target, "rm -f ~/.local/bin/agentgw-install.sh");
     installed?;
 
     if !wait_connected(&inlet, &child).await {
-        // 直結が駄目だったなら、トンネルに落ちてもう一度
+        // The direct connection failed, so fall back to the tunnel and try again
         if matches!(transport, Transport::Direct { .. }) {
             println!("{}", crate::t!("==> The direct connection didn't work. Switching to an ssh tunnel.", "==> 直結ではつながりませんでした。ssh トンネルに切り替えます。"));
             set_tunnel(&dir, &child, Some(target))?;
@@ -350,8 +350,8 @@ async fn add_child(target: &str, name: Option<&str>, from: Option<&str>) -> Resu
             ));
         }
     } else if matches!(transport, Transport::Direct { .. }) {
-        // 直結で繋がった。**前にトンネルを張っていたなら外す** — 残すと、使われない
-        // ssh をゲートウェイが張り続ける
+        // Connected directly. **If a tunnel was set up before, remove it** — otherwise the gateway
+        // keeps holding an ssh that nobody uses
         set_tunnel(&dir, &child, None)?;
     }
 
@@ -365,8 +365,8 @@ async fn add_child(target: &str, name: Option<&str>, from: Option<&str>) -> Resu
     ))
 }
 
-/// ゲートウェイの口と鍵。無ければ作って `.env` に書き、**鍵を新しく作ったときだけ**起こし直す
-/// (走っている Bridge は古い鍵を握ったままなので、マシンが来ても 401 になる)。
+/// The gateway's listener and key. Create them in `.env` if missing, and restart **only when a new key was made**
+/// (the running Bridge still holds the old key, so the machine would get a 401).
 fn ensure_inlet(dir: &StateDir) -> Result<Listener, String> {
     let env = RelayCli::env_of(dir);
     let listen = env
@@ -410,7 +410,7 @@ fn ensure_inlet(dir: &StateDir) -> Result<Listener, String> {
     })
 }
 
-/// 接続文字列を作ってマシンに食わせる。**argv に置かない**(相手の ps と履歴に残る)。
+/// Build the connection string and feed it to the machine. **Never on argv** (it would stay in the remote's ps and history).
 fn link_child(
     target: &str,
     child: &str,
@@ -431,8 +431,8 @@ fn link_child(
     Ok(())
 }
 
-/// ゲートウェイの `.env` の `AGENTGW_TUNNELS` を書き換え、**変わったときだけ**ゲートウェイを起こし直す
-/// (トンネルはゲートウェイの agentgw が起動時に読んで張る。restart はワーカーを畳まない)。
+/// Rewrite `AGENTGW_TUNNELS` in the gateway's `.env` and restart the gateway **only if it changed**
+/// (the gateway's agentgw reads it at startup to open tunnels; restart does not tear down agents).
 fn set_tunnel(dir: &StateDir, child: &str, target: Option<&str>) -> Result<(), String> {
     let env = RelayCli::env_of(dir);
     let before = env.get("AGENTGW_TUNNELS").cloned().unwrap_or_default();
@@ -457,9 +457,9 @@ fn set_tunnel(dir: &StateDir, child: &str, target: Option<&str>) -> Result<(), S
     Ok(())
 }
 
-/// ゲートウェイの `status` 口に「今つながっているマシン」を訊いて、名前が出るまで待つ。
+/// Ask the gateway's `status` endpoint for the currently connected machines and wait until the name appears.
 ///
-/// **これが通り道の判定**(probe ではなく本物の link が張れたか)。
+/// **This is what decides the route** (whether a real link came up, not a probe).
 async fn wait_connected(inlet: &Listener, child: &str) -> bool {
     for i in 0..10 {
         if i > 0 {
@@ -474,7 +474,7 @@ async fn wait_connected(inlet: &Listener, child: &str) -> bool {
     false
 }
 
-/// `cargo dist` の成果物。**repo があるときだけ**見つかる。
+/// The `cargo dist` artifact. Found **only when the repo is present**.
 fn dist_artifact(triple: &str) -> Option<std::path::PathBuf> {
     let base = std::env::var("CARGO_TARGET_DIR")
         .map(PathBuf::from)
@@ -508,7 +508,7 @@ mod tests {
 
     #[test]
     fn trims_what_ssh_gives_back() {
-        // `ssh 相手 'uname -sm'` は改行つきで返る
+        // `ssh <remote> 'uname -sm'` returns with a trailing newline
         assert_eq!(
             triple_for("Linux x86_64\n"),
             Some("x86_64-unknown-linux-musl")
@@ -589,7 +589,7 @@ mod tests {
 
     #[test]
     fn falls_back_to_the_tailscale_name() {
-        // Self.DNSName は末尾にドットが付く(実測)
+        // Self.DNSName has a trailing dot (measured)
         let json = r#"{"Self":{"DNSName":"mac.tail1234.ts.net."}}"#;
         assert_eq!(
             candidate_url(None, Some(json)).as_deref(),

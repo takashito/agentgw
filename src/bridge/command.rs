@@ -1,25 +1,25 @@
-//! Bridge が自分だけで答える「本文コマンド」— その解釈と実行。
+//! "Body commands" the Bridge answers by itself — parsing them and running them.
 //!
-//! 前半は解釈(すべて純関数・I/O なし)。
-//! 後半(`// ── running commands ──`)は実行: 解釈したコマンドを `impl Bridge` で走らせる
-//! (`handle_command` が入口。サインイン・サインアウトの結末は `CmdFx` で main に戻す)。
+//! The first half is parsing (all pure functions, no I/O).
+//! The second half (`// ── running commands ──`) runs them: a parsed command is executed in `impl Bridge`
+//! (`handle_command` is the entry point; sign-in / sign-out outcomes go back to main as `CmdFx`).
 //!
-//! コマンドは3層(検出 / パース / レンダ)のうちの**検出**。ここの唯一の掟は
-//! 「メッセージ**全体**がそのコマンドのときだけ発動する」。
-//! 語句を含むだけの文は素通しし、普通のメッセージとしてワーカーに届く。
+//! Commands are the **detection** layer of three (detect / parse / render). The single rule here:
+//! "fire only when the **whole** message is that command".
+//! A sentence that merely contains the word passes through and reaches the agent as a normal message.
 //!
-//! ここから `agent::` を見るのは依存の向きどおり(Bridge → エージェント)。逆は無い。
-//! 答えの文面は、そのコマンドを走らせる側(`command/agent.rs` / `command/bridge.rs`)に居る。
+//! Looking at `agent::` from here follows the dependency direction (Bridge → agent). Never the reverse.
+//! The reply text lives with whoever runs the command (`command/agent.rs` / `command/bridge.rs`).
 //!
-//! 並びは役割の順:
+//! Sections, in order of role:
 //!
-//! 1. 本文の読み方   `Message`(mention と不可視文字の除去はここだけ)
-//! 2. Slack の id    `SlackId`
-//! 3. コマンドの検出 `Cmd` / `PwdMode` / `OwnerCmd` — 素のワードの語彙は `Cmd::WORDS` 1枚
-//! 4. 上限の見張り   `UsageWatch`(時刻の読み書きは `state::WallClock`)
-//! 5. ツール許可     `ToolPermission`
-//! 6. 実行           `SignIn` と入口の `handle_command`。中身はスレッドのエージェントに対するもの
-//!    (`command/agent.rs`)と Bridge 自身のもの(`command/bridge.rs`)に分かれる
+//! 1. Reading the body   `Message` (the only place mentions and invisible characters are removed)
+//! 2. Slack ids          `SlackId`
+//! 3. Command detection  `Cmd` / `PwdMode` / `OwnerCmd` — the bare-word vocabulary is the single table `Cmd::WORDS`
+//! 4. Usage-limit watch  `UsageWatch` (reading and writing times is `state::WallClock`)
+//! 5. Tool permission    `ToolPermission`
+//! 6. Execution          `SignIn` and the entry point `handle_command`. The bodies split into those acting on
+//!    the thread's agent (`command/agent.rs`) and those about the Bridge itself (`command/bridge.rs`)
 
 mod agent;
 mod bridge;
@@ -36,12 +36,12 @@ use super::state::{LogCtx, ThreadKey};
 use crate::agent::screen::SpawnOutcome;
 use std::collections::HashMap;
 
-// ── 節1: 本文の読み方 ────────────────────────────────────────────────────────
+// ── Section 1: reading the body ──────────────────────────────────────────────
 
-/// Bridge に届いた1メッセージの本文。コマンド判定はここを通る。
+/// The body of one message delivered to the Bridge. Command detection goes through here.
 ///
-/// 唯一の掟は「メッセージ**全体**がそのコマンドのときだけ発動する」。
-/// 語句を含むだけの文は素通しし、普通のメッセージとしてワーカーに届く。
+/// The single rule: "fire only when the **whole** message is that command".
+/// A sentence that merely contains the word passes through and reaches the agent as a normal message.
 #[derive(Clone, Copy)]
 pub struct Message<'a> {
     text: &'a str,
@@ -53,8 +53,8 @@ impl<'a> Message<'a> {
         Self { text, bot_user_id }
     }
 
-    /// **自分の** mention だけを落とした本文。他人のは残す — `<@other> stop` は他人宛なので
-    /// 我々にとっては素のコマンドでなくなる。残りの大小文字と空白は保存(パス引数が要る)。
+    /// The body with only **our own** mention removed. Others' mentions stay — `<@other> stop` is addressed to
+    /// someone else, so for us it is no longer a bare command. Case and whitespace are preserved (path arguments need them).
     fn without_mention(&self) -> String {
         let Some(bot) = self.bot_user_id.filter(|b| !b.is_empty()) else {
             return self.text.to_string();
@@ -64,7 +64,7 @@ impl<'a> Message<'a> {
         let mut rest = self.text;
         while let Some(i) = rest.find(&needle) {
             let after = &rest[i + needle.len()..];
-            // 剥がすのは `<@ID>` と `<@ID|label>` だけ。先頭が一致するだけの別 id は温存する
+            // Strip only `<@ID>` and `<@ID|label>`. A different id that merely shares the prefix is kept
             let tail = match after.strip_prefix('>') {
                 Some(t) => Some(t),
                 None => after
@@ -88,8 +88,8 @@ impl<'a> Message<'a> {
         out
     }
 
-    /// 自 mention を落とし、異体字セレクタ / ZWJ(不可視。Slack の `text` は絵文字にこれを
-    /// 付けて寄越す)を除いた本文。大小文字と空白はそのまま。
+    /// The body with our mention removed and variation selectors / ZWJ removed (invisible; Slack's `text`
+    /// attaches them to emoji). Case and whitespace are kept.
     fn cleaned(&self) -> String {
         self.without_mention()
             .chars()
@@ -97,13 +97,13 @@ impl<'a> Message<'a> {
             .collect()
     }
 
-    /// 比較可能な形に均したメッセージ: [`Self::cleaned`] + trim + 小文字化。
+    /// The message normalized for comparison: [`Self::cleaned`] + trim + lowercase.
     pub fn normalized(&self) -> String {
         self.cleaned().trim().to_lowercase()
     }
 
-    /// 本文が**全体として** `name` コマンドであるときだけ true。語を含むだけの長い文は
-    /// 決して素のコマンドではない。未知の `name` は false。
+    /// True only when the body is, **as a whole**, the `name` command. A long sentence that contains the word
+    /// is never a bare command. An unknown `name` is false.
     pub fn is(&self, name: &str) -> bool {
         let normalized = self.normalized();
         Cmd::WORDS
@@ -112,8 +112,8 @@ impl<'a> Message<'a> {
             .is_some_and(|(_, words, _)| words.contains(&normalized.as_str()))
     }
 
-    /// 本文が `verb` で始まるときの、その**後ろ**の語。そうでなければ None。
-    /// 大小文字は保存する(パス引数が要る) — 比べるときに小文字化すること。
+    /// When the body starts with `verb`, the words **after** it; otherwise None.
+    /// Case is preserved (path arguments need it) — lowercase it when comparing.
     pub fn verb_args(&self, verb: &str) -> Option<Vec<String>> {
         let cleaned = self.cleaned();
         let mut words = cleaned.split_whitespace();
@@ -121,26 +121,26 @@ impl<'a> Message<'a> {
         (first.to_lowercase() == verb).then(|| words.map(str::to_string).collect())
     }
 
-    /// 本文が**自分を**メンションしているか(`containsSelfMention`)。
-    /// チャンネルでは、これかアクティブスレッドでないと配達しない。
+    /// Whether the body mentions **us** (`containsSelfMention`).
+    /// In a channel, a message is delivered only if this holds or the thread is active.
     pub fn mentions_bot(&self) -> bool {
         self.bot_user_id
             .filter(|b| !b.is_empty())
             .is_some_and(|_| self.without_mention() != self.text)
     }
 
-    /// 本文が**自分以外の誰か**を名指ししているか。自分の名指しを落とした残りに `<@` が
-    /// 残っていればそれは他人宛(`<@誰か> おーい` — 動いているスレッドに流れてはくるが、
-    /// こちらへの用件ではない)。
+    /// Whether the body names **someone other than us**. If `<@` remains after removing our own mention,
+    /// it is addressed to someone else (`<@someone> hey` — it does flow into a running thread,
+    /// but it is not meant for us).
     pub fn mentions_someone_else(&self) -> bool {
         self.without_mention().contains("<@")
     }
 }
 
-// ── 節2: Slack の id 形と mention ────────────────────────────────────────────
-// user も bot も `<@…>` で描画される。bot は `B…` id で識別する。
+// ── Section 2: Slack id shapes and mentions ──────────────────────────────────
+// Both users and bots render as `<@…>`. A bot is identified by its `B…` id.
 
-/// Slack の id。**形だけ**で判る種別(問い合わせに行かない)。
+/// A Slack id. The kind is known **from its shape alone** (no lookup).
 pub struct SlackId;
 
 impl SlackId {
@@ -163,7 +163,7 @@ impl SlackId {
         Self::shaped(id, &['C', 'G'])
     }
 
-    /// DM チャンネル(`D…`)— bot と相手しか居ない部屋。
+    /// A DM channel (`D…`) — a room with only the bot and the other party.
     pub fn is_dm(id: &str) -> bool {
         Self::shaped(id, &['D'])
     }
@@ -176,8 +176,8 @@ impl SlackId {
         Self::parse_mention(token, '#', Self::is_channel)
     }
 
-    /// mention トークンの中身の id — user なら `<@U…>` / `<@U…|label>`、channel なら
-    /// `<#C…>` / `<#C…|label>` — か、単体で書かれた素の id。その種の参照でなければ None。
+    /// The id inside a mention token — `<@U…>` / `<@U…|label>` for a user, `<#C…>` / `<#C…|label>` for
+    /// a channel — or a bare id written on its own. None if it is not such a reference.
     fn parse_mention(token: &str, sigil: char, shape: fn(&str) -> bool) -> Option<String> {
         let t = token.trim();
         let inner = t
@@ -185,7 +185,7 @@ impl SlackId {
             .and_then(|s| s.strip_prefix(sigil))
             .and_then(|s| s.strip_suffix('>'));
         let id = match inner {
-            // label に `>` を含む壊れたトークンは mention 扱いしない(現物の `[^>]*` 相当)
+            // A broken token whose label contains `>` is not treated as a mention (equivalent to `[^>]*`)
             Some(i) => match i.split_once('|') {
                 Some((id, label)) if !label.contains('>') => id,
                 Some(_) => t,
@@ -197,11 +197,11 @@ impl SlackId {
     }
 }
 
-// ── 節3: コマンドの検出 ─────────────────────────────────────────────────────
-// 引数を取る5つ(`model` / `effort` / `mode` / `pwd` / access verb)の検出は**形**で行う:
-// 既知のモデル名だけが引数なので、「model の説明をして」は文でありそのままワーカーに届く。
+// ── Section 3: command detection ─────────────────────────────────────────────
+// The five that take arguments (`model` / `effort` / `mode` / `pwd` / access verbs) are detected by **shape**:
+// only known model names count as arguments, so "explain model to me" is a sentence and goes to the agent as-is.
 
-/// Bridge が自分で答えるコマンド16種。
+/// The 16 commands the Bridge answers by itself.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Cmd {
     Stop,
@@ -213,26 +213,26 @@ pub enum Cmd {
     Usage,
     Compact,
     Restart,
-    /// Owner が既に居るのに来た `login`(未設定のときは gate の手前で捌く)
+    /// `login` that arrives when an Owner already exists (when unset, it is handled before the gate)
     Login,
     Logout,
-    /// `None` = 素の `model`(現在値の表示) / `Some(name)` = 切替
+    /// `None` = bare `model` (show the current value) / `Some(name)` = switch
     Model(Option<String>),
-    /// `None` = 素の `effort` / `Some(level)` = 設定
+    /// `None` = bare `effort` / `Some(level)` = set
     Effort(Option<String>),
-    /// `None` = 素の `mode`(現在値の表示) / `Some(name)` = 切替
+    /// `None` = bare `mode` (show the current value) / `Some(name)` = switch
     Mode(Option<String>),
     Pwd(PwdMode),
     Owner(OwnerCmd),
 }
 
 impl Cmd {
-    /// 素のワードで発動する全コマンドの語彙を**1つの表**に。
-    /// 名前・言い換え・変種を1行に持つので、`parse` にも `label` にも別の表が要らない。
-    /// 引数を取る5つ(`model` / `effort` / `mode` / `pwd` / access verb)は引数を読まないと
-    /// 言われたかどうかが判らないので、下で個別にパースする。
+    /// The vocabulary of every bare-word command in **one table**.
+    /// Name, synonyms and variants sit on one row, so neither `parse` nor `label` needs another table.
+    /// The five that take arguments (`model` / `effort` / `mode` / `pwd` / access verbs) can't be recognised
+    /// without reading the argument, so they are parsed separately below.
     const WORDS: [(&str, &[&str], Cmd); 11] = [
-        // stop: ワード・`:shortcode:`・生絵文字 — Slack の `text` はどれでも寄越しうる
+        // stop: word, `:shortcode:`, raw emoji — Slack's `text` may send any of them
         (
             "stop",
             &[
@@ -256,7 +256,7 @@ impl Cmd {
         ("status", &["status", "ステータス"], Cmd::Status),
         ("context", &["context", "ctx"], Cmd::Context),
         ("usage", &["usage", "usg"], Cmd::Usage),
-        // 素の疑問符は自然な「何ができる?」
+        // A bare question mark is the natural "what can you do?"
         ("help", &["help", "ヘルプ", "?", "？"], Cmd::Help),
         ("compact", &["compact"], Cmd::Compact),
         ("restart", &["restart"], Cmd::Restart),
@@ -264,11 +264,11 @@ impl Cmd {
         ("logout", &["logout"], Cmd::Logout),
     ];
 
-    /// 本文**全体**がコマンドならそれを返す。引数を読まないと言われたか判らない5つ
-    /// (model / effort / mode / pwd / owner verb)は最後に形で見る。`model` / `effort` / `mode`
-    /// が受ける値は `agent` の語彙(Bridge が `deps.agent` を渡す)。
+    /// If the **whole** body is a command, return it. The five that need their argument read
+    /// (model / effort / mode / pwd / owner verbs) are checked by shape last. The values `model` / `effort` / `mode`
+    /// accept come from `agent`'s vocabulary (the Bridge passes `deps.agent`).
     pub fn parse(msg: &Message<'_>, agent: &dyn Agent) -> Option<Cmd> {
-        // 素のワードで発動するもの — 表の順に見る(均すのは1回でいい)
+        // Bare-word commands — checked in table order (normalize only once)
         let normalized = msg.normalized();
         if let Some((_, _, cmd)) = Self::WORDS
             .into_iter()
@@ -291,7 +291,7 @@ impl Cmd {
         Self::owner(msg).map(Cmd::Owner)
     }
 
-    /// ログと断り文に出る呼び名(現行の文面と1文字同じ)。
+    /// The name shown in logs and refusals.
     pub fn label(&self) -> String {
         let name = match self {
             Cmd::Stop => "stop",
@@ -314,10 +314,10 @@ impl Cmd {
         format!("'{name}'")
     }
 
-    /// 「素の verb = 現在値の表示 / verb + **既知の値** = 設定」の形をした3つ
-    /// (`model` / `effort` / `mode`)の共通パース。返りは
-    /// None = コマンドでない / `Some(None)` = 素の verb / `Some(Some(値))` = 設定。
-    /// 大小文字は不問、知らない値(`accept` が None を返す値)はコマンドでない(文としてワーカーに届く)。
+    /// Shared parsing for the three shaped as "bare verb = show current value / verb + **known value** = set"
+    /// (`model` / `effort` / `mode`). Returns
+    /// None = not a command / `Some(None)` = bare verb / `Some(Some(value))` = set.
+    /// Case-insensitive; an unknown value (one for which `accept` returns None) is not a command (it reaches the agent as a sentence).
     fn value_of(
         msg: &Message<'_>,
         verb: &str,
@@ -333,15 +333,15 @@ impl Cmd {
         accept(&raw.to_lowercase()).map(Some)
     }
 
-    /// 一覧にある値だけを受ける `accept`(`effort` / `mode` 用)。
+    /// An `accept` that takes only values in the list (for `effort` / `mode`).
     fn listed(known: &'static [&'static str]) -> impl Fn(&str) -> Option<String> {
         move |v| known.contains(&v).then(|| v.to_string())
     }
 
-    /// `pwd` コマンドとしてのパース。コマンドでなければ None を返し、「pwd の使い方を変える」は
-    /// 文としてワーカーに届く。パスは空白を含みうるので残り**全部**をパスとして繋ぐ
-    /// (`pwd` にはラベル引数が無いので取り違えようがない)。`~…` も形としてはパスなので発動し、
-    /// 「絶対パスでどうぞ」の答えを得る(ワーカーのターンに消えるより良い)。
+    /// Parse as a `pwd` command. Returns None if it isn't one, so "change how pwd works" reaches the agent
+    /// as a sentence. A path may contain spaces, so **all** the rest is joined as the path
+    /// (`pwd` has no label argument, so nothing can be confused). `~…` is shaped like a path too, so it fires
+    /// and gets the "use an absolute path" answer (better than vanishing into the agent's turn).
     fn pwd(msg: &Message<'_>) -> Option<PwdMode> {
         let args = msg.verb_args("pwd")?;
         let Some(first) = args.first() else {
@@ -353,10 +353,10 @@ impl Cmd {
         (first.starts_with('/') || first.starts_with('~')).then(|| PwdMode::Set(args.join(" ")))
     }
 
-    /// その verb を**試みている**のか、単にその語で始まっただけなのか。判断するのは第1引数の
-    /// **形**だけ: switch のところに `on`/`off`、bot のところに bot、何も取らない verb には何も。
-    /// これで「warm の話をしよう」は文だと判る。試みが**完全**か・値が妥当かは見ない —
-    /// チャンネルを忘れた `warm on` も試みであり、dispatch から usage 行を貰う。
+    /// Whether this is an **attempt** at the verb or just a sentence that starts with that word. Decided only by
+    /// the **shape** of the first argument: `on`/`off` where a switch goes, a bot where a bot goes, nothing for verbs that take nothing.
+    /// That tells "let's talk about warm" is a sentence. Whether the attempt is **complete** or the value valid is not checked —
+    /// `warm on` without the channel is still an attempt and gets the usage line from dispatch.
     fn looks_like_owner(verb: &str, args: &[String]) -> bool {
         let first = args.first().map(String::as_str).unwrap_or("");
         match verb {
@@ -364,14 +364,14 @@ impl Cmd {
             "allow-bot" | "remove-bot" => {
                 SlackId::is_bot(first) || SlackId::from_user_mention(first).is_some()
             }
-            // set-home に引数の形は無いので、メッセージ全体が素のワードでなければならない
+            // set-home takes no argument shape, so the whole message must be the bare word
             "set-home" => args.is_empty(),
             _ => false,
         }
     }
 
-    /// Owner 管理コマンドとしてのパース。第1語が verb で、**かつ**続きがその verb の引数の形を
-    /// しているときだけ Some。bot / channel の mention は空白を含まないので単純分割で壊れない。
+    /// Parse as an Owner management command. Some only when the first word is a verb **and** the rest has
+    /// that verb's argument shape. Bot / channel mentions contain no spaces, so a plain split doesn't break them.
     fn owner(msg: &Message<'_>) -> Option<OwnerCmd> {
         OWNER_COMMAND_VERBS.iter().find_map(|verb| {
             let args = msg.verb_args(verb)?;
@@ -379,14 +379,14 @@ impl Cmd {
         })
     }
 
-    // ── コマンドは**ボタン** — 押された時に発火するか、さもなくば発火しない
-    // コマンドは送り主が「今」期待する副作用を持つのに、
-    // メッセージは送られてずっと後に届きうる(Slack は receipt を得られなかったイベントを
-    // 再配達し、停止中の投稿をまとめて寄越す)。通常のリクエストは無傷 — 再起動を待たされた
-    // リクエストはちゃんと配達される。
+    // ── A command is a **button** — it fires when pressed, or not at all
+    // A command has side effects the sender expects "now",
+    // but a message can arrive long after it was sent (Slack redelivers events it got no receipt for,
+    // and hands over everything posted while we were down). Normal requests are unaffected — a request
+    // that had to wait for a restart is still delivered.
 
-    /// このコマンドを走らせては**ならない**理由、走らせて良いなら None。読めない `ts` は決して
-    /// 妨げない(fail-open: Owner が今押したコマンドは必ず効かねばならない)。
+    /// Why this command must **not** run, or None if it may. An unreadable `ts` never
+    /// blocks (fail-open: a command the Owner just pressed must always work).
     pub fn stale_reason(
         &self,
         message_ts: &str,
@@ -408,9 +408,9 @@ impl Cmd {
     }
 }
 
-/// パースされた `pwd` が取りうる3つの形。
+/// The three forms a parsed `pwd` can take.
 ///
-/// 「引数が不正」という形は無い — 読めない引数はそもそもコマンドでなかった、と解釈する。
+/// There is no "invalid argument" form — an unreadable argument means it was never a command.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PwdMode {
     Current,
@@ -418,39 +418,39 @@ pub enum PwdMode {
     All,
 }
 
-// access 管理は MCP ツールではない: Owner が素のメッセージを送り、Bridge がここでパースして
-// **配達前に**実行する(ワーカーには決して渡らない = prompt injection の面がゼロ)。
+// Access management is not an MCP tool: the Owner sends a plain message and the Bridge parses it here and
+// runs it **before delivery** (it never reaches the agent = zero prompt-injection surface).
 
 const OWNER_COMMAND_VERBS: [&str; 4] = ["allow-bot", "remove-bot", "set-home", "warm"];
 
-/// パース済みの Owner コマンド1本(`allow-bot U123` など)。
+/// One parsed Owner command (`allow-bot U123` etc.).
 ///
-/// `verb` は [`OWNER_COMMAND_VERBS`] のどれか — 未知の語はコマンドとして成立しないので、
-/// 「不正な verb」という状態は存在しない。
+/// `verb` is one of [`OWNER_COMMAND_VERBS`] — an unknown word never forms a command, so
+/// an "invalid verb" state does not exist.
 #[derive(Debug, PartialEq, Eq)]
 pub struct OwnerCmd {
     pub verb: &'static str,
     pub args: Vec<String>,
 }
 
-// ── 節4: 上限の見張り ──────────────────────────────────────────────────────
+// ── Section 4: usage-limit watch ─────────────────────────────────────────────
 
-/// `/usage` を定期的に読んで、上限が近い/当たったことに気づく側の判断。
+/// The decisions for reading `/usage` periodically and noticing that a limit is near or hit.
 ///
-/// 「いつ読むか(間隔)」「どこで警告するか(節目)」「いつ塞がっているか(reset)」の3つは
-/// 一緒に効くので1つに置く。
+/// "When to read (interval)", "where to warn (thresholds)" and "when it is blocked (reset)" act together,
+/// so they live in one place.
 pub struct UsageWatch;
 
 impl UsageWatch {
-    /// 警告を出す使用率の節目。
+    /// Usage thresholds at which to warn.
     const WARN_THRESHOLDS: [u32; 2] = [80, 90];
-    /// 平常時の間隔と、上限到達が見込まれるときの間隔。
+    /// The normal interval, and the interval when hitting the limit is expected.
     pub const POLL_MS: u64 = 60 * 60 * 1000;
     pub const POLL_AT_RISK_MS: u64 = 15 * 60 * 1000;
 
-    /// 前回警告した節目より上で、**今回新しく跨いだ**節目(`newlyCrossedThresholds`)。
-    /// 使用率は窓の中では上がる一方なので、下がったら窓が変わったということ — 呼び手が
-    /// `last_warned` を 0 に戻して警告を張り直す。
+    /// Thresholds above the last warned one that were **newly crossed this time** (`newlyCrossedThresholds`).
+    /// Usage only rises within a window, so a drop means the window changed — the caller resets
+    /// `last_warned` to 0 to re-arm the warnings.
     pub fn newly_crossed(usage_pct: u32, last_warned: u32) -> Vec<u32> {
         Self::WARN_THRESHOLDS
             .into_iter()
@@ -458,10 +458,10 @@ impl UsageWatch {
             .collect()
     }
 
-    /// 上限に達している窓のうち、**最も遅い**リセット時刻(`bindingLimitResetEpoch`)。
+    /// The **latest** reset time among the windows that have hit their limit (`bindingLimitResetEpoch`).
     ///
-    /// 見るのは全部の行 — 週の壁はセッションの使用率が低くても効く。早く解ける方に合わせると
-    /// まだ塞がっている壁へ突っ込むので、**遅い方**を採る。達している窓が無ければ None。
+    /// Every row is checked — the weekly wall applies even when session usage is low. Following the earlier reset
+    /// would run into a wall that is still up, so take the **later** one. None if no window has hit its limit.
     pub fn binding_limit_reset(rows: &[UsageRow], now_ms: u64, limit_pct: f64) -> Option<u64> {
         rows.iter()
             .filter(|r| r.pct.parse::<f64>().unwrap_or(0.0) >= limit_pct)
@@ -472,30 +472,28 @@ impl UsageWatch {
 }
 
 
-// ── 節5: ツール許可 — 人に訊く前に効く常設の規則 ─────────
-// 人に訊くべきツールだけを人に訊くための門番。**これが無いと**ワーカーは自分の返信ツール
-// (`reply`)の許可を人に訊きにいく = 「Slack で答えてよいか」を Slack で訊くことになり、
-// 誰も押さないまま止まる。
+// ── Section 5: tool permission — standing rules applied before asking a human ─
+// The gatekeeper that makes sure only tools worth asking about are asked about. **Without it** the agent asks a
+// human for permission to use its own reply tool (`reply`) = asking on Slack "may I answer on Slack?",
+// and it stalls with nobody pressing the button.
 
-/// このワーカー自身の MCP サーバのツール接頭辞。**この実装のサーバ名**に対応する
-/// (`--mcp-config` の `agentgw` — 現行はプラグイン経由なので別綴りだが、
-/// 見ている対象は同じ「自前のツール」)。
+/// The tool prefix of this agent's own MCP server. It matches **this implementation's server name**
+/// (`agentgw` in `--mcp-config`).
 const OWN_MCP_PREFIX: &str = "mcp__agentgw__";
 
-/// 常設規則の答え。`Ask` = 規則では決まらない(人に訊く)。
+/// The standing rule's answer. `Ask` = the rules don't decide (ask a human).
 #[derive(Debug, PartialEq, Eq)]
 pub enum ToolPermission {
-    /// 訊かずに通す。文字列は理由(ワーカーに返す message に載る)。
+    /// Allow without asking. The string is the reason (carried in the message returned to the agent).
     Allow(&'static str),
-    /// 訊かずに拒む。人に「いいですか」と出してはいけないもの。
+    /// Deny without asking. Things that must never be put to a human as "is this OK?".
     Deny(&'static str),
-    /// 規則では決まらない — 人に訊く。
+    /// The rules don't decide — ask a human.
     Ask,
 }
 
 impl ToolPermission {
-    /// 常設規則を当てる。**純関数** — 状態ディレクトリは自前のファイルを見分けるためだけに使う。
-    /// 移植元。
+    /// Apply the standing rules. **Pure function** — the state directory is used only to recognise our own files.
     pub fn decide(tool_name: &str, tool_input: &serde_json::Value, state_dir: &Path) -> Self {
         let field = |k: &str| tool_input.get(k).and_then(|v| v.as_str()).unwrap_or("");
         let (skill, file_path) = (field("skill"), field("file_path"));
@@ -504,9 +502,9 @@ impl ToolPermission {
         let is =
             |p: &std::path::Path| !file_path.is_empty() && std::path::Path::new(file_path) == p;
 
-        // 自己信頼: ワーカーが答える唯一の手段は自前のツールなので、`reply` の許可を人に
-        // 訊くのは「Slack で答えてよいか」を Slack で訊くこと。実行権限は Bridge にあり、
-        // 何をしてよいかは Bridge が実行時に決める
+        // Self-trust: the agent's only way to answer is its own tool, so asking a human for `reply`
+        // permission is asking on Slack "may I answer on Slack?". Execution rights are the Bridge's,
+        // and the Bridge decides at run time what is allowed
         if tool_name.starts_with(OWN_MCP_PREFIX) {
             return Self::Allow("own MCP tool");
         }
@@ -520,9 +518,9 @@ impl ToolPermission {
             return Self::Allow("own state read");
         }
 
-        // 構造的な拒否: access は Owner のもので、変えるのは Owner の DM コマンドだけ
-        // (Bridge が自分でパースする)。ワーカーが直に書けるのは権限昇格なので、
-        // 「通しますか」と人に出さずその場で拒む
+        // Structural denial: access belongs to the Owner and only the Owner's DM commands change it
+        // (the Bridge parses them itself). An agent writing it directly is privilege escalation,
+        // so deny on the spot without asking a human "allow this?"
         if (tool_name == "Edit" || tool_name == "Write")
             && (is(&access_file) || file_path.ends_with("/.agentgw/access.json"))
         {
@@ -534,8 +532,8 @@ impl ToolPermission {
         Self::Ask
     }
 
-    /// permission hook の応答。Claude Code v2 は `hookSpecificOutput` の中に
-    /// `{decision:{behavior}}` を入れ子で欲しがる — stop の平たい形とは**別形**
+    /// The permission hook's response. Claude Code v2 wants `{decision:{behavior}}` nested inside
+    /// `hookSpecificOutput` — a **different shape** from stop's flat one
     pub fn decision_output(behavior: &str, message: &str) -> serde_json::Value {
         serde_json::json!({
             "hookSpecificOutput": {
@@ -546,17 +544,17 @@ impl ToolPermission {
     }
 }
 
-/// サインイン・サインアウトの進行状態。触るのは `command/agent.rs` だけ。
+/// Sign-in / sign-out progress. Only `command/agent.rs` touches it.
 #[derive(Default)]
 pub(super) struct SignIn {
-    /// コード待ちのサインイン: channel → その sign-in を始めた人。**同時に1本だけ**
-    /// (login セッションは1つ — 2本目を通すと後から来たコードで先の人が Owner になる)
+    /// Sign-in waiting for a code: channel → the person who started it. **Only one at a time**
+    /// (there is one login session — letting a second through would make the first person Owner via the later code)
     pending: HashMap<String, String>,
-    /// サインアウトが走っているか。`logout` の2連打で `claude auth logout` が2回走り、
-    /// 2本目の teardown が1本目の後始末と噛み合わなくなるのを防ぐ
+    /// Whether a sign-out is running. Prevents a double `logout` from running `claude auth logout` twice,
+    /// with the second teardown tripping over the first one's cleanup
     signing_out: bool,
-    /// サインイン切れの見張り: 最後に確かめた時刻(0 = まだ)と、最後に分かった状態
-    /// (`None` = まだ分からない。切れたと分かった時点で1回だけ知らせる)
+    /// Sign-in expiry watch: when it was last checked (0 = not yet) and the last known state
+    /// (`None` = not known yet. Notify once, at the moment it is found expired)
     checked_at_ms: u64,
     last_known: Option<bool>,
 }
@@ -570,15 +568,15 @@ impl SignIn {
 
 // ── running commands ─────────────────────────────────────────────────────────
 
-/// spawn したコマンドが main ループへ返す状態変更の便り。
+/// A state-change note that a spawned command sends back to the main loop.
 ///
-/// サインイン・サインアウトは spawn したタスクの中で何十秒も走る(ブラウザの往復を待つ)ので、
-/// 状態の書換えは main ループに**戻して**やる — tmux とポーリングはタスク、access.json と
-/// サインインの状態(`SignIn`)は main、と持ち場を割る(dispo_rx と同じ形)。
+/// Sign-in and sign-out run for tens of seconds inside a spawned task (waiting on the browser round trip),
+/// so state updates are **handed back** to the main loop — tmux and polling belong to the task, access.json and
+/// the sign-in state (`SignIn`) to main (the same shape as dispo_rx).
 pub(super) enum CmdFx {
-    /// サインインの結末。成否どちらでも login セッションを畳んで pending の席を空ける
-    /// (**始まり**は main が同期で登録する — 席取りを spawn に任せると2本目に奪われる)。
-    /// `bound` = Owner にする人
+    /// The outcome of a sign-in. Success or failure, the login session is torn down and the pending seat freed
+    /// (the **start** is registered synchronously by main — leaving the seat-taking to the spawn lets a second one steal it).
+    /// `bound` = the person to make Owner
     LoginFinished {
         channel: String,
         bound: Option<String>,
@@ -588,23 +586,23 @@ pub(super) enum CmdFx {
         channel: String,
         thread_ts: String,
     },
-    /// 起動直後の窓に**誰も答えられない画面**が出ていた。tmux のポーリングはタスク、
-    /// ゲートと通知は main、と持ち場を割る(LoginFinished と同じ形)。
+    /// A window right after startup showed **a screen nobody can answer**. tmux polling belongs to the task,
+    /// the gate and notification to main (the same shape as LoginFinished).
     SpawnScreen {
         outcome: SpawnOutcome,
-        /// ログに出す相手(`thread=…` / `pool session=…`)
+        /// Who to name in the log (`thread=…` / `pool session=…`)
         what: String,
     },
 }
 
 impl Bridge {
-    /// Bridge が自分で答える本文コマンド。**true = 消費した** — 呼び手はそこで打ち切る。
+    /// Body commands the Bridge answers itself. **true = consumed** — the caller stops there.
     ///
-    /// 認可は1本の規則だけ: 送信者が Owner か。チャンネルでも DM でも、
-    /// mention の有無にも依らない。Owner でない誰かのコマンドは記録して捨てる — ワーカーに
-    /// 落ちると「永遠に再spawn される未応答メッセージ」になってスレッドを詰まらせる。
+    /// Authorization is a single rule: is the sender the Owner. Regardless of channel or DM,
+    /// or whether we were mentioned. A command from anyone else is logged and dropped — if it fell through to the agent
+    /// it would become "an unanswered message respawned forever" and clog the thread.
     pub(super) async fn handle_command(&mut self, msg: &InboundMsg, key: &ThreadKey, root_ts: &str) -> bool {
-        // 検出は Cmd::parse が全部やる — どれでもなければコマンドではない
+        // Cmd::parse does all the detection — if it matches nothing, it is not a command
         let msg_body = crate::bridge::command::Message::new(&msg.text, self.bot_user_id.as_deref());
         let Some(cmd) = crate::bridge::command::Cmd::parse(&msg_body, self.deps.agent.as_ref()) else {
             return false;
@@ -616,12 +614,12 @@ impl Bridge {
             thread_key: Some(key.clone()),
         };
         let sender = msg.user.as_deref().unwrap_or("");
-        // 今は gate が非 Owner を先に落とすのでここは通らない。それでも残す — 現行が
-        // 非 Owner の発言をワーカーに「読ませる」context 配達を持っており、
-        // それを移植した日に gate は非 Owner を通し始める。コマンドの認可はその時も**ここ**にある
+        // Today the gate drops non-Owners first, so this is never reached. Kept anyway — the original had
+        // a context delivery that lets the agent "read" non-Owner messages, and the day that is
+        // ported the gate starts letting non-Owners through. Command authorization will still be **here** then
         if self.access.owner.is_empty() || msg.user.as_deref() != Some(self.access.owner.as_str()) {
-            // `login` だけは文脈が1つ増える — Owner が**既に居る**のに来た login だから
-            // ここに落ちている(居なければ gate の手前の抜け道が捌く)
+            // Only `login` carries one more piece of context — it lands here because it arrived while an Owner
+            // **already exists** (without one, the shortcut before the gate handles it)
             let note = match cmd {
                 Cmd::Login => " while an Owner is bound",
                 _ => "",
@@ -639,8 +637,8 @@ impl Bridge {
         let dm = msg.channel_kind == crate::chat::ChannelKind::Dm;
 
         match cmd {
-            // stop。ESC は tmux を通るので
-            // MCP が死んでいても効く — 止めたくなるのは大抵まさにその状況
+            // stop. ESC goes through tmux, so it
+            // works even when MCP is dead — which is usually exactly when you want to stop
             Cmd::Stop => {
                 ctx.info(
                     "bridge",
@@ -651,7 +649,7 @@ impl Bridge {
                 );
                 self.user_stop(msg, key, root_ts, &ctx);
             }
-            // exit。終わらせるのは**ワーカーだけ** — スレッドは残る
+            // exit. Ends **only the agent** — the thread stays
             Cmd::Exit => {
                 ctx.info(
                     "bridge",
@@ -662,7 +660,7 @@ impl Bridge {
                 );
                 self.user_exit(msg, key, root_ts, &ctx).await;
             }
-            // resume。手元の端末に線を渡す
+            // resume. Hand the line over to the local terminal
             Cmd::Resume => {
                 ctx.info(
                     "bridge",
@@ -688,8 +686,8 @@ impl Bridge {
                     key,
                 );
             }
-            // status。ワーカーを一切通さないので、全員が
-            // 固まっていても答えが返る
+            // status. Never goes through an agent, so it answers
+            // even when every agent is stuck
             Cmd::Status => {
                 ctx.info(
                     "bridge",
@@ -730,8 +728,8 @@ impl Bridge {
                 );
                 self.user_compact(msg, key, root_ts, &ctx);
             }
-            // restart。この Bridge 自身を
-            // 入れ替える唯一のコマンド — 進捗チェックリストだけが2つのプロセスをまたぐ
+            // restart. The only command that replaces
+            // this Bridge itself — only the progress checklist spans the two processes
             Cmd::Restart => {
                 ctx.info(
                     "bridge",
@@ -744,10 +742,10 @@ impl Bridge {
                 self.maintenance_restart("slack restart command", Some((&channel, root_ts)), &ctx)
                     .await;
             }
-            // Owner が居るときの `login`。Owner が決まっていても、**このマシンの** Claude Code の
-            // サインインは別に切れる(2026-09-18、あるマシンだけ切れていて Slack から戻す手段が無かった)。
-            // だから実際の状態を訊き、切れていればここで(このマシンで)サインインを始める。
-            // サインイン済みなら打ち止める — ワーカーに落とすと「何にログインしますか?」と訊き返す
+            // `login` with an Owner present. Even with an Owner set, **this machine's** Claude Code
+            // sign-in can expire separately (2026-09-18: one machine had expired and there was no way to restore it from Slack).
+            // So ask for the actual state, and if expired start signing in here (on this machine).
+            // If already signed in, stop — falling through to the agent makes it ask back "log in to what?"
             Cmd::Login => {
                 let signed_in = self.deps.agent.signed_in().await;
                 if signed_in == Some(true) {
@@ -875,10 +873,10 @@ impl Bridge {
 mod tests {
     use super::*;
 
-    /// 節目の跨ぎと、ゲートを解く時刻の選び方。
+    /// Threshold crossing, and choosing when to lift the gate.
     #[test]
     fn the_usage_monitor_warns_once_per_threshold_and_gates_until_the_latest_wall() {
-        // 跨いだ節目だけ返す(同じ節目で二度警告しない)
+        // Return only crossed thresholds (don't warn twice at the same one)
         assert_eq!(UsageWatch::newly_crossed(75, 0), Vec::<u32>::new());
         assert_eq!(UsageWatch::newly_crossed(80, 0), vec![80]);
         assert_eq!(
@@ -893,33 +891,33 @@ mod tests {
         );
         assert_eq!(UsageWatch::newly_crossed(95, 90), Vec::<u32>::new());
 
-        let now = 1_785_387_600_000u64; // 2026-07-30T05:00Z = 30日 14:00 JST
+        let now = 1_785_387_600_000u64; // 2026-07-30T05:00Z = 14:00 JST on the 30th
         let row = |label: &str, pct: &str, reset: &str| UsageRow {
             label: label.into(),
             pct: pct.into(),
             reset: reset.into(),
         };
-        // 達している窓が無ければゲートしない
+        // No window at its limit means no gate
         assert_eq!(
             UsageWatch::binding_limit_reset(&[row("Current session", "99", "at 11pm")], now, 100.0),
             None
         );
-        // 週の壁はセッションが低くても効く。**遅い方**まで塞ぐ
+        // The weekly wall applies even when the session is low. Block until the **later** one
         let rows = [
             row("Current session", "100", "at 4pm"),
             row("Current week (all models)", "100", "at 11pm"),
         ];
         let reset = UsageWatch::binding_limit_reset(&rows, now, 100.0).unwrap();
         assert_eq!(reset, WallClock::parse_reset_epoch("at 11pm", now).unwrap());
-        // 既に過ぎた reset は採らない(0% 行の空 reset も同じく落ちる)
+        // A reset already in the past is not taken (the empty reset of a 0% row drops out the same way)
         assert_eq!(
             UsageWatch::binding_limit_reset(&[row("Current session", "100", "")], now, 100.0),
             None
         );
     }
 
-    /// 名指しの見分け。動いているスレッドには他人宛の発言も流れてくるので、
-    /// 「自分が名指しされたか」と「他人が名指しされたか」を別々に答える。
+    /// Telling who is named. Messages addressed to others also flow into a running thread,
+    /// so "were we named" and "was someone else named" are answered separately.
     #[test]
     fn tells_our_own_mention_apart_from_someone_elses() {
         fn m<'a>(t: &'a str) -> Message<'a> {
@@ -927,21 +925,21 @@ mod tests {
         }
         assert!(m("<@UBOT> やって").mentions_bot());
         assert!(!m("<@UBOT> やって").mentions_someone_else());
-        // 他人宛 — 自分は名指しされていない
+        // Addressed to someone else — we are not named
         assert!(!m("<@UOTHER> おーい").mentions_bot());
         assert!(m("<@UOTHER> おーい").mentions_someone_else());
-        // 両方 — 自分も呼ばれている
+        // Both — we are called too
         assert!(m("<@UBOT> <@UOTHER> と相談して").mentions_bot());
         assert!(m("<@UBOT> <@UOTHER> と相談して").mentions_someone_else());
-        // 誰も名指ししていない素の続き
+        // A plain follow-up naming nobody
         assert!(!m("ありがとう").mentions_bot());
         assert!(!m("ありがとう").mentions_someone_else());
-        // 表示名つきの形(`<@ID|label>`)でも同じ
+        // Same with the display-name form (`<@ID|label>`)
         assert!(m("<@UBOT|claude> やって").mentions_bot());
     }
 
-    /// 常設規則。**自前の MCP ツールを通すのが肝** — これが無いとワーカーは
-    /// 「Slack で答えてよいか」を Slack で訊きにいき、誰も押さないまま止まる。
+    /// Standing rules. **Letting our own MCP tools through is the key** — without it the agent
+    /// asks on Slack "may I answer on Slack?" and stalls with nobody pressing the button.
     #[test]
     fn standing_tool_policy_lets_the_worker_answer_and_refuses_access_writes() {
         use ToolPermission as P;
@@ -949,7 +947,7 @@ mod tests {
         let none = serde_json::json!({});
         let file = |p: &str| serde_json::json!({ "file_path": p });
 
-        // 自前のもの: 訊かない
+        // Our own: don't ask
         assert_eq!(
             P::decide("mcp__agentgw__reply", &none, dir),
             P::Allow("own MCP tool")
@@ -971,7 +969,7 @@ mod tests {
             P::Allow("own state read")
         );
 
-        // 権限昇格は人に訊かず断る
+        // Privilege escalation is refused without asking
         assert!(matches!(
             P::decide("Write", &file("/st/access.json"), dir),
             P::Deny(_)
@@ -981,17 +979,17 @@ mod tests {
             P::Deny(_)
         ));
 
-        // それ以外は人の判断
+        // Everything else is a human's call
         assert_eq!(
             P::decide("Bash", &serde_json::json!({"command": "rm -rf /"}), dir),
             P::Ask
         );
         assert_eq!(P::decide("Read", &file("/etc/passwd"), dir), P::Ask);
-        // 他人の MCP は通さない
+        // Other MCP servers are not let through
         assert_eq!(P::decide("mcp__other__do_thing", &none, dir), P::Ask);
     }
 
-    /// 応答の形は stop の平たい形と**別**。入れ子を間違えると Claude Code が読まない。
+    /// The response shape is **different** from stop's flat one. Get the nesting wrong and Claude Code ignores it.
     #[test]
     fn perm_decision_output_is_the_nested_shape() {
         let v = ToolPermission::decision_output("allow", "Slack bridge (own MCP tool)");
@@ -1012,13 +1010,13 @@ mod tests {
     fn whole_message_only_is_a_command() {
         assert!(Message::new("stop", None).is("stop"));
         assert!(Message::new("  STOP ", None).is("stop"));
-        assert!(Message::new("🛑", None).is("stop")); // 絵文字 alias
+        assert!(Message::new("🛑", None).is("stop")); // emoji alias
         assert!(Message::new(":red_circle:", None).is("stop"));
-        assert!(!Message::new("stop the deploy", None).is("stop")); // 文中は発動しない
-        assert!(Message::new("？", None).is("help")); // 全角
+        assert!(!Message::new("stop the deploy", None).is("stop")); // doesn't fire mid-sentence
+        assert!(Message::new("？", None).is("help")); // full-width
         assert!(Message::new("ステータス", None).is("status"));
         assert!(Message::new("bye", None).is("exit"));
-        // 自ボット mention は剥がす。他人の mention は剥がさない
+        // Our own bot mention is stripped. Others' mentions are not
         assert!(Message::new("<@UBOT> stop", Some("UBOT")).is("stop"));
         assert!(!Message::new("<@UOTHER> stop", Some("UBOT")).is("stop"));
     }
@@ -1047,7 +1045,7 @@ mod tests {
                 model
             ),
             None
-        ); // 文は素通し
+        ); // a sentence passes through
         assert_eq!(
             Cmd::value_of(
                 &Message::new("effort xhigh", None),
@@ -1067,7 +1065,7 @@ mod tests {
         assert_eq!(
             Cmd::value_of(&Message::new("mode bypass", None), "mode", &modes),
             None
-        ); // 引数に無い = 文
+        ); // not among the arguments = a sentence
         assert_eq!(
             Cmd::value_of(&Message::new("mode を実装して", None), "mode", &modes),
             None
@@ -1082,12 +1080,12 @@ mod tests {
         assert_eq!(Cmd::pwd(&Message::new("pwd の使い方", None)), None);
         let oc = Cmd::owner(&Message::new("warm on <#C1|general>", None)).unwrap();
         assert_eq!((oc.verb, oc.args.len()), ("warm", 2));
-        assert!(Cmd::owner(&Message::new("warm の話をしよう", None)).is_none()); // on/off が無い = 文
+        assert!(Cmd::owner(&Message::new("warm の話をしよう", None)).is_none()); // no on/off = a sentence
         assert!(Cmd::owner(&Message::new("set-home", None)).is_some());
-        assert!(Cmd::owner(&Message::new("set-home here", None)).is_none()); // 引数付きは文
+        assert!(Cmd::owner(&Message::new("set-home here", None)).is_none()); // with an argument, it's a sentence
     }
 
-    /// 手書き走査(id 形・mention・自 mention 剥がし)の最小の網。
+    /// Minimal net for the hand-written scans (id shape, mention, stripping our own mention).
     #[test]
     fn id_shapes_and_mentions() {
         assert!(SlackId::is_user("U012AB") && !SlackId::is_user("U") && !SlackId::is_user("BU12"));
@@ -1096,13 +1094,13 @@ mod tests {
             SlackId::from_user_mention("<@U01|taito>").as_deref(),
             Some("U01")
         );
-        assert_eq!(SlackId::from_user_mention("U01").as_deref(), Some("U01")); // 素の id も可
+        assert_eq!(SlackId::from_user_mention("U01").as_deref(), Some("U01")); // a bare id works too
         assert_eq!(
             SlackId::from_channel_mention("<#C01|general>").as_deref(),
             Some("C01")
         );
         assert_eq!(SlackId::from_channel_mention("<@U01>"), None);
-        // 自 mention は剥がれ、引数の大小文字は保存される
+        // Our mention is stripped and the argument's case is preserved
         assert_eq!(
             Message::new("<@UBOT> pwd /Users/Me", Some("UBOT"))
                 .verb_args("pwd")
@@ -1117,10 +1115,10 @@ mod tests {
 
     #[test]
     fn stale_command_detection() {
-        // 起動(=100_000ms)より前に投稿された ts はコマンドとして死んでいる
+        // A ts posted before startup (=100_000ms) is dead as a command
         assert!(Cmd::Stop.stale_reason("99.000000", 100_000, 0).is_some());
         assert!(Cmd::Stop.stale_reason("101.000000", 100_000, 0).is_none());
-        assert!(Cmd::Stop.stale_reason("101.000000", 100_000, 1).is_some()); // 再配達
+        assert!(Cmd::Stop.stale_reason("101.000000", 100_000, 1).is_some()); // redelivery
         assert!(Cmd::Stop.stale_reason("garbage", 100_000, 0).is_none()); // fail-open
     }
 

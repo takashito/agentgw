@@ -1,21 +1,21 @@
-//! マシン側の接続 — ゲートウェイへ**外向きに** dial し、自分の担当チャンネルのイベントを受け取る。
-//! ゲートウェイから dial してもらう構成のための待ち受け口(`GatewayInlet`)もここ。
+//! The machine-side connection — dials **outward** to the gateway and receives events for the channels it handles.
+//! Also home to the listener (`GatewayInlet`) for setups where the gateway dials the machine.
 //!
-//! 外向きなのが要点で、だから家庭用ルータのポート開放も VPN も要らない(カフェの Wi-Fi でも
-//! テザリングでも繋がる)。
+//! Dialing outward is the point: no port forwarding on a home router and no VPN needed (it connects from
+//! café Wi-Fi or tethering too).
 //!
-//! > **接続が切れても、エージェントには一切触らない。**
-//! > この module はエージェントへの口を**渡されていない** — それは意図的な設計。エージェントの
-//! > 生死の知らせは落ちたら本当に「そのエージェントが死んだ」を意味するが、その反射を
-//! > ここに持ち込むと、2秒の Wi-Fi の瞬きが、生きて作業中のエージェントを殺すことになる。
-//! > ゲートウェイを失って起きるのはこれだけ: **戻るまで新しい Slack メッセージが来ない。**
-//! > 走っているものは走り続け、その下で繋ぎ直す。
+//! > **When the connection drops, agents are never touched.**
+//! > This module is deliberately **not given** a handle to the agents. A dropped agent
+//! > liveness signal really does mean "that agent died", but bringing that reflex in
+//! > here would let a 2-second Wi-Fi blink kill agents that are alive and working.
+//! > Losing the gateway causes only this: **no new Slack messages until it comes back.**
+//! > What is running keeps running, and the link reconnects underneath.
 //!
-//! 話し合いでは解決しない断り(鍵が違う・版が違う)は**大きな声で報告する**。ただし
-//! **プロセスは落とさない** — 落ちると supervisor がすぐ起こし直し、その連打が systemd の
-//! 起動レート制限(既定 10秒に5回)を踏んで unit を `failed` のまま放置し、デプロイ中の
-//! 一瞬の 401 でマシンが恒久的に上がってこなくなる。直らない断りでも間を空けて繋ぎ直し続け、
-//! 直された瞬間に自力で戻る。
+//! Refusals that talking can't fix (wrong key, wrong version) are **reported loudly**, but
+//! **the process does not exit** — if it did, the supervisor would restart it at once, the rapid restarts would hit
+//! systemd's start rate limit (default 5 in 10 seconds) and leave the unit `failed`, and a momentary
+//! 401 during a deploy would keep the machine down for good. Even for an unfixable refusal it keeps
+//! reconnecting at intervals, and recovers on its own the moment it is fixed.
 
 use crate::bridge::gateway::wire::{self, LinkFrame};
 use crate::bridge::state::LogCtx;
@@ -34,37 +34,37 @@ use crate::bridge::gateway;
 pub const RECONNECT_MIN_MS: u64 = 1_000;
 pub const RECONNECT_MAX_MS: u64 = 30_000;
 
-/// 無通信がこれだけ続いたら Ping を1発。次の窓でも無音なら死んだものとして切る。
+/// After this much silence, send one Ping. If the next window is silent too, treat it as dead and disconnect.
 pub const LINK_IDLE_MS: u64 = 30_000;
 
-/// 無通信の窓が閉じたときにやること。
+/// What to do when a silent window closes.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Idle {
-    /// 生きているか確かめる。
+    /// Check that it's alive.
     Ping,
-    /// 前の Ping に返事が無かった。切って繋ぎ直す。
+    /// The previous Ping got no answer. Disconnect and reconnect.
     Dead,
 }
 
-/// リンクが死んでいないかを見る番人。**half-open を見つける唯一の手段。**
+/// The watchman checking the link isn't dead. **The only way to detect half-open.**
 ///
-/// 相手が FIN を出さずに消えると(ネット断・サスペンド・NAT のエントリ落ち)、ソケットは
-/// `ESTAB` のまま残り、受信は**永久に返らない**。Close も Err も来ないので、どの受信ループも
-/// 抜けられず、その先にある再接続に一生たどり着かない(2026-08-03 に子が74分沈黙した)。
-/// WebSocket の Ping は tungstenite も axum も**受けた分に Pong を返すだけ**で、自分からは
-/// 打たない。TCP keepalive も既定では off。だから、こちらから叩いて確かめるしかない。
+/// When the peer vanishes without a FIN (network loss, suspend, a dropped NAT entry), the socket stays
+/// `ESTAB` and receiving **never returns**. No Close and no Err arrive, so no receive loop can
+/// exit, and the reconnect beyond it is never reached (2026-08-03: a machine went silent for 74 minutes).
+/// For WebSocket Ping, both tungstenite and axum **only answer received Pings with Pong** and never
+/// send their own. TCP keepalive is off by default too. So the only way is to poke from our side.
 #[derive(Default)]
 pub struct IdleWatch {
     pinged: bool,
 }
 
 impl IdleWatch {
-    /// 何か届いた / 送れた。生きている。
+    /// Something arrived / was sent. Alive.
     pub fn on_traffic(&mut self) {
         self.pinged = false;
     }
 
-    /// 無通信のまま窓が閉じた。
+    /// The window closed with no traffic.
     pub fn on_idle(&mut self) -> Idle {
         if self.pinged {
             Idle::Dead
@@ -75,47 +75,47 @@ impl IdleWatch {
     }
 }
 
-/// link から1フレーム読んだ結果。[`LinkRead`] を埋める側が返す。
+/// The result of reading one frame from the link. Returned by the implementor of [`LinkRead`].
 pub enum Frame {
-    /// 本文。
+    /// A payload.
     Text(String),
-    /// 本文以外(Pong など)。中身は要らないが、**届いた事実**が生存の証拠。
+    /// Not a payload (Pong etc.). Its content is irrelevant, but **the fact it arrived** proves liveness.
     Other,
-    /// 相手が閉じた / 壊れた。理由は人に見せる1行。
+    /// The peer closed / broke. The reason is a line for humans.
     Closed(String),
 }
 
-/// 1フレーム読む口。**タイムアウトは付けない** — 番人([`beat`])が外から被せる。
+/// A reader of one frame. **No timeout here** — the watchman ([`beat`]) wraps it from outside.
 ///
-/// axum と tungstenite で読み口の名前が違うだけなので、実装はその差を埋めるだけにする。
-/// **見張りの時計と状態機械は [`beat`] に1つしか無い**(4か所に写していた頃の再発防止)。
+/// axum and tungstenite differ only in the name of their read method, so implementations just bridge that.
+/// **The watch clock and state machine exist only once, in [`beat`]** (to prevent a repeat of when they were copied to 4 places).
 pub trait LinkRead {
     fn read_frame(&mut self) -> impl std::future::Future<Output = Frame> + Send;
 }
 
-/// 番人つきの受信の結果。
+/// The result of a watched receive.
 ///
-/// **`Ping` を握り潰さないこと。** ここを無視すると、相手が黙って消えた link
-/// (half-open)を永久に見逃す。match の網羅がそれを強制する。
+/// **Don't swallow `Ping`.** Ignoring it means never noticing a link whose peer silently vanished
+/// (half-open). Exhaustive matching enforces that.
 pub enum Beat {
-    /// 本文が届いた。
+    /// A payload arrived.
     Text(String),
-    /// 本文以外が届いた。生きている。
+    /// Something other than a payload arrived. Alive.
     Alive,
-    /// 無通信が続いた。**呼び手は Ping を1発打って、次を待つ。**
+    /// Silence continued. **The caller sends one Ping and waits for the next.**
     Ping,
-    /// 切れた。理由つき。呼び手はループを抜ける。
+    /// Disconnected, with a reason. The caller leaves the loop.
     Gone(String),
 }
 
-/// **link の受信は、必ずこれを通す。** 素の `next()` / `recv()` を直に待つと、
-/// 相手が FIN を出さずに消えたとき Close も Err も来ないまま永久に返らない
-/// (2026-08-03、子が74分沈黙)。
+/// **Every link receive goes through this.** Waiting on a bare `next()` / `recv()` directly
+/// never returns when the peer vanishes without a FIN, since neither Close nor Err arrives
+/// (2026-08-03: a machine went silent for 74 minutes).
 pub async fn beat<S: LinkRead>(socket: &mut S, watch: &mut IdleWatch) -> Beat {
     beat_within(socket, watch, LINK_IDLE_MS).await
 }
 
-/// [`beat`] の中身。窓の広さを渡せるのは**テストのため**だけ — 呼び手は `beat` を使う。
+/// The body of [`beat`]. The window size is passable **only for tests** — callers use `beat`.
 async fn beat_within<S: LinkRead>(socket: &mut S, watch: &mut IdleWatch, window_ms: u64) -> Beat {
     match tokio::time::timeout(Duration::from_millis(window_ms), socket.read_frame()).await {
         Ok(Frame::Text(t)) => {
@@ -144,26 +144,25 @@ where
         match self.next().await {
             Some(Ok(M::Text(t))) => Frame::Text(t.to_string()),
             Some(Ok(M::Close(_))) | None => Frame::Closed("closed by the other side".to_string()),
-            Some(Ok(_)) => Frame::Other, // ping/pong などは tungstenite が処理する
+            Some(Ok(_)) => Frame::Other, // tungstenite handles ping/pong and the like
             Some(Err(e)) => Frame::Closed(e.to_string()),
         }
     }
 }
 
-/// 握手が拒まれた理由のうち、**呼ぶ側が態度を変えるべきもの**。
+/// Reasons the handshake was refused where **the caller should change its behaviour**.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fatal {
-    /// 401 — api トークンが違う。再起動しても直らない。人が設定を直すしかない。
+    /// 401 — wrong api token. A restart won't fix it. Only a human fixing the config will.
     BadToken,
-    /// 426 — 版が違う。**このマシンの新しいコードで再起動すれば治る**種類。
-    /// (Bun が `RejectReason` で区別していた唯一の中身がこれ。)
+    /// 426 — version mismatch. The kind that **is fixed by restarting with this machine's new code**.
     WrongVersion,
-    /// 400 — 名乗りが通らない(Bridge ID が空 / 使えない字)。設定を直すしかない。
+    /// 400 — the name is rejected (Bridge ID empty / invalid characters). Only fixing the config helps.
     BadBridgeId,
 }
 
 impl Fatal {
-    /// HTTP のステータスから。**それ以外は fatal ではない** — 繋がらないだけなので黙って再試行する。
+    /// From an HTTP status. **Anything else is not fatal** — it just didn't connect, so retry quietly.
     fn of(status: u16) -> Option<Fatal> {
         match status {
             401 => Some(Fatal::BadToken),
@@ -188,35 +187,35 @@ impl Fatal {
     }
 }
 
-/// Relay から届いたもののうち、Bridge が使うもの。
+/// What the Bridge uses out of what arrives from the Relay.
 pub enum FromRelay {
-    /// 受理された。bot トークン(**メモリだけ**)と、いまの home。
+    /// Accepted. The bot token (**in memory only**) and the current home.
     Ready {
         bot_token: String,
         home: Option<String>,
     },
-    /// Slack のイベント1つ。
+    /// One Slack event.
     Event {
         name: String,
         event: serde_json::Value,
     },
-    /// ボタン1押し。
+    /// One button press.
     Action {
         action: serde_json::Value,
         body: serde_json::Value,
     },
-    /// Owner がこのマシンをある場所の担当に決めた。
+    /// The Owner assigned this machine to some place.
     Linked {
         owner_user_id: String,
         channel: String,
         thread_ts: String,
     },
-    /// 話し合いで解決しない断り。**再試行しない。**
+    /// A refusal that talking won't fix. **No retry.**
     Fatal(Fatal),
 }
 
-/// 親から届いたフレームは、そのまま上流の知らせになる。**dial した側でも迎えられた側でも
-/// 同じ受け皿**に流すための橋(`Fatal` だけはこちら側の事情なので `From` に無い)。
+/// A frame from the gateway becomes an upstream message as-is. The bridge that lets **both the dialing side and the
+/// accepted side use the same sink** (`Fatal` alone is a local matter, so it isn't in `From`).
 impl From<crate::bridge::gateway::wire::LinkFrame> for FromRelay {
     fn from(frame: crate::bridge::gateway::wire::LinkFrame) -> Self {
         use crate::bridge::gateway::wire::LinkFrame as F;
@@ -254,18 +253,18 @@ impl RelayLink {
         }
     }
 
-    /// 繋ぎ続ける。届いたものを `tx` に流す。**戻ってこない**(`stop()` されたときだけ戻る)。
+    /// Keep connected, forwarding what arrives to `tx`. **Does not return** (only when `stop()` is called).
     pub async fn run(&self, tx: tokio::sync::mpsc::Sender<FromRelay>) {
         let mut backoff = RECONNECT_MIN_MS;
         while !self.stopped.load(Ordering::SeqCst) {
             match self.connect_once(&tx).await {
-                // 握手が通った回。次の再接続は短い待ちから始めてよい
+                // The handshake succeeded this time. The next reconnect may start from a short wait
                 Ok(true) => backoff = RECONNECT_MIN_MS,
                 Ok(false) => {}
-                // 話し合いでは解決しない断り。**大きな声で言うが、諦めない** — ここで
-                // 抜けるとプロセスが落ち、supervisor の連打が systemd の起動レート制限を
-                // 踏んで unit が `failed` のまま残る(2026-08-03、子が5時間15分停止)。
-                // 人が直すまで間を空けて繋ぎ直し続ければ、直された瞬間に自力で戻る
+                // A refusal talking won't fix. **Say it loudly, but don't give up** — leaving here
+                // makes the process exit, and the supervisor's rapid restarts hit systemd's start rate limit
+                // and leave the unit `failed` (2026-08-03: a machine was down for 5 hours 15 minutes).
+                // Keep reconnecting at intervals until a human fixes it, and it recovers the moment it is fixed
                 Err(fatal) => {
                     LogCtx::default().error("bridge", &format!("remote link: {}", fatal.message()));
                     let _ = tx.send(FromRelay::Fatal(fatal)).await;
@@ -287,7 +286,7 @@ impl RelayLink {
         self.stopped.store(true, Ordering::SeqCst);
     }
 
-    /// 1回の接続。`Ok(true)` = 握手まで通った(その後切れた)、`Ok(false)` = 繋がらなかった。
+    /// One connection. `Ok(true)` = got through the handshake (then dropped), `Ok(false)` = didn't connect.
     async fn connect_once(&self, tx: &tokio::sync::mpsc::Sender<FromRelay>) -> Result<bool, Fatal> {
         let target = format!("{}{}", self.url, wire::path_for(&self.bridge_id));
         LogCtx::default().info(
@@ -308,7 +307,7 @@ impl RelayLink {
         let (mut socket, _) = match tokio_tungstenite::connect_async(request).await {
             Ok(ok) => ok,
             Err(e) => {
-                // **断られた**のか、**繋がらなかった**のかを分ける。後者は黙って再試行する
+                // Tell **refused** apart from **couldn't connect**. The latter is retried quietly
                 if let tokio_tungstenite::tungstenite::Error::Http(resp) = &e
                     && let Some(fatal) = Fatal::of(resp.status().as_u16())
                 {
@@ -327,7 +326,7 @@ impl RelayLink {
         use tokio_tungstenite::tungstenite::protocol::Message as M;
         let mut watch = IdleWatch::default();
         loop {
-            // **受信は `beat` 経由だけ。** 直に `next()` を待つと half-open で永久に止まる
+            // **Receive only via `beat`.** Waiting on `next()` directly hangs forever on half-open
             let raw = match beat(&mut socket, &mut watch).await {
                 Beat::Text(t) => t,
                 Beat::Alive => continue,
@@ -386,16 +385,16 @@ impl RelayLink {
                 }
             };
             if tx.send(out).await.is_err() {
-                return Ok(true); // Bridge 本体が終わった
+                return Ok(true); // the Bridge itself has ended
             }
         }
-        // ここが「反射でワーカーを片付けたくなる」場所。**やらない。**
-        // リンクが落ちたのは、Slack の流れが止まったという意味でしかない。
+        // This is where you'd be tempted to clean up agents by reflex. **Don't.**
+        // A dropped link only means the flow from Slack stopped.
         Ok(true)
     }
 }
 
-/// upgrade の3点(パス / `Authorization` / `Sec-WebSocket-Protocol`)を載せた要求を組む。
+/// Build the request carrying the three upgrade parts (path / `Authorization` / `Sec-WebSocket-Protocol`).
 pub(crate) fn build_request(
     target: &str,
     api_token: &str,
@@ -420,7 +419,7 @@ pub(crate) fn build_request(
     Ok(request)
 }
 
-/// 次の再接続までの待ち。握手が通ったら短い待ちに戻す。
+/// The wait before the next reconnect. Reset to the short wait once a handshake succeeds.
 pub fn next_backoff(current_ms: u64, handshake_succeeded: bool) -> u64 {
     if handshake_succeeded {
         RECONNECT_MIN_MS
@@ -429,34 +428,34 @@ pub fn next_backoff(current_ms: u64, handshake_succeeded: bool) -> u64 {
     }
 }
 
-// ── どちらのモードで動くか(排他) ─────────────────────────────────────
+// ── Which mode to run in (mutually exclusive) ────────────────────────────
 
-/// Bridge の入口は2つあり、**同時に開いてはいけない**。
+/// The Bridge has two entrances, and they **must never be open at once**.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
-    /// 直結 — 自分で Slack の Socket Mode を開く。
+    /// Direct — open Slack's Socket Mode ourselves.
     Direct {
         app_token: String,
         bot_token: String,
     },
-    /// 親経由 — Slack には触らず、親へ dial する。bot トークンは握手で貰う。
+    /// Via the gateway — don't touch Slack, dial the gateway. The bot token comes in the handshake.
     Relay {
         url: String,
         api_token: String,
         bridge_id: String,
     },
-    /// 親経由(**迎えに来てもらう**)— こちらからは dial せず、親の接続を口で待つ。
-    /// 親が NAT の内側にいて子から繋ぎに行けない構成のためだけに在る。
-    /// フレームの向きは変わらない(親→子)。
+    /// Via the gateway (**being picked up**) — don't dial; wait at a listener for the gateway's connection.
+    /// Exists only for setups where the gateway is behind NAT and the machine can't reach it.
+    /// The frame direction doesn't change (gateway → machine).
     AwaitParent,
 }
 
 impl Mode {
-    /// env からモードを決める。**両方揃っていたら起動を拒否する。**
+    /// Decide the mode from env. **Refuse to start if both are set.**
     ///
-    /// 黙って両方繋ぐと、Slack が同じ app トークンの2人目に対して負荷分散を始め、
-    /// この設計が防いでいる split-brain がそのまま戻る。だから既定でどちらかに寄せるのではなく、
-    /// **大きな声で断る**。
+    /// Silently connecting both makes Slack start load-balancing across two consumers of the same app token,
+    /// bringing back exactly the split-brain this design prevents. So rather than defaulting to one,
+    /// **refuse loudly**.
     pub fn resolve(get: impl Fn(&str) -> Option<String>) -> Result<Mode, String> {
         let v = |k: &str| {
             get(k)
@@ -472,7 +471,7 @@ impl Mode {
         let wants_relay = url.is_some() || token.is_some();
         let listens = v("AGENTGW_LINK_LISTEN").is_some();
 
-        // **1つの子につき link は1本。** 両方向あると同じイベントが二重に配られる
+        // **One link per machine.** With both directions, the same event is delivered twice
         if wants_relay && listens {
             return Err(crate::t!(
                 "Both AGENTGW_RELAY_URL and AGENTGW_LINK_LISTEN are set in .env. Keep one: \
@@ -506,8 +505,8 @@ impl Mode {
                      実行すると両方が書かれます。"
                 ));
             };
-            // **自動命名はしない。** ホスト名にも `default` にも落とさない —
-            // 名前が衝突したマシンは、互いの Slack メッセージを奪い合う
+            // **No automatic naming.** Don't fall back to the hostname or `default` —
+            // machines with colliding names steal each other's Slack messages
             let Some(bridge_id) = id else {
                 return Err(crate::t!(
                     "This machine has no name. Set AGENTGW_BRIDGE_ID in .env. It isn't chosen \
@@ -522,7 +521,7 @@ impl Mode {
                 bridge_id,
             });
         }
-        // Slack のトークンが無く、口だけがある = 親に迎えに来てもらう子
+        // No Slack token and only a listener = a machine that the gateway comes to pick up
         if app.is_none() && listens {
             return Ok(Mode::AwaitParent);
         }
@@ -541,39 +540,39 @@ impl Mode {
     }
 }
 
-/// 子を迎える口。既定は `0.0.0.0`(どのインターフェースでも受ける)。
+/// The listener that accepts machines. Default is `0.0.0.0` (accept on any interface).
 ///
-/// この Bridge は TLS を自分で終端しない。前段(Tailscale / SSH トンネル / reverse proxy)を
-/// 置くならその前段が終端し、置かないなら **`ws://` の平文**で受ける。この link は Slack の
-/// bot トークンを子に配るので、平文で外に出すぶんはそのまま危険度になる。
-/// 判断は運用の側 — [`Listen::is_exposed`] が真のときは起動時に1行警告を出す。
+/// This Bridge does not terminate TLS itself. If a front (Tailscale / SSH tunnel / reverse proxy) is
+/// in place, it terminates; if not, it accepts **plain `ws://`**. This link hands the Slack
+/// bot token to machines, so exposing it in plain text is exactly that much risk.
+/// The call is operational — when [`Listen::is_exposed`] is true, one warning line is logged at startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listen {
     pub addr: std::net::SocketAddr,
-    /// 子が提示する共有の秘密。`add-child` が生成する。
+    /// The shared secret machines present. Generated by `add-child`.
     pub token: String,
 }
 
 impl Listen {
-    /// loopback の外に出ているか。**警告を出すためだけの判定**で、拒否はしない。
+    /// Whether it is exposed beyond loopback. **Only decides whether to warn**; nothing is refused.
     pub fn is_exposed(&self) -> bool {
         !self.addr.ip().is_loopback()
     }
 }
 
-/// このプロセスの配線 — 上流(どこから貰うか)と下流(誰に渡すか)。
+/// This process's wiring — upstream (where it gets from) and downstream (who it hands to).
 ///
-/// **モードは2軸で、掛け算ではない。** 上流が親(= 自分は子)なら下流は持てない
-/// (3階層になる)。この検査が「多段は作らない」という裁定の置き場所。
+/// **The mode has two axes, not a product.** If upstream is a gateway (= we are a machine), there can be no downstream
+/// (that would make three tiers). This check is where the "no multi-tier" ruling lives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Wiring {
     pub upstream: Mode,
-    /// 自分の名前。子はこれを名乗り、親は `route <自分の id>` の指名先として使う。
+    /// Our own name. A machine announces it; a gateway uses it as the target of `route <own id>`.
     pub self_id: Option<String>,
-    /// 子を迎えるなら。**無ければ今までどおりの単独 Bridge**。
+    /// Set when accepting machines. **Without it, the usual standalone Bridge**.
     pub children: Option<Listen>,
-    /// 親に迎えに来てもらう子の口。`children` とは排他(どちらも `AGENTGW_LINK_LISTEN` を読むが、
-    /// 開ける相手が違う — こちらは**上流**が入ってくる口)。
+    /// The listener of a machine that the gateway picks up. Mutually exclusive with `children` (both read `AGENTGW_LINK_LISTEN`,
+    /// but for different peers — this one is where **upstream** comes in).
     pub inlet: Option<Listen>,
 }
 
@@ -595,8 +594,8 @@ impl Wiring {
                 inlet: None,
             });
         };
-        // 親に迎えに来てもらう子は、この口を**親のために**開ける(子を持つのではない)。
-        // 3階層(親へ dial しながら子を持つ)は Mode::resolve が既に断っている
+        // A machine the gateway picks up opens this listener **for the gateway** (it doesn't take machines).
+        // Three tiers (dialing a gateway while having machines) are already refused by Mode::resolve
         if matches!(upstream, Mode::AwaitParent) {
             return Ok(Wiring {
                 upstream,
@@ -623,7 +622,7 @@ impl Wiring {
                  無いとマシンはつながれません。`agentgw add-machine` を実行すると作られます。"
             ));
         };
-        // 名前が無い親は `route <自分の id>` の指名先になれない。自動では決めない
+        // A gateway with no name can't be the target of `route <own id>`. It is not decided automatically
         if self_id.is_none() {
             return Err(crate::t!(
                 "To accept machines, this gateway needs a name: set AGENTGW_BRIDGE_ID in .env. \
@@ -646,10 +645,10 @@ impl Wiring {
 
 // ── waiting for the gateway (machines the gateway dials)  ─────────────────────
 
-/// 親の接続を待つ子の一式。**上流が入ってくる口**なので、[`gateway::Fleet`](crate::bridge::gateway::Fleet)(子を迎える口)とは別物。
+/// A machine's kit for waiting for the gateway's connection. It is **where upstream comes in**, so it differs from [`gateway::Fleet`](crate::bridge::gateway::Fleet) (which accepts machines).
 pub struct GatewayInlet {
     pub token: String,
-    /// 受け取ったフレームの行き先。子から dial したときと**同じ受け皿**に流す。
+    /// Where received frames go. **The same sink** as when the machine dials.
     pub tx: tokio::sync::mpsc::Sender<FromRelay>,
 }
 
@@ -667,14 +666,14 @@ async fn on_parent_upgrade(
     }
 }
 
-/// 親から来たフレームを読み続ける。**ワーカーには触らない** — 親を失っても、
-/// 起きるのは「戻るまで新しい Slack メッセージが来ない」だけ。
+/// Keep reading frames from the gateway. **Agents are not touched** — losing the gateway
+/// only means "no new Slack messages until it comes back".
 async fn on_parent_socket(inlet: Arc<GatewayInlet>, parent_id: String, mut socket: WebSocket) {
     gateway::rlog("info", &format!("parent \"{parent_id}\" connected"));
-    // 親が黙って消えても、こちらは受信で永久に止まったまま気づけない。叩いて確かめる
+    // If the gateway silently vanishes, we'd stay stuck in receive forever without noticing. Poke to check
     let mut watch = IdleWatch::default();
     loop {
-        // **受信は `beat` 経由だけ。** 直に `recv()` を待つと half-open で永久に止まる
+        // **Receive only via `beat`.** Waiting on `recv()` directly hangs forever on half-open
         let raw = match beat(&mut socket, &mut watch).await {
             Beat::Text(t) => t,
             Beat::Alive => continue,
@@ -707,9 +706,9 @@ async fn on_parent_socket(inlet: Arc<GatewayInlet>, parent_id: String, mut socke
     gateway::rlog("info", &format!("parent \"{parent_id}\" disconnected"));
 }
 
-/// 親を迎える口を開ける。**戻ってこない。**
+/// Open the listener that accepts the gateway. **Does not return.**
 impl GatewayInlet {
-    /// 親を迎える口を開ける。**戻ってこない。**
+    /// Open the listener that accepts the gateway. **Does not return.**
     pub async fn serve(self: Arc<Self>, addr: std::net::SocketAddr) {
         let app = Router::new()
             .route(wire::PROBE_PATH, get(on_parent_upgrade))
@@ -728,12 +727,12 @@ impl GatewayInlet {
     }
 }
 
-/// `host:port` を読む。**どのインターフェースでも受ける**(既定は `0.0.0.0`)。
+/// Read `host:port`. **Accepts on any interface** (default `0.0.0.0`).
 ///
-/// 以前は loopback しか許さなかった。TLS を自分で終端しないので、前段(Tailscale /
-/// SSH トンネル / reverse proxy)を必ず通す作りにしていたためだ。**2026-08-02 に
-/// ユーザー判断で開けた** — 前段を置くかどうかは運用の側で決める。開けたときは
-/// [`Listen::is_exposed`] が真になり、起動時に1行警告が出る。
+/// It used to allow only loopback. Since it doesn't terminate TLS itself, it was built to always go through
+/// a front (Tailscale / SSH tunnel / reverse proxy). **Opened up on 2026-08-02 by user decision** —
+/// whether to put a front in is an operational choice. When opened,
+/// [`Listen::is_exposed`] is true and one warning line is logged at startup.
 fn parse_listen(listen: &str) -> Result<std::net::SocketAddr, String> {
     let (host, port) = listen.rsplit_once(':').ok_or_else(|| {
         crate::t!(
@@ -754,11 +753,11 @@ fn parse_listen(listen: &str) -> Result<std::net::SocketAddr, String> {
     Ok(std::net::SocketAddr::new(ip, port))
 }
 
-/// 親から**迎えに行く**子の一覧。`AGENTGW_CHILD_URLS=desktop=wss://a,laptop=wss://b`。
+/// The machines the gateway **goes to pick up**. `AGENTGW_CHILD_URLS=desktop=wss://a,laptop=wss://b`.
 ///
-/// **既定は子から dial** — この設定を書くのは、親が NAT の内側にいて子から繋ぎに行けない
-/// ときだけ。**自動フォールバックにしない**(親が子の URL を持っている時点で選択は済んでいる。
-/// 「まず待って駄目なら繋ぐ」にすると、繋がらない子と設定していない子を区別できなくなる)。
+/// **The default is the machine dialing** — set this only when the gateway is behind NAT and machines can't
+/// reach it. **Not an automatic fallback** (once the gateway holds a machine's URL, the choice is made;
+/// "wait first, then dial if that fails" would make an unreachable machine indistinguishable from an unconfigured one).
 pub fn child_urls(raw: &str) -> Vec<(String, String)> {
     raw.split(',')
         .filter_map(|pair| {
@@ -773,50 +772,50 @@ pub fn child_urls(raw: &str) -> Vec<(String, String)> {
 mod tests {
     use super::*;
 
-    /// 断られた理由のうち、**態度を変えるべきものだけ**が fatal。
+    /// Of the refusal reasons, **only those that call for a change of behaviour** are fatal.
 
     #[test]
     fn only_a_refusal_we_cannot_talk_our_way_out_of_is_fatal() {
         assert_eq!(Fatal::of(401), Some(Fatal::BadToken));
         assert_eq!(Fatal::of(426), Some(Fatal::WrongVersion));
         assert_eq!(Fatal::of(400), Some(Fatal::BadBridgeId));
-        // 繋がらないだけ / 相手が落ちている = 黙って再試行する
+        // Just didn't connect / the peer is down = retry quietly
         for status in [404, 500, 502, 503, 301, 200] {
             assert_eq!(Fatal::of(status), None, "{status}");
         }
     }
 
-    /// 無通信2回で死んだと見なす。**1回目では切らない** — 静かなだけの link を
-    /// 30秒ごとに切ると、繋ぎ直しの嵐になる。
+    /// Two silent windows mean dead. **Don't disconnect on the first** — cutting a link
+    /// that is merely quiet every 30 seconds causes a reconnect storm.
     #[test]
     fn two_silent_windows_mean_the_link_is_dead() {
         let mut w = IdleWatch::default();
-        assert_eq!(w.on_idle(), Idle::Ping); // 1回目: 叩いて確かめる
-        assert_eq!(w.on_idle(), Idle::Dead); // 2回目: 返事が無い = 死んでいる
+        assert_eq!(w.on_idle(), Idle::Ping); // first: poke to check
+        assert_eq!(w.on_idle(), Idle::Dead); // second: no answer = dead
     }
 
-    /// Pong でも配達でも、**何か届けば生きている**。番人はそこで数え直す。
+    /// A Pong or a delivery — **anything arriving means alive**. The watchman restarts its count there.
     #[test]
     fn any_traffic_clears_the_watch() {
         let mut w = IdleWatch::default();
         assert_eq!(w.on_idle(), Idle::Ping);
-        w.on_traffic(); // Pong が返ってきた
-        assert_eq!(w.on_idle(), Idle::Ping); // また1回目から
+        w.on_traffic(); // a Pong came back
+        assert_eq!(w.on_idle(), Idle::Ping); // back to the first one
         w.on_traffic();
         w.on_traffic();
         assert_eq!(w.on_idle(), Idle::Ping);
         assert_eq!(w.on_idle(), Idle::Dead);
     }
 
-    /// 何も返さないソケット = 相手が黙って消えた状態(half-open)。
+    /// A socket that returns nothing = the peer silently vanished (half-open).
     struct SilentSocket;
     impl LinkRead for SilentSocket {
         async fn read_frame(&mut self) -> Frame {
-            std::future::pending().await // 永久に返らない — これが74分の沈黙の正体
+            std::future::pending().await // never returns — this is what the 74-minute silence was
         }
     }
 
-    /// 2回目の読みだけ本文を返し、あとは黙るソケット(黙る→届く→黙る、の順を作る)。
+    /// A socket that returns a payload only on the second read and is silent otherwise (silent → arrives → silent).
     struct SilentThenText(u32);
     impl LinkRead for SilentThenText {
         async fn read_frame(&mut self) -> Frame {
@@ -829,7 +828,7 @@ mod tests {
         }
     }
 
-    /// **`beat` は永久に待たない。** 黙ったままなら Ping を促し、次の窓で切ると言う。
+    /// **`beat` never waits forever.** If it stays silent, it asks for a Ping, then says to disconnect in the next window.
     #[tokio::test]
     async fn a_silent_socket_gets_pinged_then_declared_gone() {
         let mut s = SilentSocket;
@@ -841,20 +840,20 @@ mod tests {
         assert!(why.contains("no reply to ping"), "{why}");
     }
 
-    /// 届いたら本文を返し、**番人を数え直す** — 生きている link を切らないための要。
-    /// 数え直しが無いと、Ping 済みの直後に1窓黙っただけで切ってしまう。
+    /// When something arrives, return the payload and **restart the watchman's count** — the key to not cutting a live link.
+    /// Without the reset, a single silent window right after a Ping would disconnect.
     #[tokio::test]
     async fn a_frame_arrives_and_resets_the_watch() {
         let mut s = SilentThenText(0);
         let mut w = IdleWatch::default();
-        // 1窓目は無音 → Ping を促す
+        // First window is silent → ask for a Ping
         assert!(matches!(beat_within(&mut s, &mut w, 10).await, Beat::Ping));
-        // そこへ本文が届く(Pong でも同じ) → 生きているので数え直す
+        // Then a payload arrives (a Pong works the same) → alive, so restart the count
         match beat_within(&mut s, &mut w, 10).await {
             Beat::Text(t) => assert_eq!(t, "hello"),
             _ => panic!("本文が来るはず"),
         }
-        // **数え直したので、また Ping から。** ここが Gone なら数え直せていない
+        // **The count was reset, so it's Ping again.** Gone here would mean the reset didn't happen
         assert!(matches!(beat_within(&mut s, &mut w, 10).await, Beat::Ping));
         assert!(matches!(
             beat_within(&mut s, &mut w, 10).await,
@@ -862,7 +861,7 @@ mod tests {
         ));
     }
 
-    /// 版違いだけは「このマシンを新しくして再起動すれば治る」と言い分ける。
+    /// Only a version mismatch is worded as "update this machine and restart to fix".
     #[test]
     fn a_version_mismatch_says_a_restart_can_heal_it() {
         assert!(Fatal::WrongVersion.message().contains("upgrade"));
@@ -877,7 +876,7 @@ mod tests {
             b = next_backoff(b, false);
             assert_eq!(b, expected);
         }
-        // 一度でも握手が通れば、次の待ちは短いところから
+        // Once a handshake has succeeded, the next wait starts short
         assert_eq!(next_backoff(b, true), RECONNECT_MIN_MS);
     }
 
@@ -898,7 +897,7 @@ mod tests {
         assert!(build_request("", "s").is_err());
     }
 
-    // ── モード選択 ──────────────────────────────────────────────────────────
+    // ── Mode selection ──────────────────────────────────────────────────────
 
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
         let map: std::collections::HashMap<String, String> = pairs
@@ -940,12 +939,12 @@ mod tests {
                 bridge_id: "desktop".into()
             }
         );
-        // URL だけ / トークンだけ = 設定が途中。分かる文面で断る
+        // Only the URL / only the token = half-finished config. Refuse with a clear message
         let half = Mode::resolve(env(&[("AGENTGW_RELAY_URL", "wss://r")])).unwrap_err();
         assert!(half.contains("half set up"), "{half}");
     }
 
-    /// **自動命名しない。** `default` に落ちると、複数マシンが揃って衝突する。
+    /// **No automatic naming.** Falling back to `default` makes multiple machines all collide.
     #[test]
     fn a_relay_bridge_without_a_name_refuses_to_start() {
         let e = Mode::resolve(env(&[
@@ -957,7 +956,7 @@ mod tests {
         assert!(e.contains("take each other's messages"), "{e}");
     }
 
-    /// ** **: 両方揃った設定は起動しない。黙って両方繋ぐと split-brain が戻る。
+    /// A config with both set doesn't start. Silently connecting both brings split-brain back.
     #[test]
     fn having_both_modes_configured_refuses_to_start() {
         let e = Mode::resolve(env(&[
@@ -972,7 +971,7 @@ mod tests {
         assert!(e.contains("SLACK_APP_TOKEN"), "{e}");
     }
 
-    /// 空文字は「無い」と同じ。`SLACK_APP_TOKEN=` だけ残った .env で起動を拒まれない。
+    /// An empty string is the same as absent. A .env left with just `SLACK_APP_TOKEN=` doesn't block startup.
     #[test]
     fn an_empty_value_counts_as_absent() {
         assert!(matches!(
@@ -986,7 +985,7 @@ mod tests {
         ));
     }
 
-    // ── 配線(上流 × 下流) ─────────────────────────────────────────────────
+    // ── Wiring (upstream × downstream) ──────────────────────────────────────
 
     fn parent(extra: &[(&str, &str)]) -> Vec<(String, String)> {
         let mut v: Vec<(String, String)> = [
@@ -1011,7 +1010,7 @@ mod tests {
         })
     }
 
-    /// 子を迎える設定が無いものは、**今までどおりの単独 Bridge**。ここが回帰の本丸。
+    /// Without a config for accepting machines, it is **the usual standalone Bridge**. This is the main regression guard.
     #[test]
     fn a_bridge_without_a_listen_is_the_lone_bridge_we_already_had() {
         let w = wire(&parent(&[])).unwrap();
@@ -1032,8 +1031,8 @@ mod tests {
         assert_eq!(w.self_id.as_deref(), Some("vps"));
     }
 
-    /// **公開インターフェースにも bind する**(2026-08-02、ユーザー判断)。拒否はしないが、
-    /// loopback の外に出たことは `is_exposed` が立てて起動時に1行警告になる。
+    /// **Binds on public interfaces too** (2026-08-02, user decision). Nothing is refused, but
+    /// being exposed beyond loopback sets `is_exposed`, which logs one warning line at startup.
     #[test]
     fn a_listen_outside_the_loopback_is_allowed_but_marked_exposed() {
         let w = wire(&parent(&[
@@ -1059,7 +1058,7 @@ mod tests {
         assert!(e.contains("AGENTGW_LINK_TOKEN"), "{e}");
     }
 
-    /// 名前の無い親は `route <自分の id>` の指名先になれない。**自動では決めない。**
+    /// A gateway with no name can't be the target of `route <own id>`. **Not decided automatically.**
     #[test]
     fn a_parent_without_a_name_refuses_to_start() {
         let mut pairs = parent(&[
@@ -1071,8 +1070,8 @@ mod tests {
         assert!(e.contains("AGENTGW_BRIDGE_ID"), "{e}");
     }
 
-    /// **1つの子につき link は1本。** 自分から dial しながら迎えにも来てもらう設定は、
-    /// 同じイベントが二重に届く(= 3階層を作ろうとした設定もここで止まる)。
+    /// **One link per machine.** A config that dials out while also being picked up
+    /// gets every event twice (= a config trying to build three tiers is stopped here too).
     #[test]
     fn a_child_cannot_face_both_ways() {
         let e = wire(&[
@@ -1086,7 +1085,7 @@ mod tests {
         assert!(e.contains("Keep one"), "{e}");
     }
 
-    /// Slack のトークンが無く、口だけある = **親に迎えに来てもらう子**。
+    /// No Slack token and only a listener = **a machine that the gateway picks up**.
     #[test]
     fn a_bridge_with_only_an_inlet_waits_for_its_parent() {
         let w = wire(&[
@@ -1096,13 +1095,13 @@ mod tests {
         ])
         .unwrap();
         assert!(matches!(w.upstream, Mode::AwaitParent));
-        // 開けた口は**上流のため**で、子を持つのではない
+        // The opened listener is **for upstream**; it doesn't take machines
         assert!(w.children.is_none());
         assert_eq!(w.inlet.unwrap().addr.to_string(), "127.0.0.1:8787");
     }
 
-    /// 迎えに行く先の表。**空白と末尾の / は落とす。壊れた組は黙って捨てる**
-    /// (半端な行き先を作るより、その子が居ないことにする方が安全)。
+    /// The table of machines to pick up. **Whitespace and a trailing / are stripped. Broken pairs are silently dropped**
+    /// (safer to treat that machine as absent than to build a half-valid destination).
     #[test]
     fn the_child_url_table_is_read_pair_by_pair() {
         assert_eq!(
@@ -1118,8 +1117,8 @@ mod tests {
         assert!(child_urls("desktop=").is_empty());
     }
 
-    /// **経路の合流点の実データ確認**: Relay が載せる形の JSON が、直結と同じ `InboundMsg`
-    /// になること。ここが崩れると、Relay 経由だけメッセージが届かなくなる。
+    /// **A real-data check at the point where the routes merge**: JSON in the shape the Relay sends must become
+    /// the same `InboundMsg` as a direct connection. If this breaks, messages stop arriving only via the Relay.
     #[test]
     fn an_event_the_relay_forwards_becomes_the_same_inbound_message() {
         let event = serde_json::json!({
@@ -1145,7 +1144,7 @@ mod tests {
         );
     }
 
-    /// ボタンは `perm:<動作>:<reqId>` のものだけ拾う。それ以外は Bridge の関心事ではない。
+    /// Only buttons of the form `perm:<action>:<reqId>` are picked up. Anything else isn't the Bridge's concern.
     #[test]
     fn a_forwarded_button_becomes_a_perm_click() {
         let click = crate::chat::slack::perm_click_from_relay(
@@ -1169,7 +1168,7 @@ mod tests {
         }
     }
 
-    /// dial 先はパスまで組み立てる — 接続文字列の URL にはパスが付いていない。
+    /// The dial target is built including the path — the connection string's URL has no path.
     #[test]
     fn the_path_is_built_from_the_bridge_id() {
         let l = RelayLink::new("wss://relay.example/", "tok", "desktop");

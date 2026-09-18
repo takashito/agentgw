@@ -20,14 +20,14 @@ use crate::bridge::{Bridge, Host};
 use crate::chat::slack;
 use tokio::sync::mpsc;
 
-/// サインインのポーリング(定数どおり)。URL は普通 1〜3 秒で出る。
+/// Sign-in polling (per the constants). The URL normally appears within 1–3 seconds.
 const LOGIN_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 
 const URL_POLL_MAX: u32 = 20;
 
 const CODE_POLL_MAX: u32 = 30;
 
-/// セッションの無いスレッドに返す1行(全コマンド共通)。
+/// The one line returned to a thread with no session (shared by all commands).
 fn no_session() -> String {
     crate::t!(
         "This thread has no session running yet. Send a message to start one first.",
@@ -47,7 +47,7 @@ impl Bridge {
             .as_deref()
             .and_then(|s| self.workers.warm(s))
             .and_then(|h| h.window_id.clone());
-        // 順に短絡する — 未応答が無い stop で tmux を叩きに行かない
+        // Short-circuit in order — a stop with nothing unanswered doesn't go poke tmux
         let running = sid.is_some()
             && !pending.is_empty()
             && self.deps.agent.pid_of(window_id.as_deref(), &name).is_some();
@@ -75,8 +75,8 @@ impl Bridge {
             );
             return;
         };
-        // 台帳を**先に**落とす — そうしないと ESC で切られたターンが未応答を抱えたまま終わり、
-        // stop hook が「応答待ち」の再プロンプトを撃つ
+        // Drop the ledger **first** — otherwise the turn cut by ESC ends still holding an unanswered message,
+        // and the stop hook fires an "awaiting reply" re-prompt
         self.ledger.disposed(key, &pending);
         let target = Window::of(window_id.as_deref().unwrap_or(&name));
         match self.deps.agent.interrupt(&target) {
@@ -100,10 +100,10 @@ impl Bridge {
         );
     }
 
-    /// `exit` / `bye` / `done`。終わらせるのは
-    /// **ワーカーであってスレッドではない** — threads.json の entry は残すので、次のメッセージが
-    /// `--resume` で同じセッションを継ぐ。走っているターンは切らずに待つ(stop との違い):
-    /// 別れの挨拶がワーカーの最後の返信より**下**に着くように。
+    /// `exit` / `bye` / `done`. What ends is
+    /// **the agent, not the thread** — the threads.json entry stays, so the next message
+    /// continues the same session with `--resume`. A running turn is waited for, not cut (unlike stop):
+    /// so the farewell lands **below** the agent's last reply.
     pub(super) async fn user_exit(&mut self, msg: &InboundMsg, key: &ThreadKey, root_ts: &str, ctx: &LogCtx) {
         let farewell = Some((msg.channel.clone(), root_ts.to_string()));
         let sid = self.threads.get(root_ts).and_then(|e| e.agent_id.clone());
@@ -115,23 +115,23 @@ impl Bridge {
             .as_deref()
             .and_then(|s| self.workers.warm(s))
             .and_then(|h| h.window_id.clone());
-        // 短絡する — セッションの無いスレッドの exit で tmux を叩きに行かない
+        // Short-circuit — an exit on a thread with no session doesn't go poke tmux
         let live = sid.is_some() && self.deps.agent.pid_of(window_id.as_deref(), &name).is_some();
-        // ワーカーが居ない exit も別れは告げる(現行 performUserExit は session 無しでも
-        // farewell まで行く)。待つものが無いので予約せずその場で片付ける
+        // An exit with no agent still says goodbye.
+        // There is nothing to wait for, so clean up on the spot instead of scheduling it
         let Some(sid) = sid.filter(|_| live) else {
             self.terminate(key, None, farewell).await;
             return;
         };
-        self.push_drain(key, sid, farewell, None, ctx); // exit は別れの挨拶を出すので shimmer 不要
+        self.push_drain(key, sid, farewell, None, ctx); // exit posts a farewell, so no shimmer is needed
     }
 
-    /// `resume`。手元の端末で続きを開く1行を
-    /// 出し、**線を本当に渡す** — ワーカーが生きていれば exit と同じドレイン後に終わらせる
-    /// (別れの挨拶は無し。報告文が終了を告げ終えている)。
+    /// `resume`. Posts the one line that continues the session in a local terminal,
+    /// and **really hands the line over** — if the agent is alive it ends after the same drain as exit
+    /// (no farewell; the report already says it is ending).
     pub(super) fn user_resume(&mut self, msg: &InboundMsg, key: &ThreadKey, root_ts: &str, ctx: &LogCtx) {
         let entry = self.threads.get(root_ts).cloned().unwrap_or_default();
-        // セッション ID は**発行しない** — 走った覚えの無いスレッドに渡す id は端末で失敗するだけ
+        // **Never issue** a session ID — an id handed to a thread that never ran just fails in the terminal
         let Some(sid) = entry.agent_id.filter(|s| !s.is_empty()) else {
             ctx.info(
                 "bridge",
@@ -146,8 +146,8 @@ impl Bridge {
             self.post(&msg.channel, root_ts, none.render(self.deps.agent.as_ref()), key);
             return;
         };
-        // 履歴の在処は hook が運んできた道が第一(worktree に入ったワーカーは transcript ごと
-        // 別プロジェクトに移る — 記録した repo_path は当てにならない。)
+        // Where the history lives: the path the hook brought wins (an agent that entered a worktree moves
+        // to another project along with its transcript — the recorded repo_path can't be trusted.)
         let remembered = self
             .workers
             .warm(&sid)
@@ -160,15 +160,15 @@ impl Bridge {
         let window_id = self.workers.window_of(&sid);
         let worker_running = self.deps.agent.pid_of(window_id.as_deref(), &name).is_some();
         let info = ResumeInfo {
-            // cwd は id と同じくらい大事 — claude は cwd ごとに履歴を仕舞うので、
-            // 違う場所で --resume すると見つからない
+            // The cwd matters as much as the id — claude stores history per cwd,
+            // so --resume from a different place won't find it
             cwd: Some(history_cwd.or(entry.repo_path).unwrap_or_else(Host::home)),
             transcript_missing: !history_exists,
             worker_running,
             session_id: Some(sid.clone()),
         };
-        // 他の6箇所と同じ文字単位の頭8字(バイト添字は非 ASCII の id で panic の芽 —
-        // ここは select ループの中)。transcript は現行と同じく在処ではなく2値
+        // First 8 characters by char, as in the other six places (a byte index panics on a non-ASCII id —
+        // and this is inside the select loop). The transcript is a yes/no, not a location
         let short: String = sid.chars().take(8).collect();
         ctx.info(
             "bridge",
@@ -188,21 +188,21 @@ impl Bridge {
                      (session handed to the Owner's terminal)"
                 ),
             );
-            // shimmer は**ドレインに預ける**。resume 本体は tmux を1回覗くだけで終わるので、
-            // ここで guard を持っても set と clear が連続して飛ぶだけで一度も描画されない。
-            // 実際に待つのは「返事が捌けるか30秒」を待つドレイン側(現行 Bun に原文なし)
+            // **Hand the shimmer to the drain.** The resume itself only peeks at tmux once,
+            // so holding the guard here would just fire set and clear back to back and never render.
+            // The actual waiting happens in the drain, which waits up to 30 seconds for the reply to go out
             let thinking =
                 slack::Thinking::new(self.deps.slack.clone(), &msg.channel, root_ts, &slack::Status::Resume.text());
             self.push_drain(key, sid, None, Some(thinking), ctx);
         }
     }
 
-    /// `context` / `ctx`。このスレッド自身の
-    /// セッションを `--fork-session` で複製して `/context` を訊く — 走っているワーカーには
-    /// 触らないので、ターンの最中でも答えが出る。probe は10〜20秒かかるので投げっぱなし。
+    /// `context` / `ctx`. Duplicates this thread's own
+    /// session with `--fork-session` and asks `/context` — the running agent is not
+    /// touched, so it answers even mid-turn. The probe takes 10–20 seconds, so it is fire-and-forget.
     pub(super) fn user_context(&self, msg: &InboundMsg, key: &ThreadKey, root_ts: &str, ctx: &LogCtx) {
         let entry = self.threads.get(root_ts);
-        // セッションが無いスレッドには訊く先が無い
+        // A thread with no session has nothing to ask
         let Some(sid) = entry.and_then(|e| e.agent_id.clone()) else {
             ctx.info(
                 "bridge",
@@ -230,7 +230,7 @@ impl Bridge {
             slack::Thinking::new(self.deps.slack.clone(), &msg.channel, root_ts, &slack::Status::Context.text());
         let agent = self.deps.agent.clone();
         tokio::spawn(async move {
-            let _thinking = thinking; // Drop = クリア(probe が失敗しても消える)
+            let _thinking = thinking; // Drop = clear (goes away even if the probe fails)
             let ctx = LogCtx {
                 session_id: Some(sid),
                 thread_key: Some(key.clone()),
@@ -258,7 +258,7 @@ impl Bridge {
                         }
                     }
                 }
-                // 失敗の理由は英語の内部文字列 — ログに置き、スレッドには流さない
+                // The failure reason is an internal English string — keep it in the log, not the thread
                 Err(ProbeErr::Failed(e)) => {
                     ctx.error(
                         "bridge",
@@ -284,8 +284,8 @@ impl Bridge {
         });
     }
 
-    /// `usage` / `usg`。アカウント全体の話
-    /// なのでスレッドもセッションも要らない — Home で `claude -p /usage` を回すだけ。
+    /// `usage` / `usg`. It is about the whole account,
+    /// so no thread or session is needed — just run `claude -p /usage` at Home.
     pub(super) fn user_usage(&self, msg: &InboundMsg, key: &ThreadKey, root_ts: &str, ctx: &LogCtx) {
         let cwd = Host::home();
         ctx.info("bridge", &format!("usage: probing /usage cwd={cwd}"));
@@ -299,7 +299,7 @@ impl Bridge {
         let thinking = slack::Thinking::new(self.deps.slack.clone(), &msg.channel, root_ts, &slack::Status::Usage.text());
         let agent = self.deps.agent.clone();
         tokio::spawn(async move {
-            let _thinking = thinking; // Drop = クリア
+            let _thinking = thinking; // Drop = clear
             let ctx = LogCtx {
                 session_id: None,
                 thread_key: Some(key.clone()),
@@ -308,8 +308,8 @@ impl Bridge {
                 Ok(raw) => {
                     ctx.info("bridge", &format!("usage: probe ok bytes={}", raw.len()));
                     match agent.usage_rows(&raw) {
-                        // 300 = "Current session" の窓(5h)。"Current week" 行の窓は
-                        // format_usage_report_with_projection が内側で差し替える
+                        // 300 = the "Current session" window (5h). The "Current week" row's window
+                        // is swapped in inside format_usage_report_with_projection
                         Some(rows) => UsageReport {
                             rows: &rows,
                             projection: Some((crate::bridge::state::WallClock::now(), 300)),
@@ -349,9 +349,9 @@ impl Bridge {
         });
     }
 
-    /// TUI を叩くコマンド(compact / model / effort)の共通の入口。
-    /// セッションと窓を解決し、ターンが走っている間は断る — 走行中の TUI には打ち込めない。
-    /// `Ok((target, session_id))` の時だけ tmux を叩いてよい。`Err` はそのまま返す1行。
+    /// Shared entry for commands that drive the TUI (compact / model / effort).
+    /// Resolves the session and window, and refuses while a turn is running — you can't type into a busy TUI.
+    /// Poke tmux only on `Ok((target, session_id))`. `Err` is the line to return as-is.
     pub(super) fn tui_guard(
         &self,
         label: &str,
@@ -370,7 +370,7 @@ impl Bridge {
         };
         let name = SessionId::from(sid.clone()).window_name();
         let window_id = self.workers.window_of(&sid);
-        // 未応答を先に見る — 空なら tmux を叩きに行かない(user_stop と同じ短絡)
+        // Check unanswered messages first — if empty, don't go poke tmux (the same short-circuit as user_stop)
         let pending = self.ledger.pending(key);
         if !pending.is_empty() && self.deps.agent.pid_of(window_id.as_deref(), &name).is_some() {
             ctx.info(
@@ -388,10 +388,10 @@ impl Bridge {
         Ok((Window::of(window_id.as_deref().unwrap_or(&name)), sid))
     }
 
-    /// `compact`。**生きているセッション**の
-    /// TUI に `/compact` を打ち込み、進捗スピナーを Slack の1本の付箋に流し込む
-    /// (context/usage と違って使い捨ての probe ではない — 圧縮するのは走っている会話そのもの)。
-    /// 最長6分かかるので select ループの外(spawn)で回す。
+    /// `compact`. Types `/compact` into the TUI of the **live session**
+    /// and streams the progress spinner into one Slack progress message
+    /// (unlike context/usage this is not a throwaway probe — it compresses the running conversation itself).
+    /// It can take up to 6 minutes, so it runs outside the select loop (spawned).
     pub(super) fn user_compact(&self, msg: &InboundMsg, key: &ThreadKey, root_ts: &str, ctx: &LogCtx) {
         let (target, sid) = match self.tui_guard(
             "compact",
@@ -413,15 +413,15 @@ impl Bridge {
             root_ts.to_string(),
             key.clone(),
         );
-        // compact に専用の thinking status は**付けない**(Bun からの逸脱 — ユーザー判断)。
-        // 以前の実装はここで「考え中」を張り、tick ごとに秒数付きへ張り直していた。
-        // こちらは進捗チェックリスト(run_compact が投稿して編集し続ける sticky)が同じことを
-        // 見せているので、shimmer と二重で冗長という判断(**移植漏れではない**)。
+        // compact gets **no** dedicated thinking status (a user decision).
+        // An earlier version set "thinking" here and re-set it each tick with the seconds.
+        // The progress checklist (the sticky that run_compact posts and keeps editing) already shows
+        // the same thing, so a shimmer on top was judged redundant (**not a porting omission**).
         tokio::spawn(Self::run_compact(api, self.deps.agent.clone(), channel, root, key, target, sid));
     }
 
-    /// `model`。名前付きは TUI に
-    /// `/model <名前>` を打ち込む。素の `model` は transcript を読むだけ — ワーカーに触らない。
+    /// `model`. With a name, types
+    /// `/model <name>` into the TUI. Bare `model` only reads the transcript — the agent is not touched.
     pub(super) fn user_model(
         &self,
         msg: &InboundMsg,
@@ -457,12 +457,12 @@ impl Bridge {
         let thinking = slack::Thinking::new(self.deps.slack.clone(), &msg.channel, root_ts, &slack::Status::Model.text());
         let agent = self.deps.agent.clone();
         tokio::spawn(async move {
-            let _thinking = thinking; // Drop = クリア(TUI が確定しなくても消える)
+            let _thinking = thinking; // Drop = clear (goes away even if the TUI never confirms)
             let ctx = LogCtx {
                 session_id: Some(sid),
                 thread_key: Some(key.clone()),
             };
-            // None = このエージェントが model 切替に非対応。実体が1つの今は起きない
+            // None = this agent doesn't support switching model. Can't happen while there is only one implementation
             let done = agent.set_model(&target, &name, &key, &ctx).await == Some(true);
             let out = if done {
                 crate::t!("✅ Switched this thread's model to *{name}*.", "✅ このスレッドのモデルを *{name}* に切り替えました。")
@@ -473,9 +473,9 @@ impl Bridge {
         });
     }
 
-    /// 素の `model`。今のモデルを名乗るのは transcript の**最後の**
-    /// assistant レコード。TUI も probe も要らないので select ループの中で答える
-    /// (読むのは末尾 256KB だけ — 長いセッションの .jsonl は数十 MB ある)。
+    /// Bare `model`. The current model is named by the **last** assistant record in the
+    /// transcript. No TUI and no probe needed, so it answers inside the select loop
+    /// (it reads only the last 256KB — a long session's .jsonl can be tens of MB).
     pub(super) fn model_show(&self, msg: &InboundMsg, key: &ThreadKey, root_ts: &str, ctx: &LogCtx) {
         let Some(sid) = self.threads.get(root_ts).and_then(|e| e.agent_id.clone()) else {
             ctx.info(
@@ -486,8 +486,8 @@ impl Bridge {
             return;
         };
         let short: String = sid.chars().take(8).collect();
-        // 履歴の在処は hook が運んできた道が第一(worktree に入ったワーカーは transcript ごと
-        // 移る)。忘れていれば総当たりで探す — resume と同じ解決順
+        // Where the history lives: the path the hook brought wins (an agent that entered a worktree moves
+        // along with its transcript). If forgotten, search exhaustively — the same resolution order as resume
         let remembered = self
             .workers
             .warm(&sid)
@@ -537,13 +537,13 @@ impl Bridge {
         self.post(&msg.channel, root_ts, out, key);
     }
 
-    /// `effort`。level 付きは model と同じ
-    /// TUI 駆動。素の `effort` は現在値を**どこにも記録が無い**ので TUI に訊く —
-    /// スライダを開いて Escape で閉じ、TUI が出す状態行を読む。
+    /// `effort`. With a level, it drives the TUI
+    /// like model. The current value of bare `effort` is **recorded nowhere**, so it asks the TUI —
+    /// open the slider, close it with Escape, and read the status line the TUI prints.
     ///
-    /// **現行 TUI との差分**(2026-07-29 実機・実弾で3経路とも確認): 履歴なしは即
-    /// `Set effort level to …`、履歴ありは確認ダイアログを挟んで**状態行しか出さず**、
-    /// 同じ level の選び直しは `Kept effort level as …`。移植元の Bun が知るのは1つ目だけ。
+    /// **How the TUI behaves** (all three paths confirmed on a real machine, 2026-07-29): without history it immediately says
+    /// `Set effort level to …`; with history it shows a confirm dialog and then **only the status line**;
+    /// re-picking the same level says `Kept effort level as …`.
     pub(super) fn user_effort(
         &self,
         msg: &InboundMsg,
@@ -569,7 +569,7 @@ impl Bridge {
             root_ts.to_string(),
             key.clone(),
         );
-        // 素の `effort` は現在値を読むだけ — 現行も status を出さない(出典は set 側の 3182)
+        // Bare `effort` only reads the current value — no status is shown
         let Some(level) = level else {
             tokio::spawn(Self::run_effort_show(
                 api,
@@ -585,12 +585,12 @@ impl Bridge {
         let thinking = slack::Thinking::new(self.deps.slack.clone(), &msg.channel, root_ts, &slack::Status::Effort.text());
         let agent = self.deps.agent.clone();
         tokio::spawn(async move {
-            let _thinking = thinking; // Drop = クリア
+            let _thinking = thinking; // Drop = clear
             let ctx = LogCtx {
                 session_id: Some(sid),
                 thread_key: Some(key.clone()),
             };
-            // None = このエージェントが effort に非対応。実体が1つの今は起きない
+            // None = this agent doesn't support effort. Can't happen while there is only one implementation
             let done = agent.set_effort(&target, &level, &key, &ctx).await == Some(true);
             let out = if done {
                 crate::t!("✅ Set this thread's effort level to *{level}*.", "✅ このスレッドの effort を *{level}* にしました。")
@@ -601,9 +601,9 @@ impl Bridge {
         });
     }
 
-    /// `mode`(移植元に無い — Rust 版の新機能)。Claude Code の権限モードは TUI の
-    /// shift+tab でしか変えられないので、`/effort` のようなスラッシュコマンドは使わず
-    /// **キーを押して**目当てのモードに着くまで回す。素の `mode` はフッタを1回読むだけ。
+    /// `mode` (new in this implementation). Claude Code's permission mode can only be changed with shift+tab
+    /// in the TUI, so there is no slash command like `/effort` — it **presses the key** repeatedly until
+    /// it lands on the wanted mode. Bare `mode` just reads the footer once.
     pub(super) fn user_mode(
         &self,
         msg: &InboundMsg,
@@ -627,7 +627,7 @@ impl Bridge {
             session_id: Some(sid),
             thread_key: Some(key.clone()),
         };
-        // 読むだけなら tmux を1回叩くだけ — spawn も shimmer も要らない
+        // Reading only pokes tmux once — no spawn or shimmer needed
         let Some(name) = name else {
             let out = match self.deps.agent.mode(&target, &ctx) {
                 Some(m) => crate::t!("Permission mode: *{m}*", "権限モード: *{m}*"),
@@ -645,7 +645,7 @@ impl Bridge {
         let thinking = slack::Thinking::new(self.deps.slack.clone(), &msg.channel, root_ts, &slack::Status::Mode.text());
         let agent = self.deps.agent.clone();
         tokio::spawn(async move {
-            let _thinking = thinking; // Drop = クリア
+            let _thinking = thinking; // Drop = clear
             let done = agent.set_mode(&target, &name, &key, &ctx).await == Some(true);
             let out = if done {
                 crate::t!("✅ Switched this thread's permission mode to *{name}*.", "✅ このスレッドの権限モードを *{name}* にしました。")
@@ -656,11 +656,11 @@ impl Bridge {
         });
     }
 
-    /// `/compact` を打ち込み、pane のスピナーを Slack の付箋に流す。付箋は**最初の進捗が出てから**作る — busy / no-session の
-    /// 断りが1本で済むのはそのため。最後の1行は付箋があれば書き換え、無ければ新規投稿。
+    /// Type `/compact` and stream the pane's spinner into a Slack progress message. The progress message is created **only after the first progress appears** — that is why
+    /// a busy / no-session refusal stays a single message. The last line edits the progress message if there is one, otherwise posts anew.
     ///
-    /// TUI を回すのはエージェント側(`Agent::compact`)。ここは**進捗を Slack に描く側**だけ —
-    /// 最長6分かかるので select ループの外(spawn)で回す。
+    /// Driving the TUI is the agent's job (`Agent::compact`). This is **only the side that draws progress on Slack** —
+    /// it can take up to 6 minutes, so it runs outside the select loop (spawned).
     pub(super) async fn run_compact(
         api: crate::chat::ChatRef,
         agent: crate::agent::AgentRef,
@@ -683,7 +683,7 @@ impl Bridge {
             let mut last_rendered = String::new();
             while let Some(st) = rx.recv().await {
                 let rendered = st.render();
-                // 同じ絵を描き直さない(Slack の編集回数はタダではない)
+                // Don't redraw the same picture (Slack edits aren't free)
                 if rendered == last_rendered {
                     continue;
                 }
@@ -701,7 +701,7 @@ impl Bridge {
                 match posted {
                     Ok(Some(ts)) => progress_ts = Some(ts),
                     Ok(None) => {}
-                    // 描き損ねても圧縮は続く
+                    // Compaction continues even if a draw fails
                     Err(e) => ctx.error("bridge", &format!(
                         "slack-events: compact progress render failed for {channel}:{root}: {e}"
                     )),
@@ -710,7 +710,7 @@ impl Bridge {
             progress_ts
         };
         let (outcome, progress_ts) = tokio::join!(agent.compact(&target, &key, &sid, tx), draw);
-        // None = このエージェントが compact に非対応。実体が1つの今は起きない
+        // None = this agent doesn't support compact. Can't happen while there is only one implementation
         let final_text = match outcome {
             Some(CompactOutcome::Done) => crate::t!("✅ Compacted the context.", "✅ コンテキストを圧縮しました。"),
             Some(CompactOutcome::Nothing) => crate::t!(
@@ -737,8 +737,8 @@ impl Bridge {
         }
     }
 
-    /// 素の `effort`。今の level を TUI に訊くのはエージェント側
-    /// (`Agent::effort`)。ここは答えを1行にして投げるだけ。
+    /// Bare `effort`. Asking the TUI for the current level is the agent's side
+    /// (`Agent::effort`). This only turns the answer into one line and posts it.
     pub(super) async fn run_effort_show(
         api: crate::chat::ChatRef,
         agent: crate::agent::AgentRef,
@@ -749,7 +749,7 @@ impl Bridge {
         sid: String,
     ) {
         let failed = || crate::t!("Couldn't read the current effort level.", "今の effort を読み取れませんでした。");
-        // None = 非対応か、状態行が読めなかったか — どちらも同じ断りを返す
+        // None = unsupported, or the status line couldn't be read — both get the same refusal
         let out = match agent.effort(&target, &key, &sid).await {
             Some(level) => crate::t!("Effort level: *{level}*", "effort: *{level}*"),
             None => failed(),
@@ -757,21 +757,21 @@ impl Bridge {
         api.post_now(&channel, &root, out, &key).await;
     }
 
-    /// Owner がまだ居ないときだけ通る、サインインの抜け道。
-    /// **true = 消費した** — 呼び手はそこで打ち切る。届く場所は2つ:
-    ///   • 人間の DM — 進行中のサインインがあれば次の1通を貼り付けコードと読む。素の `login` は
-    ///     新しいサインイン。それ以外には短い案内を返す
-    ///   • Owner が route したチャンネル — 受けるのは**貼り付けコードだけ**、しかも
-    ///     そのサインインを始めた本人からのものだけ(相席の第三者にコードプロンプトを触らせない)
+    /// The sign-in shortcut, taken only while there is no Owner yet.
+    /// **true = consumed** — the caller stops there. It is reached in two places:
+    ///   • A human's DM — if a sign-in is in progress, the next message is read as the pasted code. Bare `login`
+    ///     starts a new sign-in. Anything else gets a short hint
+    ///   • A channel the Owner routed — it accepts **only the pasted code**, and only from
+    ///     the person who started that sign-in (a bystander never gets to touch the code prompt)
     pub(in crate::bridge) fn login_carve_out(&mut self, msg: &InboundMsg) -> bool {
         let dm = msg.channel_kind == crate::chat::ChannelKind::Dm;
         let sender = msg.user.as_deref().unwrap_or("");
         let pending = self.sign_in.pending.get(&msg.channel).cloned();
         if !dm && pending.as_deref() != Some(sender) {
-            return false; // 通りすがりはこの枝の外 — 普通に gate へ落とす
+            return false; // passers-by are outside this branch — fall through to the gate as usual
         }
-        // 返信は「その人が喋ったメッセージ」の下に吊る。DM/チャンネルの根に出すと、
-        // 本人が見ているスレッドと違う場所に着く
+        // Hang the reply under "the message that person sent". Posting it at the DM/channel root would land
+        // somewhere other than the thread they are watching
         let reply_ts = msg.thread_ts.clone().unwrap_or_else(|| msg.ts.clone());
         let key = ThreadKey::new(&msg.channel, &reply_ts);
         let venue = if dm { "dm" } else { "channel" };
@@ -819,15 +819,15 @@ impl Bridge {
         true
     }
 
-    /// サインインの開始。専用の tmux セッションで `claude auth login` を
-    /// 回し、印字される認証 URL を掬って返す。ここから先はコード待ち。
+    /// Start a sign-in. Runs `claude auth login` in a dedicated tmux session,
+    /// scoops up the auth URL it prints and returns it. From here on it waits for the code.
     pub(super) fn start_login(&mut self, channel: String, user: String, reply_ts: String) {
         let key = ThreadKey::new(&channel, &reply_ts);
         let ctx = LogCtx::default();
-        // SECURITY: サインインは**全員で1つの** tmux セッションを使う。
-        // 別チャンネルの2本目にセッションを作り直させると、1人目のポーリングが2人目の pane を
-        // 読み、2人目の成功で**1人目**が Owner になる(他人の認証への相乗り)。同じチャンネルの
-        // 撃ち直しは自分の流れをやり直すだけなので通す
+        // SECURITY: sign-in uses **one shared** tmux session for everyone.
+        // If a second attempt from another channel recreated the session, the first person's polling would read
+        // the second person's pane, and the second one's success would make **the first person** Owner (piggybacking
+        // on someone else's auth). Retrying in the same channel only restarts your own flow, so it is allowed
         if let Some(other) = self.sign_in.pending.keys().find(|k| **k != channel) {
             ctx.info(
                 "bridge",
@@ -851,16 +851,16 @@ impl Bridge {
             "bridge",
             &format!("login: starting sign-in for {user} (channel {channel})"),
         );
-        // 席は判定の**直後**に取る。取るのを spawn の中(URL が出た後)にすると、URL を待つ
-        // 最大20秒の間に別チャンネルの2本目が同じ判定をすり抜け、セッションを作り直して
-        // 1本目の pane を奪う。席は成否どちらでも LoginFinished が外す。
-        // 代償: URL が届くまでの間にこのチャンネルへ来た1通はコード扱いになり失敗の返事になる
-        // (Owner は `login` を撃ち直せばよい)
+        // Take the seat **right after** the check. Taking it inside the spawn (after the URL appears) would let a
+        // second attempt from another channel slip past the same check during the up-to-20 seconds of waiting for the URL,
+        // recreate the session and steal the first one's pane. LoginFinished frees the seat on success or failure.
+        // Cost: a message arriving in this channel before the URL shows up is treated as the code and gets a failure reply
+        // (the Owner can just send `login` again)
         self.sign_in.pending.insert(channel.clone(), user.clone());
         let (api, cmd_tx, home) = (self.deps.slack.clone(), self.cmd_tx.clone(), Host::home());
-        // サインインは URL を出してからコードを待つ数十秒 — その間ずっと shimmer を出す
+        // Sign-in takes tens of seconds (show the URL, then wait for the code) — keep the shimmer up the whole time
         let thinking = slack::Thinking::new(self.deps.slack.clone(), &channel, &reply_ts, &slack::Status::Login.text());
-        // `thinking` は本文で触るので async move が丸ごと持っていく(どの経路で抜けても Drop = クリア)
+        // `thinking` is used in the body, so the async move takes it whole (Drop = clear whichever path exits)
         let agent = self.deps.agent.clone();
         tokio::spawn(async move {
             let ctx = LogCtx::default();
@@ -875,14 +875,14 @@ impl Bridge {
                     ),
                 );
             } else {
-                // 待つのは URL **だけ**。ここで広いエラー判定を回すと、URL より前の飾りに
-                // 紛れた "error/failed" で誤って諦める。本物の早期失敗は
-                // 「URL が出ないまま時間切れ」という形で下に現れる
+                // Wait **only** for the URL. A broad error check here would give up by mistake on an "error/failed"
+                // buried in the decoration before the URL. A real early failure shows up below
+                // as "timed out without a URL"
                 for _ in 0..URL_POLL_MAX {
                     tokio::time::sleep(LOGIN_POLL).await;
-                    // URL が出るまで最大 URL_POLL_MAX 秒 — Slack はそれより早く status を
-                    // 失効させるので tick ごとに張り直す(compact と同じ理由)。
-                    // 張り直さないと途中で shimmer が消えて「止まった」に見える
+                    // Up to URL_POLL_MAX seconds until the URL appears — Slack expires the status sooner than that,
+                    // so re-set it each tick (same reason as compact).
+                    // Without that the shimmer vanishes midway and it looks "stuck"
                     thinking.set(&slack::Status::Login.text());
                     url = agent.login_url();
                     if url.is_some() {
@@ -898,8 +898,8 @@ impl Bridge {
                          (channel {channel}) — aborting"
                     ),
                 );
-                // 席を空けるのは main(セッションの kill も向こうがやる)。ここで返さないと
-                // 二度と `login` を受け付けなくなる
+                // Main frees the seat (and kills the session too). If this isn't sent back,
+                // `login` would never be accepted again
                 let _ = cmd_tx
                     .send(CmdFx::LoginFinished {
                         channel: channel.clone(),
@@ -927,11 +927,11 @@ impl Bridge {
         });
     }
 
-    /// 貼られたコードを待っている CLI に流し込み、画面の判定を待つ。
-    /// Owner が縛られるのは**明示の成功マーカーを見たときだけ** — 沈黙も中断も成功ではない。
+    /// Feed the pasted code to the waiting CLI and wait for the screen's verdict.
+    /// The Owner is bound **only on seeing an explicit success marker** — neither silence nor interruption counts as success.
     ///
-    /// ponytail: CLI がシェルに戻ったことの検知(現行の paneCommand)は持たない — 30 秒の
-    /// 時間切れで代替する(最悪、失敗の返事が最大 30 秒遅れるだけ)
+    /// ponytail: no detection of the CLI returning to the shell — a 30-second
+    /// timeout stands in (at worst the failure reply is up to 30 seconds late)
     pub(super) fn submit_code(&self, channel: String, code: String, reply_ts: String, user: String) {
         let key = ThreadKey::new(&channel, &reply_ts);
         LogCtx::default().info(
@@ -939,10 +939,10 @@ impl Bridge {
             &format!("login: submitting pasted code for {user} (channel {channel})"),
         );
         let (api, cmd_tx) = (self.deps.slack.clone(), self.cmd_tx.clone());
-        // Owner が既に居るなら、これはこのマシンの Claude Code のサインインし直し。Owner は変わらない
+        // If an Owner already exists, this is re-signing-in Claude Code on this machine. The Owner doesn't change
         let had_owner = !self.access.owner.is_empty();
-        // サインインの後半(貼られたコードの判定、最大 CODE_POLL_MAX 秒)も待ち時間 —
-        // login_start の guard は URL を出した時点で落ちているので、ここで張り直す
+        // The second half of sign-in (checking the pasted code, up to CODE_POLL_MAX seconds) is also waiting —
+        // login_start's guard dropped once the URL was shown, so set it again here
         let thinking = slack::Thinking::new(self.deps.slack.clone(), &channel, &reply_ts, &slack::Status::Login.text());
         let agent = self.deps.agent.clone();
         tokio::spawn(async move {
@@ -960,9 +960,9 @@ impl Bridge {
             } else {
                 for _ in 0..CODE_POLL_MAX {
                     tokio::time::sleep(LOGIN_POLL).await;
-                    thinking.set(&slack::Status::Login.text()); // 失効させない(URL 待ちと同じ)
-                    // scrollback ごと読む: "Login successful." を出した直後に CLI はシェルへ
-                    // 戻り、次のポーリングまでに印が画面外へ流れる
+                    thinking.set(&slack::Status::Login.text()); // don't let it expire (same as waiting for the URL)
+                    // Read including scrollback: right after printing "Login successful." the CLI returns to the shell,
+                    // and the marker scrolls off screen before the next poll
                     match agent.login_outcome() {
                         LoginOutcome::Success => {
                             outcome = "success";
@@ -976,7 +976,7 @@ impl Bridge {
                     }
                 }
             }
-            // セッションの片付けと pending の削除、Owner の書き込みは main の仕事
+            // Cleaning up the session, removing the pending entry and writing the Owner are main's job
             let (text, bound) = if outcome == "success" {
                 (
                     if had_owner {
@@ -1015,11 +1015,11 @@ impl Bridge {
         });
     }
 
-    /// `logout`。CLI のサインアウトだけを
-    /// spawn で回し、ワーカーの後片付けと Owner の解除は main に戻してやる。
+    /// `logout`. Only the CLI sign-out is spawned;
+    /// cleaning up agents and clearing the Owner is handed back to main.
     pub(super) fn user_logout(&mut self, channel: &str, root_ts: &str) {
-        // restart の札と違ってこれは**本当に効く** — user_logout は spawn を撒いてすぐ返るので、
-        // `claude auth logout` が走っている数秒の間に2通目の logout が届きうる
+        // Unlike the restart flag this one **really matters** — user_logout spawns and returns at once,
+        // so a second logout can arrive during the few seconds `claude auth logout` runs
         if self.sign_in.signing_out {
             LogCtx {
                 session_id: None,
@@ -1029,8 +1029,8 @@ impl Bridge {
             return;
         }
         self.sign_in.signing_out = true;
-        // shimmer は `claude auth logout` が返るまで。この後のワーカー畳みは main 側
-        // (CmdFx::LogoutFinished)なので、ここで持たせておけば **必ず** 消える
+        // The shimmer lasts until `claude auth logout` returns. Tearing down agents afterwards is main's side
+        // (CmdFx::LogoutFinished), so holding it here guarantees it **always** goes away
         let thinking = slack::Thinking::new(self.deps.slack.clone(), channel, root_ts, &slack::Status::Logout.text());
         let (cmd_tx, channel, thread_ts) = (
             self.cmd_tx.clone(),
@@ -1039,7 +1039,7 @@ impl Bridge {
         );
         let agent = self.deps.agent.clone();
         tokio::spawn(async move {
-            let _thinking = thinking; // Drop = クリア
+            let _thinking = thinking; // Drop = clear
             let ctx = LogCtx::default();
             ctx.info("bridge", "logout: signing out (claude auth logout)");
             let ok = match agent.logout().await {
@@ -1062,7 +1062,7 @@ impl Bridge {
                     false
                 }
             };
-            // サインアウトの成否に関わらず片付けは走らせる — 半端にワーカーだけ生き残る方が悪い
+            // Run the cleanup whether or not the sign-out succeeded — agents half-surviving is worse
             let _ = cmd_tx
                 .send(CmdFx::LogoutFinished {
                     ok,
@@ -1073,10 +1073,10 @@ impl Bridge {
         });
     }
 
-    /// このマシンの Claude Code のサインインを見張る。起動時と12時間ごと(ユーザー判断)に確かめ、
-    /// **切れたと分かった時点で1回だけ**通知先に知らせる。戻っても何も言わない。確かめられなかった
-    /// (`None`)ときは状態を変えない。Owner がまだ居ない(最初のセットアップ前)ときは見ない —
-    /// 切れているのが当たり前で、知らせる相手も居ない
+    /// Watch this machine's Claude Code sign-in. Checked at startup and every 12 hours (a user decision);
+    /// notify the notification target **once, at the moment it is found expired**. Nothing is said when it comes back. If it
+    /// couldn't be checked (`None`), the state is left alone. Not watched while there is no Owner yet (before first setup) —
+    /// being signed out is expected then, and there is nobody to tell
     pub(in crate::bridge) async fn sign_in_tick(&mut self) {
         const EVERY_MS: u64 = 12 * 60 * 60 * 1000;
         let now = self.deps.clock.now_ms();
@@ -1102,7 +1102,7 @@ impl Bridge {
         self.post_notice(&text, &ctx).await;
     }
 
-    /// spawn したサインイン・サインアウトが戻してきた状態変更を、main の側で1つずつ適用する。
+    /// Apply, one by one on main's side, the state changes returned by spawned sign-ins and sign-outs.
     pub(in crate::bridge) async fn on_cmd_fx(&mut self, fx: CmdFx) {
         let ctx = LogCtx::default();
         match fx {
@@ -1119,7 +1119,7 @@ impl Bridge {
                         &format!("login: SUCCESS — {user} bound as Owner (channel {channel})"),
                     );
                 } else {
-                    // Owner は決まっている — これはこのマシンのサインインし直し
+                    // The Owner is already set — this is re-signing-in on this machine
                     ctx.info(
                         "bridge",
                         &format!(
@@ -1127,8 +1127,8 @@ impl Bridge {
                         ),
                     );
                 }
-                // サインインは仕切り直し — 前の認証状態で諦めた枠をもう一度試す
-                // (これが無いと一時的な失敗で枠が Bridge の寿命いっぱい空く)
+                // Sign-in is a fresh start — retry slots that gave up under the previous auth state
+                // (without this, a temporary failure leaves the slot empty for the Bridge's whole lifetime)
                 if !self.workers.gave_up_count() == 0 {
                     ctx.info(
                         "bridge",
@@ -1139,7 +1139,7 @@ impl Bridge {
                     );
                 }
                 self.workers.clear_gave_up();
-                // Owner が決まって初めて pool_targets が実体を持つ — ここが初回の在庫作り
+                // pool_targets only becomes real once the Owner is set — this is the first pool fill
                 self.start_missing_pool_workers(&ctx);
             }
             CmdFx::LogoutFinished {
@@ -1176,10 +1176,10 @@ impl Bridge {
             CmdFx::SpawnScreen { outcome, what } => {
                 let ctx = LogCtx::default();
                 match outcome {
-                    // pane は**疑い**でしかない。裏を取るのは既存の /usage 見張りの仕事なので、
-                    // 次の flush で見に行くよう期限を過去に倒すだけ。**0 は使わない** —
-                    // `usage_tick` が「初回なので少し待つ」の合図に使っているので、0 を書くと
-                    // 確認が走らないどころか次の probe が 60 秒先送りになる
+                    // The pane is only a **suspicion**. Confirming it is the existing /usage watch's job,
+                    // so just move its deadline into the past so the next flush checks. **Never use 0** —
+                    // `usage_tick` uses it as the "first run, wait a bit" signal, so writing 0 not only
+                    // skips the check but pushes the next probe 60 seconds out
                     SpawnOutcome::UsageLimited => {
                         ctx.error(
                             "bridge",
@@ -1191,8 +1191,8 @@ impl Bridge {
                         );
                         self.usage_polled_at_ms = 1;
                     }
-                    // フリートゲートは張らない(`claude auth status` の裏取りが無い)。
-                    // 言うだけ。Owner は `login` を送れる
+                    // No fleet gate (there is no `claude auth status` confirmation).
+                    // Just say it. The Owner can send `login`
                     SpawnOutcome::LoginRequired => {
                         ctx.error(
                             "bridge",
@@ -1219,7 +1219,7 @@ impl Bridge {
 }
 
 impl UsageRow {
-    /// この行を何分の窓で予測するか(予測しない行は None)。
+    /// The window in minutes this row is projected over (None for rows not projected).
     pub fn window_minutes(label: &str, session_minutes: i64) -> Option<i64> {
         let l = label.to_ascii_lowercase();
         if l.contains("current session") {
@@ -1232,19 +1232,19 @@ impl UsageRow {
     }
 }
 
-/// `resume` の材料。
+/// Inputs for `resume`.
 pub struct ResumeInfo {
     pub session_id: Option<String>,
-    /// セッションの履歴が置かれた場所(= ワーカーの起動 cwd)
+    /// Where the session's history lives (= the agent's startup cwd)
     pub cwd: Option<String>,
-    /// 履歴がディスク上に見つからなかった → 再開はまず失敗する
+    /// No history found on disk → resuming will most likely fail
     pub transcript_missing: bool,
-    /// 今このスレッドでワーカーが生きている → 手元に線を渡したら終了する
+    /// An agent is alive in this thread right now → end it after handing the line over
     pub worker_running: bool,
 }
 
 impl ResumeInfo {
-    /// `resume` の答えを Slack mrkdwn で。続けるコマンドは `agent` が組む。
+    /// The `resume` answer as Slack mrkdwn. The command to continue with is built by `agent`.
     pub fn render(&self, agent: &dyn Agent) -> String {
         let info = self;
         let Some(sid) = info.session_id.as_deref().filter(|s| !s.is_empty()) else {
@@ -1282,16 +1282,16 @@ impl ResumeInfo {
     }
 }
 
-// ── `context` / `ctx` — このスレッド自身のコンテキスト内訳 ─
-// 出力の**読み取り**は `agent/claude.rs` の `Pane::context_report`(画面と出力を読むのは
-// エージェント実体の仕事)。ここに残るのは Slack へ出す**描き方**だけ。
+// ── `context` / `ctx` — this thread's own context breakdown ─
+// **Reading** the output is `Pane::context_report` in `agent/claude.rs` (reading the screen and output
+// is the agent implementation's job). What remains here is only **how to draw it** for Slack.
 
-/// パース済み `/context` を Slack mrkdwn で: 人が読めるモデル名 + 等幅の使用バー + 桁揃えの内訳表。
-/// 表は生の `Free space` 行の代わりに **`Used space` の合計行**で閉じる(バーと同じ「使った側」を
-/// 見せるため)。使用率は `100 − Free space` を優先する — ヘッダの整数 `4%` より1桁細かい。
+/// Parsed `/context` as Slack mrkdwn: a human-readable model name + a monospace usage bar + an aligned breakdown table.
+/// The table ends with a **`Used space` total row** instead of the raw `Free space` row (to show the same "used" side
+/// as the bar). The usage ratio prefers `100 − Free space` — one digit finer than the header's integer `4%`.
 impl ContextReport {
-    /// JS の `parseFloat` 相当 — 先頭の数値部分だけ読む(`"95.6%"` → 95.6)。読めなければ NaN。
-    /// 指数表記は扱わない: /context が印字するのは十進のパーセントとトークン数だけ。
+    /// Like JS `parseFloat` — reads only the leading number (`"95.6%"` → 95.6). NaN if unreadable.
+    /// No exponent notation: /context prints only decimal percentages and token counts.
     fn leading_f64(s: &str) -> f64 {
         let t = s.trim_start();
         let mut end = 0;
@@ -1337,7 +1337,7 @@ impl ContextReport {
             r.total
         ));
 
-        // 表: 消費側のカテゴリ(生の Free space は落とす)+ `Used space` の合計行
+        // Table: the consuming categories (raw Free space dropped) + a `Used space` total row
         let consumers: Vec<&ContextCategory> = r
             .categories
             .iter()
@@ -1348,7 +1348,7 @@ impl ContextReport {
         } else {
             r.pct.clone()
         };
-        // 桁は「消費側の全行 + 合計行 + 最低幅」の最大
+        // Width is the max over "every consuming row + the total row + a minimum width"
         let width = |min: usize, f: fn(&ContextCategory) -> &String, own: &str| {
             consumers
                 .iter()
@@ -1377,22 +1377,22 @@ impl ContextReport {
     }
 }
 
-// ── `usage` / `usg` — アカウントのサブスク上限の要約 ────
-// スレッド単位ではなく **bot アカウント**の使用状況。バーンレート予測(projection)は
-// この実装では出さない — ラベル + バー + `Resets …` まで。
+// ── `usage` / `usg` — summary of the account's subscription limits ────
+// Usage for the **bot account**, not per thread. No burn-rate projection
+// in this implementation — label + bar + `Resets …`.
 
-// 上限行の**読み取り**は `agent/claude.rs` の `Pane::usage_rows`。ここは描き方だけ。
+// **Reading** the limit rows is `Pane::usage_rows` in `agent/claude.rs`. This is only how they are drawn.
 
-// ── `compact` — 進捗行を描く ──────────────────────────
-// 圧縮中の pane を**読む**のは `agent/claude.rs` の `Pane::compact_progress`。
+// ── `compact` — drawing the progress line ─────────────
+// **Reading** the pane during compaction is `Pane::compact_progress` in `agent/claude.rs`.
 
-/// 描くバーの幅と、その上を流れる光る窓の幅。
+/// Width of the drawn bar, and of the glowing window that sweeps across it.
 const CELLS: usize = 24;
 const WINDOW: usize = 5;
 
-/// 圧縮の状態を Slack の進捗行に。🗜️ のラベル + 経過時間、pane が本物の % を出していれば
-/// そこまで満たした**確定**バー(% はバーの**後ろ** — 実 TUI のバー行 `▐▏███…░ 31%` に合わせる)。
-/// % が無い時はトークン数と、経過秒とともに光る窓が進む(そして巻き戻る)不定バーに落ちる。
+/// Compaction state as a Slack progress line. A 🗜️ label + elapsed time, and if the pane shows a real %, a
+/// **determinate** bar filled to it (the % goes **after** the bar — matching the real TUI's bar line `▐▏███…░ 31%`).
+/// Without a %, fall back to the token count and an indeterminate bar whose glowing window moves (and wraps) with elapsed seconds.
 impl CompactProgress {
     pub fn render(&self) -> String {
         let p = self;
@@ -1403,7 +1403,7 @@ impl CompactProgress {
             Some(_) => format!(" {s}s"),
         };
         if let Some(pct) = p.percent {
-            // 確定: /usage が描くのと同じバー。% はその後ろ
+            // Determinate: the same bar /usage draws, with the % after it
             let pct = pct.min(100);
             let bar = UsageReport::bar(f64::from(pct), CELLS);
             return crate::t!(
@@ -1411,9 +1411,9 @@ impl CompactProgress {
                 "🗜️ コンテキストを圧縮中…{elapsed}\n`{bar}` {pct}%"
             );
         }
-        // 不定: 経過秒とともにバーの上を流れる光る窓
+        // Indeterminate: a glowing window sweeping over the bar with elapsed seconds
         let tok = match &p.tokens {
-            // 矢印が無ければ**空文字**(現物の `?? ''`)。`Option<char>` の既定は `'\0'` なので使えない
+            // No arrow → an **empty string**. `Option<char>`'s default is `'\0'`, so it can't be used
             Some(t) => format!(
                 " · {}{t} tokens",
                 p.tokens_dir.map(String::from).unwrap_or_default()
@@ -1437,20 +1437,20 @@ impl CompactProgress {
     }
 }
 
-/// `/usage` の答えを描くのに要るもの。
+/// What's needed to draw the `/usage` answer.
 ///
-/// `projection` があればバーンレート予測行を足す
-/// (位置 — `Resets …` の直後)。
+/// If `projection` is set, a burn-rate projection line is added
+/// (placed right after `Resets …`).
 pub struct UsageReport<'a> {
     pub rows: &'a [UsageRow],
-    /// `(now, window_minutes)` — "Current session" 行に使う窓(通常 300)。
-    /// "Current week" 行は `USAGE_WEEK_WINDOW_MINUTES` を使う。
+    /// `(now, window_minutes)` — the window used for the "Current session" row (normally 300).
+    /// The "Current week" row uses `USAGE_WEEK_WINDOW_MINUTES`.
     pub projection: Option<(WallClock, i64)>,
 }
 
 impl UsageReport<'_> {
-    /// パース済みの `/usage` 行を Slack mrkdwn で: 太字のラベル + 等幅のバー + `<n>% used`、
-    /// その下に `Resets <when>`。ラベルと reset の文言は**原文のまま**。
+    /// Parsed `/usage` rows as Slack mrkdwn: a bold label + a monospace bar + `<n>% used`,
+    /// with `Resets <when>` below. Labels and reset text are **verbatim**.
     pub fn render(&self) -> String {
         match self.projection {
             Some((now, w)) => Self::inner(self.rows, Some(now), w),
@@ -1465,7 +1465,7 @@ impl UsageReport<'_> {
             lines.push(format!("*{}*", r.label));
             lines.push(format!("`{}` {}% used", Self::bar(pct, 24), r.pct));
             if !r.reset.is_empty() {
-                lines.push(format!("Resets {}", r.reset)); // 0% 行は reset を印字しない
+                lines.push(format!("Resets {}", r.reset)); // a 0% row prints no reset
             }
             if let Some(hit) = now.and_then(|now| {
                 UsageRow::window_minutes(&r.label, window_minutes)
@@ -1487,7 +1487,7 @@ impl UsageReport<'_> {
         lines.join("\n")
     }
 
-    /// 0–100 の百分率を固定幅の unicode バーに(/usage の TUI 画面を写したもの)。
+    /// A 0–100 percentage as a fixed-width unicode bar (a copy of the /usage TUI screen).
     fn bar(pct: f64, width: usize) -> String {
         let p = if pct.is_finite() {
             pct.clamp(0.0, 100.0)
@@ -1531,8 +1531,8 @@ pub(super) fn help_sections(agent: &dyn Agent) -> Vec<(String, Vec<(String, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    // 描き方のテストが読み手を1つ呼ぶ(`renders_context_report`)。パーサ本体の網は
-    // `agent/claude.rs` の `mod tests` に居る。
+    // The drawing test calls one reader (`renders_context_report`). The parser's own net
+    // lives in `mod tests` of `agent/claude.rs`.
     use crate::agent::screen::Pane;
 
     fn sample_now() -> WallClock {
@@ -1570,15 +1570,15 @@ some preamble\n\n**Model:** claude-opus-4-8[1m]\n**Tokens:** 43.8k / 1m (4%)\n\n
 | System prompt | 3.2k | 0.3% |\n| Messages | 40.6k | 4.1% |\n| Free space | 956k | 95.6% |\n\n\
 ### Custom Agents\nignored\n";
 
-    /// 描く側の網。**読む側**(`Pane::context_report`)の網は `agent/claude.rs` に居る。
+    /// Net for the drawing side. The **reading side**'s (`Pane::context_report`) net lives in `agent/claude.rs`.
     #[test]
     fn renders_context_report() {
         let r = Pane::new(CONTEXT_RAW).context_report().unwrap();
         let out = r.render();
         assert!(out.starts_with("📊 *Context Usage*\nOpus 4.8（1M context）"));
         assert!(out.contains("43.8k / 1m ( 4% used )"));
-        assert!(out.contains("Used space")); // 合計行
-        assert!(!out.contains("Free space")); // 生の Free 行は出さない
+        assert!(out.contains("Used space")); // total row
+        assert!(!out.contains("Free space")); // the raw Free row is not shown
     }
 
     #[test]
@@ -1601,7 +1601,7 @@ some preamble\n\n**Model:** claude-opus-4-8[1m]\n**Tokens:** 43.8k / 1m (4%)\n\n
             UsageReport::bar(50.0, 24),
             format!("{}{}", "█".repeat(12), "░".repeat(12))
         );
-        // 範囲外は clamp、0% 行は Resets 行を出さない
+        // Out of range is clamped; a 0% row prints no Resets line
         assert_eq!(UsageReport::bar(150.0, 10), "█".repeat(10));
         assert_eq!(UsageReport::bar(-5.0, 10), "░".repeat(10));
         let zero = vec![UsageRow {
@@ -1632,10 +1632,10 @@ some preamble\n\n**Model:** claude-opus-4-8[1m]\n**Tokens:** 43.8k / 1m (4%)\n\n
         }
         .render();
         assert!(out.contains("Expected to reach limit at"));
-        // 原文どおり `at :`(スペース+コロン+スペース)+ fmtResetLike 形
+        // Verbatim `at :` (space + colon + space) + the fmtResetLike form
         assert!(out.contains("- Expected to reach limit at : Jul 29 at 1:45 pm"));
 
-        // 予測できない/危なくない行には何も足さない
+        // Nothing is added to rows that can't be projected or aren't at risk
         let calm = vec![UsageRow {
             label: "Current session".into(),
             pct: "6".into(),
@@ -1662,7 +1662,7 @@ some preamble\n\n**Model:** claude-opus-4-8[1m]\n**Tokens:** 43.8k / 1m (4%)\n\n
             .render()
             .contains("Expected to reach limit")
         );
-        // 週の行は 7 日窓で判定(session 窓を当てると誤判定する)
+        // The week row is judged over a 7-day window (using the session window misjudges it)
         assert_eq!(
             UsageRow::window_minutes("Current week (Fable)", 300),
             Some(UsageProjection::WEEK_MINUTES)
@@ -1673,8 +1673,8 @@ some preamble\n\n**Model:** claude-opus-4-8[1m]\n**Tokens:** 43.8k / 1m (4%)\n\n
 
     #[test]
     fn compact_progress_without_an_arrow_renders_no_nul() {
-        // driver が tokens だけ持つ状態を組み得る(全フィールド pub)。現物の `?? ''` は空文字で、
-        // `Option<char>::unwrap_or_default()` の `'\0'` を混ぜると不可視の NUL が Slack へ流れる
+        // A driver can build a state holding only tokens (all fields are pub). The arrow must fall back to an empty string;
+        // mixing in `Option<char>::unwrap_or_default()`'s `'\0'` would leak an invisible NUL to Slack
         let p = CompactProgress {
             active: true,
             seconds: Some(3),
@@ -1685,7 +1685,7 @@ some preamble\n\n**Model:** claude-opus-4-8[1m]\n**Tokens:** 43.8k / 1m (4%)\n\n
         let out = p.render();
         assert!(!out.contains('\0'));
         assert!(out.starts_with("🗜️ Compacting the context… 3s · 876 tokens\n"));
-        // 矢印があれば数字の直前に付く(空白は挟まない)
+        // If there is an arrow it goes right before the number (no space in between)
         let with_dir = CompactProgress {
             tokens_dir: Some('↑'),
             ..p
