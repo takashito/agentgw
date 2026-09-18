@@ -1,13 +1,13 @@
-//! ssh / scp / gh を叩くだけの層。**判断はここに書かない**([`add_machine`](super::add_machine) の純関数が持つ)。
+//! A thin layer that only calls ssh / scp / gh. **No decisions here** (the pure functions in [`add_machine`](super::add_machine) own them).
 //!
-//! ssh のクレートは足さない — `~/.ssh/config` の別名・鍵・踏み台・ProxyJump を
-//! そのまま使いたい。鍵とポートと踏み台の設定は ssh 自身に任せる。
+//! No ssh crate — we want `~/.ssh/config` aliases, keys, jump hosts and ProxyJump to work
+//! as they are. Keys, ports and jump hosts are left to ssh itself.
 
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-/// 相手で1つコマンドを回して標準出力を返す。失敗は Err(標準エラーの中身)。
+/// Run one command on the remote and return its stdout. On failure, Err(its stderr).
 pub fn ssh_capture(target: &str, command: &str) -> Result<String, String> {
     let out = Command::new("ssh")
         .args([
@@ -26,7 +26,7 @@ pub fn ssh_capture(target: &str, command: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// 相手で回して、成否だけ見る(出力は相手の端末にそのまま流す)。
+/// Run on the remote and check only success (output goes straight to the remote's terminal).
 pub fn ssh_run(target: &str, command: &str) -> Result<(), String> {
     let st = Command::new("ssh")
         .args(["-o", "BatchMode=yes", target, command])
@@ -37,11 +37,11 @@ pub fn ssh_run(target: &str, command: &str) -> Result<(), String> {
         .ok_or_else(|| crate::t!("Failed on {target}: {command}", "{target} で失敗しました: {command}"))
 }
 
-/// 相手で対話つきに回す。
+/// Run on the remote interactively.
 ///
-/// **`-t` で端末を割り当てる。** `install` はトークンと役割を対話で訊くので、端末が
-/// 無いと「端末ではないので役割を訊けません」で止まる。**出力をパイプに落とさない** —
-/// 割り当てた端末を潰すと入力できなくなる。
+/// **`-t` allocates a terminal.** `install` asks for the token and the role interactively, so
+/// without a terminal it stops with "not a terminal, can't ask for the role". **Don't pipe the
+/// output** — taking over the allocated terminal makes input impossible.
 pub fn ssh_interactive(target: &str, command: &str) -> Result<(), String> {
     let st = Command::new("ssh")
         .args(["-t", target, command])
@@ -52,9 +52,9 @@ pub fn ssh_interactive(target: &str, command: &str) -> Result<(), String> {
         .ok_or_else(|| crate::t!("Failed on {target}: {command}", "{target} で失敗しました: {command}"))
 }
 
-/// 標準入力から食わせる。
+/// Feed it through stdin.
 ///
-/// **接続文字列を argv に置かない** — 相手の `ps` とシェル履歴に残る。
+/// **Never put the connection string in argv** — it would stay in the remote's `ps` and shell history.
 pub fn ssh_stdin(target: &str, command: &str, stdin: &str) -> Result<String, String> {
     let mut child = Command::new("ssh")
         .args(["-o", "BatchMode=yes", target, command])
@@ -78,7 +78,7 @@ pub fn ssh_stdin(target: &str, command: &str, stdin: &str) -> Result<String, Str
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// 手元のファイルを相手に置く。
+/// Put a local file on the remote.
 pub fn scp(local: &Path, target: &str, remote_path: &str) -> Result<(), String> {
     let st = Command::new("scp")
         .args([
@@ -93,13 +93,13 @@ pub fn scp(local: &Path, target: &str, remote_path: &str) -> Result<(), String> 
         .ok_or_else(|| crate::t!("Couldn't copy to {remote_path}", "{remote_path} に置けませんでした"))
 }
 
-/// 手元の文字列を相手のファイルに書く(install.sh を送るのに使う)。
+/// Write a local string to a file on the remote (used to send install.sh).
 pub fn put_text(target: &str, remote_path: &str, text: &str) -> Result<(), String> {
-    // `cat > path` に標準入力で流す。scp のために一時ファイルを作らない
+    // Stream it into `cat > path` over stdin, so scp doesn't need a temp file
     ssh_stdin(target, &format!("cat > '{remote_path}'"), text).map(|_| ())
 }
 
-/// `gh` が使えるか(入っていて、認証が通っているか)。
+/// Whether `gh` is usable (installed and authenticated).
 pub fn gh_ready() -> bool {
     Command::new("gh")
         .args(["auth", "status"])
@@ -110,7 +110,7 @@ pub fn gh_ready() -> bool {
         .unwrap_or(false)
 }
 
-/// GitHub release から1つ落とす。落ちた先のパスを返す。
+/// Download one asset from a GitHub release. Returns the path it landed at.
 pub fn gh_download(
     args: &[String],
     out_dir: &Path,
@@ -129,7 +129,7 @@ pub fn gh_download(
         .ok_or_else(|| crate::t!("The release has no agentgw-{triple}", "release に agentgw-{triple} がありません"))
 }
 
-/// `tailscale status --json`。入っていない / 落ちていれば `None`。
+/// `tailscale status --json`. `None` if it's not installed or not running.
 pub fn tailscale_json() -> Option<String> {
     for bin in [
         "tailscale",

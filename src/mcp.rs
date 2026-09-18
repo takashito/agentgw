@@ -1,12 +1,12 @@
-//! ワーカーが Slack に話しかけるための MCP サーバ。**エージェント共通** —
-//! claude だけの道具ではないので `agent/` の下には置かない。
+//! The MCP server agents use to talk to Slack. **Shared by all agents** —
+//! it's not a claude-only tool, so it doesn't live under `agent/`.
 //!
-//! **stateless 必須** — rmcp streamable http の `stateful_mode` は既定 true で、
-//! セッション表がインメモリのため Bridge 再起動で生存ワーカーの MCP が全滅する
-//! (「聞けるが話せない」)。
+//! **Must be stateless** — rmcp streamable http's `stateful_mode` defaults to true, and its
+//! session table lives in memory, so a Bridge restart kills MCP for every surviving agent
+//! ("can hear but can't speak").
 //!
-//! ツール6種の名前・スキーマ・description は現行 connector と**同一**。
-//! 反ナレーション文言は振る舞い契約なので短縮・意訳しない。
+//! The six tools' names, schemas and descriptions are kept **identical** to the original connector.
+//! The anti-narration wording is a behavior contract: don't shorten or paraphrase it.
 
 use crate::agent::HookEvent;
 use crate::bridge::state::{LogCtx, StateDir};
@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-/// ワーカーの MCP ツール呼び出しを実行する側。実体は `slack::ToolExec`。
+/// Executes agents' MCP tool calls. The real implementation is `slack::ToolExec`.
 pub trait ToolExecutor: Send + Sync + 'static {
     fn execute(
         &self,
@@ -36,12 +36,12 @@ pub trait ToolExecutor: Send + Sync + 'static {
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<String, String>> + Send>>;
 }
 
-/// MCP の受け口。ツール定義と、ワーカーに渡す設定ファイルの書き出し。
+/// The MCP endpoint: tool definitions, and writing the config file handed to agents.
 pub struct Mcp;
 
 impl Mcp {
-    /// MCP のツール定義6種(現行の名前・スキーマ・description を
-    /// 忠実移植)。反ナレーション文言は振る舞い契約 — 短縮・意訳しない。
+    /// The six MCP tool definitions (names, schemas and descriptions ported
+    /// faithfully). The anti-narration wording is a behavior contract — don't shorten or paraphrase it.
     pub fn tool_definitions() -> Vec<serde_json::Value> {
         vec![
             serde_json::json!({
@@ -138,14 +138,14 @@ impl Mcp {
         ]
     }
 
-    /// ワーカーに渡す `--mcp-config` の中身。
+    /// The contents of `--mcp-config` handed to agents.
     ///
-    /// **サーバ名はバイナリと同じ `agentgw`。** ワーカーから見たツール名が
-    /// `mcp__agentgw__reply` になる規則で、`slack.rs` の `is_denied_tool` と
-    /// `command.rs` の `OWN_MCP_PREFIX` もこの接頭辞で判定している。
+    /// **The server name is `agentgw`, same as the binary.** Agents see tool names like
+    /// `mcp__agentgw__reply`, and `is_denied_tool` in `slack.rs` and
+    /// `OWN_MCP_PREFIX` in `command.rs` match on this prefix too.
     ///
-    /// **替えたら、走っているワーカーは `/mcp` で繋ぎ直すまで返信できない** —
-    /// セッション開始時のツール定義を握ったままなので、古い名前で呼ぼうとする。
+    /// **If you rename it, running agents can't reply until they reconnect with `/mcp`** —
+    /// they hold the tool definitions from session start and keep calling the old name.
     pub fn config_json(mcp_port: u16, session_id: &str, mcp_token: &str) -> serde_json::Value {
         serde_json::json!({ "mcpServers": { "agentgw": {
             "type": "http",
@@ -163,14 +163,14 @@ impl Mcp {
         session_id: &str,
         mcp_token: &str,
     ) -> std::io::Result<PathBuf> {
-        // 生成物なので state ではなく一時領域へ([`StateDir::runtime_dir`])
+        // Generated, so it goes to the runtime area, not state ([`StateDir::runtime_dir`])
         dir.write_runtime_json(
             &format!("mcp/{session_id}.json"),
             &Self::config_json(mcp_port, session_id, mcp_token),
         )
     }
 
-    /// MCP 受け口を上げ、(port, token) を返す。
+    /// Start the MCP endpoint and return (port, token).
     pub async fn serve(
         state_dir: &StateDir,
         executor: Arc<dyn ToolExecutor>,
@@ -187,9 +187,9 @@ impl Mcp {
                 })
             },
             LocalSessionManager::default().into(),
-            // stateless — MCP のセッション表は Bridge のメモリにしか無く、再起動で消えると
-            // 継承ワーカーの stale な Mcp-Session-Id が 401 になってツールが全滅する(E2E)。
-            // どのワーカーかは X-Agentgw-Session ヘッダで自前に見ているので、この表は要らない。
+            // stateless — the MCP session table lives only in the Bridge's memory; when a restart
+            // wipes it, inherited agents' stale Mcp-Session-Id gets 401 and every tool fails (E2E).
+            // We identify the agent ourselves via the X-Agentgw-Session header, so the table isn't needed.
             StreamableHttpServerConfig {
                 stateful_mode: false,
                 ..Default::default()
@@ -224,10 +224,10 @@ impl Mcp {
     }
 }
 
-/// rmcp に差す受け口の実体。ツールの実行(`exec`)と hook の口(`hooks`)を握る。
+/// The handler plugged into rmcp. Holds tool execution (`exec`) and the hook entry point (`hooks`).
 ///
-/// セッションの状態は持たない — streamable http は **stateless 必須**(セッション表を持つと Bridge の
-/// 再起動で生存ワーカーの MCP が全滅する)。
+/// Holds no session state — streamable http **must be stateless** (with a session table, a Bridge
+/// restart kills MCP for every surviving agent).
 #[derive(Clone)]
 struct McpServer {
     exec: Arc<dyn ToolExecutor>,
@@ -235,8 +235,8 @@ struct McpServer {
 }
 
 impl McpServer {
-    /// どのワーカーからの呼び出しか。HTTP の生パーツが extensions に入っている
-    /// (rmcp 0.8.5 は initialize を含む全リクエストで注入する — tower.rs:334)。
+    /// Which agent the call came from. The raw HTTP parts are in extensions
+    /// (rmcp 0.8.5 injects them on every request, including initialize — tower.rs:334).
     fn session_header(context: &RequestContext<RoleServer>) -> String {
         context
             .extensions
@@ -252,8 +252,8 @@ impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             capabilities: ServerCapabilities::builder().enable_tools().build(),
-            // 添付の一文は現行 connector の `RESPONDER`から原文コピー
-            // 封筒に file_paths が載る意味は、ここでしかワーカーに伝わらない
+            // The attachment sentence is copied verbatim from the original connector's `RESPONDER`
+            // This is the only place that tells the agent what file_paths on the envelope mean
             instructions: Some(
                 "Slack bridge — reply to the Slack thread with these tools. \
                  Events: <channel source=\"slack\" channel_id=... message_id=...>; attachments \
@@ -266,7 +266,7 @@ impl ServerHandler for McpServer {
         }
     }
 
-    /// ワーカーが MCP を握った瞬間 — ツールを呼べる状態になったことの唯一の合図。
+    /// The moment an agent gets hold of MCP — the only signal that it can call tools.
     async fn initialize(
         &self,
         request: InitializeRequestParam,
@@ -284,7 +284,7 @@ impl ServerHandler for McpServer {
                 })
                 .await;
         }
-        // 以下は既定実装のまま(rmcp 0.8.5 handler/server.rs:110)
+        // The rest is the default implementation as-is (rmcp 0.8.5 handler/server.rs:110)
         if context.peer.peer_info().is_none() {
             context.peer.set_peer_info(request);
         }
@@ -332,11 +332,11 @@ impl ServerHandler for McpServer {
             )]));
         }
         ctx.info("mcp", &format!("tool {tool}"));
-        // **ツールを呼べている = MCP を握っている。** Bridge を再起動すると `initialize` は
-        // 二度と来ない(ワーカーの claude は繋ぎ直さない)ので、継承したワーカーではこれが
-        // 唯一の証拠になる。印が戻らないと stop が永久に fail-open で、返事しないまま
-        // 終わるターンを止められない。冪等なので毎回送ってよい(milestone は出さない —
-        // 節目ではなく、ただの事実)
+        // **Calling a tool = holding MCP.** After a Bridge restart `initialize` never comes
+        // again (the agent's claude doesn't reconnect), so for inherited agents this is the
+        // only evidence. Without the mark, stop stays fail-open forever and can't stop a turn
+        // that ends without replying. Idempotent, so sending it every time is fine (no milestone —
+        // it's a plain fact, not a turning point)
         let _ = self
             .hooks
             .send(HookEvent {
@@ -392,9 +392,9 @@ mod tests {
         assert_eq!(out, "sid-1:reply:hi");
     }
 
-    /// E2E Bridge を再起動すると MCP のセッション表(メモリのみ)が消え、継承ワーカーが
-    /// 焼き込んだ Mcp-Session-Id が「知らないセッション」になってツール呼び出しが全滅した。
-    /// stateless ならその表を引かないので通る — stateful との対比で再現ごと固定する。
+    /// E2E: restarting the Bridge wiped the MCP session table (memory only), so the
+    /// Mcp-Session-Id baked into inherited agents became an "unknown session" and every tool call failed.
+    /// Stateless doesn't look the table up, so it passes — pinned together with the repro against stateful.
     #[tokio::test]
     async fn stale_mcp_session_id_survives_a_bridge_restart() {
         async fn status(stateful_mode: bool) -> u16 {
@@ -474,7 +474,7 @@ mod tests {
                 .unwrap()
                 .to_string()
         };
-        // 振る舞い契約 — 短縮も意訳もしない(現行 connector の原文)
+        // Behavior contract — don't shorten or paraphrase (original connector wording)
         assert!(by("reply").contains(
             r#"Do NOT narrate this tool: never write "I should use reply" / "I have reply" / "I will reply" / "I replied" or any similar preamble. Do NOT output any text after calling reply — the tool call is the entire turn."#
         ));
@@ -486,10 +486,10 @@ mod tests {
         );
     }
 
-    /// **どの引数にも説明を付ける。** 書く側(LLM)が読むのは引数の説明で、
-    /// ツール本体の説明とここが食い違うと、引数のほうを信じて間違える
-    /// (実際に `text` が「supports Slack mrkdwn」のまま残り、既定を Markdown に
-    /// 変えた後も嘘をつき続けていた)。
+    /// **Every argument gets a description.** The writer (the LLM) reads the argument descriptions,
+    /// and when they disagree with the tool's description it trusts the argument and gets it wrong
+    /// (`text` actually kept saying "supports Slack mrkdwn" and went on lying
+    /// after the default switched to Markdown).
     #[test]
     fn every_tool_argument_explains_itself() {
         for t in Mcp::tool_definitions() {
@@ -497,7 +497,7 @@ mod tests {
             let props = t["inputSchema"]["properties"].as_object().unwrap();
             assert!(!props.is_empty(), "{name}: 引数が1つも無い");
             for (arg, spec) in props {
-                // `items` は配列の要素型で、引数ではない
+                // `items` is the array's element type, not an argument
                 if arg == "items" {
                     continue;
                 }

@@ -1,14 +1,14 @@
-//! 実際にバイナリを起こして、サブコマンドが**口として通じるか**だけを見る。
+//! Start the real binary and check only that each subcommand **is still wired up**.
 //!
-//! `main.rs` の分岐はライブラリのテストからは見えない(bin クレートは lib の `cfg(test)`
-//! 隔離が効かないので、main.rs にテストを書かない)。別プロセスとして
-//! 起こせばその罠は無い。2026-09-18、`invite` を畳んだときに直後の `add-child` の分岐まで
-//! 消していて、実機で打つまで誰も気づかなかった。
+//! Library tests can't see the branches in `main.rs` (a bin crate doesn't get the lib's
+//! `cfg(test)` isolation, so we don't write tests in main.rs). Running it as a separate
+//! process avoids that trap. On 2026-09-18, removing `invite` also removed the `add-child`
+//! branch right after it, and nobody noticed until it was typed on a real machine.
 
 use std::process::Command;
 
 fn agentgw(args: &[&str]) -> (i32, String) {
-    // 本番の置き場を掴まない(起動時の guard が置き場を読むため)
+    // Don't touch the production state directory (the startup guard reads it)
     let dir = std::env::temp_dir().join(format!("agentgw-cli-test-{}", std::process::id()));
     let out = Command::new(env!("CARGO_BIN_EXE_agentgw"))
         .args(args)
@@ -25,7 +25,7 @@ fn agentgw(args: &[&str]) -> (i32, String) {
 
 #[test]
 fn add_machine_answers_with_its_own_usage() {
-    // 引数なしなら add-child 自身の usage。**全体の usage に落ちたら分岐が消えている**
+    // With no arguments, add-child prints its own usage. **Falling to the overall usage means the branch is gone**
     let (code, text) = agentgw(&["add-machine"]);
     assert_eq!(code, 2, "{text}");
     assert!(text.contains("usage: agentgw add-machine"), "{text}");

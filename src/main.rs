@@ -2,12 +2,13 @@ use agentgw::bridge::Bridge;
 use agentgw::bridge::state::LogCtx;
 use agentgw::service::Service;
 
-/// **別の実装のボットの置き場を掴んだら、何もせずに止まる。**
+/// **If we got hold of another implementation's bot state directory, stop without doing anything.**
 ///
-/// `AGENTGW_STATE_DIR` を付け忘れると既定の `~/.local/state/agentgw` に落ちる。
-/// そこが別実装のボットの置き場になっているマシンでは、`install` が plist を、`link` が
-/// `.env` を書いてしまう(2026-08-02 に実際に両方起きた)。この実装は UDS を作らないので、
-/// `bridge.sock` があれば相手は Bun 版だと分かる。**読む前・書く前に断つ。**
+/// Forgetting `AGENTGW_STATE_DIR` falls back to the default `~/.local/state/agentgw`.
+/// On a machine where that directory belongs to a different bot implementation, `install`
+/// would write its plist and `link` its `.env` (both actually happened on 2026-08-02). This
+/// implementation never creates a UDS, so a `bridge.sock` means the other side is the Bun
+/// version. **Bail out before reading or writing anything.**
 fn refuse_other_bots_state_dir() {
     let dir = agentgw::bridge::state::StateDir::resolve();
     if !dir.path().join("bridge.sock").exists() {
@@ -46,13 +47,13 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        // 接続文字列1本を .env に落とす(ゲートウェイにつなぐマシンの側)
+        // Write one connection string into .env (on the machine that connects to the gateway)
         "link" => {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             let dir = agentgw::bridge::state::StateDir::resolve();
             std::process::exit(agentgw::setup::cli(&rest, &dir));
         }
-        // マシンを1台足す(届ける → 繋ぐ → 入れて起こす)
+        // Add one machine (deliver -> connect -> install and start)
         "add-machine" => {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             std::process::exit(agentgw::setup::add_machine::cli(&rest).await);
@@ -60,21 +61,21 @@ async fn main() {
         c if Service::COMMANDS.contains(&c) => {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             let rc = Service::run(c, &rest);
-            // マシンを迎える設定があるときだけ、フリートの様子を続けて出す
+            // Only when this host is set up to accept machines, follow with the fleet status
             if c == "status" {
                 let dir = agentgw::bridge::state::StateDir::resolve();
                 agentgw::bridge::gateway::Cli::print_fleet(&dir).await;
             }
             std::process::exit(rc);
         }
-        // 版は**単独で名乗る**。usage に紛れ込ませると、実機で版を確かめる1行が
-        // 使い方の壁になる(そして終了コードが 2 になる)
+        // The version **stands on its own**. Mixed into the usage, the one line you need
+        // to check the version on a machine becomes a wall of usage (and exits with code 2)
         "--version" | "-V" | "version" => {
             println!("agentgw {}", env!("CARGO_PKG_VERSION"));
         }
         _ => {
-            // ユーザーが読む行。**内部の事情(実装言語・課題番号)は出さない** —
-            // 打ち間違えた人が要るのは正しい使い方だけ。名前は実際のコマンド名と揃える
+            // A line users read. **Don't show internals (implementation language, issue
+            // numbers)** — someone who mistyped needs only the right usage. Names match the real commands
             let v = env!("CARGO_PKG_VERSION");
             eprintln!(
                 "{}",

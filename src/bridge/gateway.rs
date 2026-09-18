@@ -1,30 +1,30 @@
-//! 親子の link に関わるものは全部ここ — フレームの契約から、誰を中に入れるか、
-//! 届いたものを誰に渡すか、フリートの出入りまで。
+//! Everything about the gateway–machine link lives here — from the frame contract to who is let in,
+//! who gets what arrives, and machines joining and leaving the fleet.
 //!
-//! 節の並び:
+//! Sections:
 //!
-//! 1. プロトコル(`mod wire`)  フレーム / 接続文字列(`Invite`)/ subprotocol — 純データ
-//! 2. 受け入れの判断           `Admit`
-//! 3. 接続簿                   `Conn` / `LinkServer`
-//! 4. 届いたものの読み方と行き先 `Event` / `Click` / `Delivery` / `NoticeCooldown`
-//! 5. コマンドの判断           `CommandCtx` / `DmOnboardingCtx`
-//! 6. presence                 `Presence` / `FleetView`
-//! 7. 親の口                   `Fleet`(axum のハンドラと link 1本の一生、親→子 dial)
-//! 8. 子の口                   `Inlet`(親に迎えに来てもらう構成でだけ開く)
-//! 9. CLI                      `Cli`(`status` のフリート欄)
+//! 1. Protocol (`mod wire`)     frames / connection string (`Invite`) / subprotocol — pure data
+//! 2. Admission                 `Admit`
+//! 3. Connection book           `Conn` / `LinkServer`
+//! 4. Reading what arrives and where it goes `Event` / `Click` / `Delivery` / `NoticeCooldown`
+//! 5. Command decisions         `CommandCtx` / `DmOnboardingCtx`
+//! 6. presence                  `Presence` / `FleetView`
+//! 7. Gateway side              `Fleet` (axum handlers, the life of one link, gateway→machine dial)
+//! 8. Machine side              `Inlet` (opened only when the gateway comes to fetch this machine)
+//! 9. CLI                       `Cli` (the fleet section of `status`)
 //!
-//! **1〜6 は純関数**(時計もソケットもワーカーも知らない)。テストが全部同期で回るのは
-//! そのためで、**7〜9 のものをここへ持ち込んだ日にそれが壊れる** — 以前は別ファイルなので
-//! grep で確かめられたが、同じモジュールに入った今は、この並びとテストの回り方が代わりの担保。
+//! **Sections 1–6 are pure functions** (they know no clock, socket or agent). That's why every
+//! test runs synchronously, and **it breaks the day something from 7–9 is pulled in here** — when these
+//! were separate files grep could check that; now that they share a module, this ordering and how the tests run are the guard.
 
-// ── 節1: プロトコル ─────────────────────────────────────
+// ── Section 1: protocol ─────────────────────────────────────
 pub mod wire {
-    //! Relay ⇄ Bridge の link プロトコル — WebSocket に載るフレームと、どこへ dial すればいいかを
-    //! 伝える接続文字列。純データだけで I/O を持たない(Relay と Bridge の**両方**が読む契約なので、
-    //! どちらかの都合を1行でも混ぜたら二枚舌になる)。
+    //! The Relay ⇄ Bridge link protocol — the frames carried over WebSocket and the connection
+    //! string that says where to dial. Pure data, no I/O (it's a contract **both** Relay and Bridge
+    //! read, so mixing in even one line of either side's convenience would make it two-faced).
     //!
-    //! **握手はここに無い。** 誰を入れるか(api トークン)・同じ言葉を喋るか(版)・どのマシンか
-    //! (名乗り)・受け入れたか、の4つは**すべて WebSocket の upgrade でやる**:
+    //! **The handshake is not here.** Who gets in (api token), whether we speak the same language (version),
+    //! which machine it is (its name) and whether it was accepted — **all four happen in the WebSocket upgrade**:
     //!
     //! ```text
     //! GET /bridge/desktop HTTP/1.1
@@ -33,78 +33,78 @@ pub mod wire {
     //! Sec-WebSocket-Protocol: sclink.1
     //! ```
     //!
-    //! 通れば 101、通らなければ 401(トークン)/ 426(版)/ 400(パス)。だから
-    //! 「最初のフレームは名乗りでなければならない」という状態機械も、名乗らない接続を切るための
-    //! 期限タイマーも要らない — **フレームが流れる時点で、相手はもう認証を通っている**。
+    //! Pass gets 101; failure gets 401 (token) / 426 (version) / 400 (path). So there's no
+    //! state machine for "the first frame must be the name", and no deadline timer to cut
+    //! connections that never name themselves — **once frames flow, the peer has already authenticated**.
     //!
-    //! 移植元(Bun)は hello / welcome / reject という3つのフレームで同じことをやっていた。
-    //! それはワイヤ互換のために踏襲する価値があったが、互換を取らないと決めた以上、
-    //! 既にあるものの作り直しでしかない。
+    //! The Bun original did the same with three frames: hello / welcome / reject.
+    //! That was worth keeping for wire compatibility, but once we decided not to be compatible,
+    //! it would only be rebuilding what the upgrade already does.
 
     use serde::{Deserialize, Serialize};
 
-    /// upgrade で突き合わせる版。フレームの形か意味を変えたら上げる。
+    /// The version matched during the upgrade. Bump it when a frame's shape or meaning changes.
     ///
-    /// バイナリの semver とはわざと別物にしてある — Relay と Bridge は別々のリリース周期を持つ
-    /// 別プログラムで、版が揃わないのが常態。揃っていなければならないのはフレームの**意味**だけ。
-    /// 食い違う相手は upgrade の時点で断る(426)。新旧が黙ってすれ違って話し続ける方がずっと悪い。
+    /// Deliberately separate from the binary's semver — Relay and Bridge are separate programs with
+    /// their own release cycles, and mismatched versions are normal. Only the frames' **meaning** must match.
+    /// A mismatched peer is refused at the upgrade (426). Old and new silently talking past each other is far worse.
     pub const LINK_SUBPROTOCOL: &str = "sclink.1";
 
-    /// Bridge が dial するパスの頭。この後ろ1セグメントがマシンの名前。
+    /// The path prefix the Bridge dials. The one segment after it is the machine's name.
     const BRIDGE_PATH: &str = "/bridge/";
 
-    /// `link` が自己到達を確かめるときに叩くパス。
+    /// The path `link` hits to check it can reach itself.
     ///
-    /// **マシンの名前空間に予約語を置かない。** 別のパスにしてあるので、どんな名前のマシンとも
-    /// 衝突しないし、名前として通せる字かどうかの検査に巻き込まれることもない
-    /// (`__link_probe__` という予約名でやろうとして、名前の検査に弾かれた — 実機で発覚)。
+    /// **No reserved words in the machine namespace.** A separate path can't collide with any
+    /// machine name, and doesn't get caught by the check on which characters a name may use
+    /// (trying it with a reserved name `__link_probe__` got rejected by the name check — found on a real machine).
     pub const PROBE_PATH: &str = "/probe";
 
-    /// 握手の**後**に流れるフレーム。4種しかなく、**全部 Relay → Bridge 向き**
-    /// (Bridge は握手を済ませたら何も送り返さない — 送るべきことが無い)。
+    /// Frames that flow **after** the handshake. Only four kinds, **all Relay → Bridge**
+    /// (once the handshake is done the Bridge sends nothing back — it has nothing to send).
     #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
     #[serde(tag = "t", rename_all = "snake_case")]
     pub enum LinkFrame {
-        /// 101 の直後に Relay が投げる最初の1本。
+        /// The first frame the Relay sends right after the 101.
         ///
-        /// Slack の **bot** トークンを渡す(Bridge は Slack へ自分で書くので要る)。**app トークンは
-        /// 渡さない** — あれは Socket Mode を開くためだけのもので、イベント列の2人目の消費者は
-        /// この設計が防いでいる失敗そのもの。Bridge はこの bot トークンを**メモリにだけ**置く。
+        /// Hands over the Slack **bot** token (the Bridge writes to Slack itself, so it needs it). **The app
+        /// token is not handed over** — it only opens Socket Mode, and a second consumer of the event stream
+        /// is exactly the failure this design prevents. The Bridge keeps this bot token **in memory only**.
         ///
-        /// `home` は毎回の握手で現在値を渡す。後から(再)接続したマシンが、`set-home` を聞き逃して
-        /// いても追いつくのはこれのおかげ。欠けている = まだ home 未設定で、Bridge 側の現在値は
-        /// そのまま(「消す」という指示は無い)。
+        /// `home` carries the current value on every handshake. That's how a machine that (re)connects later
+        /// catches up even if it missed `set-home`. Missing = home not set yet, and the Bridge's current value
+        /// stays as is (there is no "clear it" instruction).
         Ready {
             bot_token: String,
             #[serde(skip_serializing_if = "Option::is_none")]
             home: Option<String>,
         },
-        /// Slack のイベント1つを、そのチャンネルの担当マシンへ転送する。
+        /// Forward one Slack event to the machine in charge of that channel.
         ///
-        /// `event` は slack-morphism の型を `to_value` したもの。受け側は同じ型に戻すので、
-        /// 同じ serde 実装での往復になり無損失。
+        /// `event` is a slack-morphism type passed through `to_value`. The receiver turns it back into the
+        /// same type, so it's a round trip through the same serde impl and lossless.
         Event {
             name: String,
             event: serde_json::Value,
         },
-        /// ボタン1押しを同じ経路で転送する。
+        /// Forward one button press along the same path.
         ///
-        /// Slack への `ack` は**もう Relay が返している**(3秒以内にソケットを持っている側が返せ、
-        /// というのが Slack の要求)。Bridge は ack せず、判断だけする。書き戻しは
-        /// `body.response_url` — あれはトークン不要なので「Slack への書き込みは Bridge から」の
-        /// 約束が保たれる。
+        /// **The Relay has already sent** the `ack` to Slack (Slack requires whoever holds the socket to
+        /// answer within 3 seconds). The Bridge doesn't ack; it only decides. It writes back through
+        /// `body.response_url` — that needs no token, so the promise "writes to Slack come from the Bridge"
+        /// holds.
         ///
-        /// **`action_id` は持たない** — `action.action_id` を読めば済む。移植元は Bolt が別々に
-        /// 渡してくるという都合で同じ値を2回入れていた。
+        /// **No `action_id`** — reading `action.action_id` is enough. The original carried the same value
+        /// twice only because Bolt passed them separately.
         Action {
             action: serde_json::Value,
             body: serde_json::Value,
         },
-        /// Owner がこのマシンをある場所(DM / チャンネル)の担当に決めた、という通知。
+        /// Notice that the Owner put this machine in charge of a place (DM / channel).
         ///
-        /// これが来るまで Relay 経由の Bridge は Slack 上の自分の身元を何も知らない(持っているのは
-        /// Relay)。誰が Owner で、どこ(チャンネルとスレッド)へ返せばいいかの3つだけを渡す。
-        /// トークンは渡さない — 書くのは Bridge が bot トークンで自分でやる。
+        /// Until this arrives, a Bridge behind a Relay knows nothing of its own identity on Slack (the Relay
+        /// holds it). Only three things are passed: who the Owner is, and where (channel and thread) to reply.
+        /// No token — the Bridge does the writing itself with the bot token.
         Linked {
             owner_user_id: String,
             channel: String,
@@ -112,21 +112,21 @@ pub mod wire {
         },
     }
 
-    /// WebSocket が既にメッセージを区切ってくれるので、1メッセージ = 1フレーム。
-    /// UDS の NDJSON と違い「途中で切れた尻尾」を考えなくていい。
+    /// WebSocket already delimits messages, so one message = one frame.
+    /// Unlike NDJSON over a UDS, there's no "tail cut off mid-way" to worry about.
     pub fn encode(f: &LinkFrame) -> String {
         serde_json::to_string(f).unwrap_or_default()
     }
 
-    /// 1メッセージを1フレームに。知らないもの・形の違うものは `None`(= フレームではない)。
+    /// One message into one frame. Anything unknown or misshapen is `None` (= not a frame).
     pub fn decode(raw: &str) -> Option<LinkFrame> {
         serde_json::from_str(raw).ok()
     }
 
-    /// dial 先のパスからマシンの名前を読む。`/bridge/desktop` → `desktop`。
+    /// Read the machine's name from the dial path. `/bridge/desktop` → `desktop`.
     ///
-    /// 通すのは1セグメントだけで、字も絞る(`[A-Za-z0-9][A-Za-z0-9_.-]*`)。名前はログにも
-    /// `route` の表にも出るし、`..` のようなものを名前として受けて得することは何も無い。
+    /// Only one segment passes, with a narrow alphabet (`[A-Za-z0-9][A-Za-z0-9_.-]*`). The name shows up
+    /// in logs and in the `route` table, and nothing is gained by accepting something like `..` as a name.
     pub fn bridge_id_of_path(path: &str) -> Option<&str> {
         let id = path.strip_prefix(BRIDGE_PATH)?;
         let mut cs = id.chars();
@@ -136,38 +136,38 @@ pub mod wire {
         .then_some(id)
     }
 
-    /// マシンが dial するパスを組む(`link` が接続文字列に URL を載せるときは付けない —
-    /// 付けるのは繋ぐ側)。
+    /// Build the path a machine dials (`link` leaves it off when putting the URL in the connection string —
+    /// the connecting side adds it).
     pub fn path_for(bridge_id: &str) -> String {
         format!("{BRIDGE_PATH}{bridge_id}")
     }
 
-    // ── 節1b: 接続文字列(相手に貼らせる1本) ───────────────────────────
-    // マシンが Relay に届くには2つ要る: dial 先の URL と、提示する秘密。別々に打たせるのは
-    // 「何にも繋がらないのに理由を言えないマシン」を作る機会が2回あるということなので、Relay は
-    // 1本の文字列として出し、向こうはその1本を貼る。**この文字列はパスワードそのもの** —
-    // 持っている者は Bridge として繋ぎ、そのマシン宛の Slack メッセージを受け取れる。
+    // ── Section 1b: connection string (the one line the other side pastes) ────────────
+    // A machine needs two things to reach the Relay: the URL to dial and the secret to present. Asking for
+    // them separately gives two chances to create "a machine that connects to nothing and can't say why",
+    // so the Relay prints one string and the other side pastes that one string. **The string is the password
+    // itself** — whoever holds it can connect as a Bridge and receive the Slack messages meant for that machine.
     //
-    // (握手を upgrade に移しても、ここは何も変わらない — URL と秘密を1本で渡す価値は
-    //  ワイヤ互換とは無関係だから。)
+    // (Moving the handshake into the upgrade changed nothing here — handing over URL and secret as one
+    //  string is worth it regardless of wire compatibility.)
 
-    /// 接頭辞が版。将来フォーマットを変えたら「読み違い」でなく「はっきりした拒否」になる。
+    /// The prefix is the version. A future format change becomes a "clear refusal" rather than a "misreading".
     const PREFIX: &str = "SCLINK1-";
 
-    /// 相手に貼らせる1本の中身 — dial 先と鍵。**接続簿の [`Conn`](super::Conn) とは別物**
-    /// (あちらは繋がった link の書き手側)。
+    /// What the pasted line holds — where to dial and the key. **Not the same as [`Conn`](super::Conn) in the connection book**
+    /// (that one is the writer side of a connected link).
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct Invite {
-        /// dial 先。公開 WebSocket URL(実運用では `wss://…`)。**パスは付けない。**
+        /// Where to dial. The public WebSocket URL (`wss://…` in real use). **No path.**
         pub url: String,
-        /// 中に入れてもらうために提示する秘密。`Authorization: Bearer` に載る。
+        /// The secret presented to be let in. Carried in `Authorization: Bearer`.
         pub api_token: String,
     }
 
-    /// 中身は `{"u":<url>,"t":<apiToken>}` の base64url(padding 無し)。
+    /// The content is `{"u":<url>,"t":<apiToken>}` as base64url (no padding).
     ///
-    /// **キーの順は `u` → `t`**。`json!` マクロで組むと `serde_json::Map` が BTreeMap なので
-    /// アルファベット順(`t` が先)になる — だから struct で書いて宣言順を固定する。
+    /// **Key order is `u` → `t`**. Built with the `json!` macro, `serde_json::Map` is a BTreeMap and sorts
+    /// alphabetically (`t` first) — so it's written as a struct to pin the declaration order.
     pub fn encode_connection(c: &Invite) -> String {
         #[derive(Serialize)]
         struct Wire<'a> {
@@ -182,11 +182,11 @@ pub mod wire {
         format!("{PREFIX}{}", b64url_encode(json.as_bytes()))
     }
 
-    /// 読み戻す。ちょうど1本の接続文字列でないものは全部断る。
+    /// Read it back. Refuse anything that isn't exactly one connection string.
     ///
-    /// 実際に起きる失敗は**貼り付けの千切れ**だ — チャットが折り返した行の半分でも、それらしい
-    /// blob に見えてしまう。半分の秘密を持ったマシンが黙って出来上がるのが最悪なので、断る文面は
-    /// 「どこが欠けたのか」を名前で言う。
+    /// The failure that actually happens is a **torn paste** — even half of a line the chat wrapped looks
+    /// like a plausible blob. Silently ending up with a machine holding half a secret is the worst outcome,
+    /// so the refusal names what's missing.
     pub fn decode_connection(raw: &str) -> Result<Invite, String> {
         let text = raw.trim();
         let Some(body) = text.strip_prefix(PREFIX) else {
@@ -211,7 +211,7 @@ pub mod wire {
                 api_token: api_token.to_string(),
             }),
             (u, t) => {
-                // 欠けたものを**名前で**言う。黙って既定値で埋めない。
+                // Say **by name** what's missing. Don't silently fill in defaults.
                 let missing: Vec<&str> = [("url", u.is_none()), ("api token", t.is_none())]
                     .into_iter()
                     .filter(|(_, m)| *m)
@@ -225,8 +225,8 @@ pub mod wire {
         }
     }
 
-    /// `base64` クレートの URL-safe・パディング無し。**アルファベット外の1文字でも `None`** —
-    /// 緩く読むと千切れた貼り付けが通ってしまう(`+` や `/` は標準 base64 の字なので受けない)。
+    /// The `base64` crate's URL-safe, no-padding engine. **A single character outside the alphabet gives `None`** —
+    /// reading loosely would let a torn paste through (`+` and `/` are standard base64 characters, so they're refused).
     fn b64url_encode(bytes: &[u8]) -> String {
         use base64::Engine;
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
@@ -276,7 +276,7 @@ pub mod wire {
             }
         }
 
-        /// home 未設定の Ready はキーごと出さない — Bridge 側の現在値をそのままにするため。
+        /// A Ready without home omits the key entirely — so the Bridge keeps its current value.
         #[test]
         fn ready_without_home_omits_the_key() {
             let f = LinkFrame::Ready {
@@ -286,21 +286,21 @@ pub mod wire {
             assert_eq!(encode(&f), r#"{"t":"ready","bot_token":"xoxb-1"}"#);
         }
 
-        /// 型が違えばフレームではない。serde が無料でやる厳しさに乗っている。
+        /// A wrong type means it's not a frame. We ride on the strictness serde gives for free.
         #[test]
         fn a_frame_with_a_wrong_type_is_not_a_frame() {
             for bad in [
                 r#"{"t":"ready","bot_token":0}"#,
-                r#"{"t":"ready"}"#,                  // bot_token が無い
-                r#"{"t":"event","name":"message"}"#, // event が無い
-                r#"{"t":"linked","owner_user_id":"U","channel":"D1"}"#, // thread_ts が無い
+                r#"{"t":"ready"}"#,                  // no bot_token
+                r#"{"t":"event","name":"message"}"#, // no event
+                r#"{"t":"linked","owner_user_id":"U","channel":"D1"}"#, // no thread_ts
                 r#"{"t":"linked","owner_user_id":"U","channel":"D1","thread_ts":12}"#,
             ] {
                 assert!(decode(bad).is_none(), "{bad}");
             }
         }
 
-        /// 旧 Bun の握手フレームは、もう「知らないフレーム」でしかない。
+        /// The old Bun handshake frames are now just "unknown frames".
         #[test]
         fn junk_and_unknown_frame_kinds_decode_to_nothing() {
             for raw in [
@@ -318,9 +318,9 @@ pub mod wire {
             }
         }
 
-        /// **回帰**: 到達確認のパスは、名前の検査に巻き込まれない別物であること。
-        /// 予約名 `__link_probe__` を `/bridge/` の下に置いたとき、先頭が英数字でないという理由で
-        /// 400 になり、`relay link` が自分に届かないと報告した(実機で発覚)。
+        /// **Regression**: the reachability-check path must be separate and not caught by the name check.
+        /// With the reserved name `__link_probe__` under `/bridge/`, it got 400 because it didn't start with
+        /// an alphanumeric, and `relay link` reported it couldn't reach itself (found on a real machine).
         #[test]
         fn the_probe_has_its_own_path_outside_the_machine_namespace() {
             assert!(bridge_id_of_path(PROBE_PATH).is_none());
@@ -338,12 +338,12 @@ pub mod wire {
                 assert_eq!(bridge_id_of_path(path), want, "{path}");
             }
             for bad in [
-                "/bridge/",         // 名前が無い
-                "/bridge/a/b",      // 2セグメント
-                "/",                // そもそも違う
-                "/bridge",          // 区切りが無い
-                "/bridge/../etc",   // 通す理由が無い
-                "/bridge/-leading", // 先頭は英数字だけ
+                "/bridge/",         // no name
+                "/bridge/a/b",      // two segments
+                "/",                // not even close
+                "/bridge",          // no separator
+                "/bridge/../etc",   // no reason to allow it
+                "/bridge/-leading", // must start with an alphanumeric
                 "/bridge/with space",
                 "/status",
             ] {
@@ -370,11 +370,11 @@ pub mod wire {
             let s = encode_connection(&conn());
             assert!(s.starts_with("SCLINK1-"));
             assert_eq!(decode_connection(&s).unwrap(), conn());
-            // 貼り付けに付いてくる空白・改行は落とす
+            // Drop the whitespace and newlines that come along with a paste
             assert_eq!(decode_connection(&format!("\n  {s}  \n")).unwrap(), conn());
         }
 
-        /// キーの順が `u` → `t` に固定されていること(BTreeMap で組むと入れ替わる)。
+        /// Key order is pinned to `u` → `t` (building it with a BTreeMap would swap them).
         #[test]
         fn the_payload_keeps_its_key_order() {
             let s = encode_connection(&conn());
@@ -382,7 +382,7 @@ pub mod wire {
             assert!(json.starts_with(r#"{"u":"#), "{json}");
         }
 
-        /// 版が先頭にあるので、将来のフォーマットは「読み違い」でなく拒否になる。
+        /// The version comes first, so a future format is refused rather than misread.
         #[test]
         fn a_future_prefix_is_refused() {
             let s = encode_connection(&conn());
@@ -400,7 +400,7 @@ pub mod wire {
                 err.contains("damaged") || err.contains("incomplete"),
                 "{err}"
             );
-            // 長い方も、どこで千切れても半分の秘密を作らない
+            // The long one too: wherever it's torn, it never yields half a secret
             let whole = encode_connection(&conn());
             for cut in [3, 5, 7, 9] {
                 let half = &whole[..whole.len() * cut / 10];
@@ -415,7 +415,7 @@ pub mod wire {
             }
         }
 
-        /// 欠けたフィールドは名前で言う — 黙って既定値で埋めない。
+        /// A missing field is named — never silently filled with a default.
         #[test]
         fn a_string_missing_a_field_is_refused_by_name() {
             let half = format!(
@@ -433,8 +433,8 @@ pub mod wire {
                 assert!(!s.contains('='), "{s}");
                 assert_eq!(b64url_decode(&s).unwrap(), bytes);
             }
-            assert!(b64url_decode("a").is_none()); // 4n+1 は正しい符号化ではない
-            assert!(b64url_decode("ab+d").is_none()); // 標準 base64 の文字は受けない
+            assert!(b64url_decode("a").is_none()); // 4n+1 is not a valid encoding
+            assert!(b64url_decode("ab+d").is_none()); // standard base64 characters are refused
         }
     }
 }
@@ -444,11 +444,11 @@ use wire::LINK_SUBPROTOCOL;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
-/// チャンネル id → 担当マシンの名前。access.json の `routes[ch].bridge` から起こす
-/// ([`crate::bridge::state::Access::bridges`])。
+/// Channel id → name of the machine in charge. Built from `routes[ch].bridge` in access.json
+/// ([`crate::bridge::state::Access::bridges`]).
 pub type Routes = BTreeMap<String, String>;
 
-/// この節の1行ログ。component は `relay` で固定 — フリートの出来事だけをここに集める。
+/// One-line logs for this section. The component is fixed at `relay` — fleet events are gathered here.
 pub(super) fn rlog(level: &str, message: &str) {
     let ctx = LogCtx::default();
     match level {
@@ -458,28 +458,28 @@ pub(super) fn rlog(level: &str, message: &str) {
     }
 }
 
-// ── 節2: 誰を中に入れるか(upgrade を通すかどうか) ──────────────────────
-// 握手は WebSocket の upgrade でやる(link.rs のモジュール doc)。ここはその判断だけを持つ
-// 純関数で、ソケットもヘッダの型も知らない — だからテストが同期で全部回る。
+// ── Section 2: who gets in (whether to pass the upgrade) ──────────────────────
+// The handshake happens in the WebSocket upgrade (see the `wire` module doc). This holds only that
+// decision as a pure function, knowing neither sockets nor header types — so the tests all run synchronously.
 
-/// upgrade を通すか、断るなら何を返すか。
+/// Whether to pass the upgrade, and if refused, what to return.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Admit {
-    /// 通す。名乗ったマシンの名前。
+    /// Pass. The name the machine gave.
     Ok(String),
-    /// `link` の到達確認。**通すが接続簿に載せない** — 載せると一瞬「新しいマシンが繋がった」
-    /// 扱いになり、home に 🟢 が出てしまう。専用のパスなので、どんなマシン名とも衝突しない。
+    /// `link`'s reachability check. **Passed but not put in the connection book** — putting it there would
+    /// briefly count as "a new machine connected" and show 🟢 in home. Its own path, so it can't collide with any machine name.
     Probe,
-    /// 401 — api トークンが無い / 違う。**誰が繋いでよいかを決めるただ1つの検査**。
+    /// 401 — api token missing / wrong. **The one and only check deciding who may connect**.
     Unauthorized,
-    /// 426 — 同じ link プロトコルを喋っていない。新しいコードで再起動すれば治る種類。
+    /// 426 — not speaking the same link protocol. The kind of thing a restart with new code fixes.
     WrongVersion,
-    /// 400 — パスにマシンの名前が無い(または名前として通せない字が入っている)。
+    /// 400 — the path has no machine name (or has characters a name can't use).
     BadPath,
 }
 
 impl Admit {
-    /// 断るときに返す HTTP ステータス。通すときは 101 なので `None`。
+    /// The HTTP status returned on refusal. Passing is 101, so `None`.
     pub fn status(&self) -> Option<u16> {
         match self {
             Admit::Ok(_) | Admit::Probe => None,
@@ -489,7 +489,7 @@ impl Admit {
         }
     }
 
-    /// 断った理由を1行で。**黙って 401 を返すと1時間デバッグさせる。**
+    /// The refusal reason in one line. **A silent 401 costs someone an hour of debugging.**
     pub fn why(&self) -> &'static str {
         match self {
             Admit::Ok(_) => "admitted",
@@ -500,31 +500,31 @@ impl Admit {
         }
     }
 
-    /// upgrade の3点(パス / `Authorization` / `Sec-WebSocket-Protocol`)を見て決める。
+    /// Decide from the three upgrade inputs (path / `Authorization` / `Sec-WebSocket-Protocol`).
     ///
-    /// **順序が仕様**: ①同じ言葉を喋るか → ②api トークン → ③**はじめて**名乗りを信じる。
-    /// `desktop` と名乗れることが desktop 宛の Slack メッセージを受け取れる理由になってはいけない
-    /// 版を先に見るのは、食い違いを「トークンが違う」と誤って報告しないため。
+    /// **The order is the spec**: (1) same language? → (2) api token → (3) **only then** trust the name.
+    /// Being able to call yourself `desktop` must not be a reason to receive Slack messages meant for desktop.
+    /// The version comes first so a mismatch isn't wrongly reported as "wrong token".
     pub fn of(
         path: &str,
         authorization: Option<&str>,
         subprotocol: Option<&str>,
         api_token: &str,
     ) -> Admit {
-        // ① Sec-WebSocket-Protocol はカンマ区切りで複数来うる。1つでも一致すればよい。
+        // (1) Sec-WebSocket-Protocol can carry several, comma-separated. One match is enough.
         let speaks =
             subprotocol.is_some_and(|v| v.split(',').any(|p| p.trim() == LINK_SUBPROTOCOL));
         if !speaks {
             return Admit::WrongVersion;
         }
-        // ② `Bearer <token>`。ここを通るまで、名乗りはただの文字列。
+        // (2) `Bearer <token>`. Until this passes, the name is just a string.
         let presented = authorization
             .and_then(|v| v.strip_prefix("Bearer "))
             .unwrap_or("");
         if !secret_eq(presented, api_token) {
             return Admit::Unauthorized;
         }
-        // ③ ここでようやく名前を読む。到達確認は名前を名乗らない(専用のパス)。
+        // (3) Only now read the name. The reachability check gives no name (its own path).
         if path == wire::PROBE_PATH {
             return Admit::Probe;
         }
@@ -535,9 +535,9 @@ impl Admit {
     }
 }
 
-/// 定数時間の秘密比較。長さ違いは中身を見ずに `false`(長さは秘密ではない)。
+/// Constant-time secret comparison. Different lengths are `false` without looking at the content (length isn't secret).
 ///
-/// このためだけに依存を1つ増やさない。
+/// Not worth adding a dependency just for this.
 pub(crate) fn secret_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     if a.len() != b.len() {
@@ -550,10 +550,10 @@ pub(crate) fn secret_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-// ── 節3: いま誰が繋がっているか(接続簿) ───────────────────────────
+// ── Section 3: who is connected right now (connection book) ───────────────────────────
 
-/// 1本の link の書き手側。中身は「文字列を投げる口」だけ — 接続簿はソケットを知らないので、
-/// テストがソケット無しで回る。
+/// The writer side of one link. It's only "somewhere to throw strings" — the connection book knows no sockets,
+/// so tests run without them.
 #[derive(Clone)]
 pub struct Conn(Arc<tokio::sync::mpsc::UnboundedSender<String>>);
 
@@ -562,13 +562,13 @@ impl Conn {
         Self(Arc::new(tx))
     }
 
-    /// フレームを1本投げる。`false` = その link はもう死んでいる(受け手が落ちた)。
+    /// Send one frame. `false` = that link is already dead (the receiver is gone).
     pub fn send(&self, frame: &wire::LinkFrame) -> bool {
         self.0.send(wire::encode(frame)).is_ok()
     }
 
-    /// **同じ link か**(中身の等値ではなく同一性)。古い link の後始末が新しい登録を
-    /// 巻き込まないための鍵。
+    /// **Is it the same link** (identity, not content equality). The key that keeps an old link's
+    /// cleanup from sweeping up a newer registration.
     fn is(&self, other: &Conn) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
@@ -580,17 +580,17 @@ impl std::fmt::Debug for Conn {
     }
 }
 
-/// 繋がった結果。presence(🟢/🔴)に出すかどうかがここで決まる。
+/// The result of connecting. Decides whether it shows in presence (🟢/🔴).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Joined {
-    /// 新しく来た。Owner に知らせる。
+    /// Newly arrived. Tell the Owner.
     New,
-    /// 既に繋がっていたマシンが繋ぎ直した(Wi-Fi の瞬断など)。**知らせない** —
-    /// Owner から見れば、そのマシンは居なくならなかった。
+    /// A machine that was already connected reconnected (a Wi-Fi blip, etc.). **Don't tell** —
+    /// from the Owner's view, that machine never left.
     Reconnected,
 }
 
-/// Bridge ID → いまその名前を務めている link。**転送はこの表だけを見る。**
+/// Bridge ID → the link currently serving that name. **Forwarding looks only at this table.**
 #[derive(Default)]
 pub struct LinkServer {
     bridges: Mutex<HashMap<String, Conn>>,
@@ -601,11 +601,11 @@ impl LinkServer {
         Self::default()
     }
 
-    /// 認証を通った link を登録する。返り値は「古いのを押しのけたか」と、押しのけられた link。
+    /// Register an authenticated link. Returns whether it displaced an older one, and the displaced link.
     ///
-    /// **いちばん新しい link が勝つ。** Wi-Fi が切れたマシンは、こちらの古いソケットがまだ
-    /// 死んだと分からないうちに繋ぎ直してくる。新参を断ると、死んだソケットが時間切れになるまで
-    /// そのマシンは行方不明になる。
+    /// **The newest link wins.** A machine whose Wi-Fi dropped reconnects before our old socket
+    /// knows it's dead. Refusing the newcomer would leave that machine missing until the dead
+    /// socket times out.
     pub fn register(&self, bridge_id: &str, conn: Conn) -> (Joined, Option<Conn>) {
         let mut bridges = self.bridges.lock().unwrap();
         match bridges.insert(bridge_id.to_string(), conn) {
@@ -626,11 +626,11 @@ impl LinkServer {
         }
     }
 
-    /// link が閉じた。`true` = **本当に居なくなった**(presence に出す)。
+    /// A link closed. `true` = **it's really gone** (show it in presence).
     ///
-    /// `false` になるのは、押しのけられた古い link が後から閉じたとき。そこで名前ごと消すと、
-    /// 生きている新しい link の登録が道連れになり、マシンが行方不明になる
-    /// (移植元bridgeId を先に外していたのと同じ落とし穴)。
+    /// It's `false` when a displaced old link closes later. Removing the whole name there would take
+    /// the live new link's registration down with it, and the machine would go missing
+    /// (the same trap as the original removing the bridgeId first).
     pub fn unregister(&self, bridge_id: &str, conn: &Conn) -> bool {
         let mut bridges = self.bridges.lock().unwrap();
         match bridges.get(bridge_id) {
@@ -655,7 +655,7 @@ impl LinkServer {
         }
     }
 
-    /// いま繋がっている Bridge ID。`route` が指し先にできるのはこれだけで、転送もこれを見る。
+    /// The Bridge IDs connected right now. Only these can be a `route` target, and forwarding looks at them too.
     pub fn connected(&self) -> Vec<String> {
         let mut ids: Vec<String> = self.bridges.lock().unwrap().keys().cloned().collect();
         ids.sort();
@@ -666,8 +666,8 @@ impl LinkServer {
         self.bridges.lock().unwrap().contains_key(bridge_id)
     }
 
-    /// 1本のマシンへフレームを投げる。`false` = そこには居なかった(表を引いてから投げるまでの
-    /// 間に落ちた場合も含む)。**届いたふりをしない。**
+    /// Send a frame to one machine. `false` = it wasn't there (including dropping between looking up the
+    /// table and sending). **Never pretend it arrived.**
     pub fn send_to(&self, bridge_id: &str, frame: &wire::LinkFrame) -> bool {
         let conn = self.bridges.lock().unwrap().get(bridge_id).cloned();
         conn.is_some_and(|c| c.send(frame))
@@ -684,12 +684,12 @@ impl LinkServer {
     }
 }
 
-// ── 節4: 届いたものの読み方と行き先 ─────────────────────────────
-// route 表は「チャンネル → マシン」だけで、スレッド → マシンの表は**わざと持たない**。
-// スレッドはチャンネルの中に居るので、チャンネルの持ち主がその中の全スレッドの持ち主。
+// ── Section 4: reading what arrives and where it goes ─────────────────────────────
+// The route table is only "channel → machine"; there is **deliberately no** thread → machine table.
+// A thread lives inside a channel, so the channel's owner owns every thread in it.
 
-/// Slack のイベント1件。**読み方をここに集める** — 生の `Value` を引数で回すと、同じ
-/// `get("…")` が散らばって、どれが本文でどれがスレッドなのか追えなくなる。
+/// One Slack event. **All the reading is gathered here** — passing a raw `Value` around scatters the same
+/// `get("…")` everywhere, and you lose track of which is the text and which is the thread.
 pub struct Event<'a> {
     pub name: &'a str,
     pub raw: &'a serde_json::Value,
@@ -704,11 +704,11 @@ impl<'a> Event<'a> {
         self.raw.get(key)?.as_str()
     }
 
-    /// このイベントが起きたチャンネル。
+    /// The channel this event happened in.
     ///
-    /// ボタン押しは [`Click`] が持って来る — だからクリックに特別な routing が要らない
-    /// (そして**決して撒いてはいけない**: 依頼を知らないマシンは「これはもう期限切れです」と
-    /// 答えてしまう。それは嘘になる)。
+    /// Button presses are carried by [`Click`] — so clicks need no special routing
+    /// (and **must never be broadcast**: a machine that doesn't know the request would answer
+    /// "this has expired", which would be a lie).
     pub fn channel(&self) -> Option<&'a str> {
         match self.name {
             "message" | "member_joined_channel" => self.str_at("channel"),
@@ -721,37 +721,37 @@ impl<'a> Event<'a> {
         self.str_at("user")
     }
 
-    /// 人が実際に書いた文字。編集は1段下(`message.text`)に入る。
+    /// What the person actually wrote. Edits sit one level down (`message.text`).
     pub fn text(&self) -> Option<&'a str> {
         self.str_at("text")
             .or_else(|| self.raw.get("message")?.get("text")?.as_str())
     }
 
-    /// この message についての返事はどこへ入るか。スレッドの中なら中、無ければその下。
+    /// Where a reply to this message goes. Inside the thread if in one, otherwise under it.
     pub fn thread(&self) -> Option<&'a str> {
         self.str_at("thread_ts").or_else(|| self.str_at("ts"))
     }
 
-    /// bot 自身が書いたもの — **この断りたち自身を含む**。これが無いと、担当未設定の
-    /// チャンネルは自分の「担当が居ません」に「担当が居ません」で答え続ける。
+    /// Written by the bot itself — **including these very refusals**. Without this, a channel with no
+    /// machine assigned keeps answering its own "no machine assigned" with "no machine assigned".
     pub fn from_a_bot(&self) -> bool {
         self.raw.get("bot_id").is_some_and(|v| !v.is_null())
             || self.str_at("subtype") == Some("bot_message")
     }
 
-    /// Owner が自分の発言を**取り消した**。オンラインなら転送する(Bridge が中断に変える)が、
-    /// 届けられないときは**再送するものも言うことも無い** — 黙って捨てる(ログには出す)。
-    /// 編集は取り消しではない。
+    /// The Owner **deleted** their message. If the machine is online it's forwarded (the Bridge turns it into an interrupt), but
+    /// when it can't be delivered there's **nothing to resend and nothing to say** — drop it silently (it's still logged).
+    /// An edit is not a deletion.
     pub fn is_retraction(&self) -> bool {
         self.name == "message" && self.str_at("subtype") == Some("message_deleted")
     }
 
-    /// この投稿を bot として扱うか。**Owner の Web API 投稿だけは人**(
-    /// `Access::gate` が既に持っている規則を、コマンドの入口にも効かせる)。
+    /// Whether to treat this post as a bot. **Only the Owner's Web API posts count as a person** (the
+    /// rule `Access::gate` already has, applied at the command entry too).
     ///
-    /// Web API 経由の投稿には人が書いたものでも `bot_id` が付くが、Slack は本当の `user` も
-    /// 刻む(トークン由来なので本文からは詐称できない)。Owner 以外・user 無し・Owner 未設定は
-    /// bot 扱い = **閉じる方に倒す**(自分の投稿を自分で解釈して自分に返す道を作らない)。
+    /// Posts via the Web API carry a `bot_id` even when a person wrote them, but Slack also stamps the real
+    /// `user` (it comes from the token, so the text can't fake it). Not the Owner, no user, or no Owner set
+    /// all count as a bot = **fail closed** (never open a path where our own post is parsed and answered by ourselves).
     pub fn speaks_as_a_bot(&self, owner: Option<&str>) -> bool {
         if !self.from_a_bot() {
             return false;
@@ -759,20 +759,20 @@ impl<'a> Event<'a> {
         !matches!((self.user(), owner), (Some(u), Some(o)) if u == o)
     }
 
-    /// **親が配達より先に自分で見るか**(コマンド・名乗りの候補か)。
+    /// **Whether the gateway looks at it itself before delivery** (is it a command or name-claim candidate).
     ///
-    /// 候補になるのは「チャンネルが読めた人の message」だけ。リアクションや join は
-    /// コマンドになりえない。
+    /// Only "a person's message whose channel could be read" qualifies. Reactions and joins
+    /// can't be commands.
     pub fn is_a_command_candidate(&self, owner: Option<&str>) -> bool {
         self.name == "message" && self.channel().is_some() && !self.speaks_as_a_bot(owner)
     }
 
-    /// 親がこのイベントについて口を開いてよいか。
+    /// Whether the gateway may speak up about this event.
     ///
-    /// リアクションや join は誰に宛てたものでもない。bot の言葉に答えてはいけない
-    /// (無限ループ)。チャンネルでは名指しが要る — 親は Bridge のゲートより**わざと厳しい**:
-    /// Bridge は「動いているスレッドの続き」にも応じるが、どのスレッドが生きているかを
-    /// 知っているのはそのマシン自身で、留守のときに限って訊けないから。
+    /// Reactions and joins aren't addressed to anyone. Never answer a bot's words
+    /// (infinite loop). In channels a mention is required — the gateway is **deliberately stricter** than the Bridge's gate:
+    /// the Bridge also responds to "a follow-up in a running thread", but only that machine knows
+    /// which threads are alive, and it can't be asked exactly when it's away.
     pub fn may_answer(&self, bot_user_id: Option<&str>) -> bool {
         let Some(channel) = self.channel() else {
             return false;
@@ -786,27 +786,27 @@ impl<'a> Event<'a> {
     }
 }
 
-/// ボタン1押し(Slack が寄越す `block_actions` の body)。
+/// One button press (the `block_actions` body Slack sends).
 pub struct Click<'a>(pub &'a serde_json::Value);
 
 impl Click<'_> {
-    /// 押されたチャンネル。prompt が投稿された場所そのものなので、routing は message と同じ。
+    /// The channel it was pressed in. That's where the prompt was posted, so routing is the same as for a message.
     pub fn channel(&self) -> Option<&str> {
         self.0.get("channel")?.get("id")?.as_str()
     }
 }
 
-/// 配達の判断。**マシンを勝手に選ばないし、留守のマシンのために預かりもしない** —
-/// 当てずっぽうも溜め込みも黙って失敗するので、この設計は代わりに声に出す方を選ぶ。
+/// The delivery decision. **Never picks a machine on its own, and never holds messages for an absent machine** —
+/// guessing and hoarding both fail silently, so this design chooses to say it out loud instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Delivery {
-    /// 担当マシンが繋がっている。渡す。
+    /// The machine in charge is connected. Hand it over.
     Forward(String),
-    /// 担当は居るが、いまオフライン。
+    /// There is a machine in charge, but it's offline now.
     Offline(String),
-    /// このマシンが自分で処理する。**担当が書かれていない = ここ**(単独 Bridge の既定)。
+    /// This machine handles it itself. **No machine written down = here** (the default for a lone Bridge).
     Local,
-    /// どのチャンネルで起きたのかすら読めなかった。**黙って捨てず必ずログに出す。**
+    /// Couldn't even read which channel it happened in. **Never drop it silently; always log it.**
     UnknownChannel,
 }
 
@@ -821,8 +821,8 @@ impl Delivery {
             return Delivery::UnknownChannel;
         };
         match routes.get(channel) {
-            // **担当が決まっていないチャンネルは自分でやる。** 子を1台も持たない Bridge は
-            // 表が空なので、ここを通って今までどおりに動く
+            // **A channel with no machine assigned is handled here.** A Bridge with no machines has
+            // an empty table, so it passes through here and works as before
             None => Delivery::Local,
             Some(bridge_id) if bridge_id == self_id => Delivery::Local,
             Some(bridge_id) if is_connected(bridge_id) => Delivery::Forward(bridge_id.clone()),
@@ -830,8 +830,8 @@ impl Delivery {
         }
     }
 
-    /// 担当マシンが留守のときに言うこと。**その場で言う。預からない。**
-    /// 1時間後に、もう関心を失った人へ届く返事は、正直に断るより悪い。
+    /// What to say when the machine in charge is away. **Say it on the spot. Don't hold the message.**
+    /// A reply reaching someone an hour later, after they've lost interest, is worse than an honest refusal.
     pub fn offline_notice(bridge_id: &str, connected: &[String]) -> String {
         let online = if connected.is_empty() {
             crate::t!("none", "なし")
@@ -847,14 +847,14 @@ impl Delivery {
     }
 }
 
-// ── 断りの上限 ───────────────────────────────────────
-// マシンが留守の間もイベントは止まらないし、ひとつの質問は複数のイベントになる(打鍵・編集・
-// 再配達)。だからチャンネルごとに1分1回。**「一度言ったら二度と言わない」にはしない** —
-// 長い沈黙こそ、この断りが防いでいるものだから。届いたら忘れる(`delivered`)ので、
-// 復帰したあとの最初の失敗はすぐ言う。
+// ── Notice rate limit ───────────────────────────────────────
+// Events don't stop while a machine is away, and one question becomes several events (typing, edits,
+// redelivery). So once per minute per channel. **Not "say it once and never again"** —
+// a long silence is exactly what this notice prevents. Delivery clears it (`delivered`), so
+// the first failure after the machine comes back is reported right away.
 pub const NOTICE_COOLDOWN_MS: u64 = 60_000;
 
-/// 「いま言ってよいか」と「前に言ってから何本呑み込んだか」。
+/// "May we say it now" and "how many were swallowed since we last said it".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NoticeDecision {
     pub say: bool,
@@ -863,9 +863,9 @@ pub struct NoticeDecision {
 
 #[derive(Default)]
 pub struct NoticeCooldown {
-    /// チャンネル → 最後に言った時刻
+    /// Channel → when we last said it
     said_at: HashMap<String, u64>,
-    /// チャンネル → それから呑み込んだ数(次に喋るとき報告する)
+    /// Channel → how many swallowed since then (reported next time we speak)
     held: HashMap<String, u32>,
 }
 
@@ -892,26 +892,26 @@ impl NoticeCooldown {
         }
     }
 
-    /// 何かがこのチャンネルの担当マシンへ届いた。**苦情は終わり** — 忘れる。
+    /// Something reached this channel's machine. **The complaint is over** — forget it.
     pub fn delivered(&mut self, channel_id: &str) {
         self.said_at.remove(channel_id);
         self.held.remove(channel_id);
     }
 }
 
-// ── 節5: 親自身が答えるコマンド ───────────────────────────────
-// ここに居るのは「どのマシンにも訊けないこと」だけ: `route`(訊く先のマシンこそが変更対象)、
-// `set-home`(フリート全体への放送)、DM の名乗り(Owner が生まれる瞬間)。
-// 判断は純関数にして、実行(保存・投稿・転送)は呼ぶ側がやる。
+// ── Section 5: commands the gateway answers itself ───────────────────────────────
+// Only "things no machine can be asked" live here: `route` (the machine you'd ask is the thing being changed),
+// `set-home` (a broadcast to the whole fleet), and the DM name-claim (the moment the Owner is born).
+// Decisions are pure functions; the caller does the execution (saving, posting, forwarding).
 
-/// 1つのコマンド判定に要る文脈。
+/// The context one command decision needs.
 pub struct CommandCtx<'a> {
     pub channel_id: &'a str,
     pub user_id: Option<&'a str>,
     pub text: &'a str,
-    /// Owner が決まるまでは `None` — その間は誰も命令できない。
+    /// `None` until the Owner is decided — until then nobody can give commands.
     pub owner_user_id: Option<&'a str>,
-    /// Relay が自分の id を解決するまでは `None` ⇒ チャンネルのコマンドは1つも成立しない。
+    /// `None` until the Relay resolves its own id ⇒ no channel command can succeed.
     pub bot_user_id: Option<&'a str>,
 }
 
@@ -924,23 +924,23 @@ impl CommandCtx<'_> {
         crate::bridge::command::Message::new(self.text, self.bot_user_id)
     }
 
-    /// このコマンドは bot に宛てられているか。DM は名指し不要。
+    /// Whether this command is addressed to the bot. DMs need no mention.
     ///
-    /// 宛てられていない `route` は**断りもしない** — 人の会話に混ざった1語に「それは
-    /// Owner だけです」と割り込むのは、bot が入っていない会話への闖入だから。
+    /// An unaddressed `route` **isn't even refused** — cutting into people's conversation over one word
+    /// with "that's Owner-only" is barging into a conversation the bot isn't part of.
     fn addressed(&self) -> bool {
         self.is_dm() || self.msg().mentions_bot()
     }
 
-    /// 本文が `verb` で始まるコマンドなら、その後ろの語。宛てられていなければ `None`。
+    /// If the text is a command starting with `verb`, the words after it. `None` if not addressed.
     fn verb_args(&self, verb: &str) -> Option<Vec<String>> {
         self.addressed()
             .then(|| self.msg().verb_args(verb))
             .flatten()
     }
 
-    /// Owner の検査。**要求が well-formed かは、その人が要求してよいかの後**。
-    /// 書き手の分からないメッセージ(bot)も断る。
+    /// The Owner check. **Whether a request is well-formed comes after whether that person may make it**.
+    /// Messages whose author is unknown (bots) are refused too.
     fn refuse_if_not_owner(&self, command: &str) -> Option<String> {
         match (self.user_id, self.owner_user_id) {
             (Some(u), Some(o)) if u == o => None,
@@ -951,20 +951,20 @@ impl CommandCtx<'_> {
         }
     }
 
-/// `route` — Owner がこのチャンネルの担当マシンを決める。
+/// `route` — the Owner picks the machine in charge of this channel.
 ///
-/// **Owner だけ**。これが無いと、共有チャンネルに居る他人が `route 自分のマシン` と打つだけで
-/// そのチャンネルを乗っ取れ、以後のメッセージがその人のマシン(その人の権限)へ流れる。
-/// 飾りの検査ではない。
-    /// `route` — Owner がこのチャンネルの担当マシンを決める。
-    /// `self_id` は親の名前 — **担当の決まっていないチャンネルは親が受ける**ので、一覧で言う。
+/// **Owner only**. Without this, anyone else in a shared channel could type `route my-machine` and
+/// hijack the channel, sending every later message to their machine (with their permissions).
+/// This check is not decoration.
+    /// `route` — the Owner picks the machine in charge of this channel.
+    /// `self_id` is the gateway's name — **channels with no machine assigned go to the gateway**, so the list says so.
     pub fn route(&self, routes: &Routes, connected: &[String], self_id: &str) -> RouteOutcome {
         let ctx = self;
         let Some(args) = ctx.verb_args("route") else {
             return RouteOutcome::NotACommand;
         };
         if args.len() > 1 {
-            // 文の中に紛れた `route` は文であってコマンドではない
+            // A `route` buried in a sentence is a sentence, not a command
             return RouteOutcome::NotACommand;
         }
         if let Some(reply) = ctx.refuse_if_not_owner("route")
@@ -976,8 +976,8 @@ impl CommandCtx<'_> {
             return RouteOutcome::List(route_table(ctx.channel_id, routes, connected, self_id));
         };
 
-        // **いま繋がっているマシンにしか向けられない。** 打ち間違いも、まだ起動していないマシンも
-        // 扱いは同じ — 基準は「今ここに居るか」だけ。行き先の無い担当を黙って作らない。
+        // **Only a machine connected right now can be the target.** A typo and a machine not yet started
+        // are treated the same — the only test is "is it here now". Never silently create an assignment with nowhere to go.
         if !connected.iter().any(|c| c == bridge_id) {
             let here = if connected.is_empty() {
                 crate::t!("none", "なし")
@@ -999,9 +999,9 @@ impl CommandCtx<'_> {
             "このチャンネルは *{bridge_id}* が受け持つようになりました。"
         )];
         if let Some(before) = routes.get(ctx.channel_id).filter(|b| *b != bridge_id) {
-            // 正直な部分: 新しいマシンは Slack のスレッドを読み直せるが、前のマシンが**何をしたか**
-            // (どのファイルを読み、何を試し、何を書き換えたか)は知りようがない。そう言っておくから、
-            // 切り替えは他のことについて黙っていられる。
+            // The honest part: the new machine can reread the Slack thread, but it can't know **what the
+            // previous machine did** (which files it read, what it tried, what it changed). Saying so lets
+            // the handover stay quiet about everything else.
             lines.push(crate::t!(
                 "(It was *{before}* before. Running threads continue on *{bridge_id}*, which reads \
                  the thread to catch up — but *it can't see what {before} actually did*.)",
@@ -1015,7 +1015,7 @@ impl CommandCtx<'_> {
         }
     }
 
-    /// `set-home` — 打ったチャンネルがフリート共通の home になる。引数の形は持たない。
+    /// `set-home` — the channel it's typed in becomes the fleet-wide home. Takes no arguments.
     pub fn set_home(&self) -> SetHomeOutcome {
         let ctx = self;
         match ctx.verb_args("set-home") {
@@ -1044,7 +1044,7 @@ pub enum RouteOutcome {
     NotACommand,
     Refused(String),
     List(String),
-    /// 担当が決まった。`reply` を返し、`bridge_id` をこのチャンネルに紐づける。
+    /// A machine was assigned. Return `reply`, and bind `bridge_id` to this channel.
     Set {
         bridge_id: String,
         reply: String,
@@ -1052,11 +1052,11 @@ pub enum RouteOutcome {
     UnknownBridge(String),
 }
 
-/// 引数なしの `route` の答え。**打ったチャンネルがどうなっているか**を先に言い、
-/// ほかのチャンネルとマシンの様子を後に並べる。どれにもオンラインかどうかを付ける。
+/// The answer to `route` with no arguments. Says **what's going on in the channel it was typed in** first,
+/// then lists the other channels and machines. Each one is marked online or not.
 ///
-/// 担当の決まっていないチャンネルは親が受ける — 一覧に「担当なし」とだけ書くと、
-/// そこに書いたメッセージがどこへ行くのか読み手に分からない。
+/// Channels with no machine assigned go to the gateway — writing only "unassigned" in the list
+/// leaves the reader unsure where messages written there go.
 pub fn route_table(here: &str, routes: &Routes, connected: &[String], self_id: &str) -> String {
     let online = |id: &str| connected.iter().any(|c| c == id);
     let mark = |id: &str| {
@@ -1066,7 +1066,7 @@ pub fn route_table(here: &str, routes: &Routes, connected: &[String], self_id: &
             crate::t!("🔴 offline", "🔴 オフライン")
         }
     };
-    // 1つの行き先を一言で(担当が無ければゲートウェイ)
+    // One destination in a few words (the gateway if nobody is assigned)
     let dest = |id: Option<&String>| match id {
         Some(id) => format!("*{id}* {}", mark(id)),
         None => {
@@ -1100,7 +1100,7 @@ pub fn route_table(here: &str, routes: &Routes, connected: &[String], self_id: &
         out.extend(others);
     }
 
-    // マシン: 繋がっているもの + route にだけ名前がある(= 今は居ない)もの
+    // Machines: those connected + those named only in routes (= not here now)
     let mut machines: Vec<String> = connected.to_vec();
     for id in routes.values() {
         if !machines.contains(id) {
@@ -1133,35 +1133,35 @@ pub fn route_table(here: &str, routes: &Routes, connected: &[String], self_id: &
 pub enum SetHomeOutcome {
     NotACommand,
     Refused(String),
-    /// DM で打たれた。home は**チャンネル**でなければならない。
+    /// Typed in a DM. home must be a **channel**.
     NeedsChannel(String),
     Set(String),
 }
 
-// ── DM の名乗り — Owner が生まれる瞬間 ───────────────────────────
-// 新しい Relay には Owner が居ない。立てた本人は、**接続文字列を DM する**ことでそれを証明する
-// (あの秘密は Relay の運用者しか持っていない)。そのあと、接続中 0台なら結び先が無く、
-// 1台なら自動、複数なら名前を訊く。これは `route` ではない — Owner が生まれる瞬間で、
-// 続けて送る `Linked` が「あなたの Owner はこの人です」を Bridge に教える。
+// ── DM name-claim — the moment the Owner is born ───────────────────────────
+// A new Relay has no Owner. The person who set it up proves they did by **DMing the connection string**
+// (only the Relay's operator has that secret). After that: with 0 machines connected there's nothing to bind to,
+// with 1 it's automatic, with several it asks for the name. This isn't `route` — it's the moment the Owner is born,
+// and the `Linked` sent right after tells the Bridge "this person is your Owner".
 
 pub struct DmOnboardingCtx<'a> {
     pub text: &'a str,
-    /// 書き手(bot / 匿名なら `None` — その人は Owner になれない)。
+    /// The author (`None` for a bot / anonymous — that person can't become the Owner).
     pub user_id: Option<&'a str>,
-    /// Relay 自身の api トークン。DM された接続文字列がこれを含むことが所有の証明。
+    /// The Relay's own api token. A DMed connection string containing it is the proof of ownership.
     pub api_token: &'a str,
     pub current_owner: Option<&'a str>,
     pub connected: &'a [String],
-    /// Owner が名乗り終えて、マシンの名前を待っている最中か。
+    /// Whether the Owner has claimed and we're waiting for a machine name.
     pub awaiting_selection: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum DmOnboarding {
     NotOnboarding,
-    /// 接続文字列に見えたが、この bot のものではない(違うトークン / 千切れた貼り付け)。
+    /// Looked like a connection string, but not this bot's (different token / torn paste).
     BadToken(String),
-    /// 正しいトークンだが Owner は既に居る。**名乗り直させない。秘密も転送しない。**
+    /// Right token, but there's already an Owner. **No re-claiming. The secret isn't forwarded either.**
     AlreadyConfigured(String),
     ClaimedAuto {
         owner_user_id: String,
@@ -1184,7 +1184,7 @@ pub enum DmOnboarding {
 }
 
 impl DmOnboardingCtx<'_> {
-    /// DM に貼られた接続文字列で Owner が決まる瞬間。
+    /// The moment a connection string pasted in a DM decides the Owner.
     pub fn decide(&self) -> DmOnboarding {
         let ctx = self;
         let list = if ctx.connected.is_empty() {
@@ -1193,7 +1193,7 @@ impl DmOnboardingCtx<'_> {
             ctx.connected.join(", ")
         };
 
-        // ① 名前を待っている最中: それを終わらせられるのは Owner の返信だけ。
+        // (1) Waiting for a name: only the Owner's reply can end it.
         if ctx.awaiting_selection
             && ctx.current_owner.is_some()
             && ctx.user_id.is_some()
@@ -1224,7 +1224,7 @@ impl DmOnboardingCtx<'_> {
             )
         };
 
-        // ② Owner が既に居る: トークンの DM は名乗り直しにならず、秘密も先へ渡さない。
+        // (2) There's already an Owner: a DMed token isn't a re-claim, and the secret isn't passed on.
         if ctx.current_owner.is_some() {
             return match token {
                 Some(true) => DmOnboarding::AlreadyConfigured(crate::t!(
@@ -1235,9 +1235,9 @@ impl DmOnboardingCtx<'_> {
             };
         }
 
-        // ③ まだ Owner が居ない。
+        // (3) No Owner yet.
         match token {
-            None => DmOnboarding::NotOnboarding, // 設定前の普通の DM
+            None => DmOnboarding::NotOnboarding, // an ordinary DM before setup
             Some(false) => DmOnboarding::BadToken(crate::t!(
                 "That connection string doesn't match this bot — it belongs to another bot, or the paste was cut off.",
                 "接続文字列がこのボットのものと一致しません。別のボットのものか、貼り付けが途中で切れています。"
@@ -1278,21 +1278,21 @@ impl DmOnboardingCtx<'_> {
     }
 }
 
-// ── 節6: presence(フリートの出入りを home に出す) ──────────────────────
+// ── Section 6: presence (post machines joining and leaving the fleet to home) ──────────────────────
 
-/// 切断を握っておく猶予。Wi-Fi が瞬いたマシンは1〜2秒で戻ってくるので、その間に戻ったら
-/// 何も言わない — Owner から見れば、そのマシンは居なくならなかった。
+/// How long a disconnect is held. A machine whose Wi-Fi blinked comes back in 1–2 seconds, so if it
+/// returns within this window nothing is said — from the Owner's view, the machine never left.
 pub const PRESENCE_GRACE_MS: u64 = 5_000;
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 struct Seen {
-    /// Owner がいま「繋がっている」と思っているか。
+    /// Whether the Owner currently believes it's "connected".
     up: bool,
-    /// 猶予の満了時刻(切断を握っている最中だけ `Some`)。
+    /// When the grace period ends (`Some` only while a disconnect is being held).
     down_due_ms: Option<u64>,
 }
 
-/// join / drop を home の1行に変える。時計は呼ぶ側から渡す(タイマーを持たない)。
+/// Turns joins / drops into one line in home. The clock is passed in by the caller (no timers here).
 #[derive(Default)]
 pub struct Presence {
     seen: HashMap<String, Seen>,
@@ -1314,18 +1314,18 @@ impl Presence {
         }
     }
 
-    /// 繋がった。**何も言わない** — 「繋がった」を人に知らせるのは子自身の `online`
-    /// (版・pid・warm pool 付き)で、2か所で同じことを言わないため。ここは
-    /// 「落ちていたのが戻った」の状態管理だけをする。
+    /// Connected. **Say nothing** — telling people "connected" is the machine's own `online` notice
+    /// (with version, pid and warm pool), so the same thing isn't said in two places. This only
+    /// tracks the state for "the one that dropped came back".
     pub fn on_connect(&mut self, bridge_id: &str) {
         let e = self.seen.entry(bridge_id.to_string()).or_default();
-        // 瞬き(落ちて猶予の内に戻った)も、初めての接続も、扱いは同じ —
-        // 握っていた「切断」を捨てて、繋がっていることにする
+        // A blink (dropped and back within the grace period) and a first connection are treated the same —
+        // throw away the held "disconnect" and mark it connected
         e.down_due_ms = None;
         e.up = true;
     }
 
-    /// 切れた。**すぐには言わない** — 猶予を置いて [`Presence::due`] が拾う。
+    /// Disconnected. **Not said right away** — after the grace period [`Presence::due`] picks it up.
     pub fn on_disconnect(&mut self, bridge_id: &str, now_ms: u64) {
         if let Some(e) = self.seen.get_mut(bridge_id) {
             if e.up && e.down_due_ms.is_none() {
@@ -1334,7 +1334,7 @@ impl Presence {
         }
     }
 
-    /// 猶予が切れた切断を回収する。定期的に呼ぶ。
+    /// Collect disconnects whose grace period has run out. Call periodically.
     pub fn due(&mut self, now_ms: u64) -> Vec<String> {
         let mut out = Vec::new();
         for (id, e) in self.seen.iter_mut() {
@@ -1349,29 +1349,29 @@ impl Presence {
     }
 }
 
-/// `status` のフリート欄が出すもの。ディスクと env から起こす(I/O は呼ぶ側)。
+/// What the fleet section of `status` shows. Built from disk and env (the caller does the I/O).
 pub struct FleetView {
-    /// `host:port`。子を迎える口。
+    /// `host:port`. Where machines are accepted.
     pub listen: String,
     pub owner: Option<String>,
     pub home: Option<String>,
     pub routes: Routes,
 }
 
-/// 親が張っている ssh トンネル1本の様子。**親は自分で張っているので知っている**
-/// ([`keep_tunnel`] が状態の変わり目で書く)。
+/// The state of one ssh tunnel the gateway keeps open. **The gateway opens it itself, so it knows**
+/// ([`keep_tunnel`] writes it when the state changes).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Tunnel {
-    /// ssh 先(`me@laptop` など)
+    /// ssh target (e.g. `me@laptop`)
     pub target: String,
-    /// 張れていないときの理由。張れていれば `None`
+    /// Why it's not up. `None` when it is
     pub error: Option<String>,
 }
 
-/// 子の名前 → その子へのトンネル。載っていない子は直結で来ている。
+/// Machine name → the tunnel to that machine. Machines not listed connect directly.
 pub type Tunnels = HashMap<String, Tunnel>;
 
-/// 子1台の経路を一言で。
+/// One machine's route in a few words.
 pub fn route_of(id: &str, tunnels: &Tunnels) -> String {
     match tunnels.get(id) {
         None => crate::t!("direct", "直結"),
@@ -1389,10 +1389,10 @@ pub fn route_of(id: &str, tunnels: &Tunnels) -> String {
     }
 }
 
-/// `status` のフリート欄の平文表示。**純関数** — I/O は呼ぶ側。
+/// Plain-text rendering of the fleet section of `status`. **Pure function** — the caller does the I/O.
 ///
-/// `connected` が `None` = 走っている Bridge が答えなかった(= 動いていない)。その場合でも
-/// ディスクの route 表は出す — 「動いていない」と「設定が無い」を混ぜない。
+/// `connected` is `None` = the running Bridge didn't answer (= it's not running). Even then the route table
+/// on disk is shown — don't mix up "not running" with "not configured".
 pub fn format_fleet(
     f: &FleetView,
     connected: Option<&[String]>,
@@ -1408,10 +1408,10 @@ pub fn format_fleet(
             },
         }
     };
-    // 見出しは**何のことか**を書く。生の `owner:` `home:` は、それが人なのか
-    // チャンネルなのか、何に効くのかを読み手に一言も言っていなかった
-    // **分かったのは「この口が答えたか」だけ。** 生死を名乗ると、launchd が running と
-    // 言っている隣で「動いていません」と出て食い違う(再起動の直後は口が開く前のことが多い)
+    // Headings say **what the thing is**. The raw `owner:` `home:` never told the reader whether
+    // it was a person or a channel, or what it affects
+    // **All we know is "did this endpoint answer".** Claiming alive/dead would show "not running" right next to
+    // launchd saying running (right after a restart the endpoint often isn't open yet)
     let listen = &f.listen;
     let answer = if connected.is_some() {
         crate::t!("answering", "応答あり")
@@ -1461,8 +1461,8 @@ pub fn format_fleet(
     out.join("\n")
 }
 
-// ── 節7: 親の口 ───────────────────────────────────────
-// ここから下は I/O。上の節(1〜6)が決めたことを配線して回すだけで、判断は1つも持たない。
+// ── Section 7: gateway side ───────────────────────────────────────
+// From here down is I/O. It only wires up and runs what sections 1–6 decided, and makes no decisions itself.
 
 use crate::bridge::machine as link_watch;
 use crate::chat::InboundMsg;
@@ -1477,33 +1477,33 @@ use axum::routing::get;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::Sender;
 
-/// 子を持つ Bridge(= 親)が持って回る一式。
+/// What a Bridge with machines (= the gateway) carries around.
 ///
-/// **owner / home / 担当表はディスク(access.json)が正。** Bridge 本体も同じファイルを
-/// 持っているので、こちらが書いたら `reload` を1つ送って読み直させる — メモリを2つ持って
-/// 食い違わせない。
+/// **The disk (access.json) is the source of truth for owner / home / the assignment table.** The Bridge itself
+/// holds the same file, so after writing here we send one `reload` to make it reread — never keep two copies
+/// in memory that can drift apart.
 pub struct Fleet {
     pub links: LinkServer,
-    /// 子が提示する鍵。
+    /// The key machines present.
     pub token: String,
-    /// このマシンの名前。`route <自分の id>` の指名先。
+    /// This machine's name. What `route <own id>` points at.
     pub self_id: String,
-    /// 子へ渡す Slack の bot トークン(`Ready` フレームで配る)。
+    /// The Slack bot token handed to machines (given out in the `Ready` frame).
     pub bot_token: String,
     pub api: crate::chat::ChatRef,
     pub dir: StateDir,
     pub cooldown: AsyncMutex<NoticeCooldown>,
     pub presence: AsyncMutex<Presence>,
-    /// DM の名乗りが「マシンの名前待ち」で止まっている場所。メモリだけ。
+    /// Where a DM name-claim is stuck "waiting for a machine name". Memory only.
     pub pending_selection: AsyncMutex<Option<(String, String)>>,
-    /// 自分の Slack user id(`@mention` の判定)。auth.test の後に入る。
+    /// Our own Slack user id (for detecting `@mention`). Filled after auth.test.
     pub bot_user_id: AsyncMutex<Option<String>>,
-    /// ローカル配達の口。**直結モードと同じ2本**に流す。
+    /// Local delivery. Flows into **the same two channels as direct mode**.
     pub msg_tx: Sender<InboundMsg>,
     pub click_tx: Sender<PermClick>,
-    /// access.json を書いたことを Bridge 本体に伝える口(SIGHUP と同じ再読込)。
+    /// Tells the Bridge itself that access.json was written (the same reload as SIGHUP).
     pub reload: Sender<()>,
-    /// 自分が張っている ssh トンネル(`status` に経路を出すため)。
+    /// The ssh tunnels we keep open (to show the route in `status`).
     pub tunnels: std::sync::Mutex<Tunnels>,
 }
 
@@ -1512,7 +1512,7 @@ impl Fleet {
         Access::load(&self.dir)
     }
 
-    /// access.json を書き換え、Bridge 本体に読み直させる。
+    /// Rewrite access.json and make the Bridge itself reread it.
     async fn edit_access(&self, f: impl FnOnce(&mut Access)) {
         let mut access = self.access();
         f(&mut access);
@@ -1532,7 +1532,7 @@ impl Fleet {
         self.access().home_channel
     }
 
-    /// 自分と、いま繋がっている子。**自分も担当になれる**ので一覧に居る。
+    /// Ourselves plus the machines connected right now. **We can be assigned too**, so we're in the list.
     fn machines(&self) -> Vec<String> {
         let mut all = vec![self.self_id.clone()];
         all.extend(self.links.connected());
@@ -1541,10 +1541,10 @@ impl Fleet {
         all
     }
 
-    /// link が1本つながった。**接続簿に載せ、初参加なら home に知らせ、`Ready` を渡す。**
+    /// A link connected. **Put it in the connection book, tell home if it's new, and hand over `Ready`.**
     ///
-    /// 子から dial されたときも、こちらから迎えに行ったときも**同じ記帳** — 違うのは
-    /// ソケットの型と、そこから先の送受の書き方だけ。
+    /// Dialed by a machine or fetched by us, **the bookkeeping is the same** — only the socket type
+    /// and how sending and receiving are written differ from there on.
     async fn attach(
         &self,
         bridge_id: &str,
@@ -1552,12 +1552,12 @@ impl Fleet {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let conn = Conn::new(tx);
         let (joined, displaced) = self.links.register(bridge_id, conn.clone());
-        // 押しのけた古い link の書き手を終わらせる。登録は既に新しい方に差し替わっている
+        // End the writer of the displaced old link. The registration has already been swapped to the new one
         drop(displaced);
         if joined == Joined::New {
             self.presence.lock().await.on_connect(bridge_id);
         }
-        // 受理の1本目 — bot トークンと、いまの home
+        // The first frame on acceptance — the bot token and the current home
         let _ = conn.send(&wire::LinkFrame::Ready {
             bot_token: self.bot_token.clone(),
             home: self.home(),
@@ -1565,8 +1565,8 @@ impl Fleet {
         (conn, rx)
     }
 
-    /// link が1本切れた。**押しのけられた古い link では presence を鳴らさない**
-    /// (`unregister` が「まだ自分が登録されているか」で見分ける)。
+    /// A link dropped. **A displaced old link doesn't ring presence**
+    /// (`unregister` tells by "am I still the registered one").
     async fn detach(&self, bridge_id: &str, conn: &Conn) {
         if self.links.unregister(bridge_id, conn) {
             self.presence
@@ -1576,7 +1576,7 @@ impl Fleet {
         }
     }
 
-    /// home に1行。home が未設定なら**投稿せずログに残す**(黙って捨てない)。
+    /// One line to home. If home isn't set, **don't post; log it** (never drop it silently).
     async fn post_home(&self, text: &str) {
         let Some(home) = self.home() else {
             rlog(
@@ -1588,8 +1588,8 @@ impl Fleet {
         self.post(&home, None, text).await;
     }
 
-    /// 親が Slack に書く用事: 届けられないと言うこと、自分のコマンドに答えること、
-    /// フリートの出入りを知らせること。**bot が実際にやることは各マシンが書く。**
+    /// What the gateway writes to Slack: saying something can't be delivered, answering its own commands,
+    /// and announcing machines joining and leaving. **What the bot actually does is written by each machine.**
     async fn post(&self, channel: &str, thread_ts: Option<&str>, text: &str) {
         if let Err(e) = self
             .api
@@ -1600,9 +1600,9 @@ impl Fleet {
         }
     }
 
-// ── Slack から来たものを、どこへ渡すか ───────────────────────────
+// ── Where what comes from Slack gets handed ───────────────────────────
 
-    /// presence の猶予切れを拾う番人。タイマーを持たない設計なので、ここが唯一の時計。
+    /// The watcher that picks up presence grace expiries. The design has no timers, so this is the only clock.
     pub async fn watch_presence(self: Arc<Self>) {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
@@ -1614,7 +1614,7 @@ impl Fleet {
         }
     }
 
-    /// Slack の生イベントを1つ引き取る。**親だけがここを通る。**
+    /// Take one raw Slack event. **Only the gateway goes through here.**
     pub async fn on_fleet_event(self: &Arc<Self>, item: FleetEvent) {
         match item {
             FleetEvent::Event { name, event } => self.on_event(&name, &event).await,
@@ -1627,8 +1627,8 @@ impl Fleet {
         let channel = ev.channel();
         let bot_user_id = self.bot_user_id.lock().await.clone();
 
-        // 親自身が答えるもの(コマンドと名乗り)を**配達の判断より先に**。答えたらそこで終わり —
-        // `route` を転送してしまうと、行き先を変える指示が古い行き先へ飛ぶ
+        // What the gateway answers itself (commands and name-claims) comes **before the delivery decision**. Once answered, stop —
+        // forwarding `route` would send the instruction to change the destination to the old destination
         if ev.is_a_command_candidate(self.owner().as_deref())
             && let Some(ch) = channel
             && self
@@ -1642,7 +1642,7 @@ impl Fleet {
         match Delivery::decide(channel, &routes, &self.self_id, |b| {
             connected.iter().any(|c| c == b)
         }) {
-            // このマシンの担当。**直結モードと同じ変換**を通して同じ口に流す
+            // This machine's job. Goes through **the same conversion as direct mode** into the same channel
             Delivery::Local => {
                 rlog("debug", &format!("{name} chan={channel:?} → local"));
                 if let Some(ch) = channel {
@@ -1664,7 +1664,7 @@ impl Fleet {
                     }
                     return;
                 }
-                // 表を引いてから投げるまでの間に落ちた。**行ったふりをしない。**
+                // Dropped between looking up the table and sending. **Don't pretend it went.**
                 rlog(
                     "info",
                     &format!(
@@ -1697,7 +1697,7 @@ impl Fleet {
         }
     }
 
-    /// 「届けられませんでした」の一本道。**言ってよい相手にだけ、1分に1回。**
+    /// The single path for "couldn't deliver". **Only to those we may answer, once a minute.**
     async fn cannot_deliver(self: &Arc<Self>, ev: &Event<'_>, text: &str, why: &str) {
         let bot_user_id = self.bot_user_id.lock().await.clone();
         let Some(ch) = ev.channel() else { return };
@@ -1743,7 +1743,7 @@ impl Fleet {
         rlog("info", &format!("{why} chan={ch} — told them so"));
     }
 
-    /// 親が答えたら `true`(= 配達しない)。
+    /// `true` if the gateway answered (= don't deliver).
     async fn answer_own_commands(
         self: &Arc<Self>,
         ev: &Event<'_>,
@@ -1756,7 +1756,7 @@ impl Fleet {
         let owner = self.owner();
         let machines = self.machines();
 
-        // ── DM の名乗り。`route` より先(route は Owner が既に居ることを前提にする)
+        // ── DM name-claim. Before `route` (route assumes there's already an Owner)
         if crate::bridge::command::SlackId::is_dm(channel) {
             let awaiting = self.pending_selection.lock().await.is_some();
             let outcome = DmOnboardingCtx {
@@ -1820,7 +1820,7 @@ impl Fleet {
             bot_user_id,
         };
 
-        // ── route — ここで答え、**決して配達しない**(行き先こそが変更対象)
+        // ── route — answered here and **never delivered** (the destination is the very thing being changed)
         let routes = self.access().bridges();
         match ctx.route(&routes, &machines, &self.self_id) {
             RouteOutcome::NotACommand => {}
@@ -1843,8 +1843,8 @@ impl Fleet {
             }
         }
 
-        // ── set-home — ここで保存し、**繋がっている全マシンへ同じイベントを配る**
-        //    (各自のゲートを通す)
+        // ── set-home — saved here, and **the same event goes to every connected machine**
+        //    (each passes it through its own gate)
         match ctx.set_home() {
             SetHomeOutcome::NotACommand => {}
             SetHomeOutcome::Set(reply) => {
@@ -1877,8 +1877,8 @@ impl Fleet {
         false
     }
 
-    /// ある場所の担当を決め、そのマシンに「あなたが担当です」を渡す。
-    /// **自分自身を担当にしたときは何も送らない** — 自分に電話はかけない。
+    /// Assign a place to a machine and hand that machine "you're in charge".
+    /// **Send nothing when assigning ourselves** — we don't phone ourselves.
     async fn bind_and_link(self: &Arc<Self>, bridge_id: &str, channel: &str, thread_ts: &str) {
         let (ch, id) = (channel.to_string(), bridge_id.to_string());
         self.edit_access(move |a| a.set_bridge(&ch, &id)).await;
@@ -1949,7 +1949,7 @@ impl Fleet {
                     self.cooldown.lock().await.delivered(ch);
                 }
             }
-            // 押した人はそれが何かすることを見ている。**呑み込むのがいちばん悪い。**
+            // The person who pressed is watching for something to happen. **Swallowing it is the worst.**
             other => {
                 let Some(ch) = channel.as_deref() else { return };
                 let Delivery::Offline(id) = &other else {
@@ -1965,17 +1965,17 @@ impl Fleet {
         }
     }
 
-// ── 親→子 dial(親が NAT の内側にいるときだけ) ────────────────────────
+// ── Gateway→machine dial (only when the gateway is behind NAT) ────────────────────────
 //
-// **既定は子から dial。** ここに来るのは、親が家のルータの内側などに居て、子から繋ぎに
-// 行けない構成だけ。フレームの向きは変わらない(`Ready` / `Event` / `Action` / `Linked` は
-// 常に親→子)ので、変わるのは**どちらが電話をかけるか**だけ。
+// **By default the machine dials.** This is only for setups where the gateway sits behind a home router
+// or similar and machines can't reach it. Frame direction doesn't change (`Ready` / `Event` / `Action` / `Linked`
+// always go gateway→machine), so the only thing that changes is **who places the call**.
 
-/// 子1台へ繋ぎ続ける。**戻ってこない。**
+/// Keep connecting to one machine. **Never returns.**
 ///
-/// 繋がったら [`LinkServer`] に登録するので、配達も presence も set-home の一斉配りも
-/// 子から dial された link と1行も変わらない扱いになる。
-    /// `AGENTGW_CHILD_URLS` に書かれた子へ、1台につき1本ずつ繋ぎに行く。
+/// Once connected it's registered in [`LinkServer`], so delivery, presence and the set-home broadcast
+/// treat it exactly the same as a link dialed by the machine.
+    /// Connect once to each machine listed in `AGENTGW_CHILD_URLS`.
     pub fn dial_children(self: &Arc<Self>, targets: Vec<(String, String)>) {
         for (bridge_id, url) in targets {
             if bridge_id == self.self_id {
@@ -1989,19 +1989,19 @@ impl Fleet {
         }
     }
 
-    /// 子1台へ繋ぎ続ける。**戻ってこない。**
+    /// Keep connecting to one machine. **Never returns.**
     ///
-    /// 繋がったら [`LinkServer`] に登録するので、配達も presence も set-home の一斉配りも
-    /// 子から dial された link と1行も変わらない扱いになる。
+    /// Once connected it's registered in [`LinkServer`], so delivery, presence and the set-home broadcast
+    /// treat it exactly the same as a link dialed by the machine.
     async fn dial_child(self: Arc<Self>, bridge_id: String, url: String) {
         let mut backoff = crate::bridge::machine::RECONNECT_MIN_MS;
         loop {
             match self.dial_child_once(&bridge_id, &url).await {
-                // 握手が通った回。次の再接続は短い待ちから始めてよい
+                // The handshake got through. The next reconnect may start from the short wait
                 Ok(true) => backoff = crate::bridge::machine::RECONNECT_MIN_MS,
                 Ok(false) => {}
                 Err(why) => {
-                    // 話し合いでは解決しない断り。**ループで埋めない** — 1回、大きな声で
+                    // A refusal that talking won't fix. **Don't fill the log in a loop** — say it once, loudly
                     rlog(
                         "error",
                         &format!("dial {bridge_id}: {why} — not retrying"),
@@ -2014,10 +2014,10 @@ impl Fleet {
         }
     }
 
-    /// 1回の接続。`Ok(true)` = 握手まで通った(その後切れた)。`Err` = 設定を直すまで無駄。
+    /// One connection. `Ok(true)` = got through the handshake (and dropped later). `Err` = pointless until the config is fixed.
     async fn dial_child_once(&self, bridge_id: &str, url: &str) -> Result<bool, &'static str> {
         use futures_util::SinkExt;
-        // **鍵は1本。** どちらから dial しても同じ `AGENTGW_LINK_TOKEN` を見せる
+        // **One key.** Whichever side dials, it presents the same `AGENTGW_LINK_TOKEN`
         let target = format!("{url}{}", wire::path_for(&self.self_id));
         let request = match crate::bridge::machine::build_request(&target, &self.token) {
             Ok(r) => r,
@@ -2044,8 +2044,8 @@ impl Fleet {
 
         let (conn, mut rx) = self.attach(bridge_id).await;
 
-        // 迎えに行った先も黙って消える(相手の VM がサスペンドすれば FIN は来ない)。
-        // 叩いて確かめないと、死んだ子を掴んだまま配達を捨て続ける
+        // The machine we fetched can vanish silently too (if its VM suspends, no FIN comes).
+        // Without probing, we'd hold a dead machine and keep throwing deliveries away
         let mut watch = link_watch::IdleWatch::default();
         loop {
             use tokio_tungstenite::tungstenite::protocol::Message as M;
@@ -2059,9 +2059,9 @@ impl Fleet {
                     }
                     None => break,
                 },
-                // **受信は `beat` 経由だけ。** 直に `next()` を待つと half-open で永久に止まる
+                // **Receive only through `beat`.** Waiting on `next()` directly hangs forever on a half-open socket
                 incoming = link_watch::beat(&mut socket, &mut watch) => match incoming {
-                    link_watch::Beat::Text(_) | link_watch::Beat::Alive => {} // 送ってくるものは無いはず
+                    link_watch::Beat::Text(_) | link_watch::Beat::Alive => {} // it shouldn't send anything
                     link_watch::Beat::Ping => {
                         if socket.send(M::Ping(Default::default())).await.is_err() {
                             break;
@@ -2082,9 +2082,9 @@ impl Fleet {
 
 // ── HTTP handlers ──────────────────────────────────────
 
-/// upgrade を通してよいか。**通すなら名乗り**、通さない/到達確認なら**返す応答**。
+/// Whether to pass the upgrade. **If passed, the name**; if refused or a reachability probe, **the response to return**.
 ///
-/// 親(子を迎える口)と子(親を迎える口)で、判断も断り方も同じ — 違うのは通ったあとだけ。
+/// The gateway (accepting machines) and a machine (accepting the gateway) decide and refuse the same way — only what happens after passing differs.
 pub(super) fn admit_upgrade(
     headers: &HeaderMap,
     uri: &axum::http::Uri,
@@ -2100,7 +2100,7 @@ pub(super) fn admit_upgrade(
         token,
     ) {
         Admit::Ok(id) => Ok((id, ws)),
-        // 到達確認 — upgrade は通すが、接続簿には載せない
+        // Reachability probe — pass the upgrade, but don't put it in the connection book
         Admit::Probe => {
             rlog("debug", "answered a reachability probe — not recorded");
             Err(ws
@@ -2108,7 +2108,7 @@ pub(super) fn admit_upgrade(
                 .on_upgrade(|_socket| async {}))
         }
         decision => {
-            // **黙って断らない。** 何が駄目だったのかを、こちらのログにも1行残す
+            // **Never refuse silently.** Leave one line in our own log saying what was wrong
             rlog(
                 "info",
                 &format!("refused {who} on {}: {}", uri.path(), decision.why()),
@@ -2123,7 +2123,7 @@ pub(super) fn admit_upgrade(
     }
 }
 
-/// 子が dial してくる口。`/bridge/{id}`。
+/// Where machines dial in. `/bridge/{id}`.
 async fn on_upgrade(
     State(fleet): State<Arc<Fleet>>,
     headers: HeaderMap,
@@ -2134,7 +2134,7 @@ async fn on_upgrade(
         Ok(ok) => ok,
         Err(response) => return response,
     };
-    // 自分と同じ名前は通さない。通すと `route <自分の id>` の行き先が2つになる
+    // Don't accept our own name. Accepting it would give `route <own id>` two destinations
     if bridge_id == fleet.self_id {
         rlog(
             "info",
@@ -2142,12 +2142,12 @@ async fn on_upgrade(
         );
         return (StatusCode::CONFLICT, "that name is taken by the parent").into_response();
     }
-    // upgrade の応答に subprotocol を返すのが作法(返さないと厳しいクライアントは切る)
+    // Returning the subprotocol in the upgrade response is the convention (strict clients hang up otherwise)
     ws.protocols([LINK_SUBPROTOCOL])
         .on_upgrade(move |socket| on_socket(fleet, bridge_id, socket))
 }
 
-/// axum 側の読み口。差を埋めるだけ — 見張りの時計と状態機械は `link::beat` に1つしか無い。
+/// The axum-side reader. It only bridges the difference — the watch clock and state machine live only in `link::beat`.
 impl link_watch::LinkRead for WebSocket {
     async fn read_frame(&mut self) -> link_watch::Frame {
         match self.recv().await {
@@ -2161,16 +2161,16 @@ impl link_watch::LinkRead for WebSocket {
     }
 }
 
-/// 1本の link の一生(**子が dial してきた側**)。
+/// The life of one link (**the side a machine dialed**).
 async fn on_socket(fleet: Arc<Fleet>, bridge_id: String, mut socket: WebSocket) {
     let (conn, mut rx) = fleet.attach(&bridge_id).await;
 
-    // ソケットを分割しない(futures_util の Sink 側を使わない)。**握手のあと子は何も送って
-    // こない**ので、この1本のループで「送る」と「閉じるのを待つ」を兼ねられる。
+    // Don't split the socket (don't use futures_util's Sink side). **After the handshake the machine sends
+    // nothing**, so this one loop can both "send" and "wait for close".
     //
-    // **黙って消えた子を掴んだままにしない。** 握手のあと子は何も送ってこないので、この口は
-    // 無通信が正常。だから Ping で叩かないと half-open と区別がつかず、居ない子が
-    // `status` に「つながっています」と出続け、その子宛の配達が宙に消える
+    // **Don't hold on to a machine that vanished silently.** After the handshake the machine sends nothing,
+    // so silence is normal on this connection. Without Ping probes it's indistinguishable from half-open: a missing machine
+    // keeps showing as "connected" in `status`, and deliveries to it vanish into thin air
     let mut watch = link_watch::IdleWatch::default();
     loop {
         tokio::select! {
@@ -2183,9 +2183,9 @@ async fn on_socket(fleet: Arc<Fleet>, bridge_id: String, mut socket: WebSocket) 
                 }
                 None => break,
             },
-            // **受信は `beat` 経由だけ。** 直に `recv()` を待つと half-open で永久に止まる
+            // **Receive only through `beat`.** Waiting on `recv()` directly hangs forever on a half-open socket
             incoming = link_watch::beat(&mut socket, &mut watch) => match incoming {
-                link_watch::Beat::Text(_) | link_watch::Beat::Alive => {} // 送ってくるものは無いはず
+                link_watch::Beat::Text(_) | link_watch::Beat::Alive => {} // it shouldn't send anything
                 link_watch::Beat::Ping => {
                     if socket.send(Message::Ping(Default::default())).await.is_err() {
                         break;
@@ -2198,12 +2198,12 @@ async fn on_socket(fleet: Arc<Fleet>, bridge_id: String, mut socket: WebSocket) 
             },
         }
     }
-    // axum の WebSocket は drop で閉じる
+    // axum's WebSocket closes on drop
     fleet.detach(&bridge_id, &conn).await;
 }
 
-/// 走っている親に「いま誰が繋がっているか」を聞く口。**生きているプロセスしか知らない。**
-/// loopback にしか bind しないが、前段の proxy が全パスを転送する構成もありうるので鍵で守る。
+/// Asks the running gateway "who is connected right now". **Only the live process knows.**
+/// It binds to loopback only, but a front proxy might forward every path, so it's guarded by the key.
 async fn on_status(
     State(fleet): State<Arc<Fleet>>,
     headers: HeaderMap,
@@ -2220,10 +2220,10 @@ async fn on_status(
         .into_response()
 }
 
-/// 子を迎える口を開ける。**戻ってこない。**
+/// Open the endpoint that accepts machines. **Never returns.**
 ///
-/// bind に失敗しても Bridge は止めない — 自分のワーカーは動き続ける。ただし子は1台も
-/// 繋がらないので、error で大きく残す(黙ると「繋がらない」の原因がどこにも出ない)。
+/// A bind failure doesn't stop the Bridge — its own agents keep running. But no machine can
+/// connect, so it's logged loudly as an error (silence would leave the cause of "can't connect" nowhere).
 pub async fn serve_children(fleet: Arc<Fleet>, addr: std::net::SocketAddr) {
     let Some(listener) = bind_link_port(addr, "children").await else {
         return;
@@ -2232,8 +2232,8 @@ pub async fn serve_children(fleet: Arc<Fleet>, addr: std::net::SocketAddr) {
     serve_children_on(fleet, listener).await;
 }
 
-/// link の口を開ける。**開けなくても Bridge は止めない** — 自分のワーカーは動き続ける。
-/// ただし相手は1台も繋がらないので、error で大きく残す(黙ると原因がどこにも出ない)。
+/// Open the link port. **Failing to open it doesn't stop the Bridge** — its own agents keep running.
+/// But no peer can connect, so it's logged loudly as an error (silence would leave the cause nowhere).
 pub(super) async fn bind_link_port(addr: std::net::SocketAddr, what: &str) -> Option<tokio::net::TcpListener> {
     match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => Some(l),
@@ -2247,9 +2247,9 @@ pub(super) async fn bind_link_port(addr: std::net::SocketAddr, what: &str) -> Op
     }
 }
 
-/// **この口に載っているのは link の3本だけ。** hook intake(`bridge.rs`)と MCP は
-/// **別の口**で、あちらは loopback + トークンで守られている。こちらは前段の proxy 経由で
-/// 公開されるので、同じ口に載せると hook と MCP が外から叩けるようになる。
+/// **Only the three link routes live on this port.** The hook intake (`bridge.rs`) and MCP are on
+/// **a different port**, guarded by loopback + token. This one is exposed through a front proxy, so putting
+/// them on the same port would let hooks and MCP be hit from outside.
 async fn serve_children_on(fleet: Arc<Fleet>, listener: tokio::net::TcpListener) {
     let app = Router::new()
         .route("/status", get(on_status))
@@ -2261,13 +2261,13 @@ async fn serve_children_on(fleet: Arc<Fleet>, listener: tokio::net::TcpListener)
     }
 }
 
-/// トンネルを使うときの、**マシンの loopback 側**のポート。
+/// The port on **the machine's loopback side** when using a tunnel.
 pub const TUNNEL_PORT: u16 = 8799;
 
-/// ゲートウェイが張り続ける ssh の引数。**-N でコマンドは流さない。**
+/// The ssh arguments the gateway keeps running. **-N: no command is run.**
 ///
-/// `ExitOnForwardFailure=yes` が要る — 無いと転送に失敗しても ssh だけ生き残り、
-/// 「繋がっているのに届かない」状態になる。
+/// `ExitOnForwardFailure=yes` is required — without it ssh survives even when forwarding fails,
+/// leaving a "connected but nothing arrives" state.
 pub fn tunnel_ssh_args(target: &str, remote_port: u16, parent_addr: &str) -> Vec<String> {
     [
         "-N",
@@ -2288,15 +2288,15 @@ pub fn tunnel_ssh_args(target: &str, remote_port: u16, parent_addr: &str) -> Vec
     .collect()
 }
 
-/// ゲートウェイの agentgw の中で、マシン1台分の ssh トンネルを張り続ける。
+/// Keep one machine's ssh tunnel open from inside the gateway's agentgw.
 ///
-/// **別サービスにしない。** agentgw が動いている間だけ見張ればよいので、子プロセス(OS の意味)として持つ。
+/// **Not a separate service.** It only needs watching while agentgw runs, so it's held as a child process (in the OS sense).
 ///
-/// **ssh の多重化(`ControlMaster auto` + `ControlPersist`)はそのまま使う。** そのときの ssh は
-/// 既にある親玉に転送を預けて、すぐ**終了 0** で抜ける(2026-09-18 実機)。これは失敗ではない —
-/// 転送は親玉の中で生きている。なので 0 で抜けたら間を空けて頼み直すだけにする(親玉が
-/// 居なくなっていれば、次の ssh が新しい親玉になって転送を持つ)。多重化を使っていない
-/// 設定なら ssh は前に居続け、`kill_on_drop` で agentgw と一緒に消える。
+/// **ssh multiplexing (`ControlMaster auto` + `ControlPersist`) is used as is.** In that case ssh hands the
+/// forward to the existing master and exits right away **with 0** (2026-09-18, on a real machine). That's not a failure —
+/// the forward lives on inside the master. So on exit 0 we just wait and ask again (if the master is gone,
+/// the next ssh becomes the new master and holds the forward). Without multiplexing,
+/// ssh stays in the foreground and goes away together with agentgw via `kill_on_drop`.
 pub async fn keep_tunnel(
     fleet: Arc<Fleet>,
     child: String,
@@ -2305,7 +2305,7 @@ pub async fn keep_tunnel(
 ) {
     use crate::bridge::state::LogCtx;
     let args = tunnel_ssh_args(&target, TUNNEL_PORT, &parent_addr);
-    // ログは状態が変わったときだけ(1分ごとの頼み直しで plugin-debug.log を埋めない)
+    // Log only on state changes (so the once-a-minute re-request doesn't flood plugin-debug.log)
     let mut was_ok: Option<bool> = None;
     loop {
         let out = tokio::process::Command::new("ssh")
@@ -2316,7 +2316,7 @@ pub async fn keep_tunnel(
             .await;
         let (ok, why) = match out {
             Ok(o) if o.status.success() => (true, String::new()),
-            // 抜けた理由を残す。黙って張り直し続けると、鍵が無いのか相手が居ないのか分からない
+            // Keep why it exited. Silently reopening forever hides whether the key is missing or the peer is gone
             Ok(o) => (
                 false,
                 format!(
@@ -2328,7 +2328,7 @@ pub async fn keep_tunnel(
             Err(e) => (false, format!("could not start ssh: {e}")),
         };
         if was_ok != Some(ok) {
-            // `status` に経路を出すため、ゲートウェイの手元に今の様子を置く
+            // Keep the current state on the gateway so `status` can show the route
             fleet.tunnels.lock().unwrap().insert(
                 child.clone(),
                 Tunnel {
@@ -2353,11 +2353,11 @@ pub async fn keep_tunnel(
     }
 }
 
-// ── 節9: CLI(`status` のフリート欄) ─────────────────────────────────
+// ── Section 9: CLI (the fleet section of `status`) ─────────────────────────────────
 
 pub(crate) const DEFAULT_LISTEN: &str = "0.0.0.0:8787";
 
-/// `status` のフリート欄。**人に見せる文字列はここだけ。**
+/// The fleet section of `status`. **The only strings shown to people are here.**
 pub struct Cli;
 
 impl Cli {
@@ -2372,17 +2372,17 @@ impl Cli {
         crate::bridge::state::write_atomic_mode(&path, &after, Some(0o600))
     }
 
-    /// 秘密を1本作る。`/dev/urandom` を16進に。
+    /// Mint one secret. `/dev/urandom` as hex.
     ///
-    /// **32バイトだけ読む。** `/dev/urandom` は EOF を返さないので `fs::read` は永久に読み続ける
-    /// (2026-08-01 実機で確認 — Relay から持ってきたこの1行が接続文字列を固めた)。
+    /// **Read only 32 bytes.** `/dev/urandom` never returns EOF, so `fs::read` reads forever
+    /// (confirmed on a real machine on 2026-08-01 — this one line brought over from the Relay hung the connection string).
     fn mint_token() -> String {
         let mut bytes = [0u8; 32];
         if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
             use std::io::Read;
             let _ = f.read_exact(&mut bytes);
         }
-        // 万一読めなくても全ゼロを秘密にしない
+        // Even if it somehow can't be read, never use all zeros as the secret
         let pid = std::process::id().to_be_bytes();
         let now = now_ms().to_be_bytes();
         for (i, b) in pid.iter().chain(now.iter()).enumerate() {
@@ -2391,8 +2391,8 @@ impl Cli {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    /// 子に見せる鍵。**一度作ったら変えない** — 作り直すと、繋がっている全マシンが一斉に
-    /// 締め出される。返り値の `bool` は「いま作った」。
+    /// The key shown to machines. **Once made, never changed** — remaking it would lock out every
+    /// connected machine at once. The returned `bool` is "just made it".
     pub(crate) fn key_for_invite(existing: Option<&str>) -> (String, bool) {
         match existing {
             Some(t) if !t.trim().is_empty() => (t.trim().to_string(), false),
@@ -2400,10 +2400,10 @@ impl Cli {
         }
     }
 
-    /// `status` の頭の1行。**役割は `.env` だけで決まる** — プロセスを見に行かないので
-    /// Bridge が走っていなくても出る(走っていないときこそ読みたい)。
-    /// `Wiring::resolve` が断る設定なら、その理由をそのまま出す — 起動できない Bridge の
-    /// 理由をログを開かずに知れる唯一の場所になる。
+    /// The first line of `status`. **The role is decided by `.env` alone** — it doesn't look at processes, so
+    /// it shows even when the Bridge isn't running (which is exactly when you want to read it).
+    /// If `Wiring::resolve` rejects the config, its reason is shown as is — the only place to learn why
+    /// a Bridge can't start without opening the logs.
     pub fn role_line(env: &HashMap<String, String>) -> String {
         use crate::bridge::machine::{Mode, Wiring};
         let wiring = match Wiring::resolve(|k| env.get(k).cloned()) {
@@ -2448,10 +2448,10 @@ impl Cli {
         }
     }
 
-    /// 開いている口。ワーカーはここに繋ぎ返してくるので、繋がらないときに最初に見る数字。
+    /// The open ports. Agents connect back here, so it's the first number to check when they can't connect.
     ///
-    /// **ここでは割り当てない** — 記録されている物だけ読む(status がポートを増やしたら
-    /// 本末転倒だし、Bridge が握っている番号と食い違う)。
+    /// **Nothing is allocated here** — it only reads what's recorded (status adding ports would defeat
+    /// the point, and would disagree with the numbers the Bridge holds).
     pub fn ports_line(dir: &StateDir) -> String {
         let endpoints =
             dir.read_json_or("access.json", serde_json::Value::Null)["endpoints"].clone();
@@ -2464,7 +2464,7 @@ impl Cli {
             })
             .collect();
         if open.is_empty() {
-            // 記録が無いことしか分からない — 起動直後と未起動を見分けられない
+            // All we know is there's no record — can't tell "just started" from "not running"
             crate::t!(
                 "Local ports: none yet (agentgw just started, or isn't running)",
                 "ローカルのポート: まだありません(起動した直後か、動いていません)"
@@ -2475,9 +2475,9 @@ impl Cli {
         }
     }
 
-    /// `status` のフリート欄。役割の1行は**必ず出す**(設定を間違えたとき最初に見る場所が
-    /// ここなので、子で黙っていると何も手掛かりが無い)。表の方は子を迎える設定が無ければ
-    /// 出さない — 単独 Bridge のときに空の表を見せない。
+    /// The fleet section of `status`. The role line is **always shown** (it's the first place to look when the
+    /// config is wrong, so staying silent on a machine leaves no clue). The table is only shown when this host is
+    /// set up to accept machines — a lone Bridge doesn't get an empty table.
     pub async fn print_fleet(dir: &StateDir) {
         let env = Self::env_of(dir);
         println!("\n{}", Self::role_line(&env));
@@ -2506,15 +2506,15 @@ impl Cli {
         );
     }
 
-    /// status 口を叩く。答えなければ `None`(= この口が答えなかった、それだけ)。
+    /// Hit the status endpoint. `None` if it doesn't answer (= this endpoint didn't answer, nothing more).
     ///
-    /// **3回試す。** `install.sh` は再起動の直後に status を出すので、1回きりだと
-    /// 「まだ口が開いていない」を「動いていない」と読み違える。
+    /// **Tries 3 times.** `install.sh` shows status right after a restart, so a single try would
+    /// misread "the endpoint isn't open yet" as "not running".
     pub(crate) async fn ask_connected(listen: &str, token: &str) -> Option<Vec<String>> {
         Self::ask_status(listen, token).await.map(|r| r.0)
     }
 
-    /// 走っている親の `status` 口の答え — 繋がっている子と、親が張っているトンネル。
+    /// The answer from the running gateway's `status` endpoint — connected machines, and the tunnels the gateway keeps open.
     async fn ask_status(listen: &str, token: &str) -> Option<(Vec<String>, Tunnels)> {
         for i in 0..3 {
             if i > 0 {
@@ -2528,7 +2528,7 @@ impl Cli {
     }
 
     async fn ask_status_once(listen: &str, token: &str) -> Option<(Vec<String>, Tunnels)> {
-        // 依存を増やさないために curl に聞く(この1回だけの用事に HTTP クライアントを宣言しない)
+        // Ask curl to avoid a dependency (no HTTP client declared for this one-off job)
         let out = tokio::process::Command::new("curl")
             .args([
                 "-s",
@@ -2548,7 +2548,7 @@ impl Cli {
             .iter()
             .filter_map(|x| x.as_str().map(str::to_string))
             .collect();
-        // 古い親は tunnels を返さない — そのときは「全部直結」として読む
+        // An older gateway doesn't return tunnels — then read it as "all direct"
         let tunnels = v
             .get("tunnels")
             .and_then(|t| serde_json::from_value(t.clone()).ok())
@@ -2556,7 +2556,7 @@ impl Cli {
         Some((connected, tunnels))
     }
 
-    /// id → 読める名前(best-effort)。引けなかったものは生の id のまま出す。
+    /// id → readable name (best-effort). Anything that can't be looked up is shown as the raw id.
     async fn names_of(env: &HashMap<String, String>, view: &FleetView) -> HashMap<String, String> {
         let mut names = HashMap::new();
         let Some(bot) = env.get("SLACK_BOT_TOKEN") else {
@@ -2565,7 +2565,7 @@ impl Cli {
         let Ok(api) = crate::chat::slack::Api::new(bot) else {
             return names;
         };
-        // home も route と同じチャンネル。owner だけが人なので users.info の側で引く
+        // home is a channel like the routes. Only owner is a person, so it's looked up via users.info
         for id in view.routes.keys().chain(view.home.iter()) {
             if let Some(n) = api.channel_display_name(id).await {
                 names.insert(id.clone(), n);
@@ -2586,8 +2586,8 @@ mod tests {
 
     const TOKEN: &str = "the-shared-secret";
 
-    /// `status` の頭の1行。**役割を取り違えたまま黙るのが一番困る**ので、4つの形と
-    /// 「決められない」を固定する。
+    /// The first line of `status`. **Staying silent with the role misread is the worst**, so the four shapes and
+    /// "can't tell" are pinned.
     #[test]
     fn role_line_names_the_role() {
         let env = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
@@ -2626,7 +2626,7 @@ mod tests {
         ]);
         assert!(awaiting.contains("waits for the gateway"), "{awaiting}");
 
-        // 起動できない設定こそ status で理由が要る(ログを開かずに分かるように)
+        // A config that can't start is exactly when status needs to give the reason (without opening the logs)
         let broken = line(&[]);
         assert!(broken.starts_with("Role: can't tell"), "{broken}");
     }
@@ -2652,8 +2652,8 @@ mod tests {
             None,
             Some("Bearer "),
             Some("Bearer wrong"),
-            Some(TOKEN),                      // Bearer が無い
-            Some("bearer the-shared-secret"), // 綴りは仕様どおり区別する
+            Some(TOKEN),                      // no Bearer
+            Some("bearer the-shared-secret"), // spelling is case-sensitive, per the spec
             Some("Basic dXNlcjpwYXNz"),
         ] {
             let got = Admit::of("/bridge/desktop", auth, Some(LINK_SUBPROTOCOL), TOKEN);
@@ -2682,7 +2682,7 @@ mod tests {
         }
     }
 
-    /// ブラウザ流儀のカンマ区切りでも、1つ一致すれば通す。
+    /// A browser-style comma-separated list passes if one of them matches.
     #[test]
     fn a_list_of_subprotocols_is_accepted_when_one_matches() {
         let got = Admit::of(
@@ -2694,12 +2694,12 @@ mod tests {
         assert_eq!(got, Admit::Ok("desktop".into()));
     }
 
-    /// 到達確認は**通るが名乗らない**。認証は他と同じく通す必要がある。
+    /// The reachability probe **passes but gives no name**. It still has to pass authentication like the rest.
     #[test]
     fn the_probe_path_is_admitted_without_a_name() {
         assert_eq!(ok_admit(wire::PROBE_PATH), Admit::Probe);
         assert_eq!(ok_admit(wire::PROBE_PATH).status(), None);
-        // 認証は素通しではない
+        // Authentication isn't skipped
         assert_eq!(
             Admit::of(
                 wire::PROBE_PATH,
@@ -2720,8 +2720,8 @@ mod tests {
         }
     }
 
-    /// **検査の順序が仕様。** 版が違えば、トークンを見る前に断る — 版の食い違いを
-    /// 「トークンが違う」と報告すると、直しようのない調査に人を送り込む。
+    /// **The check order is the spec.** A different version is refused before looking at the token — reporting a version
+    /// mismatch as "wrong token" sends people on an investigation that can't fix anything.
     #[test]
     fn the_version_is_checked_before_the_token() {
         assert_eq!(
@@ -2735,7 +2735,7 @@ mod tests {
         );
     }
 
-    /// 名乗りを信じるのは**トークンが通ったあと**。通っていない相手のパスは読みもしない。
+    /// The name is trusted **only after the token passes**. A peer that hasn't passed doesn't even get its path read.
     #[test]
     fn the_name_is_read_only_after_the_token_passes() {
         assert_eq!(
@@ -2758,7 +2758,7 @@ mod tests {
         assert!(secret_eq("", ""));
     }
 
-    // ── 接続簿 ──────────────────────────────────────────────────────────────
+    // ── Connection book ──────────────────────────────────────────────────────────────
 
     fn conn() -> (Conn, tokio::sync::mpsc::UnboundedReceiver<String>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2781,8 +2781,8 @@ mod tests {
         assert!(s.is_connected("desktop"));
     }
 
-    /// **回帰**: 同じ名前で繋ぎ直したら新しい方が残る。ここが壊れると、繋ぎ直すたびに
-    /// マシンが行方不明になる。
+    /// **Regression**: reconnecting under the same name keeps the new one. If this breaks, the machine
+    /// goes missing on every reconnect.
     #[test]
     fn a_reconnect_keeps_the_newest_link() {
         let s = LinkServer::new();
@@ -2791,14 +2791,14 @@ mod tests {
         assert_eq!(s.register("desktop", old.clone()).0, Joined::New);
 
         let (joined, displaced) = s.register("desktop", new.clone());
-        assert_eq!(joined, Joined::Reconnected); // 新規 join ではない = presence に出さない
+        assert_eq!(joined, Joined::Reconnected); // not a new join = not shown in presence
         assert!(displaced.unwrap().is(&old));
 
-        // 押しのけられた古い link が**後から**閉じても、新しい登録は消えない
+        // Even when the displaced old link closes **later**, the new registration stays
         assert!(!s.unregister("desktop", &old));
         assert_eq!(s.connected(), vec!["desktop".to_string()]);
 
-        // 届く先は新しい方だけ
+        // Only the new one receives
         assert!(s.send_to("desktop", &ready()));
         assert!(new_rx.try_recv().is_ok());
         assert!(old_rx.try_recv().is_err());
@@ -2809,8 +2809,8 @@ mod tests {
         let s = LinkServer::new();
         let (c, _rx) = conn();
         s.register("desktop", c.clone());
-        assert!(s.unregister("desktop", &c)); // 本当に居なくなった
-        assert!(!s.unregister("desktop", &c)); // 2度目は何も起きない
+        assert!(s.unregister("desktop", &c)); // really gone
+        assert!(!s.unregister("desktop", &c)); // the second time does nothing
         assert!(s.connected().is_empty());
         assert!(!s.is_connected("desktop"));
     }
@@ -2820,7 +2820,7 @@ mod tests {
         let s = LinkServer::new();
         assert!(!s.send_to("nobody", &ready()));
 
-        // 受け手が落ちた link も「届いた」とは言わない
+        // A link whose receiver is gone doesn't say "delivered" either
         let (c, rx) = conn();
         s.register("desktop", c);
         drop(rx);
@@ -2842,7 +2842,7 @@ mod tests {
         drop(keep);
     }
 
-    // ── 配達の判断 ──────────────────────────────────────────────────────────
+    // ── Delivery decision ──────────────────────────────────────────────────────────
 
     fn routes(pairs: &[(&str, &str)]) -> Routes {
         pairs
@@ -2871,7 +2871,7 @@ mod tests {
                 Some("C3")
             );
         }
-        // 知らない種類・形が違うものは「読めなかった」
+        // Unknown kinds and wrong shapes are "couldn't read"
         assert_eq!(
             Event::new("app_mention", &serde_json::json!({"channel": "C1"})).channel(),
             None
@@ -2902,14 +2902,14 @@ mod tests {
         let d = |ch: Option<&str>| Delivery::decide(ch, &r, "vps", up);
         assert_eq!(d(Some("C1")), Delivery::Forward("desktop".into()));
         assert_eq!(d(Some("C2")), Delivery::Offline("laptop".into()));
-        // 自分を名指しした行(`route <自分の id>`)は自分でやる
+        // A route naming ourselves (`route <own id>`) is handled here
         assert_eq!(d(Some("C3")), Delivery::Local);
-        // **未 route はローカル**。ここが単独 Bridge の既定
+        // **No route means local**. This is the default for a lone Bridge
         assert_eq!(d(Some("C_NEW")), Delivery::Local);
         assert_eq!(d(None), Delivery::UnknownChannel);
     }
 
-    /// 子を1台も持たない Bridge は表が空 — **すべてローカル**。回帰の本丸。
+/// A Bridge with no machines has an empty table — **everything is local**. The heart of the regression.
     #[test]
     fn a_bridge_with_no_children_keeps_everything() {
         let r = Routes::new();
@@ -2921,7 +2921,7 @@ mod tests {
         }
     }
 
-    // ── 親の口・鍵・順序 ──────────────────────────
+    // ── Gateway endpoints, key, order ──────────────────────────
 
     fn a_fleet() -> (Arc<Fleet>, tokio::sync::mpsc::Receiver<InboundMsg>) {
         let (msg_tx, msg_rx) = tokio::sync::mpsc::channel(4);
@@ -2949,8 +2949,8 @@ mod tests {
         (fleet, msg_rx)
     }
 
-    /// 生の HTTP を1本投げて、返ってきたステータス行だけ読む。
-    /// (この1回の用事のために HTTP クライアントを宣言しない — 依存は7つのまま)
+    /// Send one raw HTTP request and read only the status line.
+    /// (No HTTP client declared for this one-off job — dependencies stay at seven)
     async fn status_line(addr: std::net::SocketAddr, path: &str) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -2968,9 +2968,9 @@ mod tests {
             .to_string()
     }
 
-    /// **子を迎える口に載っているのは link の3本だけ。**
-    /// hook intake と MCP は別の口(loopback + トークン)で、こちらは前段の proxy 経由で
-    /// **公開される** — 同じ口に載せた日に、hook と MCP が外から叩けるようになる。
+    /// **Only the three link routes live on the machines' port.**
+    /// The hook intake and MCP are on a different port (loopback + token), while this one is **exposed** through
+    /// a front proxy — the day they share a port, hooks and MCP can be hit from outside.
     #[tokio::test]
     async fn the_children_port_carries_the_link_and_nothing_else() {
         let (fleet, _rx) = a_fleet();
@@ -2978,29 +2978,29 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve_children_on(fleet, listener));
 
-        // Bridge の他の口はここに居ない
+        // The Bridge's other endpoints aren't here
         for path in ["/hook", "/mcp", "/"] {
             assert!(
                 status_line(addr, path).await.contains("404"),
                 "{path} がこの口に居る"
             );
         }
-        // 居るのは status(鍵で守られている)と link の2本
+        // What's here is status (guarded by the key) and the two link routes
         assert!(status_line(addr, "/status").await.contains("401"));
         assert!(!status_line(addr, "/bridge/desktop").await.contains("404"));
     }
 
-    /// **答えるものは配達より先に見る。** `route` を転送してしまうと、行き先を変える指示が
-    /// 古い行き先へ飛ぶ(答えた後に `return` するのは呼び出し側の構造)。
+    /// **What we answer is checked before delivery.** Forwarding `route` would send the instruction to change the
+    /// destination to the old destination (returning after answering is the caller's structure).
     #[test]
     fn only_a_persons_channel_message_is_a_command_candidate() {
         let owner = Some("U_OWNER");
         let msg = serde_json::json!({"channel": "C1", "user": "U_OWNER", "text": "route"});
         assert!(Event::new("message", &msg).is_a_command_candidate(owner));
-        // チャンネルが読めなければ答えようがない
+        // If the channel can't be read, there's no way to answer
         let nowhere = serde_json::json!({"user": "U_OWNER", "text": "route"});
         assert!(!Event::new("message", &nowhere).is_a_command_candidate(owner));
-        // リアクションや join はコマンドになりえない
+        // Reactions and joins can't be commands
         for name in [
             "reaction_added",
             "reaction_removed",
@@ -3011,44 +3011,44 @@ mod tests {
                 "{name}"
             );
         }
-        // 自分の投稿は見ない(Owner の Web API 投稿だけが例外 — speaks_as_a_bot)
+        // Our own posts are ignored (the Owner's Web API posts are the only exception — speaks_as_a_bot)
         let from_bot = serde_json::json!({"channel": "C1", "user": "U_BOT", "bot_id": "B1"});
         assert!(!Event::new("message", &from_bot).is_a_command_candidate(owner));
     }
 
-    /// **鍵は一度作ったら変えない。** 作り直すと、繋がっている全マシンが一斉に締め出される。
+    /// **The key is never changed once made.** Remaking it locks out every connected machine at once.
     #[test]
     fn the_key_is_minted_once_and_then_kept() {
         let (fresh, minted) = Cli::key_for_invite(None);
         assert!(minted);
         assert_eq!(fresh.len(), 64, "32バイトを16進で: {fresh}");
         assert!(fresh.chars().all(|c| c.is_ascii_hexdigit()));
-        // 空・空白だけは「無い」と同じ
+        // Empty or whitespace-only is the same as "none"
         assert!(Cli::key_for_invite(Some("   ")).1);
-        // 既にあるものは**そのまま**返る
+        // An existing one comes back **as is**
         assert_eq!(
             Cli::key_for_invite(Some(" kept ")),
             ("kept".to_string(), false)
         );
-        // 作るたびに違う(全ゼロの秘密を作らない)
+        // Different every time (never an all-zero secret)
         assert_ne!(Cli::mint_token(), Cli::mint_token());
     }
 
-    /// 同じ規則が**コマンドの入口にも**要る — `Access::gate` は Owner の
-    /// Web API 投稿を人として通すのに、こちらが bot として弾いていたら `route` が打てない。
+    /// The same rule is needed **at the command entry too** — `Access::gate` lets the Owner's
+    /// Web API posts through as a person, so if we rejected them as a bot here, `route` couldn't be typed.
     #[test]
     fn only_the_owners_web_api_post_counts_as_a_person() {
         let bot_post = |user: &str| serde_json::json!({"user": user, "bot_id": "B1"});
         let owner = Some("U_OWNER".to_string());
-        // Owner 本人 = 人として扱う
+        // The Owner themself = treated as a person
         assert!(!Event::new("message", &bot_post("U_OWNER")).speaks_as_a_bot(owner.as_deref()));
-        // それ以外の bot(自分の投稿を含む)は落とす
+        // Any other bot (including our own posts) is dropped
         assert!(Event::new("message", &bot_post("U_BOT")).speaks_as_a_bot(owner.as_deref()));
         let no_user = serde_json::json!({"bot_id": "B1"});
         assert!(Event::new("message", &no_user).speaks_as_a_bot(owner.as_deref()));
-        // Owner が未設定なら全部 bot(fail-closed)
+        // With no Owner set, everything is a bot (fail-closed)
         assert!(Event::new("message", &bot_post("U_OWNER")).speaks_as_a_bot(None));
-        // 人の投稿はそのまま人
+        // A person's post stays a person
         let a_person = serde_json::json!({"user": "U_ANY"});
         assert!(!Event::new("message", &a_person).speaks_as_a_bot(owner.as_deref()));
     }
@@ -3063,7 +3063,7 @@ mod tests {
         assert!(Delivery::offline_notice("laptop", &some).contains("desktop, vps"));
     }
 
-    // ── 断りの上限 ──────────────────────────────────────────────────────────
+    // ── Notice rate limit ──────────────────────────────────────────────────────────
 
     #[test]
     fn a_notice_is_said_once_a_minute_and_counts_what_it_swallowed() {
@@ -3089,7 +3089,7 @@ mod tests {
                 swallowed: 2
             }
         );
-        // 1分の境目
+        // The one-minute boundary
         assert_eq!(
             c.take("C1", 59_999),
             NoticeDecision {
@@ -3104,7 +3104,7 @@ mod tests {
                 swallowed: 3
             }
         );
-        // 報告したら数え直し
+        // Once reported, the count starts over
         assert_eq!(
             c.take("C1", 120_000),
             NoticeDecision {
@@ -3118,11 +3118,11 @@ mod tests {
     fn each_channel_has_its_own_cooldown() {
         let mut c = NoticeCooldown::new();
         assert!(c.take("C1", 0).say);
-        assert!(c.take("C2", 0).say); // 別のチャンネルは巻き添えにならない
+        assert!(c.take("C2", 0).say); // other channels aren't affected
         assert!(!c.take("C1", 100).say);
     }
 
-    /// 届いたら苦情は終わり — 復帰後の最初の失敗はすぐ言う。
+    /// Delivery ends the complaint — the first failure after recovery is said right away.
     #[test]
     fn a_delivery_resets_the_complaint() {
         let mut c = NoticeCooldown::new();
@@ -3138,7 +3138,7 @@ mod tests {
         );
     }
 
-    // ── 断ってよい相手か ────────────────────────────────────────────────────
+    // ── Whom we may refuse ────────────────────────────────────────────────────
 
     const BOT: Option<&str> = Some("U_BOT");
 
@@ -3159,11 +3159,11 @@ mod tests {
     fn in_a_channel_only_a_mention_is_addressed_to_the_bot() {
         assert!(Event::new("message", &said("<@U_BOT> hi")).may_answer(BOT));
         assert!(!Event::new("message", &said("hi")).may_answer(BOT));
-        // 自分の id をまだ知らない間は、チャンネルの何もこちらへの用件にならない
+        // Until we know our own id, nothing in a channel is addressed to us
         assert!(!Event::new("message", &said("<@U_BOT> hi")).may_answer(None));
     }
 
-    /// **これが無いと、担当未設定のチャンネルは自分の断りに断りを返し続ける。**
+    /// **Without this, a channel with no machine assigned keeps answering its own refusals with refusals.**
     #[test]
     fn the_bots_own_words_are_never_answered() {
         for ev in [
@@ -3188,7 +3188,7 @@ mod tests {
         }
     }
 
-    /// 取り消しは、届けられないなら黙って捨てる — 再送するものが無い。
+    /// A deletion that can't be delivered is dropped silently — there's nothing to resend.
     #[test]
     fn a_deletion_is_dropped_in_silence() {
         let ev = serde_json::json!({"channel": "D1", "subtype": "message_deleted"});
@@ -3252,13 +3252,13 @@ mod tests {
             RouteOutcome::Set { bridge_id, reply } => {
                 assert_eq!(bridge_id, "desktop");
                 assert!(reply.contains("This channel is now handled by *desktop*."));
-                assert!(!reply.contains("before")); // 初回は注記なし
+                assert!(!reply.contains("before")); // no note the first time
             }
             other => panic!("{other:?}"),
         }
     }
 
-    /// 担当を**変えた**ときは正直に言う — 話の流れは読めるが、作業の詳細は残っていない。
+    /// **Changing** the machine is said honestly — the conversation can be reread, but the details of the work are gone.
     #[test]
     fn changing_the_owner_of_a_channel_says_what_is_lost() {
         let got = CommandCtx::route(
@@ -3276,7 +3276,7 @@ mod tests {
         }
     }
 
-    /// **他人は使えない。** これが無いと共有チャンネルを乗っ取れる。
+    /// **Nobody else can use it.** Without this, a shared channel could be hijacked.
     #[test]
     fn only_the_owner_may_route() {
         for user in [Some("U_STRANGER"), None] {
@@ -3293,7 +3293,7 @@ mod tests {
         }
     }
 
-    /// 繋がっていないマシンには向けられない — 打ち間違いも未起動も同じ扱い。
+    /// Can't point at a machine that isn't connected — a typo and one not started are treated the same.
     #[test]
     fn a_route_to_a_machine_that_is_not_here_is_refused() {
         let got = CommandCtx::route(
@@ -3315,7 +3315,7 @@ mod tests {
 
     #[test]
     fn a_bare_route_says_who_handles_this_channel_first() {
-        // here() = ["desktop", "vps"](繋がっている)。laptop は route にだけ名前がある
+        // here() = ["desktop", "vps"] (connected). laptop is named only in routes
         let got = CommandCtx::route(
             &ctx("C1", "<@U_BOT> route", Some(OWNER)),
             &routes(&[("C1", "desktop"), ("C2", "laptop")]),
@@ -3325,12 +3325,12 @@ mod tests {
         let RouteOutcome::List(reply) = got else {
             panic!("{got:?}")
         };
-        // 打ったチャンネルが先頭
+        // The channel it was typed in comes first
         assert!(
             reply.starts_with("*This channel (<#C1>)*: *desktop* 🟢"),
             "{reply}"
         );
-        // ほかのチャンネル。居ないマシンの担当はオフラインと言う
+        // Other channels. A channel whose machine isn't here says offline
         assert!(
             reply.contains("• <#C2> → *laptop* 🔴 offline"),
             "{reply}"
@@ -3339,7 +3339,7 @@ mod tests {
             !reply.contains("• <#C1>"),
             "ここは「ほか」に重ねて出さない: {reply}"
         );
-        // マシン: 親の印、route にだけ居る(= 居ない)マシンも出す
+        // Machines: the gateway's mark, and machines only in routes (= not here) are shown too
         assert!(
             reply.contains("*Machines*: 🟢 desktop · 🔴 laptop · 🟢 vps (gateway)"),
             "{reply}"
@@ -3378,7 +3378,7 @@ mod tests {
         assert!(reply.contains("the gateway handles every channel"), "{reply}");
     }
 
-    /// **名指しの無い `route` は断りもしない。** bot が入っていない会話への闖入になる。
+    /// **A `route` without a mention isn't even refused.** That would be barging into a conversation the bot isn't part of.
     #[test]
     fn an_unaddressed_route_falls_through_without_a_refusal() {
         let got = CommandCtx::route(
@@ -3406,7 +3406,7 @@ mod tests {
         }
     }
 
-    /// DM では名指しが要らない。
+    /// In a DM no mention is needed.
     #[test]
     fn in_a_dm_route_needs_no_mention() {
         let got = CommandCtx::route(
@@ -3452,7 +3452,7 @@ mod tests {
         }
     }
 
-    /// 自分の id を知らないうちは、チャンネルのコマンドは1つも成立しない。
+    /// Until the bot knows its own id, no channel command can succeed.
     #[test]
     fn no_channel_command_is_recognised_before_the_bot_knows_its_own_id() {
         let c = CommandCtx {
@@ -3468,7 +3468,7 @@ mod tests {
         );
     }
 
-    // ── DM の名乗り ─────────────────────────────────────────────────────────
+    // ── DM name-claim ─────────────────────────────────────────────────────────
 
     fn conn_string() -> String {
         wire::encode_connection(&wire::Invite {
@@ -3554,7 +3554,7 @@ mod tests {
         ));
     }
 
-    /// **Owner が居るなら名乗り直させない。** しかも秘密を先へ渡さない。
+    /// **With an Owner already there, no re-claiming.** And the secret isn't passed on.
     #[test]
     fn an_existing_owner_is_not_reclaimed() {
         match DmOnboardingCtx::decide(&dm(&conn_string(), &here(), Some("U_SOMEONE"))) {
@@ -3575,7 +3575,7 @@ mod tests {
             DmOnboardingCtx::decide(&dm(&other, &here(), None)),
             DmOnboarding::BadToken(_)
         ));
-        // 千切れた貼り付けも同じ扱い
+        // A torn paste is treated the same
         let cut = &conn_string()[..conn_string().len() - 6];
         assert!(matches!(
             DmOnboardingCtx::decide(&dm(cut, &here(), None)),
@@ -3594,7 +3594,7 @@ mod tests {
         }
     }
 
-    /// 書き手の分からない DM(bot)は Owner になれない。
+    /// A DM with an unknown author (a bot) can't become the Owner.
     #[test]
     fn an_authorless_dm_cannot_claim() {
         let (text, connected) = (conn_string(), here());
@@ -3609,8 +3609,8 @@ mod tests {
 
     #[test]
     fn a_join_says_nothing() {
-        // **「繋がった」を言うのは子自身の `online`**(版・pid・warm pool 付き)。
-        // 2か所で同じことを言わない(2026-09-18、admin に3行並んだので直した)
+        // **Saying "connected" is the machine's own `online` notice** (with version, pid and warm pool).
+        // Don't say the same thing in two places (2026-09-18: fixed after three lines piled up in admin)
         let mut p = Presence::new();
         p.on_connect("desktop");
         assert!(p.due(0).is_empty());
@@ -3624,17 +3624,17 @@ mod tests {
         assert!(p.due(1_000).is_empty());
         assert!(p.due(5_999).is_empty());
         assert_eq!(p.due(6_000), ["🔴 Lost the connection to *desktop*"]);
-        assert!(p.due(9_999).is_empty()); // 2度は言わない
+        assert!(p.due(9_999).is_empty()); // not said twice
     }
 
-    /// **瞬き**: 猶予の内に戻ったら何も言わない — Owner から見れば居なくならなかった。
+    /// **A blink**: back within the grace period says nothing — from the Owner's view it never left.
     #[test]
     fn a_flap_says_nothing_at_all() {
         let mut p = Presence::new();
         p.on_connect("desktop");
         p.on_disconnect("desktop", 1_000);
-        p.on_connect("desktop"); // 戻ってきた
-        assert!(p.due(60_000).is_empty()); // 握っていた 🔴 は消えている
+        p.on_connect("desktop"); // it came back
+        assert!(p.due(60_000).is_empty()); // the held 🔴 is gone
     }
 
     #[test]
@@ -3644,7 +3644,7 @@ mod tests {
         assert!(p.due(60_000).is_empty());
     }
 
-    // ── status の表示 ───────────────────────────────────────────────────────
+    // ── status display ───────────────────────────────────────────────────────
 
     fn a_view() -> FleetView {
         FleetView {
@@ -3667,10 +3667,10 @@ mod tests {
         assert!(out.contains("(answering)"), "{out}");
         assert!(out.contains("● Machines connected — 1"), "{out}");
         assert!(out.contains("#dev (C1) → desktop  ● online"), "{out}");
-        assert!(out.contains("C2 → laptop  ○ offline"), "{out}"); // 名前が引けなければ生の id
+        assert!(out.contains("C2 → laptop  ○ offline"), "{out}"); // the raw id if the name can't be looked up
     }
 
-    /// **走っていない**と**設定が無い**を混ぜない — route 表はどちらでも出す。
+    /// Don't mix up **not running** with **not configured** — the route table is shown either way.
     #[test]
     fn an_offline_bridge_still_shows_what_is_configured() {
         let out = format_fleet(&a_view(), None, &Tunnels::new(), &HashMap::new());
@@ -3678,15 +3678,15 @@ mod tests {
         assert!(!out.contains("Machines connected"), "{out}");
         assert!(out.contains("● Channels assigned (route) — 2"), "{out}");
         assert!(out.contains("C1 → desktop"), "{out}");
-        // 生死不明のときに印は付けない
+        // No marks when alive/dead is unknown
         assert!(!out.contains("● online"), "{out}");
         assert!(!out.contains("○ offline"), "{out}");
     }
 
     #[test]
     fn each_child_says_how_it_reaches_the_parent() {
-        // 親は自分でトンネルを張っているので、どの子がトンネルかを知っている。
-        // 載っていない子は直結で来ている
+        // The gateway opens the tunnels itself, so it knows which machines use one.
+        // Machines not listed connect directly
         let mut tunnels = Tunnels::new();
         tunnels.insert(
             "desktop".to_string(),
@@ -3738,7 +3738,7 @@ mod tests {
 
     #[test]
     fn after_a_real_drop_the_next_drop_is_announced_again() {
-        // 🔴 は1回の切断につき1回。戻ってきたら、また言えるようになる
+        // 🔴 once per disconnect. After it comes back, it can be said again
         let mut p = Presence::with_grace(10);
         p.on_connect("desktop");
         p.on_disconnect("desktop", 0);
