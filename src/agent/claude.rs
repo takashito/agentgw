@@ -417,6 +417,8 @@ impl Claude {
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
         let mut answered = false;
         let mut trust_answered = false;
+        // 下キーで Yes に移した回数。画面の並びがまた変わっても選び続けないための上限
+        let mut trust_moves = 0;
         // **confirm にも掛け金が要る。** 現行は confirm に答えた時点で見張りを畳むので
         // 掛け金を持たない。こちらは畳まないので、掛け金が無いと
         // 画面が消えるまで毎秒 Enter を撃ち続ける
@@ -453,20 +455,39 @@ impl Claude {
                     );
                     return SpawnOutcome::UsageLimited;
                 }
-                // 同じ画面が続く間に何度も撃たない(現行)
-                SpawnScreen::Trust => {
-                    if !trust_answered {
-                        if let Err(e) = self.tmux.send_enter(w) {
-                            ctx.error("spawn", &format!("{w}: trust dialog Enter failed: {e}"));
+                // 同じ画面が続く間に何度も撃たない(現行)。
+                // **Enter の前に、選ばれているのが Yes か確かめる** — 2.1.276 は No を先頭で選んだ
+                // 状態で出すので、Enter だけでは終了を選ぶ(2026-09-18、あるマシンで毎回すぐ終了していた)
+                SpawnScreen::Trust if !trust_answered => {
+                    match Pane::new(&pane).trust_selected_is_yes() {
+                        Some(false) if trust_moves < TRUST_MOVES_MAX => {
+                            trust_moves += 1;
+                            if let Err(e) = self.tmux.send_key(w, "Down") {
+                                ctx.error("spawn", &format!("{w}: trust dialog Down failed: {e}"));
+                            }
+                            ctx.info("spawn", &format!("{w}: workspace-trust dialog has No selected — moving to Yes"));
                         }
-                        trust_answered = true;
-                        answered = true;
-                        ctx.info(
-                            "spawn",
-                            &format!("{w}: workspace-trust dialog seen — accepted"),
-                        );
+                        Some(false) => {
+                            ctx.error(
+                                "spawn",
+                                &format!("{w}: workspace-trust dialog: could not select Yes — not answering"),
+                            );
+                            trust_answered = true;
+                        }
+                        _ => {
+                            if let Err(e) = self.tmux.send_enter(w) {
+                                ctx.error("spawn", &format!("{w}: trust dialog Enter failed: {e}"));
+                            }
+                            trust_answered = true;
+                            answered = true;
+                            ctx.info(
+                                "spawn",
+                                &format!("{w}: workspace-trust dialog seen — accepted"),
+                            );
+                        }
                     }
                 }
+                SpawnScreen::Trust => {}
                 SpawnScreen::Confirm => {
                     if !confirm_answered {
                         if let Err(e) = self.tmux.send_enter(w) {
@@ -1131,6 +1152,8 @@ impl crate::agent::Agent for Claude {
 }
 
 /// headless probe を諦める時刻(`ms = 60_000`)。
+/// Down presses allowed on the trust dialog before giving up (No, then Yes, has needed one).
+const TRUST_MOVES_MAX: u32 = 3;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 /// `claude auth status` is a local check; it answers in well under a second.
 const AUTH_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -2146,6 +2169,20 @@ mod tests {
             Ok(String::new())
         });
         (keys, c)
+    }
+
+    /// Claude Code 2.1.276 selects "No, exit" first. Enter alone would quit; move to Yes first.
+    #[tokio::test]
+    async fn a_trust_dialog_with_no_selected_is_moved_to_yes_before_enter() {
+        use crate::agent::screen::tests::{TRUST_PANE_NO_FIRST, TRUST_PANE_YES_SECOND};
+        let (keys, c) = claude_showing(vec![TRUST_PANE_NO_FIRST, TRUST_PANE_YES_SECOND, ""]);
+        let out = c
+            .watch_spawn_screens(&Window::of("1-1"), 30, 1, &LogCtx::default())
+            .await;
+        assert_eq!(out, SpawnOutcome::Answered);
+        let keys = keys.lock().unwrap();
+        let sent: Vec<&str> = keys.iter().map(|k| k.rsplit(' ').next().unwrap_or("")).collect();
+        assert_eq!(sent, ["Down", "Enter"], "{keys:?}");
     }
 
     #[tokio::test]

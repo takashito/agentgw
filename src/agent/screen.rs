@@ -165,6 +165,20 @@ impl<'a> Pane<'a> {
         SpawnScreen::None_
     }
 
+    /// On the workspace-trust dialog: is the selected answer (the `❯` row) Yes? `None` if no
+    /// row is selected or it is neither. Claude Code 2.1.276 lists "No, exit" first and
+    /// selects it; older versions selected Yes.
+    pub fn trust_selected_is_yes(&self) -> Option<bool> {
+        let row = self.0.lines().find(|l| l.trim_start().starts_with('\u{276f}'))?.to_ascii_lowercase();
+        if row.contains("yes") {
+            Some(true)
+        } else if row.contains("no, exit") {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
     pub fn context_report(&self) -> Option<ContextReport> {
         let raw = self.0;
         let model = header_value(raw, "**Model:**")?;
@@ -1101,6 +1115,46 @@ the full history gets re-read on your next message.
    2. No, exit
 
  Enter to confirm \u{b7} Esc to cancel";
+
+    /// Claude Code 2.1.276 の実物(2026-09-18、pve)。**No が先頭で、既定で選ばれている** —
+    /// Enter だけ押すと終了を選ぶ
+    pub(crate) const TRUST_PANE_NO_FIRST: &str = "\
+ Accessing workspace:
+
+ /tmp
+
+ Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team). If not, take a moment to review what's in this
+ folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+ \u{276f} No, exit
+   Yes, I trust this folder
+
+ Enter to confirm \u{b7} Esc to cancel";
+
+    /// 上の画面で下キーを1回押した後。
+    pub(crate) const TRUST_PANE_YES_SECOND: &str = "\
+ Accessing workspace:
+
+ /tmp
+
+ Security guide
+
+   No, exit
+ \u{276f} Yes, I trust this folder
+
+ Enter to confirm \u{b7} Esc to cancel";
+
+    #[test]
+    fn the_trust_dialog_says_which_answer_is_selected() {
+        assert_eq!(Pane::new(TRUST_PANE).trust_selected_is_yes(), Some(true));
+        assert_eq!(Pane::new(TRUST_PANE_NO_FIRST).trust_selected_is_yes(), Some(false));
+        assert_eq!(Pane::new(TRUST_PANE_YES_SECOND).trust_selected_is_yes(), Some(true));
+        assert_eq!(Pane::new("no dialog here").trust_selected_is_yes(), None);
+    }
 
     /// 現行のLOGIN(Claude Code v2.1.207 の実物と注記されている)。
     pub(crate) const LOGIN_PANE: &str = " Claude Code can be used with your Claude subscription\u{2026}\n \
