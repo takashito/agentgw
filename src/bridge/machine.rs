@@ -18,7 +18,7 @@
 //! reconnecting at intervals, and recovers on its own the moment it is fixed.
 
 use crate::bridge::gateway::wire::{self, LinkFrame};
-use crate::bridge::state::LogCtx;
+use crate::log::LogCtx;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;

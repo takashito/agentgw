@@ -6,7 +6,7 @@ pub mod add_machine;
 pub mod ssh;
 
 use crate::bridge::gateway::wire;
-use crate::bridge::state::StateDir;
+use crate::state_dir::{StateDir, set_env_keys};
 use crate::service::{Action, JobSpec, Service};
 use std::io::Write;
 use std::path::Path;
@@ -202,7 +202,7 @@ fn ask_child(state_dir: &StateDir) -> Result<(), String> {
     let after = apply_connection(&before, &conn, &name);
     std::fs::create_dir_all(state_dir.path())
         .map_err(|e| format!("{}: {e}", state_dir.path().display()))?;
-    crate::bridge::state::write_atomic_mode(&env_file, &after, Some(0o600))
+    crate::state_dir::write_atomic_mode(&env_file, &after, Some(0o600))
         .map_err(|e| format!("{}: {e}", env_file.display()))?;
     println!(
         "{}",
@@ -341,7 +341,7 @@ pub fn install(mac: bool, job: &Path, rest: &[String]) -> i32 {
     } else {
         spec.systemd_unit()
     };
-    if let Err(e) = crate::bridge::state::write_atomic_at(job, &text) {
+    if let Err(e) = crate::state_dir::write_atomic_at(job, &text) {
         eprintln!("install: {}", crate::t!("couldn't write {}: {e}", "{} が書けません: {e}", job.display()));
         return 1;
     }
@@ -408,34 +408,6 @@ pub fn apply_connection(env_text: &str, conn: &wire::Invite, bridge_id: &str) ->
             ("AGENTGW_BRIDGE_ID", bridge_id.to_string()),
         ],
     )
-}
-
-/// Writes a `.env` key **by replacing** (appends it if missing). No other line is touched.
-///
-/// If appended instead, `load_env` reads last-wins, so a value you thought you removed keeps living.
-pub fn set_env_keys(env_text: &str, pairs: &[(&str, String)]) -> String {
-    let mut out: Vec<String> = Vec::new();
-    let mut seen = vec![false; pairs.len()];
-    for line in env_text.lines() {
-        let key = line.split_once('=').map(|(k, _)| k.trim());
-        match pairs.iter().position(|(k, _)| Some(*k) == key) {
-            Some(i) => {
-                seen[i] = true;
-                out.push(format!("{}={}", pairs[i].0, pairs[i].1));
-            }
-            None => out.push(line.to_string()),
-        }
-    }
-    for (i, (k, v)) in pairs.iter().enumerate() {
-        if !seen[i] {
-            out.push(format!("{k}={v}"));
-        }
-    }
-    let mut text = out.join("\n");
-    if !text.ends_with('\n') {
-        text.push('\n');
-    }
-    text
 }
 
 /// `agentgw link [--name <name>] [<connection-string>|-]` — puts one connection string into `.env`.
@@ -515,7 +487,7 @@ pub fn cli(args: &[String], dir: &StateDir) -> i32 {
     let env_path = dir.path().join(".env");
     let before = std::fs::read_to_string(&env_path).unwrap_or_default();
     let after = apply_connection(&before, &conn, &bridge_id);
-    if let Err(e) = crate::bridge::state::write_atomic_mode(&env_path, &after, Some(0o600)) {
+    if let Err(e) = crate::state_dir::write_atomic_mode(&env_path, &after, Some(0o600)) {
         eprintln!("link: {}", crate::t!("couldn't write {}: {e}", "{} に書けません: {e}", env_path.display()));
         return 1;
     }
@@ -683,7 +655,7 @@ mod tests {
         }
         .apply_to_env("");
         // If writer and reader disagree on the format it breaks silently. Check with the reader itself
-        let dir = crate::bridge::state::StateDir::at(
+        let dir = crate::state_dir::StateDir::at(
             std::env::temp_dir().join(format!("sc-env-{}", std::process::id())),
         );
         dir.write_atomic(".env", &after).unwrap();

@@ -1,5 +1,5 @@
 use agentgw::bridge::Bridge;
-use agentgw::bridge::state::LogCtx;
+use agentgw::log::LogCtx;
 use agentgw::service::Service;
 
 /// **If we got hold of another implementation's bot state directory, stop without doing anything.**
@@ -10,7 +10,7 @@ use agentgw::service::Service;
 /// implementation never creates a UDS, so a `bridge.sock` means the other side is the Bun
 /// version. **Bail out before reading or writing anything.**
 fn refuse_other_bots_state_dir() {
-    let dir = agentgw::bridge::state::StateDir::resolve();
+    let dir = agentgw::state_dir::StateDir::resolve();
     if !dir.path().join("bridge.sock").exists() {
         return;
     }
@@ -50,7 +50,7 @@ async fn main() {
         // Write one connection string into .env (on the machine that connects to the gateway)
         "link" => {
             let rest: Vec<String> = std::env::args().skip(2).collect();
-            let dir = agentgw::bridge::state::StateDir::resolve();
+            let dir = agentgw::state_dir::StateDir::resolve();
             std::process::exit(agentgw::setup::cli(&rest, &dir));
         }
         // Add one machine (deliver -> connect -> install and start)
@@ -63,7 +63,7 @@ async fn main() {
             let rc = Service::run(c, &rest);
             // Only when this host is set up to accept machines, follow with the fleet status
             if c == "status" {
-                let dir = agentgw::bridge::state::StateDir::resolve();
+                let dir = agentgw::state_dir::StateDir::resolve();
                 agentgw::bridge::gateway::Cli::print_fleet(&dir).await;
             }
             std::process::exit(rc);

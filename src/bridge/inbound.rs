@@ -10,7 +10,9 @@ use crate::bridge::turn::Stall;
 use crate::agent::tmux::Window;
 use crate::agent::{Envelope, SessionId, SpawnReq, WorkerState};
 use crate::bridge::state as bridge;
-use crate::bridge::state::{Access, LogCtx, ThreadEntry, ThreadKey};
+use crate::bridge::state::{Access, ThreadEntry};
+use crate::log::LogCtx;
+use crate::chat::ThreadKey;
 use crate::bridge::{inbound, worker};
 use crate::chat::{ChannelKind, InboundMsg, Reaction, slack};
 
@@ -43,7 +45,7 @@ pub fn envelope_guarded(
         channel_id: msg.channel.clone(),
         message_id: msg.ts.clone(),
         user: msg.user.clone().unwrap_or_else(|| "unknown".to_string()),
-        ts: crate::bridge::state::iso8601(now_ms),
+        ts: crate::clock::iso8601(now_ms),
         thread_ts: Some(root_ts.to_string()),
         text: msg.text.clone(),
         // The message carries the result of the eager download (it survives the queue too)

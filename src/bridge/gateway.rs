@@ -439,7 +439,7 @@ pub mod wire {
     }
 }
 
-use crate::bridge::state::LogCtx;
+use crate::log::LogCtx;
 use wire::LINK_SUBPROTOCOL;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -1466,7 +1466,9 @@ pub fn format_fleet(
 
 use crate::bridge::machine as link_watch;
 use crate::chat::InboundMsg;
-use crate::bridge::state::{Access, StateDir, now_ms};
+use crate::bridge::state::Access;
+use crate::state_dir::StateDir;
+use crate::clock::now_ms;
 use crate::chat::slack::{FleetEvent, PermClick};
 use axum::Router;
 use axum::extract::State;
@@ -2303,7 +2305,7 @@ pub async fn keep_tunnel(
     target: String,
     parent_addr: String,
 ) {
-    use crate::bridge::state::LogCtx;
+    use crate::log::LogCtx;
     let args = tunnel_ssh_args(&target, TUNNEL_PORT, &parent_addr);
     // Log only on state changes (so the once-a-minute re-request doesn't flood plugin-debug.log)
     let mut was_ok: Option<bool> = None;
@@ -2368,8 +2370,8 @@ impl Cli {
     pub(crate) fn write_env(dir: &StateDir, pairs: &[(&str, String)]) -> std::io::Result<()> {
         let path = dir.path().join(".env");
         let before = std::fs::read_to_string(&path).unwrap_or_default();
-        let after = crate::setup::set_env_keys(&before, pairs);
-        crate::bridge::state::write_atomic_mode(&path, &after, Some(0o600))
+        let after = crate::state_dir::set_env_keys(&before, pairs);
+        crate::state_dir::write_atomic_mode(&path, &after, Some(0o600))
     }
 
     /// Mint one secret. `/dev/urandom` as hex.

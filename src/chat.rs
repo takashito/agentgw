@@ -303,6 +303,51 @@ pub trait Chat: Send + Sync + 'static {
 
 pub type ChatRef = Arc<dyn Chat>;
 
+/// `{channel}:{thread_ts}`.
+///
+/// **Not used as a log directory name as-is** — dropping `:` and `.` is
+/// [`LogCtx::sanitized_key`](crate::log::LogCtx::sanitized_key)'s job.
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub struct ThreadKey(String);
+
+impl ThreadKey {
+    pub fn new(channel: &str, thread_ts: &str) -> Self {
+        ThreadKey(format!("{channel}:{thread_ts}"))
+    }
+
+    /// From an existing string (from threads.json / logs / hook payloads).
+    pub fn parse(raw: &str) -> Self {
+        ThreadKey(raw.to_string())
+    }
+
+    /// Splits at the first `:`. With no `:`, it is a channel-only key.
+    pub fn split(&self) -> (String, Option<String>) {
+        match self.0.split_once(':') {
+            Some((ch, ts)) => (ch.to_string(), Some(ts.to_string())),
+            None => (self.0.clone(), None),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ThreadKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Compare against a literal (reads better in log lines and tests).
+impl PartialEq<&str> for ThreadKey {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
 #[cfg(test)]
 pub mod fake {
     use super::*;
@@ -525,5 +570,19 @@ mod tests {
         assert!(edit_notice("1.2", "", true, true).contains("a file/attachment only"));
         assert!(edit_notice("1.2", "", false, true).contains("Its new text is unavailable."));
         assert!(edit_notice("1.2", &"あ".repeat(1500), false, true).contains("… (truncated)"));
+    }
+
+    #[test]
+    fn thread_key_roundtrip() {
+        assert_eq!(ThreadKey::new("C0AAA", "123.456").as_str(), "C0AAA:123.456");
+        assert_eq!(
+            ThreadKey::parse("C0AAA:123.456").split(),
+            ("C0AAA".into(), Some("123.456".into()))
+        );
+        assert_eq!(ThreadKey::parse("C0AAA").split(), ("C0AAA".into(), None));
+        assert_eq!(
+            ThreadKey::parse("C0AAA:1:2").split(),
+            ("C0AAA".into(), Some("1:2".into()))
+        ); // split at the first ':'
     }
 }

@@ -1,7 +1,7 @@
 //! The progress message: one Slack message per turn that lists the tools the agent runs,
 //! updated in place and folded away when the turn ends. Includes the Edit diff rendering.
 
-use crate::bridge::state::ThreadKey;
+use crate::chat::ThreadKey;
 
 // ─── Progress message (progress sticky) ────────────────────────────────────
 //

@@ -139,7 +139,7 @@ use crate::bridge::gateway::TUNNEL_PORT;
 
 use crate::bridge::gateway::Cli as RelayCli;
 use crate::bridge::gateway::wire;
-use crate::bridge::state::StateDir;
+use crate::state_dir::StateDir;
 
 /// The bootstrap sent to the machine. **Baked into the binary** — a gateway installed from a release
 /// has no repo, so looking for it as a file would fail.

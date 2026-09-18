@@ -14,7 +14,9 @@ use crate::agent::{
     SessionId, UsageRow,
 };
 use crate::chat::InboundMsg;
-use crate::bridge::state::{LogCtx, ThreadKey, WallClock};
+use crate::log::LogCtx;
+use crate::chat::ThreadKey;
+use crate::clock::WallClock;
 use crate::bridge::turn::UsageProjection;
 use crate::bridge::{Bridge, Host};
 use crate::chat::slack;
@@ -312,7 +314,7 @@ impl Bridge {
                         // is swapped in inside format_usage_report_with_projection
                         Some(rows) => UsageReport {
                             rows: &rows,
-                            projection: Some((crate::bridge::state::WallClock::now(), 300)),
+                            projection: Some((crate::clock::WallClock::now(), 300)),
                         }
                         .render(),
                         None => {

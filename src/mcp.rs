@@ -9,7 +9,8 @@
 //! The anti-narration wording is a behavior contract: don't shorten or paraphrase it.
 
 use crate::agent::HookEvent;
-use crate::bridge::state::{LogCtx, StateDir};
+use crate::log::LogCtx;
+use crate::state_dir::StateDir;
 use axum::{Router, http::StatusCode};
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,

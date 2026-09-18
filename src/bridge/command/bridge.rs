@@ -4,7 +4,9 @@
 use super::PwdMode;
 use crate::agent::SessionId;
 use crate::chat::InboundMsg;
-use crate::bridge::state::{self as bridge, LogCtx, ThreadKey};
+use crate::bridge::state::{self as bridge};
+use crate::log::LogCtx;
+use crate::chat::ThreadKey;
 use crate::bridge::{Bridge, Host};
 use crate::chat::slack;
 use std::collections::HashMap;

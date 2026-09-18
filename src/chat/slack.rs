@@ -6,7 +6,9 @@ pub use sticky::{StickyAction, StickyBoard, ToolStatus};
 use crate::chat::{
     ChannelKind, Edited, FetchedMsg, InboundFile, InboundMsg, MessageAt, Reaction, deletion_notice,
 };
-use crate::bridge::state::{self as bridge_state, LogCtx, ThreadKey};
+use crate::bridge::state as bridge_state;
+use crate::log::LogCtx;
+use crate::chat::ThreadKey;
 use crate::chat::Chat;
 use slack_morphism::prelude::*;
 use std::sync::Arc;
@@ -1711,7 +1713,7 @@ pub async fn post_chunked(
     thread_ts: Option<&str>,
     markdown: bool,
 ) -> Result<String, String> {
-    let a = bridge_state::Access::load(&bridge_state::StateDir::at(state_dir));
+    let a = bridge_state::Access::load(&crate::state_dir::StateDir::at(state_dir));
     let limit = a
         .text_chunk_limit
         .unwrap_or(MAX_CHUNK_LIMIT)
@@ -1755,7 +1757,7 @@ pub async fn download_attachment(
     // The sweep piggybacks **after the write succeeds**. So there is no dedicated timer,
     // and so a sweep failure never affects this download (the file just written has mtime = now,
     // so it is not a target)
-    Api::sweep_inbox(&state_dir.join("inbox"), bridge_state::now_ms());
+    Api::sweep_inbox(&state_dir.join("inbox"), crate::clock::now_ms());
     Ok(dest.to_string_lossy().to_string())
 }
 
@@ -2076,7 +2078,7 @@ mod tests {
         };
         let (fresh, old, edge) = (write("fresh"), write("old"), write("edge"));
         // mtime is "now", so advance the sweep's now to create age
-        let now = bridge_state::now_ms();
+        let now = crate::clock::now_ms();
         Api::sweep_inbox(&dir, now); // nothing deleted yet
         assert!(fresh.exists() && old.exists());
 

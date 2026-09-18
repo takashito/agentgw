@@ -11,7 +11,10 @@ use super::screen::{Pane, SpawnOutcome, SpawnScreen, strip_modal_decoration};
 use super::tmux::{Pid, Tmux, Window, WindowRow};
 use super::{CompactOutcome, CompactProgress, LimitHit, LoginOutcome, ProbeErr, SpawnReq};
 use crate::agent::WorkerState;
-use crate::bridge::state::{LogCtx, StateDir, ThreadKey, WallClock};
+use crate::log::LogCtx;
+use crate::state_dir::StateDir;
+use crate::chat::ThreadKey;
+use crate::clock::WallClock;
 use std::time::Duration;
 
 /// A fresh ID per spawn. claude refuses to start with an ID that was already used (measured in the spike).
@@ -2204,7 +2207,7 @@ mod tests {
     #[test]
     fn config_writers_land_on_disk() {
         let dir = hook_tmp("write");
-        let dir = crate::bridge::state::StateDir::at(dir);
+        let dir = crate::state_dir::StateDir::at(dir);
         let hooks = HookIntake::write_settings(&dir, 8791, "tok").unwrap();
         let mcp = crate::mcp::Mcp::write_config(&dir, 8790, "sid-1", "secret").unwrap();
         assert!(hooks.exists() && mcp.exists());

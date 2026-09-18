@@ -6,7 +6,10 @@ use super::{Bridge, Host};
 use crate::agent::tmux::Window;
 use crate::agent::{HookEvent, ProbeErr, SessionId};
 use crate::bridge::state as bridge;
-use crate::bridge::state::{Disposition, LogCtx, ThreadKey, WallClock};
+use crate::bridge::state::Disposition;
+use crate::log::LogCtx;
+use crate::chat::ThreadKey;
+use crate::clock::WallClock;
 use crate::chat::slack;
 
 const NARRATION_CAP: usize = 600;
@@ -463,8 +466,8 @@ impl Bridge {
             self.usage_warned_pct = 0;
         }
         // Projection (how soon the limit will be hit). It also sets the interval
-        let w = crate::bridge::state::WallClock::now();
-        let projection = crate::bridge::state::WallClock::parse_reset(&reset_text, &w)
+        let w = crate::clock::WallClock::now();
+        let projection = crate::clock::WallClock::parse_reset(&reset_text, &w)
             .map(|reset| UsageProjection::of(pct, &reset, &w, 300));
         self.usage_at_risk = projection
             .as_ref()

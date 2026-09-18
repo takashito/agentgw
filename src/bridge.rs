@@ -1,5 +1,5 @@
 //! Bridge — the core that sits between Slack and the agent. This file holds only **the starting point of the assembly**:
-//! the `Bridge` struct, [`Deps`] for receiving the outside world (Slack, the agent, the clock — [`crate::chat::Chat`], [`crate::agent::Agent`], [`state::Clock`]),
+//! the `Bridge` struct, [`Deps`] for receiving the outside world (Slack, the agent, the clock — [`crate::chat::Chat`], [`crate::agent::Agent`], [`crate::clock::Clock`]),
 //! `run()` (wiring and the select loop), and start-up, shutdown and restart.
 //!
 //! Each feature's `impl Bridge` lives in its own child module:
@@ -21,7 +21,8 @@ use crate::agent::claude::Claude;
 use crate::bridge::command::CmdFx;
 use crate::bridge::state as bridge;
 use crate::chat::InboundMsg;
-use crate::bridge::state::{LogCtx, ThreadKey};
+use crate::log::LogCtx;
+use crate::chat::ThreadKey;
 use crate::bridge::turn::{PermPending, Stall};
 use crate::chat::slack;
 use crate::mcp;
@@ -108,8 +109,8 @@ pub struct Bridge {
 pub struct Deps {
     pub slack: crate::chat::ChatRef,
     pub agent: crate::agent::AgentRef,
-    pub clock: crate::bridge::state::ClockRef,
-    pub dir: bridge::StateDir,
+    pub clock: crate::clock::ClockRef,
+    pub dir: crate::state_dir::StateDir,
 }
 
 /// Values fixed at start-up (the result of the wiring).
@@ -417,7 +418,7 @@ impl Bridge {
     /// Wires things up and runs the select loop. The signal contract is
     /// SIGTERM/SIGINT=graceful shutdown / SIGUSR1=maintenance restart / SIGHUP=reload.
     pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let dir = bridge::StateDir::resolve();
+        let dir = crate::state_dir::StateDir::resolve();
         for (k, v) in dir.load_env()? {
             // Safe: single-threaded section at start-up, before any spawn
             unsafe { std::env::set_var(k, v) };
@@ -668,7 +669,7 @@ impl Bridge {
             Deps {
                 slack: api.clone(),
                 agent: Arc::new(Claude::real()),
-                clock: Arc::new(crate::bridge::state::SystemClock),
+                clock: Arc::new(crate::clock::SystemClock),
                 dir,
             },
             Config {
@@ -755,7 +756,7 @@ impl Bridge {
 /// **Consumes** the marker the previous process left when going down with `restart` (read, then delete).
 /// Left in place, the next start would post an unexplained "✅ restart complete".
 /// This implementation has no auto-resume of interrupted threads, so the resume line closes with 0 entries.
-async fn consume_restart_marker(dir: &bridge::StateDir, api: &dyn crate::chat::Chat) {
+async fn consume_restart_marker(dir: &crate::state_dir::StateDir, api: &dyn crate::chat::Chat) {
     let ctx = LogCtx::default();
     let path = dir.restart_marker();
     let Ok(raw) = std::fs::read_to_string(&path) else {
@@ -829,7 +830,7 @@ impl Host {
 
     /// Wall-clock epoch ms for the wiring in `run()`. Bridge methods read `deps.clock` instead.
     pub fn now_ms() -> u64 {
-        bridge::now_ms()
+        crate::clock::now_ms()
     }
 }
 
@@ -852,7 +853,7 @@ impl Host {
 /// dropped home, so the home the gateway sends once in `attach()` was read by nobody, and a
 /// freshly started machine posted its notices to its own old home (or, unset → the Owner's DM)
 /// (2026-08-02 on a real machine: a machine's online notice went to a different channel than the gateway's home).
-fn adopt_home(dir: &bridge::StateDir, home: Option<String>) -> bool {
+fn adopt_home(dir: &crate::state_dir::StateDir, home: Option<String>) -> bool {
     let Some(home) = home else { return false };
     let mut access = bridge::Access::load(dir);
     if access.home_channel.as_deref() == Some(home.as_str()) {
@@ -874,7 +875,7 @@ async fn pump_relay(
     item: machine::FromRelay,
     msg_tx: &mpsc::Sender<InboundMsg>,
     click_tx: &mpsc::Sender<slack::PermClick>,
-    dir: &bridge::StateDir,
+    dir: &crate::state_dir::StateDir,
     reload: &mpsc::Sender<()>,
     relink: &mpsc::Sender<()>,
 ) {
@@ -1180,7 +1181,7 @@ mod tests {
     /// (2026-08-02 on a real machine. Dropped at the door, so even the fixing command couldn't get in; only a restart got out).
     #[tokio::test]
     async fn being_put_in_charge_asks_the_running_bridge_to_reread_access() {
-        let dir = bridge::StateDir::at(
+        let dir = crate::state_dir::StateDir::at(
             std::env::temp_dir().join(format!("sc-linked-{}", std::process::id())),
         );
         let _ = std::fs::remove_dir_all(dir.path());
@@ -1216,7 +1217,7 @@ mod tests {
     /// signal when nothing changed would make the gate reread access.json on every reconnect.
     #[test]
     fn a_home_from_the_handshake_is_kept_on_disk() {
-        let dir = bridge::StateDir::at(
+        let dir = crate::state_dir::StateDir::at(
             std::env::temp_dir().join(format!("sc-adopt-home-{}", std::process::id())),
         );
         let _ = std::fs::remove_dir_all(dir.path());
@@ -1267,7 +1268,7 @@ mod tests {
     // ── flows through Bridge, with fakes for Slack, the agent and the clock ──
 
     use crate::agent::fake::FakeAgent;
-    use crate::bridge::state::fake::FakeClock;
+    use crate::clock::fake::FakeClock;
     use crate::chat::fake::FakeChat;
 
     /// A fresh state dir with only the owner in access.json.
@@ -1283,7 +1284,7 @@ mod tests {
             slack: slack.clone(),
             agent: agent.clone(),
             clock: clock.clone(),
-            dir: bridge::StateDir::at(path),
+            dir: crate::state_dir::StateDir::at(path),
         };
         (deps, slack, agent, clock)
     }
@@ -1480,7 +1481,7 @@ mod tests {
         // Limited notice in its thread — no ack reaction, no agent.
         let (d, slack, agent, clock) = flow_deps("limit");
         let (mut b, _fx) = Bridge::for_test(d);
-        let until_ms = crate::bridge::state::Clock::now_ms(clock.as_ref()) + 3_600_000;
+        let until_ms = crate::clock::Clock::now_ms(clock.as_ref()) + 3_600_000;
         b.limited_until_ms = until_ms;
         b.on_inbound(&channel_msg(ROOT, "U_OWNER", "<@U_BOT> fix the tests"))
             .await;

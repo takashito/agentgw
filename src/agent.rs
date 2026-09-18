@@ -11,7 +11,8 @@ pub mod tmux;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-use crate::bridge::state::{LogCtx, ThreadKey};
+use crate::log::LogCtx;
+use crate::chat::ThreadKey;
 use screen::SpawnOutcome;
 use tmux::{Pid, Window, WindowRow};
 

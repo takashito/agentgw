@@ -24,7 +24,7 @@
 mod agent;
 mod bridge;
 
-use crate::bridge::state::WallClock;
+use crate::clock::WallClock;
 
 use crate::agent::UsageRow;
 use crate::agent::Agent;
@@ -32,7 +32,8 @@ use std::path::Path;
 
 use super::Bridge;
 use crate::chat::InboundMsg;
-use super::state::{LogCtx, ThreadKey};
+use crate::log::LogCtx;
+use crate::chat::ThreadKey;
 use crate::agent::screen::SpawnOutcome;
 use std::collections::HashMap;
 

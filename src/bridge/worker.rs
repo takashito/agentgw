@@ -11,13 +11,14 @@ use crate::agent::tmux::{self as tmux_mod, Pid, Window};
 use crate::agent::{SessionId, SpawnReq};
 use crate::bridge::worker;
 use crate::bridge::state as bridge;
-use crate::bridge::state::LogCtx;
+use crate::log::LogCtx;
 use crate::bridge::{Bridge, CmdFx, Host};
 use crate::chat::slack;
 use crate::mcp;
 use crate::agent::Agent;
 use crate::agent::WorkerState;
-use crate::bridge::state::{PoolKey, ThreadEntry, ThreadKey};
+use crate::bridge::state::{PoolKey, ThreadEntry};
+use crate::chat::ThreadKey;
 use std::collections::{HashMap, HashSet};
 
 /// Rules for tearing down cold agents (four numbers the user decided on 2026-08-02).

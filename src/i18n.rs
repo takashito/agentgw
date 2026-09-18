@@ -52,7 +52,7 @@ pub fn lang() -> Lang {
     *LANG.get_or_init(|| {
         let from_env = std::env::var("AGENTGW_LANG").ok();
         let value = from_env.or_else(|| {
-            crate::bridge::state::StateDir::resolve()
+            crate::state_dir::StateDir::resolve()
                 .load_env()
                 .ok()?
                 .into_iter()

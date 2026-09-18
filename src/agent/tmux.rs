@@ -89,14 +89,14 @@ impl Pid {
         if self.wait_until_gone(grace_ms).await {
             return true;
         }
-        crate::bridge::state::LogCtx::default().info(
+        crate::log::LogCtx::default().info(
             "worker",
             &format!("SIGKILL pid {pid} — survived SIGTERM within {grace_ms}ms"),
         );
         self.signal("-9");
         let gone = self.wait_until_gone(KILL_HARD_MS).await;
         if !gone {
-            crate::bridge::state::LogCtx::default()
+            crate::log::LogCtx::default()
                 .error("worker", &format!("pid {pid} still alive after SIGKILL"));
         }
         gone
@@ -253,7 +253,7 @@ impl Tmux {
         // Lock out renaming so the name fallback keeps working (spawn succeeds even if this fails)
         for opt in ["automatic-rename", "allow-rename"] {
             if let Err(e) = (self.run)(&["set-option", "-w", "-t", &id, opt, "off"]) {
-                crate::bridge::state::LogCtx::default()
+                crate::log::LogCtx::default()
                     .error("worker", &format!("could not turn off {opt} on {id}: {e}"));
             }
         }
