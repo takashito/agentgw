@@ -3,25 +3,25 @@
 
 use super::{CompactProgress, ContextReport, LoginOutcome, UsageRow};
 
-/// `/model` にそのまま渡す形のモデル名。**claude の語彙**なので
-/// ここが正 — `Claude::models` もこの表を返す。
+/// Model names in the form `/model` takes as is. This is **claude's vocabulary**, so this table
+/// is the source of truth; `Claude::models` returns it too.
 pub const MODEL_NAMES: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
 
-/// スライダの状態行に出る表示レベル。`auto` は**入らない** — auto の時は解決先の
-/// レベルが名乗られる。 の選択肢そのまま。
+/// Levels shown on the slider's status line. `auto` is **not** among them: under auto the line
+/// names the level it resolved to.
 const STATUS_LEVELS: [&str; 6] = ["low", "medium", "high", "xhigh", "max", "ultracode"];
 
-/// 権限モードのフッタ行 → こちらの呼び名。TUI は入力欄の下に
-/// `⏵⏵ auto mode on (shift+tab to cycle)` の形で今のモードを名乗る
-/// (cli 2.1.220 の表: default→`manual mode` / plan→`plan mode` / acceptEdits→`accept edits` /
-/// auto→`auto mode` / bypassPermissions→`bypass permissions` / dontAsk→`don't ask`)。
+/// Permission-mode footer line → our name for it. Below the input box the TUI states the
+/// current mode as `⏵⏵ auto mode on (shift+tab to cycle)`
+/// (table in cli 2.1.220: default→`manual mode` / plan→`plan mode` / acceptEdits→`accept edits` /
+/// auto→`auto mode` / bypassPermissions→`bypass permissions` / dontAsk→`don't ask`).
 ///
-/// **2026-07-31 実機**(dev ワーカーに `send-keys BTab` を4回)で巡回が
-/// `auto → manual → accept edits → plan → auto` と1周することと、
-/// manual でも `⏸ manual mode on` の行が出ることを確認。`(shift+tab to cycle)` の但し書きは
-/// 出たり出なかったりするので目印にしない。
-/// bypass / dontask は `mode` コマンドの引数には無いが、行が読めれば manual と
-/// 取り違えずに済むので表に入れておく。
+/// **Checked on a real agent 2026-07-31** (`send-keys BTab` four times on a dev agent): the cycle
+/// goes `auto → manual → accept edits → plan → auto`, and manual also shows a
+/// `⏸ manual mode on` line. The `(shift+tab to cycle)` note comes and goes, so it is not used
+/// as a marker.
+/// bypass / dontask are not arguments of the `mode` command, but reading their lines keeps
+/// them from being mistaken for manual, so they are in the table.
 const MODE_LABELS: [(&str, &str); 6] = [
     ("plan mode on", "plan"),
     ("accept edits on", "edit"),
@@ -31,7 +31,7 @@ const MODE_LABELS: [(&str, &str); 6] = [
     ("manual mode on", "manual"),
 ];
 
-/// エラー側の目印(alternation 原文どおり)。
+/// Markers of a failed sign-in.
 const LOGIN_ERROR_MARKERS: [&str; 9] = [
     "invalid code",
     "please make sure the full code",
@@ -44,13 +44,12 @@ const LOGIN_ERROR_MARKERS: [&str; 9] = [
     "try again",
 ];
 
-/// 画面が**自分で印字した行**の頭に出うる飾り(枠線・選択子・選択肢の番号)。
-/// 現行 `MODAL_LINE_DECORATION` と同じ集合。
+/// Decoration that can lead a line **the screen printed itself** (frame, selector, option number).
 const MODAL_DECORATION: &[char] = &[
     ' ', '\t', '│', '┃', '|', '┆', '╎', '▏', '▕', '>', '❯', '➤', '·', '•', '-', '–', '—',
 ];
 
-/// 現行 `LIMIT_MODAL_PROMPTS`。
+/// Usage-limit modal prompts.
 const LIMIT_PROMPTS: Prompts = &[
     (
         &["", "you've ", "you have "],
@@ -82,54 +81,56 @@ const LIMIT_PROMPTS: Prompts = &[
     ),
 ];
 
-/// 現行 `LOGIN_SCREEN_PROMPTS`。
+/// Sign-in screen prompts.
 const LOGIN_PROMPTS: Prompts = &[(&[""], &["select login method:"])];
 
-/// workspace-trust。**行頭アンカー付き**(現行は素の部分一致)。文面は 2026-08-02 に
-/// 実機で撮った実物: ` ❯ 1. Yes, I trust this folder` → 飾りを落として `yes, i trust…`。
+/// workspace-trust. **Anchored at line start** (not a plain substring match). The wording was
+/// captured from a real screen on 2026-08-02: ` ❯ 1. Yes, I trust this folder` → decoration
+/// stripped to `yes, i trust…`.
 const TRUST_PROMPTS: Prompts = &[(&[""], &["yes, i trust this folder"])];
 
-/// 起動直後の窓に出うる画面。**誰かが答えるまで claude はプロンプトを1文字も読まない。**
+/// Screens that can appear in a freshly started window. **Until someone answers, claude reads
+/// not a single character of the prompt.**
 ///
-/// 現行 `classifySpawnPane` の移植。4種のうち上2つは Enter で答えられ、
-/// 下2つは**答えられない**(アカウントの事情なので、何度起こし直しても同じ壁に当たる)。
+/// Of the four, the first two can be answered with Enter and the last two **cannot** (they are
+/// about the account, so restarting hits the same wall every time).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpawnScreen {
-    /// claude 自身の workspace-trust。cwd が `~/.claude.json` の
-    /// `projects[cwd].hasTrustDialogAccepted` に無いと出る(2026-08-02、実機)
+    /// claude's own workspace-trust. Shown when the cwd is not in `~/.claude.json`'s
+    /// `projects[cwd].hasTrustDialogAccepted` (2026-08-02, real machine)
     Trust,
-    /// dev channels の確認。既定の選択肢が Yes なので Enter で通る
+    /// dev channels confirmation. The default option is Yes, so Enter gets through
     Confirm,
-    /// サインイン画面。Enter では消えない
+    /// Sign-in screen. Enter does not dismiss it
     LoginRequired,
-    /// 上限モーダル。Enter では消えない
+    /// Usage-limit modal. Enter does not dismiss it
     UsageLimited,
     None_,
 }
 
-/// 見張りの結末。現行 `SpawnOutcome` の移植だが、**成功の意味が違う**:
-/// Rust の「起動できた」は `starting` の掛け金を最初の user_prompt が外すことで表しているので、
-/// ここは「答えるべき画面に答えたか」しか言わない。
+/// How the watch ended. **This is not "started successfully"**: that is expressed by the first
+/// user_prompt releasing the `starting` latch, so this only says whether the screens that
+/// needed an answer got one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpawnOutcome {
-    /// 答えられる画面に答えた(あるいは答えた上で期限まで見ていた)
+    /// Answered a screen that could be answered (or answered and kept watching until the deadline)
     Answered,
-    /// サインイン画面。**誰も答えられない** — Owner に言うしかない
+    /// Sign-in screen. **Nobody here can answer it**; the only option is to tell the Owner
     LoginRequired,
-    /// 上限モーダル。同上(裏取りは呼び手の仕事)
+    /// Usage-limit modal. Same as above (confirming it is the caller's job)
     UsageLimited,
-    /// 期限まで何も出なかった。**失敗ではない** — 普通に立ち上がった窓がこれ
+    /// Nothing showed up before the deadline. **Not a failure**: a window that started normally looks like this
     NoScreen,
 }
 
-/// 「省略可の前置き」×「語幹」。現行の正規表現を `regex` 無しで言うための形
-/// (`(?:…)?` は空も許すので前置きに `""` が入っている)。
+/// "Optional prefix" × "stem": a way to express the patterns without `regex`
+/// (`(?:…)?` also allows empty, hence the `""` prefix).
 type Prompts = &'static [(&'static [&'static str], &'static [&'static str])];
 
-/// claude の画面(`capture-pane` の出力)と、headless 実行の出力。読むだけ。
+/// claude's screen (`capture-pane` output) and headless run output. Read only.
 ///
-/// TUI は日付が変わるとドリフトすることがある(実機で確定した2件)。
-/// **ここのメソッドがそのドリフトを吸収する唯一の場所** — 見張っているのは下の `mod tests`。
+/// The TUI can drift from one day to the next (two cases confirmed on real machines).
+/// **These methods are the only place that absorbs that drift**; the `mod tests` below guards it.
 pub struct Pane<'a>(&'a str);
 
 impl<'a> Pane<'a> {
@@ -137,13 +138,11 @@ impl<'a> Pane<'a> {
         Pane(text)
     }
 
-    /// `claude -p "/context"` の Markdown をパース。前置きの警告文(「workspace not trusted」など)は
-    /// 素通しし、Model/Tokens ヘッダが無ければ None — 呼び手は文字化けを投稿する代わりに
-    /// 「読めなかった」と言える。
-    /// 起動直後の窓に何が出ているか。現行 `classifySpawnPane`。
+    /// What a freshly started window is showing.
     ///
-    /// **アカウントの拒絶を先に見る** — サインイン画面や上限モーダルは他の文字と同居できるし、
-    /// 「遅い確認プロンプト」と取り違えて Enter を撃っても消えない(現行)。
+    /// **Account refusals are checked first**: the sign-in screen and the usage-limit modal can
+    /// share the screen with other text, and pressing Enter after mistaking them for a slow
+    /// confirmation prompt does not dismiss them.
     pub fn spawn_screen(&self) -> SpawnScreen {
         if self.0.is_empty() {
             return SpawnScreen::None_;
@@ -157,8 +156,8 @@ impl<'a> Pane<'a> {
         if shows_prompt(self.0, TRUST_PROMPTS) {
             return SpawnScreen::Trust;
         }
-        // ここだけ素の部分一致(現行)。実物のキャプチャが無いので、
-        // 飾りの形を推測してアンカーを掛けると**本物を取り逃がす**方が痛い
+        // Plain substring match here only. There is no real capture of this screen, and anchoring
+        // on a guessed decoration would hurt more by **missing the real one**
         if self.0.to_ascii_lowercase().contains("local development") {
             return SpawnScreen::Confirm;
         }
@@ -179,6 +178,9 @@ impl<'a> Pane<'a> {
         }
     }
 
+    /// Parse the Markdown of `claude -p "/context"`. A leading warning (such as "workspace not
+    /// trusted") is passed over; None without the Model/Tokens headers, so the caller can say
+    /// "couldn't read it" instead of posting garbage.
     pub fn context_report(&self) -> Option<ContextReport> {
         let raw = self.0;
         let model = header_value(raw, "**Model:**")?;
@@ -199,7 +201,7 @@ impl<'a> Pane<'a> {
                 continue;
             }
             if t.starts_with('#') {
-                break; // 次の見出しが表の終わり
+                break; // the next heading ends the table
             }
             if !t.starts_with('|') {
                 if !categories.is_empty() {
@@ -207,17 +209,17 @@ impl<'a> Pane<'a> {
                 }
                 continue;
             }
-            // `split('|')` の両端(表の縦罫の外側)を落とす
+            // Drop both ends of `split('|')` (outside the table's vertical rules)
             let parts: Vec<&str> = t.split('|').map(str::trim).collect();
             let cells = parts.get(1..parts.len() - 1).unwrap_or(&[]);
             let [name, tokens, pct, ..] = cells else {
                 continue;
             };
             if name.eq_ignore_ascii_case("category") {
-                continue; // ヘッダ行
+                continue; // header row
             }
             if !name.is_empty() && name.chars().all(|c| c == '-') {
-                continue; // markdown の区切り行
+                continue; // markdown separator row
             }
             categories.push((name.to_string(), tokens.to_string(), pct.to_string()));
         }
@@ -230,32 +232,33 @@ impl<'a> Pane<'a> {
         })
     }
 
-    /// `claude -p "/usage"` の平文をパース。拾うのは `<label>: <n>% used [· resets <when>]` の
-    /// 上限行だけで、後ろに続く「What's contributing…」の内訳は無視する。`· resets <when>` は
-    /// **任意** — 0%(リセット直後の Current session など)では印字されないが、その行も残す
-    /// (落としていたのが修正)。1本も無ければ None。
+    /// Parse the plain text of `claude -p "/usage"`. Only the limit rows
+    /// `<label>: <n>% used [· resets <when>]` are taken; the "What's contributing…" breakdown after
+    /// them is ignored. `· resets <when>` is **optional**: it is not printed at 0% (e.g. Current
+    /// session right after a reset), but the row is still kept (dropping it was a bug). None if
+    /// there are no rows.
     pub fn usage_rows(&self) -> Option<Vec<UsageRow>> {
         let rows: Vec<UsageRow> = self.0.split('\n').filter_map(parse_usage_line).collect();
         (!rows.is_empty()).then_some(rows)
     }
 
-    /// モーダルが**キーボードを持っている**印。Claude Code のダイアログは種類を問わず
-    /// 取り消しの案内を足元に出す(2026-08-18 実物: auto mode オンボーディングの
-    /// `Enter to confirm · Esc to cancel` / `/model` の
-    /// `Enter to set as default · s to use this session only · Esc to cancel`)。
+    /// Sign that a modal **holds the keyboard**. Every Claude Code dialog shows a cancel hint at
+    /// its foot (real screens 2026-08-18: the auto mode onboarding's
+    /// `Enter to confirm · Esc to cancel` / `/model`'s
+    /// `Enter to set as default · s to use this session only · Esc to cancel`).
     ///
-    /// 走行中のターンは `esc to interrupt` で**別の語** — 動いているワーカーを詰まりと
-    /// 読み違えない。判定は種類を問わない: 名前を知らないモーダルこそが沈黙の正体なので、
-    /// 文言表で当てにいかない。
+    /// A running turn says `esc to interrupt`, a **different phrase**, so a working agent is not
+    /// mistaken for a stuck one. The check ignores the dialog type: modals we don't know by name
+    /// are exactly what causes silence, so no table of wordings.
     pub fn modal_footer(&self) -> Option<&'a str> {
         self.0
             .split('\n')
             .find(|l| l.to_ascii_lowercase().contains("esc to cancel"))
     }
 
-    /// TUI の生きた入力ボックス = pane の**最後の** `❯` 行。**送信済み**のコマンドも
-    /// echo された `❯ /effort high` として画面に残り、打鍵途中の行と形が同じ —
-    /// 位置だけが両者を分ける。
+    /// The TUI's live input box = the **last** `❯` line of the pane. A command **already sent**
+    /// stays on screen as the echoed `❯ /effort high`, shaped exactly like a line being typed;
+    /// only its position tells them apart.
     pub fn input_line(&self) -> &str {
         self.0
             .split('\n')
@@ -263,19 +266,19 @@ impl<'a> Pane<'a> {
             .unwrap_or("")
     }
 
-    /// `cmd`(例 `/effort`)が**未送信**のまま入力ボックスに居る間だけ true。pane 全体に訊くと
-    /// 上記の echo のせいで永遠に yes になる。
+    /// True only while `cmd` (e.g. `/effort`) sits **unsent** in the input box. Asking the whole
+    /// pane would say yes forever because of the echo above.
     pub fn still_has_command(&self, cmd: &str) -> bool {
         self.input_line().contains(cmd)
     }
 
-    /// 入力ボックスが空 = **送信された**。空でも `❯` の行そのものは残る(後ろは半角空白では
-    /// なく U+00A0 — `trim` は White_Space なのでどちらも落ちる)。長い本文は箱の中で
-    /// 折り返され、`❯` の行には**その時見えている先頭行**が乗る。中身が何であれ
-    /// 「空でない = まだ送られていない」は同じ。
+    /// Input box empty = **it was sent**. The `❯` line itself stays even when empty (followed by
+    /// U+00A0, not a plain space; `trim` uses White_Space, so both go). A long message wraps
+    /// inside the box and the `❯` line holds **the first line currently visible**. Whatever the
+    /// content, "not empty = not sent yet" holds.
     ///
-    /// `❯` の行が1本も無いとき(許可プロンプトが箱を覆っている / 画面が読めない)も空を返す —
-    /// 見えていないものに Enter を撃たないため。
+    /// Also returns empty when there is no `❯` line at all (a permission prompt covers the box /
+    /// the screen can't be read), so we never press Enter on something we can't see.
     pub fn input_box_empty(&self) -> bool {
         self.input_line()
             .trim_start()
@@ -284,14 +287,13 @@ impl<'a> Pane<'a> {
             .is_empty()
     }
 
-    /// `/effort <level>` が効いた時に出る行。どれも level を名指しする:
-    /// `Set effort level to high (saved as your default …)`、auto の `Effort level set to auto`
-    /// (ここまでregex を文字列走査に)、そして**同じ level を選び直した時**の
-    /// `Kept effort level as xhigh`。
+    /// Lines printed when `/effort <level>` takes effect. Each names the level:
+    /// `Set effort level to high (saved as your default …)`, auto's `Effort level set to auto`,
+    /// and, **when the same level is picked again**, `Kept effort level as xhigh`.
     ///
-    /// **原文からの意図的差分**: 3つ目の `Kept effort level as` は 2026-07-29 実機で確認した文言
-    /// (`model` の `Kept model as` と対)。Bun の移植元は 2026-07-17 時点の TUI で、これを取り
-    /// こぼして毎回タイムアウトしていた。
+    /// The third, `Kept effort level as`, was confirmed on a real machine 2026-07-29 (it pairs with
+    /// `model`'s `Kept model as`). Code written against the 2026-07-17 TUI missed it and timed out
+    /// every time.
     pub fn effort_confirmed(&self, level: &str) -> bool {
         let pane = self.0;
         [
@@ -304,7 +306,7 @@ impl<'a> Pane<'a> {
             match_indices_ci(pane, marker).into_iter().any(|i| {
                 let rest = &pane[i + marker.len()..];
                 let t = rest.trim_start();
-                // `\s+` は1文字以上 / level の後ろは `\b`(語が続くなら別の語 — `highest`)
+                // `\s+` needs at least one char / `\b` after the level (a following word char makes another word: `highest`)
                 t.len() < rest.len()
                     && starts_with_ci(t, level)
                     && !t[level.len()..].starts_with(is_word)
@@ -312,19 +314,19 @@ impl<'a> Pane<'a> {
         })
     }
 
-    /// `/model <名前>` が効いた時に出る行。モデルは**フレンドリ名**で名乗り、頼んだ alias を
-    /// 含む(`opus` → "Set model to Opus 4.8 …")。既にそのモデルなら "Kept model as Opus 4.8"
-    /// になるが、どちらも「頼んだモデルに居る」という答え。
+    /// Lines printed when `/model <name>` takes effect. The model is named by its **friendly
+    /// name**, which contains the requested alias (`opus` → "Set model to Opus 4.8 …"). If already
+    /// on that model it says "Kept model as Opus 4.8"; both mean "on the requested model".
     pub fn model_confirmed(&self, name: &str) -> bool {
         let pane = self.0;
         let name = name.to_ascii_lowercase();
         ["set model to", "kept model as"].iter().any(|marker| {
             match_indices_ci(pane, marker).into_iter().any(|i| {
                 let rest = &pane[i + marker.len()..];
-                // marker の後ろの `\b` と、`[^\n]*` — 同一行の中だけを見る
+                // `\b` after the marker, and `[^\n]*`: look within the same line only
                 !rest.starts_with(is_word) && {
                     let line = rest.split('\n').next().unwrap_or("");
-                    // name の手前は `\b`(`myopus` は opus ではない)
+                    // `\b` before the name (`myopus` is not opus)
                     match_indices_ci(line, &name)
                         .into_iter()
                         .any(|j| !line[..j].ends_with(is_word))
@@ -333,33 +335,33 @@ impl<'a> Pane<'a> {
         })
     }
 
-    /// pane に `/effort` のスライダが出ているか(フッタのヒント行が安定した目印)。
+    /// Whether the `/effort` slider is on the pane (the footer hint line is a stable marker).
     pub fn effort_slider_open(&self) -> bool {
         self.0.contains("←/→ to adjust")
     }
 
-    /// **履歴のある**セッションで `/effort <level>` を出すと、現行 TUI は確定の前に確認ダイアログを
-    /// 挟む(2026-07-29 実機。キャッシュが効かなくなることの断り):
+    /// In a session **with history**, `/effort <level>` makes the TUI show a confirmation dialog
+    /// before applying it (2026-07-29, real machine; a warning that the cache stops helping):
     /// ```text
     /// Change effort level?
     /// This conversation is cached for the current effort level. Switching to xhigh …
     /// ❯ 1. Yes, switch to xhigh
     ///   2. No, go back
     /// ```
-    /// 見出しだけを目印にする — 選択肢の行は level を含んで揺れる。**移植元(2026-07-17 時点の
-    /// TUI)にはダイアログが無く**、Bun 版はこの経路を知らない。
+    /// Only the heading is used as the marker; the option rows vary with the level. **The
+    /// 2026-07-17 TUI had no such dialog.**
     pub fn effort_confirm_dialog_open(&self) -> bool {
         self.0.contains("Change effort level?")
     }
 
-    /// `/effort` のスライダを Escape で閉じた後に TUI が出す状態行から、今の effort level を読む
-    /// (入力ボックスの上の右寄せ行。両方の文言を実測):
-    ///     ● high · /effort            (○ のこともある — 点は変わる)
+    /// Read the current effort level from the status line the TUI prints after the `/effort`
+    /// slider is closed with Escape (right-aligned above the input box; both wordings measured):
+    ///     ● high · /effort            (sometimes ○; the dot changes)
     ///     ✦ ultracode · xhigh effort + dynamic workflows for maximum thoroughness
-    /// 画面に無ければ None(まだ出ていない / 別の通知に置き換わった)。
+    /// None if not on screen (not shown yet / replaced by another notice).
     ///
-    /// **原文からの意図的差分**: `◉`(U+25C9)を追加 — 2026-07-29 の実機は `◉ xhigh · /effort`。
-    /// Bun の `●○✦` は 2026-07-17 時点の TUI で、点は今後も変わり得る(足すのはここだけ)。
+    /// `◉` (U+25C9) was added: the real machine on 2026-07-29 shows `◉ xhigh · /effort`.
+    /// `●○✦` came from the 2026-07-17 TUI and the dot may change again (add new ones only here).
     pub fn effort_status(&self) -> Option<&'static str> {
         let pane = self.0;
         for (i, glyph) in pane
@@ -379,10 +381,11 @@ impl<'a> Pane<'a> {
         None
     }
 
-    /// 入力欄の**下**のフッタが名乗る権限モード。行が無ければ `manual`(既定は名乗らない)。
+    /// The permission mode named by the footer **below** the input box. `manual` if there is no
+    /// such line (the default is not announced).
     ///
-    /// 見るのを入力欄より下に限るのは、会話の本文に同じ語(この機能の話をした transcript)が
-    /// 出ても拾わないため — `input_line` と同じ錨。
+    /// Only below the input box, so the same words in the conversation (a transcript discussing
+    /// this feature) are not picked up; same anchor as `input_line`.
     pub fn mode_status(&self) -> &'static str {
         let foot = match self.0.rfind('❯') {
             Some(i) => &self.0[i..],
@@ -395,13 +398,15 @@ impl<'a> Pane<'a> {
             .unwrap_or("manual")
     }
 
-    /// 捕った pane をパースする。錨は生きた圧縮スピナー — `Compacting conversation` を含む行 — で、
-    /// そこから読むのは:
-    ///   • その行の括弧の経過タイマー `(33s)` / `(1m 4s · …)`(まだ出ていれば);
-    ///   • 直下のバー行の完了率(スピナー行 + 次の2行に**限る**ので、遠くの status line の
-    ///     `ctx:NN%` を拾うことは無い)。スピナー行から見るので、% が同じ行にある版も拾える。
-    /// 生きたスピナーは必ずどちらかを出す。単なる静的言及(コード・コメント・この機能を引用した
-    /// transcript)はどちらも持たないので、進行中とは取り違えない(初版が数分ハングしたバグ)。
+    /// Parse a captured pane. The anchor is the live compaction spinner, the line containing
+    /// `Compacting conversation`, and from it we read:
+    ///   • the elapsed timer in that line's parentheses, `(33s)` / `(1m 4s · …)` (if shown yet);
+    ///   • the completion percent on the bar line just below (**limited** to the spinner line + the
+    ///     next two, so a distant status line's `ctx:NN%` is never taken). Starting at the spinner
+    ///     line also catches versions that put the % on the same line.
+    /// A live spinner always shows one of them. A static mention (code, a comment, a transcript
+    /// quoting this feature) has neither, so it is not mistaken for progress (the first version
+    /// hung for minutes on this).
     pub fn compact_progress(&self) -> CompactProgress {
         let lines: Vec<&str> = self.0.split('\n').collect();
         let Some(idx) = lines
@@ -417,7 +422,7 @@ impl<'a> Pane<'a> {
             .iter()
             .filter(|l| !l.is_empty() && match_indices_ci(l, "ctx:").is_empty())
             .find_map(|l| parse_percent_line(l).filter(|v| *v <= 100));
-        // 生きた進捗の合図が1つも無い → ただ言葉が出てくる静的なテキスト
+        // No live progress signal at all → just static text that happens to contain the words
         if seconds.is_none() && percent.is_none() {
             return CompactProgress::default();
         }
@@ -430,10 +435,11 @@ impl<'a> Pane<'a> {
         }
     }
 
-    /// `claude auth login` の pane から `https://claude.com/cai/oauth/authorize?…` を取り出す。
-    /// URL は `visit: ` の後に印字される。**広い** pane(driver は `-x 400`)なら1行に収まるが、
-    /// 狭い pane が折り返した場合、折り返しの続き行は空白を含まないので再結合する(空行・
-    /// 「Paste code」のような空白入りの行・末尾で止める)。無ければ None。
+    /// Extract `https://claude.com/cai/oauth/authorize?…` from the `claude auth login` pane.
+    /// The URL is printed after `visit: `. A **wide** pane (the driver uses `-x 400`) fits it on
+    /// one line; if a narrow pane wraps it, the continuation lines contain no whitespace, so they
+    /// are joined back (stopping at a blank line, a line with spaces like "Paste code", or the
+    /// end). None if absent.
     pub fn auth_login_url(&self) -> Option<String> {
         const MARKER: &str = "visit: ";
         const URL: &str = "https://claude.com/cai/oauth/authorize?";
@@ -444,30 +450,31 @@ impl<'a> Pane<'a> {
         for seg in lines {
             let seg = seg.trim();
             if seg.is_empty() || seg.contains(char::is_whitespace) {
-                break; // 空行 = URL の終わり / 空白入りは本文の行(「Paste code」)で折り返しではない
+                break; // blank line = end of URL / a line with spaces is body text ("Paste code"), not a wrap
             }
-            joined.push_str(seg); // soft-wrap の続き: 再結合
+            joined.push_str(seg); // soft-wrap continuation: join it back
         }
         let i = joined.find(URL)?;
         let url: String = joined[i..]
             .chars()
             .take_while(|c| !c.is_whitespace())
             .collect();
-        (url.len() > URL.len()).then_some(url) // `\S+` は1文字以上
+        (url.len() > URL.len()).then_some(url) // `\S+` needs at least one char
     }
 
-    /// `claude auth login` の実際の目印から pane を分類する(成功・失敗の実出力で確認):
-    ///   success → "Login successful."(「Paste code here …」の後にインラインで出る)
+    /// Classify the pane by the real markers of `claude auth login` (checked against real success
+    /// and failure output):
+    ///   success → "Login successful." (printed inline after "Paste code here …")
     ///   invalid → "Invalid code. Please make sure the full code was copied."
-    /// success を名乗るには**明示の成功マーカーが必須** — 悪いコード(やクラッシュ・中断)が
-    /// 成功に見えることは無い — ので、Owner が縛られるのは本物のサインインの時だけ。
-    /// pending = まだ待っている。
+    /// Success **requires the explicit success marker**, so a bad code (or a crash / abort) never
+    /// looks like success, and the Owner is bound only on a real sign-in.
+    /// pending = still waiting.
     pub fn login_outcome(&self) -> LoginOutcome {
         let low = self.0.to_ascii_lowercase();
         if low.contains("login successful") {
             return LoginOutcome::Success;
         }
-        // `\berror\b` だけは語境界つき(`errorless` や識別子の中は拾わない)
+        // Only `\berror\b` uses word boundaries (not `errorless` or inside an identifier)
         let bare_error = low
             .match_indices("error")
             .any(|(i, m)| !low[..i].ends_with(is_word) && !low[i + m.len()..].starts_with(is_word));
@@ -478,10 +485,10 @@ impl<'a> Pane<'a> {
         }
     }
 
-    /// transcript の末尾から、**最後の** assistant レコードが名乗ったモデル id を拾う
-    /// (`/"model"\s*:\s*"(claude-[^"]+)"/g` を文字列走査に)。
-    /// 見るのは `claude-` 始まりだけなので、エラーレコードの `"model":"<synthetic>"` は
-    /// 素通りする。末尾を途中から切って渡してよい(半端な行は形が合わず無視される)。
+    /// From the tail of a transcript, take the model id named by the **last** assistant record
+    /// (`/"model"\s*:\s*"(claude-[^"]+)"/g` as a string scan).
+    /// Only ids starting with `claude-` count, so an error record's `"model":"<synthetic>"` is
+    /// skipped. The tail may be cut mid-line (a partial line doesn't match and is ignored).
     pub fn last_model_id(&self) -> Option<String> {
         let tail = self.0;
         let mut last = None;
@@ -493,7 +500,7 @@ impl<'a> Pane<'a> {
             let Some(rest) = rest.strip_prefix("\"claude-") else {
                 continue;
             };
-            // `[^"]+` — `claude-` の後ろが空なら id ではない
+            // `[^"]+`: nothing after `claude-` means it is not an id
             let Some(end) = rest.find('"').filter(|e| *e > 0) else {
                 continue;
             };
@@ -503,7 +510,7 @@ impl<'a> Pane<'a> {
     }
 }
 
-/// claude のモデル識別子(`claude-opus-4-8[1m]` のような**フルの id**)。
+/// A claude model identifier (a **full id** such as `claude-opus-4-8[1m]`).
 pub struct ModelId<'a>(&'a str);
 
 impl<'a> ModelId<'a> {
@@ -511,21 +518,21 @@ impl<'a> ModelId<'a> {
         ModelId(id)
     }
 
-    /// フルのモデル id に含まれる親しみ名(`claude-fable-5` → `fable`)。既知の名前を
-    /// どれも含まなければ None。
+    /// The friendly name inside a full model id (`claude-fable-5` → `fable`). None if it contains
+    /// none of the known names.
     pub fn alias(&self) -> Option<&'static str> {
         let lower = self.0.to_lowercase();
         MODEL_NAMES.iter().find(|n| lower.contains(**n)).copied()
     }
 
-    /// 見出し用に人が読めるモデル名: `("claude-opus-4-8", "1m")` → `Opus 4.8（1M context）`。
-    /// 窓の注記は **Tokens の total** から採る(id の `[1m]` サフィックスではなく) — このサフィックスは
-    /// 1M でも出る版と出ない版があるのに対し total は必ずある。total が読めない形のときだけ
-    /// サフィックスに落ちる。claude 以外の id は生のまま。
+    /// Human-readable model name for headings: `("claude-opus-4-8", "1m")` → `Opus 4.8（1M context）`.
+    /// The window note comes from the **Tokens total** (not the id's `[1m]` suffix): some versions
+    /// omit the suffix even at 1M, while the total is always there. Falls back to the suffix only
+    /// when the total can't be read. Non-claude ids are returned as is.
     pub fn friendly(&self, total: &str) -> String {
         let id = self.0;
         let t = total.trim();
-        // `/^[\d.]+[mk]$/i` — 末尾が m/k で、その手前は数字とドットだけ
+        // `/^[\d.]+[mk]$/i`: ends in m/k with only digits and dots before it
         let numeric_total = matches!(t.chars().next_back(), Some('m' | 'M' | 'k' | 'K'))
             && t.len() > 1
             && t[..t.len() - 1]
@@ -560,21 +567,21 @@ impl<'a> ModelId<'a> {
 }
 
 // ── parsing helpers ──
-// 手書きの走査ヘルパ(regex を足さない)
+// Hand-written scanning helpers (no `regex` dependency)
 
-/// ASCII 大小文字を無視した接頭辞一致(regex の `/i` の代わり)。
+/// Prefix match ignoring ASCII case (in place of regex `/i`).
 fn starts_with_ci(s: &str, prefix: &str) -> bool {
     s.get(..prefix.len())
         .is_some_and(|p| p.eq_ignore_ascii_case(prefix))
 }
 
-/// regex の `\w`(語構成文字)。`\b` の判定は両側をこれで見る。
+/// regex `\w` (word character). `\b` checks both sides with this.
 fn is_word(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
-/// ASCII 大小を無視した全出現位置(regex の `/i` + エンジンの位置送り相当)。
-/// `to_ascii_lowercase` は ASCII しか変えないのでバイト位置は原文と同じ。`needle` は小文字で渡す。
+/// All match positions ignoring ASCII case (like regex `/i` plus the engine advancing).
+/// `to_ascii_lowercase` changes only ASCII, so byte positions match the original. Pass `needle` in lowercase.
 fn match_indices_ci(hay: &str, needle: &str) -> Vec<usize> {
     hay.to_ascii_lowercase()
         .match_indices(needle)
@@ -582,8 +589,8 @@ fn match_indices_ci(hay: &str, needle: &str) -> Vec<usize> {
         .collect()
 }
 
-/// `**Key:**` の**値**: 続く空白(改行も含む — 現物の `\s*` がそう)を飛ばした先の行。
-/// 値が空なら None。
+/// The **value** of `**Key:**`: the line after skipping following whitespace (newlines included,
+/// as `\s*` does). None if the value is empty.
 fn header_value(raw: &str, key: &str) -> Option<String> {
     let i = raw.find(key)?;
     let rest = raw[i + key.len()..].trim_start();
@@ -591,13 +598,13 @@ fn header_value(raw: &str, key: &str) -> Option<String> {
     (!line.is_empty()).then(|| line.to_string())
 }
 
-/// `**Tokens:** <used> / <total> (<pct>)`。 の3捕獲 regex 相当
-/// 形が崩れているヘッダは飛ばして次の `**Tokens:**` を試す(regex が位置を進めるのと同じ)。
+/// `**Tokens:** <used> / <total> (<pct>)`, like a regex with three captures.
+/// A malformed header is skipped and the next `**Tokens:**` is tried (as a regex would advance).
 fn tokens_header(raw: &str) -> Option<(String, String, String)> {
     const KEY: &str = "**Tokens:**";
     for (i, _) in raw.match_indices(KEY) {
         let s = raw[i + KEY.len()..].trim_start();
-        // `[^/\s]+` — スラッシュも空白も含まない一続き
+        // `[^/\s]+`: a run with no slash and no whitespace
         let used: String = s
             .chars()
             .take_while(|c| !c.is_whitespace() && *c != '/')
@@ -625,15 +632,15 @@ fn tokens_header(raw: &str) -> Option<(String, String, String)> {
     None
 }
 
-/// `used` の後ろの残り: `(?:.*?\bresets\s+(.+?))?\s*$` 相当。
-/// `Some("")` = reset 節なしで行が終わっている / `Some(when)` = 節あり /
-/// **None = 上限行ではない**(`resets` でない余計な文字が残っている)。
+/// The rest after `used`, like `(?:.*?\bresets\s+(.+?))?\s*$`.
+/// `Some("")` = the line ends with no reset clause / `Some(when)` = has a clause /
+/// **None = not a limit row** (extra text that isn't `resets` remains).
 fn usage_reset_clause(tail: &str) -> Option<String> {
-    let lower = tail.to_ascii_lowercase(); // ASCII 変換なのでバイト位置は tail と同じ
+    let lower = tail.to_ascii_lowercase(); // ASCII-only, so byte positions match tail
     let mut from = 0;
     while let Some(rel) = lower[from..].find("resets") {
         let i = from + rel;
-        // `\b`: 直前が語構成文字なら境界でない(`presets` は resets ではない)
+        // `\b`: no boundary if the previous char is a word char (`presets` is not resets)
         let word_before = tail[..i]
             .chars()
             .next_back()
@@ -647,13 +654,13 @@ fn usage_reset_clause(tail: &str) -> Option<String> {
     tail.trim().is_empty().then(String::new)
 }
 
-/// 1行を上限行として読む。`^\s*(.+?):\s*(\d+)%\s+used\b…$` の手書き版 —
-/// ラベルは最短一致なので、**うまくパースできる最初のコロン**で切る。
+/// Read one line as a limit row. Hand-written `^\s*(.+?):\s*(\d+)%\s+used\b…$`:
+/// the label is a lazy match, so split at **the first colon that parses**.
 fn parse_usage_line(line: &str) -> Option<UsageRow> {
     for (ci, _) in line.match_indices(':') {
         let label = line[..ci].trim();
         if label.is_empty() {
-            continue; // `(.+?)` は1文字以上
+            continue; // `(.+?)` needs at least one char
         }
         let after = line[ci + 1..].trim_start();
         let pct: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
@@ -665,18 +672,18 @@ fn parse_usage_line(line: &str) -> Option<UsageRow> {
         };
         let trimmed = rest.trim_start();
         if trimmed.len() == rest.len() {
-            continue; // `\s+` は1文字以上
+            continue; // `\s+` needs at least one char
         }
         if !starts_with_ci(trimmed, "used") {
             continue;
         }
         let rest = &trimmed["used".len()..];
-        // `used` の直後の `\b` — 語が続くなら別の語(`usedxx`)
+        // `\b` right after `used`: a following word char makes another word (`usedxx`)
         if rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
             continue;
         }
-        // ここも continue — 残りが reset 節でなければ「このコロンでの切り方が違った」だけで、
-        // 現物の遅延一致は次のコロンを試す(`A: 12% used, X: 66% used` は2つ目で一致する)
+        // continue here too: if the rest is not a reset clause, only this colon was the wrong
+        // split, and a lazy match tries the next colon (`A: 12% used, X: 66% used` matches at the second)
         let Some(reset) = usage_reset_clause(rest) else {
             continue;
         };
@@ -689,8 +696,8 @@ fn parse_usage_line(line: &str) -> Option<UsageRow> {
     None
 }
 
-/// `(33s)` / `(1m 4s · ↑ 876 tokens)` の経過秒。`\((?:(\d+)m\s*)?(\d+)s\b[^)]*\)` の手書き版 —
-/// 数字は `(` の**直後**から始まる(`(elapsed 33s)` は一致しない)。
+/// Elapsed seconds from `(33s)` / `(1m 4s · ↑ 876 tokens)`. Hand-written
+/// `\((?:(\d+)m\s*)?(\d+)s\b[^)]*\)`: digits start **right after** `(` (`(elapsed 33s)` does not match).
 fn parse_elapsed(spinner: &str) -> Option<u32> {
     for (i, _) in spinner.match_indices('(') {
         let s = &spinner[i + 1..];
@@ -699,7 +706,7 @@ fn parse_elapsed(spinner: &str) -> Option<u32> {
             continue;
         }
         let after = &s[d1.len()..];
-        // `Nm` があれば分。無ければ最初の数字がそのまま秒(regex の optional group の backtrack)
+        // `Nm` means minutes. Otherwise the first number is the seconds (the regex optional group backtracking)
         let (mins, secs, rest) = match after.strip_prefix(['m', 'M']) {
             Some(r) => {
                 let r = r.trim_start();
@@ -711,7 +718,7 @@ fn parse_elapsed(spinner: &str) -> Option<u32> {
             }
             None => (0u32, d1.clone(), after),
         };
-        // `s\b` の後は `[^)]*\)` — `[^)]*` は `)` を跨げないので「後ろに `)` がある」と同義
+        // After `s\b` comes `[^)]*\)`; `[^)]*` can't cross `)`, so this just means "a `)` follows"
         let Some(tail) = rest.strip_prefix(['s', 'S']) else {
             continue;
         };
@@ -723,7 +730,7 @@ fn parse_elapsed(spinner: &str) -> Option<u32> {
     None
 }
 
-/// スピナー行の括弧内のトークン数: `([↑↓])\s*([\d.]+[km]?)\s*tokens` 相当。
+/// Token count in the spinner line's parentheses, like `([↑↓])\s*([\d.]+[km]?)\s*tokens`.
 fn parse_tokens(spinner: &str) -> Option<(char, String)> {
     for (i, dir) in spinner
         .char_indices()
@@ -738,7 +745,7 @@ fn parse_tokens(spinner: &str) -> Option<(char, String)> {
             continue;
         }
         let after = &s[num.len()..];
-        // `[km]?` は捕獲の中(`1.6k` で1つの印字)
+        // `[km]?` is inside the capture (`1.6k` is printed as one token)
         let after = match after.strip_prefix(['k', 'm', 'K', 'M']) {
             Some(r) => {
                 num.push_str(&after[..after.len() - r.len()]);
@@ -753,7 +760,7 @@ fn parse_tokens(spinner: &str) -> Option<(char, String)> {
     None
 }
 
-/// 1行から `(\d{1,3})\s*%` の**最初の**一致。`%` の手前の空白を飛ばして最大3桁を後ろから取る。
+/// The **first** match of `(\d{1,3})\s*%` in a line. Skip whitespace before `%` and take up to 3 digits backwards.
 fn parse_percent_line(line: &str) -> Option<u32> {
     for (i, _) in line.match_indices('%') {
         let head = line[..i].trim_end();
@@ -767,13 +774,13 @@ fn parse_percent_line(line: &str) -> Option<u32> {
             .rev()
             .collect();
         if !digits.is_empty() {
-            return digits.parse().ok(); // 行内の最初の一致だけ(現物も break せず次の行へ)
+            return digits.parse().ok(); // only the first match in the line
         }
     }
     None
 }
 
-/// 行頭の飾りを落とす。現行 `MODAL_LINE_DECORATION` と同じ順(飾り → 選択肢番号 → 空白)。
+/// Strip leading decoration, in order: decoration → option number → whitespace.
 pub(super) fn strip_modal_decoration(line: &str) -> &str {
     let t = line.trim_start_matches(MODAL_DECORATION);
     let digits = t.len() - t.trim_start_matches(|c: char| c.is_ascii_digit()).len();
@@ -789,9 +796,9 @@ pub(super) fn strip_modal_decoration(line: &str) -> &str {
     }
 }
 
-/// 「画面が**自分で**このプロンプトを印字しているか」。現行
-/// `paneShowsPrompt` の移植 — **行頭アンカーが全部**。同じ語が文の途中にあるもの
-/// (このリポのソース・grep の結果・引用された Slack の発言)は画面ではない。
+/// "Is the screen **itself** printing this prompt?" **The line-start anchor is everything**: the
+/// same words in the middle of a line (this repo's source, grep output, a quoted Slack message)
+/// are not the screen.
 fn shows_prompt(pane: &str, prompts: Prompts) -> bool {
     pane.lines().any(|line| {
         let lower = line.to_ascii_lowercase();
@@ -805,8 +812,8 @@ fn shows_prompt(pane: &str, prompts: Prompts) -> bool {
     })
 }
 
-/// `[...]` を全部落として trim(`id.replace(/\[[^\]]*\]/g, '').trim()` 相当)。
-/// 閉じない `[` は括弧でない — そのまま残す。
+/// Drop every `[...]` and trim (like `id.replace(/\[[^\]]*\]/g, '').trim()`).
+/// An unclosed `[` is not a bracket; leave it.
 fn strip_brackets(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
@@ -821,7 +828,7 @@ fn strip_brackets(s: &str) -> String {
     out.trim().to_string()
 }
 
-/// id の `[<n>m]` サフィックスから窓の大きさ(`"1M"`)。無ければ None。`/\[(\d+)\s*m\]/i`
+/// Window size (`"1M"`) from the id's `[<n>m]` suffix. None if absent. `/\[(\d+)\s*m\]/i`
 fn id_context_suffix(id: &str) -> Option<String> {
     for (i, _) in id.match_indices('[') {
         let s = &id[i + 1..];
@@ -849,11 +856,11 @@ fn capitalize(s: &str) -> String {
 pub(crate) mod tests {
     use super::*;
 
-    // ── 画面と出力の読み取り ────────────────────────────────────────────────
-    // ここから下は **TUI ドリフトの見張り**(実機で確定した2件)。
-    // 1件も落とさないこと — 落とすと次のドリフトに気づけない。
+    // ── Reading the screen and output ─────────────────────────────────────────
+    // Everything below **guards against TUI drift** (two cases confirmed on real machines).
+    // Do not drop a single one; without them the next drift goes unnoticed.
 
-    /// 旧 `command.rs` の同名 const(描く側のテストと同じ現物)。
+    /// Same sample as the const of this name in the old `command.rs` (shared with the rendering tests).
     const CONTEXT_RAW: &str = "\
 some preamble\n\n**Model:** claude-opus-4-8[1m]\n**Tokens:** 43.8k / 1m (4%)\n\n\
 ### Estimated usage by category\n\n| Category | Tokens | % |\n| --- | --- | --- |\n\
@@ -877,14 +884,14 @@ some preamble\n\n**Model:** claude-opus-4-8[1m]\n**Tokens:** 43.8k / 1m (4%)\n\n
         assert!(Pane::new("no headers here").context_report().is_none());
     }
 
-    /// 1M 注記の出どころは **Tokens の total**(id の `[1m]` はある版と無い版がある)。
+    /// The 1M note comes from the **Tokens total** (some versions have the id's `[1m]`, some don't).
     #[test]
     fn context_window_note_comes_from_total() {
         assert_eq!(
             ModelId::new("claude-opus-4-8").friendly("1m"),
             "Opus 4.8（1M context）"
         );
-        // total が読めないときだけ id の `[<n>m]` サフィックスに落ちる
+        // Falls back to the id's `[<n>m]` suffix only when the total can't be read
         assert_eq!(
             ModelId::new("claude-opus-4-8[1m]").friendly("-"),
             "Opus 4.8（1M context）"
@@ -893,16 +900,16 @@ some preamble\n\n**Model:** claude-opus-4-8[1m]\n**Tokens:** 43.8k / 1m (4%)\n\n
             ModelId::new("claude-haiku").friendly("200k"),
             "Haiku（200K context）"
         );
-        assert_eq!(ModelId::new("gpt-4").friendly(""), "gpt-4"); // claude でなければ生の id
+        assert_eq!(ModelId::new("gpt-4").friendly(""), "gpt-4"); // non-claude ids stay raw
     }
 
-    /// 旧 `command::model_alias` / `command::last_model_id` の網
-    /// (旧 `id_shapes_and_mentions` から分離 — 残りの id 形の網は `command.rs` に居る)。
+    /// Coverage for the old `command::model_alias` / `command::last_model_id`
+    /// (split from the old `id_shapes_and_mentions`; the rest of the id-shape coverage is in `command.rs`).
     #[test]
     fn model_id_alias_and_transcript_tail() {
         assert_eq!(ModelId::new("claude-fable-5").alias().unwrap(), "fable");
         assert_eq!(ModelId::new("gpt-4").alias(), None);
-        // 勝つのは**最後の** claude- id。`<synthetic>` はモデルではない
+        // The **last** claude- id wins. `<synthetic>` is not a model
         let tail = "{\"model\":\"claude-opus-4-5\"}\n{\"model\" : \"claude-fable-5\"}\n\
                     {\"model\":\"<synthetic>\"}\n";
         assert_eq!(
@@ -925,9 +932,9 @@ What's contributing to your limits\nignored: 55% something\n";
         let rows = Pane::new(raw).usage_rows().unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].pct, "12");
-        assert_eq!(rows[2].reset, ""); // 0% 行は resets 無しでも拾う
+        assert_eq!(rows[2].reset, ""); // a 0% row is kept even without resets
         assert!(Pane::new("garbage").usage_rows().is_none());
-        // ラベルの遅延一致は**行を捨てず**次のコロンへ進む(bun で現物の出力を確認)
+        // The lazy label match **does not drop the row**; it moves to the next colon
         let two = Pane::new("A: 12% used, X: 66% used").usage_rows().unwrap();
         assert_eq!(two.len(), 1);
         assert_eq!(
@@ -938,8 +945,8 @@ What's contributing to your limits\nignored: 55% something\n";
             ),
             ("A: 12% used, X", "66", "")
         );
-        // 2026-07 の実物(`claude -p /usage` をそのまま貼った): タイムゾーン付きの reset と、
-        // `%` とコロンを含む「What's contributing」の内訳。上限行**だけ**拾うこと
+        // Real output from 2026-07 (`claude -p /usage` pasted as is): resets with a time zone, and
+        // a "What's contributing" breakdown containing `%` and colons. Take **only** the limit rows
         let live = "\
 You are currently using your subscription to power your Claude Code usage\n\n\
 Current session: 21% used · resets Jul 29 at 12:29am (Asia/Tokyo)\n\
@@ -953,13 +960,13 @@ Last 24h · 2120 requests · 21 sessions\n\
             rows.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(),
             ["Current session", "Current week (all models)"]
         );
-        assert_eq!(rows[0].reset, "Jul 29 at 12:29am (Asia/Tokyo)"); // 行内の `12:29` で切らない
+        assert_eq!(rows[0].reset, "Jul 29 at 12:29am (Asia/Tokyo)"); // don't split at the `12:29` in the line
     }
 
     #[test]
     fn input_line_is_the_last_prompt() {
         let pane = "❯ /effort high\nSet effort level to high (saved)\n❯ ";
-        assert_eq!(Pane::new(pane).input_line().trim(), "❯"); // 送信済み echo は入力行ではない
+        assert_eq!(Pane::new(pane).input_line().trim(), "❯"); // a sent echo is not the input line
         assert!(!Pane::new(pane).still_has_command("/effort"));
         assert!(Pane::new("❯ /effort").still_has_command("/effort"));
     }
@@ -968,10 +975,10 @@ Last 24h · 2120 requests · 21 sessions\n\
     fn confirmations_match_both_wordings() {
         assert!(Pane::new("Set effort level to high (saved as default)").effort_confirmed("high"));
         assert!(Pane::new("Effort level set to auto").effort_confirmed("auto"));
-        assert!(!Pane::new("Set effort level to highest").effort_confirmed("high")); // 語境界
-        // 同じ level を選び直した時の3つ目の文言(2026-07-29 実機の行そのまま)
+        assert!(!Pane::new("Set effort level to highest").effort_confirmed("high")); // word boundary
+        // The third wording, for re-picking the same level (the exact line from a real machine, 2026-07-29)
         assert!(Pane::new("Kept effort level as xhigh").effort_confirmed("xhigh"));
-        assert!(!Pane::new("Kept effort level as xhigh").effort_confirmed("high")); // 語境界
+        assert!(!Pane::new("Kept effort level as xhigh").effort_confirmed("high")); // word boundary
         assert!(Pane::new("⏺ Set model to Opus 4.8 (claude-opus-4-8)").model_confirmed("opus"));
         assert!(Pane::new("Kept model as Opus 4.8").model_confirmed("opus"));
         assert!(!Pane::new("model: opus is nice").model_confirmed("opus"));
@@ -984,18 +991,18 @@ Last 24h · 2120 requests · 21 sessions\n\
         assert!(p.active);
         assert_eq!((p.seconds, p.percent), (Some(64), Some(31)));
         assert_eq!(p.tokens.as_deref(), Some("1.6k"));
-        // 静的な言及(タイマーも % も無い)は inactive
+        // A static mention (no timer, no %) is inactive
         assert!(
             !Pane::new("the words Compacting conversation appear in prose")
                 .compact_progress()
                 .active
         );
-        // ctx:NN% は percent として拾わない
+        // ctx:NN% is not taken as the percent
         let ctx = "✳ Compacting conversation… (3s)\n  ctx:42%\n";
         assert_eq!(Pane::new(ctx).compact_progress().percent, None);
     }
 
-    /// フッタ行(2026-07-31 実機の現物)から今の権限モードを読む。
+    /// Read the current permission mode from the footer line (real lines from 2026-07-31).
     #[test]
     fn mode_status_reads_the_footer_below_the_input_box() {
         let pane = |foot: &str| {
@@ -1023,9 +1030,9 @@ Last 24h · 2120 requests · 21 sessions\n\
             Pane::new(&pane("  ⏸ manual mode on · ← 1 agent")).mode_status(),
             "manual"
         );
-        // 名乗る行が無ければ manual(将来また出なくなっても既定に落ちる)
+        // No such line → manual (if it ever disappears again, this falls back to the default)
         assert_eq!(Pane::new(&pane("")).mode_status(), "manual");
-        // 会話の本文に同じ語が出ても入力欄より上なので拾わない
+        // The same words in the conversation are above the input box, so they are not picked up
         assert_eq!(
             Pane::new(&pane("").replace("mode を実装した", "plan mode on の話")).mode_status(),
             "manual"
@@ -1043,7 +1050,7 @@ Last 24h · 2120 requests · 21 sessions\n\
             Pane::new("✦ ultracode · xhigh effort + …").effort_status(),
             Some("ultracode")
         );
-        // 2026-07-29 実機(E2E で 2 連続失敗した現物の行そのまま)— 点は ◉ にドリフトした
+        // 2026-07-29 real machine (the exact line that failed E2E twice in a row): the dot drifted to ◉
         assert_eq!(
             Pane::new("                  ◉ xhigh · /effort").effort_status(),
             Some("xhigh")
@@ -1053,7 +1060,7 @@ Last 24h · 2120 requests · 21 sessions\n\
 
     #[test]
     fn effort_change_dialog_is_detected_and_not_mistaken_for_a_confirmation() {
-        // 2026-07-29 実機のダイアログ全文(履歴のあるセッションの `/effort xhigh`)
+        // Full dialog from a real machine, 2026-07-29 (`/effort xhigh` in a session with history)
         let dialog = "\
 Change effort level?
 Your next response will be slower and use more tokens
@@ -1062,10 +1069,10 @@ the full history gets re-read on your next message.
 ❯ 1. Yes, switch to xhigh
   2. No, go back";
         assert!(Pane::new(dialog).effort_confirm_dialog_open());
-        // ダイアログは**まだ**確定ではない。level を名指す行があっても done と読まない
+        // The dialog is **not yet** applied. Don't read it as done even though a line names the level
         assert!(!Pane::new(dialog).effort_confirmed("xhigh"));
         assert_eq!(Pane::new(dialog).effort_status(), None);
-        // 選択肢の `❯` 行は入力ボックスに見えるが、コマンドは残っていない(Enter リトライを誘わない)
+        // The option's `❯` row looks like the input box, but no command is left (don't invite an Enter retry)
         assert!(!Pane::new(dialog).still_has_command("/effort"));
         assert!(!Pane::new("… ←/→ to adjust …").effort_confirm_dialog_open());
     }
@@ -1077,7 +1084,7 @@ the full history gets re-read on your next message.
         assert_eq!(
             Pane::new(pane).auth_login_url().unwrap(),
             "https://claude.com/cai/oauth/authorize?code=abcdef"
-        ); // soft-wrap 再結合
+        ); // soft-wrap joined back
         assert!(Pane::new("no marker").auth_login_url().is_none());
         assert!(matches!(
             Pane::new("… Login successful.").login_outcome(),
@@ -1093,11 +1100,10 @@ the full history gets re-read on your next message.
         ));
     }
 
-    // ── 起動画面の分類と見張り ──────────────────────────────────────────────
-    // 現行 `classifySpawnPane` `answerSpawnScreens` の移植。
-    // 実機の文面は 2026-08-02 に撮ったもの。
+    // ── Classifying and watching startup screens ─────────────────────────────
+    // The real-screen wording was captured on 2026-08-02.
 
-    /// 2026-08-02、実機の `tmux capture-pane` の原文。
+    /// Verbatim `tmux capture-pane` output from a real machine, 2026-08-02.
     pub(crate) const TRUST_PANE: &str = "\
  Accessing workspace:
 
@@ -1116,8 +1122,8 @@ the full history gets re-read on your next message.
 
  Enter to confirm \u{b7} Esc to cancel";
 
-    /// Claude Code 2.1.276 の実物(2026-09-18、pve)。**No が先頭で、既定で選ばれている** —
-    /// Enter だけ押すと終了を選ぶ
+    /// Real screen from Claude Code 2.1.276 (2026-09-18). **No comes first and is selected by
+    /// default**: pressing just Enter picks exit
     pub(crate) const TRUST_PANE_NO_FIRST: &str = "\
  Accessing workspace:
 
@@ -1135,7 +1141,7 @@ the full history gets re-read on your next message.
 
  Enter to confirm \u{b7} Esc to cancel";
 
-    /// 上の画面で下キーを1回押した後。
+    /// The screen above after pressing Down once.
     pub(crate) const TRUST_PANE_YES_SECOND: &str = "\
  Accessing workspace:
 
@@ -1156,7 +1162,7 @@ the full history gets re-read on your next message.
         assert_eq!(Pane::new("no dialog here").trust_selected_is_yes(), None);
     }
 
-    /// 現行のLOGIN(Claude Code v2.1.207 の実物と注記されている)。
+    /// Sign-in screen (noted as real output from Claude Code v2.1.207).
     pub(crate) const LOGIN_PANE: &str = " Claude Code can be used with your Claude subscription\u{2026}\n \
 Select login method:\n \u{276f} 1. Claude account with subscription \u{b7} Pro, Max, Team, or Enterprise\n \
   2. Anthropic Console account \u{b7} API usage billing";
@@ -1176,12 +1182,12 @@ Select login method:\n \u{276f} 1. Claude account with subscription \u{b7} Pro, 
 
     #[test]
     fn spawn_screen_reads_the_limit_modal_with_its_frame() {
-        // 以前の実装が挙げていた実物の描かれ方(枠の中に1行)
+        // How the real screen was drawn, as recorded by the earlier implementation (one line in a frame)
         assert_eq!(
             Pane::new("\u{2502} You've hit your session limit").spawn_screen(),
             SpawnScreen::UsageLimited
         );
-        // 番号つきの選択肢(現行)
+        // Numbered option
         assert_eq!(
             Pane::new("\u{276f} 1. Stop and wait for the limit to reset").spawn_screen(),
             SpawnScreen::UsageLimited
@@ -1194,7 +1200,7 @@ Select login method:\n \u{276f} 1. Claude account with subscription \u{b7} Pro, 
 
     #[test]
     fn spawn_screen_reads_the_dev_channels_confirm() {
-        // 現行 / 2865 の文面。**素の部分一致**(実物のキャプチャが無い)
+        // **Plain substring match** (there is no real capture)
         assert_eq!(
             Pane::new("Yes, proceed with local development").spawn_screen(),
             SpawnScreen::Confirm
@@ -1207,8 +1213,8 @@ Select login method:\n \u{276f} 1. Claude account with subscription \u{b7} Pro, 
 
     #[test]
     fn an_account_refusal_wins_over_the_ordinary_prompts() {
-        // 現行 と同じ順序の約束 — サインイン/上限は trust/confirm に
-        // 「答えて消す」ものではない。Enter を撃っても消えないので、撃つ前に諦める
+        // Order matters: sign-in / limit are not dismissed by answering like trust/confirm.
+        // Enter won't clear them, so give up before pressing it
         let mixed = format!("{LOGIN_PANE}\n \u{276f} 1. Yes, I trust this folder");
         assert_eq!(Pane::new(&mixed).spawn_screen(), SpawnScreen::LoginRequired);
         assert_eq!(
@@ -1219,8 +1225,8 @@ Select login method:\n \u{276f} 1. Claude account with subscription \u{b7} Pro, 
 
     #[test]
     fn the_words_inside_a_line_of_content_are_not_a_screen() {
-        // 自分のソースや grep の結果を映しているワーカーの画面。ここへ Enter を撃つと
-        // 入力欄の中身が送信される。行頭アンカーが唯一の防波堤(現行)
+        // An agent's screen showing its own source or grep output. Pressing Enter here would send
+        // whatever is in the input box. The line-start anchor is the only safeguard
         assert_eq!(
             Pane::new("  if paneText.includes('I trust this folder') return 'trust'")
                 .spawn_screen(),
@@ -1238,7 +1244,7 @@ Select login method:\n \u{276f} 1. Claude account with subscription \u{b7} Pro, 
 
     #[test]
     fn an_ordinary_booting_pane_is_not_a_screen() {
-        // 誤検知はフリートを止めうる(現行)。疑わしきは None_
+        // A false positive can stall the fleet. When in doubt, None_
         assert_eq!(Pane::new("").spawn_screen(), SpawnScreen::None_);
         assert_eq!(
             Pane::new("still booting\u{2026}").spawn_screen(),

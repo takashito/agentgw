@@ -14,24 +14,24 @@ use crate::bridge::state::{Access, LogCtx, ThreadEntry, ThreadKey};
 use crate::bridge::{inbound, worker};
 use crate::chat::{ChannelKind, InboundMsg, Reaction, slack};
 
-/// ドレインを諦めてでも殺す上限。現行は受信確認のタイムアウトを流用する
-/// (RECEIPT_TIMEOUT_MS = 30s)— 新しいつまみを増やさないため。
+/// Deadline after which the agent is killed even if draining hasn't finished. Reuses the
+/// receipt timeout (30 s) rather than adding another knob.
 const DRAIN_TIMEOUT_MS: u64 = 30_000;
 
-/// Slack が再配達に刻む試行回数。slack-morphism 2.24.0 の Socket Mode envelope は
-/// `envelope_id` と `accepts_response_payload` しか持たず、Slack が載せる `retry_attempt` は
-/// push イベントのコールバックに渡る前に捨てられる(models/socket_mode/mod.rs:59-64)ので
-/// 0 固定。同じ (channel, ts) の再到着は dedup が落とすため、stale の判定に残るのは
-/// 「この Bridge が聞き始める前に投稿されたか」だけになる。
+/// Retry attempt count Slack stamps on a redelivery. Fixed at 0: slack-morphism 2.24.0's
+/// Socket Mode envelope only keeps `envelope_id` and `accepts_response_payload`, and the
+/// `retry_attempt` Slack sends is dropped before the push-event callback sees it. Re-arrivals
+/// of the same (channel, ts) are dropped by dedup, so all the stale check has left is
+/// "was it posted before this Bridge started listening".
 const RETRY_NUM: u32 = 0;
 
-/// この1通 → エージェントに渡す封筒テキスト。`ts` は**配達時点**の now(`now_ms`)、
-/// `thread_ts` は解決済みの根(現行`threadTs || msg.ts` を渡す)。
+/// This message → the envelope text handed to the agent. `ts` is now **at delivery** (`now_ms`),
+/// `thread_ts` is the resolved thread root (the thread's ts, or the message's own ts).
 pub fn envelope(msg: &InboundMsg, root_ts: &str, now_ms: u64) -> String {
     envelope_guarded(msg, root_ts, None, now_ms)
 }
 
-/// ループ遮断が立った配達だけ `loop_guard` を載せる(空文字 = 呼ぶ相手が居ない)。
+/// Only deliveries that tripped the loop guard carry `loop_guard` (empty = nobody to call).
 pub fn envelope_guarded(
     msg: &InboundMsg,
     root_ts: &str,
@@ -46,29 +46,29 @@ pub fn envelope_guarded(
         ts: crate::bridge::state::iso8601(now_ms),
         thread_ts: Some(root_ts.to_string()),
         text: msg.text.clone(),
-        // 先読みダウンロードの結果はメッセージが持っている(queue 経由でも持ち越す)
+        // The message carries the result of the eager download (it survives the queue too)
         file_paths: msg.file_paths.clone(),
         file_errors: msg.file_errors.clone(),
     }
     .render()
 }
 
-/// 門番の答え — この1通をワーカーに渡すか。
+/// The gate's answer: whether this message goes to the agent.
 ///
-/// `Drop` の `&'static str` は落とした理由で、そのままログに出る(黙って捨てない)。
-/// 判断そのものは [`Access::gate`]。
+/// The `&'static str` in `Drop` is the reason, logged as is (nothing is dropped silently).
+/// The decision itself is [`Access::gate`].
 #[derive(PartialEq, Eq, Debug)]
 pub enum GateVerdict {
     Serve,
-    /// Owner 以外の人が、動いているスレッドで喋った。ワーカーには**文脈として**
-    /// 渡す(返事は期待しない)。落とすとスレッドの会話が歯抜けになる。
+    /// Someone other than the Owner spoke in an active thread. Hand it to the agent **as
+    /// context** (no reply expected). Dropping it would leave gaps in the thread's conversation.
     Context,
     Drop(&'static str),
 }
 
-/// 門を通った1通をどう捌くか — 「起こす / 再開する / 渡す / 溜める」の4通りしかない。
+/// What to do with a message that passed the gate. Only four options: start / resume / deliver / queue.
 ///
-/// スレッドの記録とワーカーの生死だけで決まる([`Dispatch::decide`])。
+/// Decided only by the thread record and whether the agent is alive ([`Dispatch::decide`]).
 #[derive(PartialEq, Eq, Debug)]
 pub enum Dispatch {
     SpawnNew,
@@ -77,7 +77,7 @@ pub enum Dispatch {
     Queue,
 }
 
-/// entry 無し → SpawnNew / Ready → Deliver / Starting → Queue / Absent → SpawnResume。
+/// No entry → SpawnNew / Ready → Deliver / Starting → Queue / Absent → SpawnResume.
 impl Dispatch {
     pub fn decide(entry: Option<&ThreadEntry>, worker: WorkerState) -> Dispatch {
         let Some(entry) = entry else {
@@ -86,7 +86,7 @@ impl Dispatch {
         match worker {
             WorkerState::Ready => Dispatch::Deliver,
             WorkerState::Starting => Dispatch::Queue,
-            // 過去のセッションを知らない entry は再開できない → 新規で建てる
+            // An entry with no past session can't be resumed → start a new one
             WorkerState::Absent => match entry.agent_id.as_deref() {
                 Some(sid) => Dispatch::SpawnResume(sid.to_string()),
                 None => Dispatch::SpawnNew,
@@ -97,9 +97,9 @@ impl Dispatch {
 
 const DEDUP_CAP: usize = 512;
 
-/// 同一 (channel, ts) の再配達を落とす覚え書き。1メッセージが複数イベントで届くため必須
+/// Memory of seen (channel, ts) to drop redeliveries. Required: one message arrives as several events
 ///
-/// ponytail: 上限512の線形スキャン。イベント率が上がるなら HashSet + VecDeque に。
+/// ponytail: linear scan capped at 512. Switch to HashSet + VecDeque if the event rate grows.
 #[derive(Default)]
 pub struct RecentDeliveries {
     seen: std::collections::VecDeque<(String, String)>,
@@ -110,7 +110,7 @@ impl RecentDeliveries {
         Self::default()
     }
 
-    /// 既出なら true。初出なら覚えて false。
+    /// True if already seen. Otherwise remember it and return false.
     pub fn seen(&mut self, channel: &str, ts: &str) -> bool {
         if self.seen.iter().any(|(c, t)| c == channel && t == ts) {
             return true;
@@ -124,9 +124,9 @@ impl RecentDeliveries {
 }
 
 impl Access {
-    // ── 門 ──
-    // 疑わしきは Drop(fail-closed)。owner 空の access は誰も通さない。
-    /// このチャンネルで「以後訊かない」と押されたツールか。
+    // ── Gate ──
+    // When in doubt, Drop (fail-closed). An access with no owner lets nobody through.
+    /// Whether this tool was granted "don't ask again" in this channel.
     pub fn channel_tool_allowed(&self, channel: &str, tool: &str) -> bool {
         self.routes
             .get(channel)
@@ -134,7 +134,7 @@ impl Access {
             .is_some_and(|v| v.iter().any(|t| t == tool))
     }
 
-    /// 「以後このチャンネルでは訊かない」を覚える。**人がボタンを押したときだけ**呼ばれる。
+    /// Remember "don't ask again in this channel". Called **only when a person presses the button**.
     pub fn grant_channel_tool(&mut self, channel: &str, tool: &str) {
         if channel.is_empty() || tool.is_empty() {
             return;
@@ -150,27 +150,26 @@ impl Access {
         }
     }
 
-    /// 入れる / 文脈として入れる / 落とす の3値(`decideChannelAccess` と
-    /// `decideDmAccess`)。
+    /// Three outcomes: serve / serve as context / drop.
     ///
-    /// **チャンネルが access.json に載っているかは見ない。** 登録(routes)が持っているのは
-    /// 「そのチャンネルでどのフォルダを触るか」で、入れる判断には使わない — 未登録の
-    /// チャンネルでも Owner のメンションには応える(現行の判定と同じ)。
+    /// **Whether the channel is in access.json is not checked.** A route only says which folder
+    /// to work in for that channel and plays no part in letting a message in: the Owner's
+    /// mention is answered even in an unregistered channel.
     ///
-    /// チャンネルでは**メンション**か**既に動いているスレッド**が要る。これが無いと、
-    /// 登録済みチャンネルの雑談まで全部ワーカーに流れる。
+    /// In a channel it takes a **mention** or an **already active thread**. Without that, every
+    /// bit of chatter in a registered channel would flow to the agent.
     pub fn gate(&self, msg: &InboundMsg, is_mention: bool, is_active_thread: bool) -> GateVerdict {
         let dm = msg.channel_kind == ChannelKind::Dm;
-        // bot を DM に入れる道は無い(`isBotDMBlocked`)
+        // There is no way for a bot to get in through a DM
         if msg.is_bot && dm {
             return GateVerdict::Drop("bot-dm-blocked");
         }
         if self.owner.is_empty() {
             return GateVerdict::Drop(if dm { "dm-no-owner" } else { "no-owner" });
         }
-        // Slack Web API 経由の投稿には**人が書いたものでも** bot_id が付く。
-        // それでも Slack は本当の `user` を刻む(トークン由来なので本文からは詐称できない)ので、
-        // その人が Owner なら人として扱う。Owner 以外・user 無しは bot(閉じる方に倒す)
+        // Posts made through the Slack Web API carry a bot_id **even when a person wrote them**.
+        // Slack still stamps the real `user` (it comes from the token, so the text can't spoof it),
+        // so if that person is the Owner, treat it as a person. Anyone else, or no user, is a bot (fail closed)
         let is_owner = msg.user.as_deref() == Some(self.owner.as_str());
         if dm {
             return if is_owner {
@@ -181,7 +180,7 @@ impl Access {
         }
         let reachable = is_mention || is_active_thread;
         if msg.is_bot && !is_owner {
-            // Owner が allow-bot で許した bot だけ。それ以外は名指しでも通さない
+            // Only bots the Owner allowed with allow-bot. Others don't get in even when mentioned
             let allowed = msg
                 .bot_id
                 .as_deref()
@@ -202,7 +201,7 @@ impl Access {
                 GateVerdict::Drop("require-mention-unmet")
             };
         }
-        // Owner 以外の人 — 動いているスレッドの中でだけ**文脈として**渡す(返事はさせない)
+        // Someone other than the Owner: pass **as context** only inside an active thread (no reply)
         if is_active_thread {
             GateVerdict::Context
         } else {
@@ -211,39 +210,40 @@ impl Access {
     }
 }
 
-/// 「同じ出来事を2度処理しない」ための鍵。
+/// Key that keeps the same event from being handled twice.
 ///
-/// 素の `ts` で足りるのは**本文が届いたとき**だけ。リアクション・書き換え・削除は `ts` が
-/// **相手側のメッセージ**を指すので、そのままだと元の配達で覚えた鍵とぶつかって必ず
-/// 「重複」で落ちる。種別ごとに名前空間を分ける。
+/// A bare `ts` is enough only **when a message body arrives**. For reactions, edits and
+/// deletions `ts` points at **the target message**, so as is it collides with the key stored
+/// for the original delivery and is always dropped as a duplicate. Each kind gets its own namespace.
 pub(super) fn dedup_key(msg: &InboundMsg) -> String {
     match (&msg.reaction, &msg.edited, &msg.deleted_ts) {
-        // 同じ投稿への2つ目の絵文字を「重複」にしない — 絵文字と付/外を混ぜて数える
+        // A second emoji on the same post is not a duplicate: the key includes the emoji and add/remove
         (Some(r), _, _) => format!("{}#{}{}", msg.ts, r.emoji, if r.added { "+" } else { "-" }),
-        // 書き換えは改訂ごとに1回だけ通す(同じ改訂の再配達は落とす)
+        // An edit passes once per revision (redeliveries of the same revision are dropped)
         (_, Some(e), _) => format!("{}#edit#{}", msg.ts, e.revision),
         (_, _, Some(_)) => format!("{}#deleted", msg.ts),
         _ => msg.ts.clone(),
     }
 }
 
-/// 自分が付けた印(ack の 👀 / 🤖 / 受信確認の 🔄)は、Slack から自分に返ってくる。
+/// Our own marks (the ack 👀 / 🤖 / the receipt 🔄) come back to us from Slack.
 ///
-/// **ワーカーには渡さない。** リアクションの合成本文は「黙っていないで返事を」と促すので、
-/// 素直に従うワーカーは ack のたびに返事を増やす。実測(2026-08-02)では**スレッドの1通目**の
-/// たびに3通入っていた — 1通目に限るのは、リアクションの通知がスレッドを教えてくれず、
-/// 代用した ID がそのときだけ本物のスレッドと一致するため。
+/// **Never pass them to the agent.** The synthesized reaction text urges "reply rather than
+/// stay silent", so an obedient agent adds a reply for every ack. Measured (2026-08-02): three
+/// extra messages on **the first message of every thread**. Only the first, because the
+/// reaction event doesn't say which thread it's in, and the ID used as a stand-in matched the
+/// real thread only then.
 pub(super) fn is_own_reaction(msg: &InboundMsg, bot_user_id: Option<&str>) -> bool {
     msg.reaction.is_some() && bot_user_id.is_some_and(|b| msg.user.as_deref() == Some(b))
 }
 
-/// **自分が書いたのではない**投稿に付いたリアクションの行き先。
+/// Where a reaction on a post **we did not write** goes.
 #[derive(PartialEq, Debug)]
 pub(super) enum ForeignReaction {
-    /// Owner が**自分の依頼**に stop を付けた — 止める(2026-08-02 のユーザー指定)。
+    /// The Owner put stop on **their own request**: stop (the user's call, 2026-08-02).
     Stop,
-    /// それ以外。現行はここを黙って捨てる — 他人のやりとりへの
-    /// リアクションが、合成テキストとしてワーカーに流れ込まないように
+    /// Anything else. Dropped quietly, so reactions to other people's exchanges don't flow
+    /// into the agent as synthesized text
     Drop,
 }
 
@@ -254,8 +254,8 @@ pub(super) fn foreign_reaction(
     owner: &str,
 ) -> ForeignReaction {
     let by_owner = !owner.is_empty() && reactor == Some(owner);
-    // `author == reactor` = 自分の投稿に自分で付けた。**他人の投稿への stop は効かない** —
-    // 誰の仕事を止めるのかが決まらない
+    // `author == reactor` = put on their own post. **stop on someone else's post does nothing**:
+    // there's no telling whose work to stop
     if r.is_stop() && by_owner && author == reactor {
         ForeignReaction::Stop
     } else {
@@ -266,15 +266,16 @@ pub(super) fn foreign_reaction(
 // ── handling inbound messages ──
 
 impl Bridge {
-    /// 受信メッセージの添付を先読みダウンロードし、結果を msg に書き戻す。
-    /// **決して失敗を投げない** — 1ファイルごとに握りつぶして劣化ノートにする。壊れた/大きすぎる
-    /// 1つが、ユーザーの本文や他の添付を巻き添えにしないため(現行)。
+    /// Download the incoming message's attachments up front and write the result back to msg.
+    /// **Never fails**: each file's failure is swallowed into a degraded note, so one broken or
+    /// oversized file doesn't take the user's text or other attachments down with it.
     async fn with_attachments(&self, mut msg: InboundMsg, ctx: &LogCtx) -> InboundMsg {
         let (mut paths, mut errors) = (Vec::new(), Vec::new());
-        // ここは select ループの腕の中 — 止まった分だけ**全スレッド**の hook / disposition /
-        // コマンド / sticky flush が待たされる。だから締切は1ファイルごとではなく
-        // **メッセージ全体で1つ**。何枚貼られても最悪 DOWNLOAD_TIMEOUT で必ず抜ける。
-        // ponytail: 逐次。並列化(tokio::spawn)は多数添付の待ち時間が実際に痛くなってから
+        // This runs inside an arm of the select loop: while it waits, hooks / dispositions /
+        // commands / progress-message flushes for **every thread** wait too. So the deadline is
+        // **one for the whole message**, not per file. However many files, it always returns
+        // within DOWNLOAD_TIMEOUT.
+        // ponytail: sequential. Parallelize (tokio::spawn) once many-attachment waits actually hurt
         let deadline = tokio::time::Instant::now() + slack::DOWNLOAD_TIMEOUT;
         for f in &msg.files {
             let dl = self.deps.slack.download_attachment(&f.id, self.deps.dir.path());
@@ -284,7 +285,7 @@ impl Bridge {
                     continue;
                 }
                 Ok(Err(e)) => e,
-                // 締切超過。残りのファイルも同じ枝で即座にノートになる
+                // Deadline passed. The remaining files hit this branch at once and become notes
                 Err(_) => format!(
                     "timed out ({}s budget for this message's attachments)",
                     slack::DOWNLOAD_TIMEOUT.as_secs()
@@ -294,7 +295,7 @@ impl Bridge {
                 "bridge",
                 &format!("attachment download failed file={}: {reason}", f.id),
             );
-            // 文言は原文コピー— ワーカーが人に伝える一次資料
+            // Keep this wording: it is what the agent relays to the person
             errors.push(format!("[attachment {} not downloaded: {reason}]", f.name));
         }
         ctx.debug("bridge", &format!(
@@ -315,7 +316,7 @@ impl Bridge {
     }
 
     pub(super) async fn on_inbound(&mut self, msg: &InboundMsg) {
-        // 自分の印は自分に返る。**dedup より前**で捨てる — 覚え書きを自分の絵文字で埋めない
+        // Our own marks come back to us. Drop them **before dedup** so our emoji don't fill the memory
         if is_own_reaction(msg, self.bot_user_id.as_deref()) {
             LogCtx::default().debug(
                 "bridge",
@@ -330,7 +331,7 @@ impl Bridge {
             );
             return;
         }
-        // dedup は gate の前 — 1メッセージが複数イベントで届く
+        // dedup before the gate: one message arrives as several events
         let dedup_key = dedup_key(msg);
         if self.dedup.seen(&msg.channel, &dedup_key) {
             LogCtx::default().debug(
@@ -339,10 +340,10 @@ impl Bridge {
             );
             return;
         }
-        // コマンドは**ボタン**: 押された時に効くか、さもなくば効かない。
-        // Bridge が落ちていた間の投稿は Slack が再接続時にまとめて寄越すので、送り主がとうに
-        // 諦めた後の `exit` が届いて二度目の別れを告げる。全コマンド経路の手前で落とす。
-        // 普通のリクエストは無傷 — 遅れて配達される方が、本物の仕事を失うよりましだから
+        // A command is a **button**: it works when pressed or not at all.
+        // Slack delivers posts made while the Bridge was down in a batch on reconnect, so an `exit`
+        // the sender gave up on long ago arrives and says goodbye a second time. Drop it before
+        // any command path. Ordinary requests are untouched: late delivery beats losing real work
         let body = crate::bridge::command::Message::new(&msg.text, self.bot_user_id.as_deref());
         if let Some(cmd) = crate::bridge::command::Cmd::parse(&body, self.deps.agent.as_ref())
             && let Some(stale) = cmd.stale_reason(&msg.ts, self.started_at_ms, RETRY_NUM)
@@ -368,25 +369,26 @@ impl Bridge {
             );
             return;
         }
-        // サインイン専用の抜け道。gate は owner 空を全部落とすので、**その手前**でなければ
-        // 最初のサインインは永久に始められない。Owner が居ても、このチャンネルでサインインが
-        // コードを待っているなら通す — マシンのサインインし直し(Owner が居る状態で始まる)の
-        // コードがエージェントに流れてしまう(2026-09-18 に実機で発覚)
+        // Sign-in carve-out. The gate drops everything while there is no owner, so unless this
+        // comes **before** it, the first sign-in could never start. Even with an Owner, let it
+        // through while a sign-in in this channel is waiting for a code; otherwise the code for a
+        // machine's re-sign-in (which starts with an Owner set) flows to the agent (found on a
+        // real machine 2026-09-18)
         if (self.access.owner.is_empty() || self.sign_in.awaiting_code(&msg.channel))
             && !msg.is_bot
             && self.login_carve_out(msg)
         {
             return;
         }
-        // 編集・削除のイベントは**スレッドを教えてくれない**(ライブラリの型が
-        // 入れ子の `thread_ts` を落とす)。まず未応答の台帳で引き、載っていなければ Slack に
-        // 1件だけ問い合わせる。**返事し終わった過去のメッセージを直した場合はこちらしか無い** —
-        // 台帳から消えているので、聞かないと別スレッド扱いで捨ててしまう
-        // リアクションも同じで、**書き手もスレッドも教えてくれない**。元の投稿を1回だけ引く。
-        // 省いて ts をスレッドの代用にしていたのが、
-        // 「スレッドの1通目にだけ湧く誤配達」の正体だった(2026-08-02)。
-        // ponytail: リアクション1つにつき1回問い合わせる。多すぎるなら `item_user` を
-        // InboundMsg まで持ち上げて、stop でない他人宛のものを引く前に落とす
+        // Edit and delete events **don't say which thread** (the library's type drops the nested
+        // `thread_ts`). Look it up in the pending ledger first, and if it's not there ask Slack
+        // once. **For an edit to an old, already answered message this is the only way**: it's
+        // gone from the ledger, so without asking it would be dropped as a different thread.
+        // Reactions are the same and **tell us neither the author nor the thread**, so fetch the
+        // original post once. Skipping that and using ts as the thread was the cause of the
+        // "misdelivery only on a thread's first message" (2026-08-02).
+        // ponytail: one lookup per reaction. If that's too many, lift `item_user` into
+        // InboundMsg and drop non-stop reactions on other people's posts before the lookup
         let reacted = match &msg.reaction {
             Some(r) => match self.deps.slack.message_at(&msg.channel, &r.item_ts).await {
                 Some(m) => Some(m),
@@ -426,8 +428,8 @@ impl Bridge {
             thread_key: Some(key.clone()),
         };
 
-        // チャンネルでは**名指しか、もう動いているスレッド**でないと入れない
-        // (DM は名指し扱い)。登録済みかどうかは見ない — 判断材料はこの2つだけ
+        // In a channel it takes **a mention or an already active thread** to get in
+        // (a DM counts as a mention). Registration is not checked; these two are all that matter
         let dm = msg.channel_kind == inbound::ChannelKind::Dm;
         let is_mention = dm
             || crate::bridge::command::Message::new(&msg.text, self.bot_user_id.as_deref())
@@ -441,7 +443,7 @@ impl Bridge {
                 );
                 return;
             }
-            // Owner 以外が動いているスレッドで喋った — 流すが返事は期待しない
+            // Someone other than the Owner spoke in an active thread: pass it on, no reply expected
             GateVerdict::Context => {
                 ctx(None).info(
                     "bridge",
@@ -459,27 +461,26 @@ impl Bridge {
         };
         let _ = context_only;
 
-        // ユーザーが自分の依頼を消した。**まだ処理中のものだけ**取り消しを伝える:
-        // 既に答えた過去のメッセージを消しても、取り下げる仕事はもう無い
+        // The user deleted their own request. Report the cancellation **only if it's still in
+        // progress**: deleting an old, already answered message leaves no work to withdraw
         if let Some(deleted) = msg.deleted_ts.clone() {
             self.on_message_deleted(msg, &key, &root_ts, &deleted, &ctx(None));
             return;
         }
 
-        // ユーザーが依頼を書き換えた。**いま処理中のもの**なら中断して新しい方を
-        // やり直させ、過去のものなら今の仕事は続けさせて「手が空いたら」と伝える
+        // The user edited a request. If it's **the one in progress**, interrupt and redo it with
+        // the new text; if it's an old one, keep the current work going and say "when you're free"
         if let Some(edited) = msg.edited.clone() {
             self.on_message_edited(msg, &key, &root_ts, &edited.ts, &ctx(None));
             return;
         }
 
-        // **Owner が自分の依頼に付けた stop は止める合図**(2026-08-02 のユーザー指定。現行との
-        // 意図的な差 — 現行は付箋に付いたものだけを見る)。付箋を探して押さなくても、
-        // 止めたい依頼そのものに ✋ を付ければ止まる。
+        // **A stop the Owner puts on their own request means stop** (the user's call, 2026-08-02;
+        // not only on the progress message). No need to find the progress message: putting ✋
+        // on the request itself stops it.
         //
-        // その手前に、現行にあって移植されていなかった検査を置く: **自分が書いた投稿への
-        // リアクションだけ拾う**。他人の投稿に付いたものまで拾うと、
-        // 無関係なやりとりが合成テキストとしてワーカーに流れ込む
+        // Before that, a check: **only take reactions on posts we wrote**. Taking reactions on
+        // other people's posts would pour unrelated exchanges into the agent as synthesized text
         if let (Some(r), Some(m)) = (&msg.reaction, &reacted)
             && !(m.is_bot || m.user.as_deref() == self.bot_user_id.as_deref())
         {
@@ -511,8 +512,8 @@ impl Bridge {
             return;
         }
 
-        // **進捗付箋に付いた** stop 絵文字は stop コマンドと同じ。他のメッセージへの
-        // 同じ絵文字はただのリアクションとして下へ流す(付箋を狙って押した時だけ止める)
+        // A stop emoji **on the progress message** is the same as the stop command. The same emoji
+        // on another message falls through as a plain reaction (stop only when aimed at the progress message)
         if let Some(r) = &msg.reaction
             && r.is_stop()
             && self.sticky.sticky_ts(&key).as_deref() == Some(r.item_ts.as_str())
@@ -528,8 +529,8 @@ impl Bridge {
             return;
         }
 
-        // ループ遮断(チャンネルのみ)。許可した bot が居る以上、
-        // bot 同士が延々と返し合う道が開いている。**人が入るまで**止めるのがここ
+        // Loop guard (channels only). Once bots are allowed, bots can reply to each other forever.
+        // This stops the thread **until a person steps in**
         let mut loop_guard: Option<String> = None;
         if !dm {
             if msg.is_bot {
@@ -555,7 +556,7 @@ impl Bridge {
                             msg.ts
                         ),
                     );
-                    // 呼ぶ相手が居なければ空(印だけ立てる)
+                    // Empty if there is nobody to call (just set the flag)
                     loop_guard = Some(match self.access.owner.as_str() {
                         "" => String::new(),
                         o => format!("<@{o}>"),
@@ -575,25 +576,25 @@ impl Bridge {
             }
         }
 
-        // コマンドは Bridge が自分で答えて**ここで終わる** — ワーカーには決して渡さない。
-        // ack より前に返すのは、コマンドに 👀 を付けないため
+        // The Bridge answers commands itself and **stops here**; they never reach the agent.
+        // Returning before the ack keeps 👀 off commands
         if self.handle_command(msg, &key, &root_ts).await {
-            // Bridge が**このスレッドで喋った**。status / usage のようにワーカーを起こさない
-            // コマンドでも、以後そのスレッドは「動いているスレッド」— 続きはメンション無しで
-            // 受ける(ユーザー指定。セッションの有無とは切り離す)
+            // The Bridge **spoke in this thread**. Even for commands that don't start an agent,
+            // like status / usage, the thread is active from now on and follow-ups are taken
+            // without a mention (the user's call; independent of whether a session exists)
             self.mark_thread_seen(&msg.channel, &root_ts, &ctx(None));
             return;
         }
 
-        // usage 上限中は新規の依頼を受けない。キューイングもしない。
-        // コマンドの**後ろ**なのは現行どおり — 上限中でも stop/restart/logout は効く
+        // While at the usage limit, take no new requests and don't queue them either.
+        // This comes **after** commands so stop/restart/logout still work at the limit
         if self.deps.clock.now_ms() < self.limited_until_ms {
             let text = super::turn::limited_notice(self.limited_until_ms);
             self.post(&msg.channel, &root_ts, text, &key);
             return;
         }
 
-        // 「見た」の合図をすぐ返し、未応答として台帳に載せる(🤖 への切替は user_prompt hook)
+        // Signal "seen" right away and record it as pending in the ledger (the switch to 🤖 is the user_prompt hook)
         self.react(
             &msg.channel,
             &msg.ts,
@@ -603,21 +604,21 @@ impl Bridge {
         .await;
         self.ledger.track(&key, &msg.ts);
 
-        // 添付は**受信した時に**落とし、封筒には
-        // ローカルパスを載せる。ワーカーは Read するだけでよく、引き金のメッセージについて
-        // download_attachment を呼ぶ必要が無い(呼ぶための file_id も知らされない)
+        // Attachments are downloaded **on receipt** and the envelope carries local paths. The
+        // agent just Reads them and never needs download_attachment for the triggering message
+        // (it isn't even told the file_id)
         let msg = &self.with_attachments(msg.clone(), &ctx(None)).await;
 
         let entry = self.threads.get(&root_ts).cloned();
         let is_new = entry.is_none();
         let sid = entry.as_ref().and_then(|e| e.agent_id.as_deref());
-        // 窓名は session_id だけで決まる。まだセッションの無いスレッドは
-        // 窓も無い — worker_state は sid 無しで Absent を返すので空文字で害が無い
+        // The window name depends only on session_id. A thread with no session yet has no
+        // window; worker_state returns Absent without a sid, so an empty string is harmless
         let window = sid
             .map(|s| SessionId::from(s).window_name())
             .unwrap_or_default();
         let state = self.workers.state_of(entry.as_ref(), &window, self.deps.agent.as_ref());
-        // 配達先は window_id を優先(窓名は改名されうる)
+        // Prefer window_id as the target (window names can be renamed)
         let target = entry
             .as_ref()
             .and_then(|e| e.agent_id.as_deref())
@@ -625,17 +626,17 @@ impl Bridge {
             .and_then(|h| h.window_id.clone())
             .unwrap_or_else(|| window.clone());
         let envelope = envelope_guarded(msg, &root_ts, loop_guard, self.deps.clock.now_ms());
-        // ターン失敗の再送に要る。`track` は ack の直後(封筒がまだ無い時点)なので、
-        // 封筒ができた**ここ**で台帳に預ける — これより下の配達経路は全部この後ろ
+        // Needed to resend after a failed turn. `track` runs right after the ack (before the
+        // envelope exists), so store it in the ledger **here**, once built; every delivery path below comes after this
         self.ledger.remember_envelope(&key, &msg.ts, &envelope);
-        // pwd と同じ解決を通す(ルート無し → Home フォールバック)
+        // Resolve the same way as pwd (no route → fall back to Home)
         let (cwd, _) = self.access.repo_path(&msg.channel, &Host::home());
 
-        // 新規スレッドは cold spawn の前に在庫を覗く。無ければ下の decide にそのまま落ちる
+        // A new thread checks the pool before a cold spawn. If it's empty, fall through to decide below
         if bridge::Threads::should_claim_pool(entry.as_ref()) {
             let key_pool = bridge::PoolKey::of_cwd(&cwd);
             if let Some(claimed) = self.claim_pool_worker(&key_pool) {
-                // SpawnNew と同じ話題の取り方(trim して頭 60 文字 — 文字単位)
+                // Same topic as SpawnNew (trimmed, first 60 characters, counted in chars)
                 let topic: String = msg.text.trim().chars().take(60).collect();
                 let assigned = self.assign_pool_worker(
                     claimed,
@@ -648,7 +649,7 @@ impl Bridge {
                     &key,
                     &ctx(None),
                 );
-                // Dispatch::Deliver の失敗と同じ扱い: 取っておいて、待っている人に言う
+                // Same as a failed Dispatch::Deliver: keep it and tell the person waiting
                 if let Err(e) = assigned {
                     self.pending
                         .entry(root_ts.clone())
@@ -664,8 +665,8 @@ impl Bridge {
             }
         }
 
-        // 配達できたら沈黙見張りを起こす。`entry` の借用が生きているうちは `&mut self` を
-        // 取れないので、match の外まで持ち出す
+        // Once delivered, start the silence watch. `&mut self` can't be taken while `entry` is
+        // borrowed, so carry the flag out of the match
         let mut delivered = false;
         match Dispatch::decide(entry.as_ref(), state) {
             Dispatch::SpawnNew => {
@@ -674,8 +675,8 @@ impl Bridge {
                 e.agent_id = Some(sid.clone());
                 e.channel_id = Some(msg.channel.clone());
                 e.repo_path = Some(cwd.clone());
-                // status のリンク文字列になる話題。現行と同じく trim して頭 60 文字
-                // (字数は文字単位で数える — 日本語を割らないため)
+                // The topic used as the link text in status: trimmed, first 60 characters
+                // (counted in chars so multi-byte text isn't split)
                 let topic: String = msg.text.trim().chars().take(60).collect();
                 e.topic = (!topic.is_empty()).then_some(topic);
                 self.threads.upsert(&root_ts, e);
@@ -690,7 +691,7 @@ impl Bridge {
                     cwd: cwd.clone(),
                     prompt: Some(envelope.clone()),
                     resume_from: None,
-                    // 窓名は**今決まった** session_id から作る(スレッドの窓名は存在しない)
+                    // The window name comes from the session_id **just chosen** (the thread has no window name yet)
                     window: SessionId::from(sid.clone()).window_name(),
                     state,
                     hooks_file: self.hooks_file.clone(),
@@ -706,7 +707,7 @@ impl Bridge {
                     session_id: sid.clone().into(),
                     cwd: cwd.clone(),
                     prompt: Some(envelope.clone()),
-                    // 継続は同じ session_id を `--resume` で開き直す
+                    // To continue, reopen the same session_id with `--resume`
                     resume_from: Some(sid.clone().into()),
                     window: SessionId::from(sid.clone()).window_name(),
                     state,
@@ -717,9 +718,9 @@ impl Bridge {
             }
             Dispatch::Deliver => {
                 let sid = entry.as_ref().and_then(|e| e.agent_id.clone());
-                // 暖まっているワーカーには prefix 抜きの素の封筒(push と同じ形)
+                // A warm agent gets the bare envelope with no prefix (same shape as push)
                 match self.deps.agent.deliver(&Window::of(&target), &envelope) {
-                    // 1メッセージ1行の配達記録(現行)
+                    // One delivery log line per message
                     Ok(()) => {
                         ctx(sid.as_deref()).info(
                             "bridge",
@@ -731,18 +732,18 @@ impl Bridge {
                         );
                         delivered = true;
                     }
-                    // 配達できなかった = このメッセージは**誰にも届いていない**。ログだけだと
-                    // 👀 が付いたまま無言で終わる(2026-08-18: モーダルで詰まった2スレッドが
-                    // それで18分沈黙した)ので、待っている人に1本言う。
-                    // ponytail: 詰まっている間は1通ごとに1本出る。うるさければスレッド単位で
-                    // 抑制する(`cannot_deliver` の cooldown と同じ形)
+                    // Not delivered = this message **reached nobody**. A log line alone leaves 👀
+                    // on it in silence (2026-08-18: two threads stuck behind a modal were silent
+                    // for 18 minutes this way), so tell the person waiting.
+                    // ponytail: while stuck, one notice per message. If that's noisy, throttle
+                    // per thread (like the `cannot_deliver` cooldown)
                     Err(e) => {
                         ctx(sid.as_deref()).error(
                             "bridge",
                             &format!("delivery failed: {e} — queued for retry"),
                         );
-                        // 取っておかないと、覆いが晴れても**このメッセージは二度と届かない**
-                        // (再配達の経路が無い理由は [`Bridge::retry_pending`])
+                        // Unless kept, **this message never arrives**, even after the cover clears
+                        // (see [`Bridge::retry_pending`] for why there is no other redelivery path)
                         self.pending
                             .entry(root_ts.clone())
                             .or_default()
@@ -763,13 +764,13 @@ impl Bridge {
                 ctx(None).info("bridge", "worker still starting — queued");
             }
         }
-        // 渡した = ここから先は返事待ち。shimmer で「受け取って動いている」を出す
-        // 無音が続けば見張りが「思考中」に差し替える。
-        // 見張りの張り直しと同じ1回の送信で出すので、既に出ている shimmer と喧嘩しない
-        // リアクションは軽い合図 — 👀 だけが活動の印で、shimmer は立てない
-        // (ユーザー判断)。
-        // **他人宛の発言でも立てない** — 動いているスレッドには `<@誰か> おーい` も流れてくるが、
-        // それはこちらへの用件ではない。出すと「返事を書いている」という嘘になる
+        // Handed over = now waiting for a reply. Show the shimmer for "received and working";
+        // if silence continues, the watch replaces it with "thinking".
+        // It goes out in the same single send as re-arming the watch, so it doesn't fight a shimmer already shown.
+        // A reaction is a light signal: 👀 alone marks activity, no shimmer
+        // (the user's call).
+        // **Nor for messages addressed to someone else**: an active thread also carries things like
+        // `<@someone> hey`, which aren't for us. Showing it would falsely claim a reply is being written
         let for_someone_else = !is_mention
             && crate::bridge::command::Message::new(&msg.text, self.bot_user_id.as_deref())
                 .mentions_someone_else();
@@ -778,17 +779,15 @@ impl Bridge {
         }
     }
 
-    /// 走っているターンを ESC で断ち切る。生きているのは
-    /// 「ワーカーのプロセスが在る」かつ「未応答が1件以上ある」ときだけ。
-    /// 書き換えられた依頼をワーカーに渡す。分かれ道は1つだけ:
-    /// **いま処理中の依頼が書き換わったのか**(= 未応答に載っていて、かつスレッドで最新)。
+    /// Hand an edited request to the agent. There is one fork:
+    /// **was the request in progress edited?** (= it's pending and the newest in the thread).
     ///
-    /// - 処理中 → 付箋に「Interrupted by user.」を足し(既に出ているときだけ)、新しい本文を
-    ///   押し込んでから ESC。古い言い回しのためにやっていた作業は捨てさせる
-    /// - 過去の依頼 → **中断しない**。「手が空いてから直した依頼をやって」と伝えるだけ
-    ///   (過去のメッセージを消したときに今の仕事へ手を出さないのと同じ扱い)
+    /// - In progress → add "Interrupted by user." to the progress message (only if one is shown),
+    ///   push the new text, then ESC. Work done for the old wording is thrown away
+    /// - An old request → **don't interrupt**. Just say "do the edited request when you're free"
+    ///   (the same as deleting an old message doesn't touch the current work)
     ///
-    /// ワーカーの居ないスレッドは best-effort で捨てる(中断する相手も渡す先も無い)。
+    /// A thread with no agent is dropped best-effort (nothing to interrupt or deliver to).
     fn on_message_edited(
         &mut self,
         msg: &InboundMsg,
@@ -808,8 +807,8 @@ impl Bridge {
             );
             return;
         };
-        // 「いま処理中」= 未応答に載っていて、かつスレッドの未応答の中で最新
-        // (Slack の id は秒.マイクロ秒なので数値比較が新しさの比較になる)
+        // "In progress" = pending and the newest pending in the thread
+        // (Slack ids are seconds.microseconds, so comparing numbers compares recency)
         let pending = self.ledger.pending(key);
         let num = |id: &str| id.parse::<f64>().unwrap_or(0.0);
         let is_current = pending.iter().any(|id| id == edited_ts)
@@ -827,7 +826,7 @@ impl Bridge {
             .warm(&sid)
             .and_then(|h| h.window_id.clone())
             .unwrap_or_else(|| SessionId::from(sid.clone()).window_name());
-        // 付箋が出ているときだけ中断の締め行を足す(まだ何も出ていないなら足さない)
+        // Add the interrupted closing line only when a progress message is shown (not if nothing is out yet)
         if is_current && self.sticky.sticky_ts(key).is_some() {
             self.sticky.on_interrupted(key);
         }
@@ -848,25 +847,25 @@ impl Bridge {
             ctx.error("bridge", &format!("message_changed delivery failed: {e}"));
             return;
         }
-        // 押し込んでから切る(削除と同じ順序)— 逆にすると、切られたワーカーが
-        // 書き換えを知らないまま次の入力を待つ
+        // Push first, then cut (same order as deletion). The other way round, the interrupted
+        // agent waits for the next input without knowing about the edit
         if is_current {
             self.user_stop(msg, key, root_ts, ctx);
         }
-        // 書き換えられた依頼は**もう一度未応答**。載せ直しは user_stop の後(先に載せると
-        // dispose が巻き込む)。これが無いと沈黙見張りが「決着済み」と見て即畳まれ、
-        // ワーカーが作り直している間ずっと shimmer も「考え中」も出ない。
-        // 封筒も差し替える — 覚えているのは書き換え**前**の本文で、ターン失敗の再送が
-        // 古い言い回しを送り直してしまう
+        // The edited request is **pending again**. Re-add it after user_stop (added before, the
+        // dispose would sweep it up). Without this the silence watch sees it as settled and folds
+        // at once, and no shimmer or "thinking" shows while the agent redoes the work.
+        // Replace the envelope too: the stored one has the text from **before** the edit, and a
+        // resend after a failed turn would send the old wording again
         self.ledger.track(key, edited_ts);
         self.ledger.remember_envelope(key, edited_ts, &envelope);
         self.touch_thread(key, slack::TYPING_STATUS);
     }
 
-    /// 降りる前に、**まだ渡していないメッセージを threads.json へ逃がす**。
-    /// これが無いと、起動待ちで queue に積まれた依頼は落ちた瞬間に消える。
+    /// Before exiting, **save messages not yet handed over to threads.json**.
+    /// Without this, requests queued while an agent was starting vanish the moment we go down.
     ///
-    /// 逃がすのは queue の中身だけ(台帳の未応答は**渡し済み**で、ワーカーが抱えている)。
+    /// Only the queue is saved (pending entries in the ledger were **already handed over** and the agent holds them).
     pub(super) fn flush_pending_to_disk(&mut self, ctx: &LogCtx) {
         let queued: Vec<(String, Vec<InboundMsg>)> = self.pending.drain().collect();
         let mut n = 0usize;
@@ -892,8 +891,8 @@ impl Bridge {
         }
     }
 
-    /// 逃がしてあった分を配り直す(起動時に1回)。**普通の受信と同じ道**に流すので、
-    /// ワーカーが生きていれば押し込み、居なければ起こして渡す(= 中断したスレッドの再開)。
+    /// Redeliver what was saved (once at startup). It goes **the same way as a normal incoming
+    /// message**: pushed if the agent is alive, otherwise the agent is started (= the interrupted thread resumes).
     pub(super) async fn resume_pending_from_disk(&mut self) {
         for root_ts in self.threads.threads_with_pending() {
             let msgs = self.threads.drain_pending(&root_ts);
@@ -921,14 +920,14 @@ impl Bridge {
         }
     }
 
-    /// 消された依頼をワーカーに取り下げさせる。
+    /// Make the agent withdraw a deleted request.
     ///
-    /// 順序は Bun と同じ: **先に取り消しの通知を押し込み**、
-    /// そのあと ESC で走っているターンを切る。逆にすると、切られたワーカーが取り消しを
-    /// 知らないまま次の入力を待つ。
+    /// Order: **push the cancellation notice first**, then cut the running turn with ESC. The
+    /// other way round, the interrupted agent waits for the next input without knowing about
+    /// the cancellation.
     ///
-    /// 最後に台帳から落とす — 消した本人はもう返事を待っていないので、ここを残すと
-    /// 「応答待ち」の見張りが取り消しの処理中ずっと居座る(塞いだ穴)。
+    /// Finally drop it from the ledger: the person who deleted it isn't waiting for a reply,
+    /// and leaving it would keep the "awaiting reply" watch around for the whole cancellation (a fixed hole).
     fn on_message_deleted(
         &mut self,
         msg: &InboundMsg,
@@ -980,12 +979,12 @@ impl Bridge {
                 ),
             ),
         }
-        // 取り消された依頼は未応答ではない(見張りの対象から外す)
+        // A cancelled request is not pending (take it off the watch)
         self.ledger.disposed(key, &[deleted.to_string()]);
     }
 
-    /// 終了予約を積む。同じスレッドの2本目は積まない — 積むと同じ窓を二度殺しに行き、
-    /// 二度目の別れを告げる(現行の in-flight guard 相当)。
+    /// Queue a termination. No second one for the same thread: it would try to kill the same
+    /// window twice and say goodbye twice (an in-flight guard).
     pub(super) fn push_drain(
         &mut self,
         key: &ThreadKey,
@@ -1020,15 +1019,15 @@ impl Bridge {
         });
     }
 
-    /// 満期の来た終了予約を実行する。待ちの終わりは「未応答が空になった」か 30 秒のどちらか早い方
-    /// (見るのは**生死ではなく未応答**なので、
-    /// ドレイン中の一瞬の respawn 隙間で早まって殺すことがない)。
+    /// Run terminations that are due. The wait ends when nothing is pending or after 30 s,
+    /// whichever comes first (it watches **pending, not liveness**, so a brief respawn gap
+    /// during draining never triggers an early kill).
     pub(super) async fn run_drains(&mut self) {
         let now = self.deps.clock.now_ms();
-        // ponytail: select 直列・1 tick 1本・最悪 ~3秒(SIGTERM 猶予 + SIGKILL 待ち)。この間
-        // main ループは止まるので、Stop hook の 5 秒枠(endpoints.rs STOP_DECISION_CAP)を割らない
-        // ように**同一 tick で2本殺さない** — 残りは次の tick(500ms 後)。並行 kill が要るなら
-        // kill を spawn に逃がす(hooked 除去の順序に注意)
+        // ponytail: serial in select, one per tick, worst case ~3 s (SIGTERM grace + SIGKILL wait).
+        // The main loop is blocked meanwhile, so to stay inside the Stop hook's 5 s budget
+        // (endpoints.rs STOP_DECISION_CAP) **never kill two in one tick**; the rest wait for the
+        // next tick (500 ms later). If concurrent kills are needed, move kill into a spawn (mind the order of hooked removal)
         let ledger = &self.ledger;
         let Some(i) = self
             .workers
@@ -1063,14 +1062,14 @@ impl Bridge {
         }
         self.terminate(&job.key, Some(&job.session_id), job.farewell)
             .await;
-        // 待っていたものが終わった**後**に消す(Drop = クリア)。scope 終端の暗黙 Drop でも
-        // 同じ順序になるが、ここが消えるタイミングだと読めるように明示しておく
+        // Clear it **after** what was waiting has finished (Drop = clear). The implicit Drop at the
+        // end of scope gives the same order, but this makes the moment explicit
         drop(job.thinking);
     }
 
-    /// このスレッドで一度でも喋ったことを threads.json に残す。**セッションは紐付けない** —
-    /// 印だけ(`agent_id` 無し = ワーカーはまだ居ない)。次にここへ来たメッセージは
-    /// 「動いているスレッドの続き」として、名指し無しでも通る。既にエントリがあれば触らない。
+    /// Record in threads.json that we have spoken in this thread. **No session is attached**, just
+    /// a mark (no `agent_id` = no agent yet). The next message here passes as a follow-up in an
+    /// active thread, without a mention. Leaves an existing entry alone.
     fn mark_thread_seen(&mut self, channel: &str, root_ts: &str, ctx: &LogCtx) {
         if self.threads.get(root_ts).is_some() {
             return;
@@ -1087,18 +1086,19 @@ impl Bridge {
         }
     }
 
-    /// 前の Bridge が答えを待っていたスレッドを拾い直す(起動時に1回)。
+    /// Pick up the threads the previous Bridge was waiting on (once at startup).
     ///
-    /// 台帳は pending.json に落ちているが、**そのまま全部載せない**。ワーカーが死んでいる
-    /// スレッドの未応答は誰も応えないので、載せると沈黙の見張りが永久に居座る。在庫の
-    /// [`Self::restore_pools`] と同じ論法で、tmux に実体が残っている分だけを残す。
+    /// The ledger is saved in pending.json, but **not all of it is restored**. Nobody answers
+    /// pending messages in threads whose agent is dead, so restoring them would keep the silence
+    /// watch around forever. Same reasoning as the pool's [`Self::restore_pools`]: keep only
+    /// what still exists in tmux.
     ///
-    /// **生き残りを数え上げに行かない** — 掛け金は元から空だし(= 継承ワーカーはそのまま
-    /// 渡してよい)、MCP の印は最初のツール呼び出しが事実として立てる(`"mcp_ready"` hook)。
-    /// 起動時に threads.json を全件 tmux に問い合わせても、その2つは何も早くならない。
+    /// **Don't go counting survivors**: the latch starts empty (= inherited agents can be
+    /// delivered to as is), and the MCP mark is set by the first tool call as a fact (the
+    /// `"mcp_ready"` hook). Asking tmux about every entry in threads.json at startup speeds neither up.
     ///
-    /// 載せ直したら見張りも張り直す(`touch_thread` の空文字 = 何も出さずに時計だけ始める)。
-    /// これが無いと台帳だけ復活して、無音になっても「考え中」が出ない。
+    /// Re-arm the watch after restoring (`touch_thread` with "" = start the clock without
+    /// showing anything). Without it only the ledger comes back and "thinking" never shows during silence.
     pub(super) fn restore_pending(&mut self, ctx: &LogCtx) {
         let all = self.ledger.pending_keys();
         let alive = self.threads.surviving(&all, |sid| {
@@ -1122,8 +1122,8 @@ impl Bridge {
         }
     }
 
-    /// ack の付与は**待つ** — 投げっぱなしだと受領時の flip(👀 remove → 🤖 add)が
-    /// 飛行中の add を追い越し、👀 が後から付き直して残る。失敗は握る(best-effort)。
+    /// **Await** adding the ack. Fire-and-forget lets the flip on receipt (👀 remove → 🤖 add)
+    /// overtake the add in flight, and 👀 lands afterwards and stays. Failures are swallowed (best-effort).
     async fn react(&self, channel: &str, ts: &str, emoji: &str, key: &ThreadKey) {
         if let Err(e) = self.deps.slack.add_reaction(channel, ts, emoji).await {
             LogCtx {
@@ -1134,15 +1134,16 @@ impl Bridge {
         }
     }
 
-    /// 活動があった — 沈黙タイマーを張り直し、ステータスを `status` に差し替える
-    /// (現行の `armWatchdog` + `clearStall`)。冪等。
+    /// There was activity: re-arm the silence timer and replace the status with `status`.
+    /// Idempotent.
     ///
-    /// `status` は「活動の結果いま出したいもの」: 配達は `is typing…`、hook は `""`(解除)。
-    /// **差し替えは1回の送信にまとめる** — 「出す」と「消す」を別々に投げると順序が無いので
-    /// 互いを打ち消す(既に `is thinking…` が出ているスレッドへの追撃配達で実際に起きる)。
+    /// `status` is what to show now as a result of the activity: delivery gives `is typing…`,
+    /// a hook gives `""` (clear). **The replacement is one send**: sending "show" and "clear"
+    /// separately has no ordering and they cancel each other (it really happens with a follow-up
+    /// delivery to a thread already showing `is thinking…`).
     pub(super) fn touch_thread(&mut self, key: &ThreadKey, status: &str) {
-        // 未応答が1件も無いスレッドに見張りは要らない — 立てても撃たないうえ、次の tick が
-        // 「決着済み」として畳むだけ(答えた後も流れてくる hook で毎回それをやるのは無駄)
+        // A thread with nothing pending needs no watch: it would never fire, and the next tick
+        // would just fold it as settled (wasteful for every hook that keeps coming after the answer)
         if !self.stall.contains_key(key) && self.ledger.pending(key).is_empty() {
             return;
         }
@@ -1150,10 +1151,10 @@ impl Bridge {
             Some(e) => e,
             None => {
                 let (channel, thread) = key.split();
-                // API は thread_ts 必須 — 根の引けない鍵は見張らない
+                // The API requires thread_ts, so a key without a root isn't watched
                 let Some(ts) = thread else { return };
-                // **黙って**作る(空文字 = 初回送信なし)。`status` を渡すとここで1回送り、
-                // 下の共通処理でもう1回同じものを送ってしまう。送信口は下の1箇所に統一する
+                // Create it **silently** (empty = no initial send). Passing `status` would send once
+                // here and again in the shared code below. The single send point is below
                 self.stall.entry(key.clone()).or_insert(Stall {
                     last_activity_ms: 0,
                     shown: false,
@@ -1163,15 +1164,15 @@ impl Bridge {
             }
         };
         e.last_activity_ms = self.deps.clock.now_ms();
-        // 送るのは**見た目が変わるときだけ**。出ていた見張りを解除する(shown)か、
-        // 新しく何かを出す(status 非空)か。turn 中の hook 連打は既に何も出ていなければ無送信
+        // Send **only when the display changes**: clearing a shown watch (shown), or showing
+        // something new (non-empty status). A burst of hooks mid-turn sends nothing if nothing is shown
         let was_shown = std::mem::replace(&mut e.shown, false);
         if was_shown || !status.is_empty() {
             e.thinking.set(status);
         }
     }
 
-    /// 受領した id を milestone に出し、👀 を 🤖 に替える(投げっぱなし)。
+    /// Log the received ids as a milestone and swap 👀 for 🤖 (fire-and-forget).
     pub(super) fn received(&mut self, key: &ThreadKey, ids: Vec<String>, ctx: &LogCtx) {
         if ids.is_empty() {
             return;
@@ -1187,15 +1188,16 @@ impl Bridge {
         }
     }
 
-    /// queue に残っている分を tick ごとに押し直す。**Rust 版には受領タイムアウトの再配達が
-    /// 無い**ので、これが無いと詰まりから自力で戻れない — 既存の再送経路は2つとも hook 起点で、
-    /// どちらもワーカーが止まっている間は永久に飛ばない:
-    /// [`Bridge::retry_turn_failure`] は StopFailure(ターンが始まらないので出ない)、
-    /// [`Bridge::flush_queued`] は user_prompt(何も送信できていないので出ない)。
+    /// Push whatever is left in the queue again on each tick. **There is no receipt-timeout
+    /// redelivery**, so without this a stuck thread can't recover on its own: both existing
+    /// resend paths start from hooks, and neither fires while the agent is stuck:
+    /// [`Bridge::retry_turn_failure`] needs StopFailure (never sent, the turn never starts),
+    /// [`Bridge::flush_queued`] needs user_prompt (never sent, nothing was submitted).
     ///
-    /// 押し直しが安全なのは [`crate::agent::claude::Claude::deliver`] が**打つ前に**入力欄を
-    /// 見るから — 覆われていれば1文字も送らずに Err を返す。だから「人がダイアログに答えた
-    /// 次の tick で流れる」が、余計な打鍵なしで成立する。2026-08-18 の18分沈黙への答え。
+    /// Re-pushing is safe because [`crate::agent::claude::Claude::deliver`] looks at the input box
+    /// **before typing**: if it's covered it returns Err without sending a character. So "it flows
+    /// on the tick after a person answers the dialog" works without stray keystrokes. This is the
+    /// answer to the 18-minute silence of 2026-08-18.
     pub(super) fn retry_pending(&mut self, ctx: &LogCtx) {
         let roots: Vec<String> = self.pending.keys().cloned().collect();
         for root_ts in roots {
@@ -1204,7 +1206,7 @@ impl Bridge {
                 continue;
             };
             let window = SessionId::from(sid.clone()).window_name();
-            // 聞こえる相手にだけ押す。Starting の分は user_prompt が流す道が生きている
+            // Push only to agents that can hear. For Starting ones, the user_prompt path still flushes
             if self.workers.state_of(entry.as_ref(), &window, self.deps.agent.as_ref())
                 != crate::agent::WorkerState::Ready
             {
@@ -1218,7 +1220,7 @@ impl Bridge {
         }
     }
 
-    /// Ready になった瞬間に、待たせていた分を押し込む。
+    /// The moment it becomes Ready, push what was held back.
     pub(super) fn flush_queued(
         &mut self,
         session_id: &str,
@@ -1244,8 +1246,9 @@ impl Bridge {
                     delivered = true;
                     i += 1;
                 }
-                // 渡せなかった分は queue に**戻す**(捨てると二度と届かない)。同じ窓宛なので
-                // 1通目が詰まれば残りも詰まる — そこで止めて、順序のまま先頭に返す
+                // Put what couldn't be delivered **back** in the queue (dropped, it never arrives).
+                // They all go to the same window, so if one is stuck the rest are too: stop there
+                // and put them back at the front, in order
                 Err(e) => {
                     let back: Vec<InboundMsg> = queued.split_off(i);
                     ctx.error(
@@ -1260,8 +1263,8 @@ impl Bridge {
                 }
             }
         }
-        // 押し込みも配達 — 渡した瞬間に shimmer を出す(直接配達の 446-448 と同じ)。
-        // ここを落とすと、起動待ちで queue に積まれたメッセージは最後まで無印のままになる
+        // A flush is a delivery too: show the shimmer the moment it's handed over (as direct delivery does).
+        // Without this, messages queued while an agent was starting stay unmarked to the end
         if delivered {
             if let Some(key) = key {
                 self.touch_thread(key, slack::TYPING_STATUS);
@@ -1300,8 +1303,8 @@ mod tests {
         Access::from_str(r#"{"owner":"U1","routes":{"C1":{"repo_path":"/x"}}}"#).unwrap()
     }
 
-    /// Web API 経由の投稿は**人が書いたものでも** bot_id が付く。Owner 本人の
-    /// 投稿は人として通し、それ以外の bot は `allow-bot` されていなければ落とす。
+    /// Posts through the Web API carry a bot_id **even when a person wrote them**. The Owner's own
+    /// post passes as a person; other bots are dropped unless `allow-bot` lets them in.
     #[test]
     fn gate_drops_bots_but_honors_the_owners_web_api_post() {
         let a = access_with_route();
@@ -1317,7 +1320,7 @@ mod tests {
             a.gate(&msg(ChannelKind::Channel, None, true), true, false),
             GateVerdict::Drop("drop-bot-not-allowed")
         );
-        // allow-bot された bot は、名指し(かアクティブスレッド)でだけ通る
+        // An allow-bot bot passes only when mentioned (or in an active thread)
         let allowed =
             Access::from_str(r#"{"owner":"U1","allowedBots":["B7"],"routes":{}}"#).unwrap();
         let mut b = msg(ChannelKind::Channel, Some("U9"), true);
@@ -1327,7 +1330,7 @@ mod tests {
             allowed.gate(&b, false, false),
             GateVerdict::Drop("require-mention-unmet")
         );
-        // bot の DM は無条件で落とす
+        // A bot's DM is always dropped
         let mut dm_bot = msg(ChannelKind::Dm, Some("U9"), true);
         dm_bot.bot_id = Some("B7".into());
         assert_eq!(
@@ -1348,8 +1351,8 @@ mod tests {
         assert_eq!(v, GateVerdict::Drop("dm-not-owner"));
     }
 
-    /// チャンネルで入れるかは **名指しか、動いているスレッドか** だけで決まる。
-    /// **登録(routes)は見ない** — 未登録のチャンネルでも Owner の名指しには応える。
+    /// Getting in on a channel depends only on **a mention or an active thread**.
+    /// **Routes are not checked**: the Owner's mention is answered even in an unregistered channel.
     #[test]
     fn gate_needs_a_mention_or_an_active_thread_not_a_route() {
         let a = access_with_route();
@@ -1365,13 +1368,13 @@ mod tests {
             GateVerdict::Drop("require-mention-unmet"),
             "名指しでもスレッドの続きでもない雑談は流さない"
         );
-        // 未登録チャンネル(C9)でも Owner の名指しは通る
+        // The Owner's mention passes even in an unregistered channel (C9)
         let mut elsewhere = owner.clone();
         elsewhere.channel = "C9".into();
         assert_eq!(a.gate(&elsewhere, true, false), GateVerdict::Serve);
     }
 
-    /// Owner 以外の人は、動いているスレッドの中でだけ**文脈として**渡す。
+    /// Someone other than the Owner is passed **as context** only inside an active thread.
     #[test]
     fn gate_passes_a_non_owner_as_context_only_inside_an_active_thread() {
         let a = access_with_route();
@@ -1416,7 +1419,7 @@ mod tests {
             assert!(!d.seen("C1", &format!("{i}")));
         }
         assert!(d.seen("C1", "511"), "newest must still be remembered");
-        d.seen("C1", "512"); // 513件目 → 最古(0)が押し出される
+        d.seen("C1", "512"); // the 513th → the oldest (0) is pushed out
         assert!(!d.seen("C1", "0"), "oldest must have been evicted");
     }
 
