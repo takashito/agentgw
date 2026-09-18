@@ -1,0 +1,15 @@
+# `cargo dist` = 配る物を作る。**Mac 用と Linux 用の両方**を1コマンドで。
+#
+# 既定値(`[build] target`)ではなく alias にしてある。配列の `[build] target` は
+# **全 cargo コマンドの既定**になるので、`cargo build` も `cargo test` も musl 向けの
+# リンクをやろうとして落ちる(実測: `ld: unknown options: --as-needed -Bstatic …`。
+# Mac の ld に GNU 形式のオプションが渡る)。alias なら dev ループは無傷。
+#
+# zigbuild なのは musl(静的リンク = 相手の glibc の版を問わない)を通すため。
+# Mac 向けも zigbuild で問題なくリンクできる(Mach-O 64-bit executable arm64)。
+# 要る道具: brew install zig cargo-zigbuild && rustup target add <triple>
+#
+# **triple を素で書いている。** このリポは1台の Mac から配る前提で、増やすときは
+# ここに足す(1 本あたり 80 秒ほど伸びる)。
+[alias]
+dist = "zigbuild --release --target aarch64-apple-darwin --target x86_64-unknown-linux-musl"
