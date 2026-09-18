@@ -15,9 +15,10 @@ pub mod worker;
 
 use crate::agent::claude::HookIntake;
 use crate::agent::screen::SpawnOutcome;
-use crate::agent::tmux::{self as tmux_mod, Pid, Tmux, Window};
+use crate::agent::claude::Claude;
+use crate::agent::tmux::{self as tmux_mod, Pid, Window};
 use crate::agent::{
-    Agent, CompactOutcome, CompactProgress, Envelope, HookEvent, LoginOutcome, ProbeErr, SessionId,
+    CompactOutcome, CompactProgress, Envelope, HookEvent, LoginOutcome, ProbeErr, SessionId,
     SpawnReq,
 };
 use crate::bridge::command::{Cmd, PwdMode};
@@ -25,8 +26,7 @@ use crate::bridge::render::RestartPhase;
 use crate::bridge::state as bridge;
 use crate::bridge::inbound::{Dispatch, GateVerdict, InboundMsg};
 use crate::bridge::state::{Disposition, LogCtx, PoolKey, ThreadKey};
-use crate::slack::SlackOps;
-use crate::{mcp, slack};
+use crate::{mcp, ports, slack};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -150,8 +150,11 @@ const POOL_MCP_INIT_TIMEOUT_MS: u64 = 50_000;
 
 /// main ループが握る可変状態ひとまとめ。select の各腕はここのメソッドを呼ぶだけ。
 pub struct Bridge {
-    dir: bridge::StateDir,
-    api: Arc<slack::Api>,
+    /// The outside world: Slack, the agent, the clock and the state directory.
+    deps: Deps,
+    // TODO(Task 12): `slack::Thinking` and `Api::post_now` still want the concrete Api.
+    // Once they take `ports::Slack`, this goes and `deps.slack` does the job.
+    slack_api: Arc<slack::Api>,
     access: bridge::Access,
     threads: bridge::Threads,
     /// cwd → 在庫に指名したセッション(pools.json)。**実体ではなく指名**なので Bridge を
@@ -171,9 +174,6 @@ pub struct Bridge {
     perm_pending: HashMap<String, PermPending>,
     /// `thread_key\0message_id` → まだ final が来ていない narration の断片。
     narration: HashMap<String, String>,
-    /// エージェント実体。ワーカーの起動・配達・畳みはここ越しにやる。
-    agent: Agent,
-    tmux: Tmux,
     hooks_file: String,
     mcp_port: u16,
     mcp_token: String,
@@ -192,7 +192,7 @@ pub struct Bridge {
     /// サインアウトが走っているか。`logout` の2連打で `claude auth logout` が2回走り、
     /// 2本目の teardown が1本目の後始末と噛み合わなくなるのを防ぐ
     signing_out: bool,
-    /// usage 上限のリセット時刻(epoch ms)。`Host::now_ms()` がこれを下回る間は新規配達を遮断する。
+    /// usage 上限のリセット時刻(epoch ms)。いまの時刻がこれを下回る間は新規配達を遮断する。
     /// 0 = ゲート開放。実際に埋めるのは定期ポーリング。
     limited_until_ms: u64,
     /// 上限の見張り。最後に `/usage` を読んだ時刻・上限が見込まれるか・
@@ -206,6 +206,84 @@ pub struct Bridge {
     /// (実行するのは `relay::CommandCtx::route`。持っていないマシンで一覧に出しても
     /// 振り分ける相手が居ない)。
     fleet: bool,
+}
+
+/// The outside world. Only `Bridge::run()` wires the real ones; tests fill it with fakes
+/// and hand it to `Bridge::new`.
+#[derive(Clone)]
+pub struct Deps {
+    pub slack: ports::Slack,
+    pub agent: ports::AgentRef,
+    pub clock: ports::ClockRef,
+    pub dir: bridge::StateDir,
+}
+
+/// Values fixed at start-up (the result of the wiring).
+struct Config {
+    hooks_file: String,
+    mcp_port: u16,
+    mcp_token: String,
+    bot_user_id: Option<String>,
+    /// When this Bridge started listening. Commands posted before it are stale.
+    started_at_ms: u64,
+    fleet: bool,
+    cmd_tx: mpsc::Sender<CmdFx>,
+    // TODO(Task 12): goes away with `Bridge::slack_api`.
+    slack_api: Arc<slack::Api>,
+}
+
+impl Bridge {
+    /// Loads the state files from `deps.dir`; everything else starts empty.
+    fn new(deps: Deps, config: Config) -> Bridge {
+        // 台帳は threads.json の中(entry の `inflight`)なので、読んだ後に組み立てる
+        let threads = bridge::Threads::load(&deps.dir);
+        Bridge {
+            ledger: bridge::Ledger::load(&threads),
+            threads,
+            pools: bridge::Pools::load(&deps.dir),
+            access: bridge::Access::load(&deps.dir),
+            deps,
+            slack_api: config.slack_api,
+            dedup: inbound::RecentDeliveries::new(),
+            workers: worker::Workers::default(),
+            pending: HashMap::new(),
+            lifecycle: bridge::Lifecycle::new(),
+            sticky: slack::StickyBoard::default(),
+            perm_pending: HashMap::new(),
+            narration: HashMap::new(),
+            hooks_file: config.hooks_file,
+            mcp_port: config.mcp_port,
+            mcp_token: config.mcp_token,
+            bot_user_id: config.bot_user_id,
+            started_at_ms: config.started_at_ms,
+            cmd_tx: config.cmd_tx,
+            login_pending: HashMap::new(),
+            restarting: false,
+            signing_out: false,
+            limited_until_ms: 0,
+            usage_polled_at_ms: 0,
+            usage_at_risk: false,
+            usage_warned_pct: 0,
+            stall: HashMap::new(),
+            fleet: config.fleet,
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(deps: Deps) -> (Bridge, mpsc::Receiver<CmdFx>) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let config = Config {
+            hooks_file: String::new(),
+            mcp_port: 0,
+            mcp_token: String::new(),
+            bot_user_id: Some("U_BOT".into()),
+            started_at_ms: deps.clock.now_ms(),
+            fleet: false,
+            cmd_tx,
+            slack_api: Arc::new(slack::Api::new("xoxb-test").expect("slack client")),
+        };
+        (Bridge::new(deps, config), cmd_rx)
+    }
 }
 
 /// 1スレッドぶんの沈黙見張り。
@@ -292,7 +370,7 @@ impl Bridge {
         // ponytail: 逐次。並列化(tokio::spawn)は多数添付の待ち時間が実際に痛くなってから
         let deadline = tokio::time::Instant::now() + slack::DOWNLOAD_TIMEOUT;
         for f in &msg.files {
-            let dl = self.api.download_attachment(&f.id, self.dir.path());
+            let dl = self.deps.slack.download_attachment(&f.id, self.deps.dir.path());
             let reason = match tokio::time::timeout_at(deadline, dl).await {
                 Ok(Ok(path)) => {
                     paths.push(path);
@@ -399,7 +477,7 @@ impl Bridge {
         // ponytail: リアクション1つにつき1回問い合わせる。多すぎるなら `item_user` を
         // InboundMsg まで持ち上げて、stop でない他人宛のものを引く前に落とす
         let reacted = match &msg.reaction {
-            Some(r) => match self.api.message_at(&msg.channel, &r.item_ts).await {
+            Some(r) => match self.deps.slack.message_at(&msg.channel, &r.item_ts).await {
                 Some(m) => Some(m),
                 None => {
                     LogCtx::default().debug(
@@ -424,7 +502,7 @@ impl Bridge {
             (None, Some(id)) => match self.ledger.key_of_id(id).and_then(|k| k.split().1) {
                 Some(root) => root,
                 None => self
-                    .api
+                    .deps.slack
                     .parent_thread_of(&msg.channel, id)
                     .await
                     .or_else(|| msg.thread_ts.clone())
@@ -598,7 +676,7 @@ impl Bridge {
 
         // usage 上限中は新規の依頼を受けない。キューイングもしない。
         // コマンドの**後ろ**なのは現行どおり — 上限中でも stop/restart/logout は効く
-        if Host::now_ms() < self.limited_until_ms {
+        if self.deps.clock.now_ms() < self.limited_until_ms {
             let text = crate::bridge::render::Notice::Limited {
                 until_ms: self.limited_until_ms,
             }
@@ -630,7 +708,7 @@ impl Bridge {
         let window = sid
             .map(|s| SessionId::from(s).window_name())
             .unwrap_or_default();
-        let state = self.workers.state_of(entry.as_ref(), &window, &self.agent);
+        let state = self.workers.state_of(entry.as_ref(), &window, self.deps.agent.as_ref());
         // 配達先は window_id を優先(窓名は改名されうる)
         let target = entry
             .as_ref()
@@ -638,7 +716,7 @@ impl Bridge {
             .and_then(|sid| self.workers.warm(sid))
             .and_then(|h| h.window_id.clone())
             .unwrap_or_else(|| window.clone());
-        let envelope = Envelope::of_guarded(msg, &root_ts, loop_guard);
+        let envelope = Envelope::of_guarded(msg, &root_ts, loop_guard, self.deps.clock.now_ms());
         // ターン失敗の再送に要る。`track` は ack の直後(封筒がまだ無い時点)なので、
         // 封筒ができた**ここ**で台帳に預ける — これより下の配達経路は全部この後ろ
         self.ledger.remember_envelope(&key, &msg.ts, &envelope);
@@ -720,7 +798,7 @@ impl Bridge {
             Dispatch::Deliver => {
                 let sid = entry.as_ref().and_then(|e| e.agent_id.clone());
                 // 暖まっているワーカーには prefix 抜きの素の封筒(push と同じ形)
-                match self.tmux.deliver(&Window::of(&target), &envelope) {
+                match self.deps.agent.send_text(&Window::of(&target), &envelope) {
                     // 1メッセージ1行の配達記録(現行)
                     Ok(()) => {
                         ctx(sid.as_deref()).info(
@@ -1100,8 +1178,8 @@ impl Bridge {
                 }
             ),
         );
-        let envelope = Envelope::of(&notice, root_ts);
-        if let Err(e) = self.tmux.deliver(&Window::of(&target), &envelope) {
+        let envelope = Envelope::of(&notice, root_ts, self.deps.clock.now_ms());
+        if let Err(e) = self.deps.agent.send_text(&Window::of(&target), &envelope) {
             ctx.error("bridge", &format!("message_changed delivery failed: {e}"));
             return;
         }
@@ -1214,8 +1292,8 @@ impl Bridge {
         });
         match target {
             Some(w) => {
-                let envelope = Envelope::of(msg, root_ts);
-                match self.tmux.deliver(&Window::of(&w), &envelope) {
+                let envelope = Envelope::of(msg, root_ts, self.deps.clock.now_ms());
+                match self.deps.agent.send_text(&Window::of(&w), &envelope) {
                     Ok(()) => ctx.info(
                         "bridge",
                         &format!(
@@ -1255,7 +1333,7 @@ impl Bridge {
         // 順に短絡する — 未応答が無い stop で tmux を叩きに行かない
         let running = sid.is_some()
             && !pending.is_empty()
-            && self.tmux.pid_of(window_id.as_deref(), &name).is_some();
+            && self.deps.agent.pid_of(window_id.as_deref(), &name).is_some();
         let Some(sid) = sid.as_deref().filter(|_| running) else {
             ctx.info(
                 "bridge",
@@ -1284,7 +1362,7 @@ impl Bridge {
         // stop hook が「応答待ち」の再プロンプトを撃つ
         self.ledger.disposed(key, &pending);
         let target = Window::of(window_id.as_deref().unwrap_or(&name));
-        match self.tmux.send_escape(&target) {
+        match self.deps.agent.interrupt(&target) {
             Ok(()) => ctx.info(
                 "bridge",
                 &format!(
@@ -1321,7 +1399,7 @@ impl Bridge {
             .and_then(|s| self.workers.warm(s))
             .and_then(|h| h.window_id.clone());
         // 短絡する — セッションの無いスレッドの exit で tmux を叩きに行かない
-        let live = sid.is_some() && self.tmux.pid_of(window_id.as_deref(), &name).is_some();
+        let live = sid.is_some() && self.deps.agent.pid_of(window_id.as_deref(), &name).is_some();
         // ワーカーが居ない exit も別れは告げる(現行 performUserExit は session 無しでも
         // farewell まで行く)。待つものが無いので予約せずその場で片付ける
         let Some(sid) = sid.filter(|_| live) else {
@@ -1357,13 +1435,13 @@ impl Bridge {
             .workers
             .warm(&sid)
             .and_then(|h| h.transcript_path.clone());
-        let history_cwd = self.agent.session_cwd(remembered.as_deref(), &sid);
+        let history_cwd = self.deps.agent.session_cwd(remembered.as_deref(), &sid);
         let history_exists = self
-            .agent
+            .deps.agent
             .session_history_exists(remembered.as_deref(), &sid);
         let name = SessionId::from(sid.clone()).window_name();
         let window_id = self.workers.window_of(&sid);
-        let worker_running = self.agent.pid_of(window_id.as_deref(), &name).is_some();
+        let worker_running = self.deps.agent.pid_of(window_id.as_deref(), &name).is_some();
         let info = crate::bridge::render::ResumeInfo {
             // cwd は id と同じくらい大事 — claude は cwd ごとに履歴を仕舞うので、
             // 違う場所で --resume すると見つからない
@@ -1397,7 +1475,7 @@ impl Bridge {
             // ここで guard を持っても set と clear が連続して飛ぶだけで一度も描画されない。
             // 実際に待つのは「返事が捌けるか30秒」を待つドレイン側(現行 Bun に原文なし)
             let thinking =
-                slack::Thinking::new(&self.api, &msg.channel, root_ts, &slack::Status::Resume.text());
+                slack::Thinking::new(&self.slack_api, &msg.channel, root_ts, &slack::Status::Resume.text()); // TODO(Task 12)
             self.push_drain(key, sid, None, Some(thinking), ctx);
         }
     }
@@ -1432,7 +1510,7 @@ impl Bridge {
         self.workers.push_drain(worker::DrainJob {
             key: key.clone(),
             session_id,
-            deadline_ms: Host::now_ms() + DRAIN_TIMEOUT_MS,
+            deadline_ms: self.deps.clock.now_ms() + DRAIN_TIMEOUT_MS,
             farewell,
             thinking,
         });
@@ -1442,7 +1520,7 @@ impl Bridge {
     /// (見るのは**生死ではなく未応答**なので、
     /// ドレイン中の一瞬の respawn 隙間で早まって殺すことがない)。
     async fn run_drains(&mut self) {
-        let now = Host::now_ms();
+        let now = self.deps.clock.now_ms();
         // ponytail: select 直列・1 tick 1本・最悪 ~3秒(SIGTERM 猶予 + SIGKILL 待ち)。この間
         // main ループは止まるので、Stop hook の 5 秒枠(endpoints.rs STOP_DECISION_CAP)を割らない
         // ように**同一 tick で2本殺さない** — 残りは次の tick(500ms 後)。並行 kill が要るなら
@@ -1508,7 +1586,7 @@ impl Bridge {
         if let Some(sid) = sid {
             let name = SessionId::from(sid.to_string()).window_name();
             let window_id = self.workers.window_of(sid);
-            match self.tmux.pid_of(window_id.as_deref(), &name) {
+            match self.deps.agent.pid_of(window_id.as_deref(), &name) {
                 Some(pid) => {
                     ctx.info(
                         "bridge",
@@ -1530,7 +1608,7 @@ impl Bridge {
             // 窓名で落ちてくる道がある(継承ワーカーは window_id を覚えていない)。素の名前を
             // -t に渡すと tmux が**今いるセッション**に当てる — 必ずセッション修飾を通す
             let target = Window::of(window_id.as_deref().unwrap_or(&name));
-            if let Err(e) = self.tmux.kill_window(&target) {
+            if let Err(e) = self.deps.agent.terminate(&target) {
                 ctx.error("bridge", &format!("exit: kill-window failed: {e}"));
             }
             // 3. セッション鍵の記憶だけ落とす(threads.json は無傷 → 次のメッセージが --resume)
@@ -1591,22 +1669,22 @@ impl Bridge {
             "bridge",
             &format!("context: probing /context tts={root_ts} session={short} cwd={cwd}"),
         );
-        let argv = self.agent.context_argv(&sid);
+        let argv = self.deps.agent.context_argv(&sid);
         let (api, channel, root, key) = (
-            self.api.clone(),
+            self.slack_api.clone(), // TODO(Task 12): post_now
             msg.channel.clone(),
             root_ts.to_string(),
             key.clone(),
         );
         let thinking =
-            slack::Thinking::new(&self.api, &msg.channel, root_ts, &slack::Status::Context.text());
+            slack::Thinking::new(&self.slack_api, &msg.channel, root_ts, &slack::Status::Context.text()); // TODO(Task 12)
+        let agent = self.deps.agent.clone();
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = クリア(probe が失敗しても消える)
             let ctx = LogCtx {
                 session_id: Some(sid),
                 thread_key: Some(key.clone()),
             };
-            let agent = Agent::real();
             let out = match agent.probe(argv, cwd).await {
                 Ok(raw) => {
                     ctx.info(
@@ -1661,21 +1739,21 @@ impl Bridge {
     fn user_usage(&self, msg: &InboundMsg, key: &ThreadKey, root_ts: &str, ctx: &LogCtx) {
         let cwd = Host::home();
         ctx.info("bridge", &format!("usage: probing /usage cwd={cwd}"));
-        let argv = self.agent.usage_argv();
+        let argv = self.deps.agent.usage_argv();
         let (api, channel, root, key) = (
-            self.api.clone(),
+            self.slack_api.clone(), // TODO(Task 12): post_now
             msg.channel.clone(),
             root_ts.to_string(),
             key.clone(),
         );
-        let thinking = slack::Thinking::new(&self.api, &msg.channel, root_ts, &slack::Status::Usage.text());
+        let thinking = slack::Thinking::new(&self.slack_api, &msg.channel, root_ts, &slack::Status::Usage.text()); // TODO(Task 12)
+        let agent = self.deps.agent.clone();
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = クリア
             let ctx = LogCtx {
                 session_id: None,
                 thread_key: Some(key.clone()),
             };
-            let agent = Agent::real();
             let out = match agent.probe(argv, cwd).await {
                 Ok(raw) => {
                     ctx.info("bridge", &format!("usage: probe ok bytes={}", raw.len()));
@@ -1744,7 +1822,7 @@ impl Bridge {
         let window_id = self.workers.window_of(&sid);
         // 未応答を先に見る — 空なら tmux を叩きに行かない(user_stop と同じ短絡)
         let pending = self.ledger.pending(key);
-        if !pending.is_empty() && self.tmux.pid_of(window_id.as_deref(), &name).is_some() {
+        if !pending.is_empty() && self.deps.agent.pid_of(window_id.as_deref(), &name).is_some() {
             ctx.info(
                 "bridge",
                 &format!(
@@ -1780,7 +1858,7 @@ impl Bridge {
             }
         };
         let (api, channel, root, key) = (
-            self.api.clone(),
+            self.deps.slack.clone(),
             msg.channel.clone(),
             root_ts.to_string(),
             key.clone(),
@@ -1789,7 +1867,7 @@ impl Bridge {
         // 以前の実装はここで「考え中」を張り、tick ごとに秒数付きへ張り直していた。
         // こちらは進捗チェックリスト(run_compact が投稿して編集し続ける sticky)が同じことを
         // 見せているので、shimmer と二重で冗長という判断(**移植漏れではない**)。
-        tokio::spawn(Self::run_compact(api, channel, root, key, target, sid));
+        tokio::spawn(Self::run_compact(api, self.deps.agent.clone(), channel, root, key, target, sid));
     }
 
     /// `model`。名前付きは TUI に
@@ -1821,19 +1899,19 @@ impl Bridge {
             }
         };
         let (api, channel, root, key) = (
-            self.api.clone(),
+            self.slack_api.clone(), // TODO(Task 12): post_now
             msg.channel.clone(),
             root_ts.to_string(),
             key.clone(),
         );
-        let thinking = slack::Thinking::new(&self.api, &msg.channel, root_ts, &slack::Status::Model.text());
+        let thinking = slack::Thinking::new(&self.slack_api, &msg.channel, root_ts, &slack::Status::Model.text()); // TODO(Task 12)
+        let agent = self.deps.agent.clone();
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = クリア(TUI が確定しなくても消える)
             let ctx = LogCtx {
                 session_id: Some(sid),
                 thread_key: Some(key.clone()),
             };
-            let agent = Agent::real();
             // None = このエージェントが model 切替に非対応。実体が1つの今は起きない
             let done = agent.set_model(&target, &name, &key, &ctx).await == Some(true);
             let out = if done {
@@ -1864,7 +1942,7 @@ impl Bridge {
             .workers
             .warm(&sid)
             .and_then(|h| h.transcript_path.clone());
-        let found = self.agent.current_model(remembered.as_deref(), &sid);
+        let found = self.deps.agent.current_model(remembered.as_deref(), &sid);
         let failed = || crate::t!("Couldn't read the current model.", "今のモデルを読み取れませんでした。");
         let out = match found {
             None => {
@@ -1898,7 +1976,7 @@ impl Bridge {
                             "bridge",
                             &format!("model: current={model} session={short} key={key}"),
                         );
-                        match self.agent.model_alias(&model) {
+                        match self.deps.agent.model_alias(&model) {
                             Some(alias) => crate::t!("Model: *{alias}* (`{model}`)", "モデル: *{alias}*(`{model}`)"),
                             None => crate::t!("Model: `{model}`", "モデル: `{model}`"),
                         }
@@ -1936,24 +2014,32 @@ impl Bridge {
             }
         };
         let (api, channel, root, key) = (
-            self.api.clone(),
+            self.slack_api.clone(), // TODO(Task 12): post_now
             msg.channel.clone(),
             root_ts.to_string(),
             key.clone(),
         );
         // 素の `effort` は現在値を読むだけ — 現行も status を出さない(出典は set 側の 3182)
         let Some(level) = level else {
-            tokio::spawn(Self::run_effort_show(api, channel, root, key, target, sid));
+            tokio::spawn(Self::run_effort_show(
+                api,
+                self.deps.agent.clone(),
+                channel,
+                root,
+                key,
+                target,
+                sid,
+            ));
             return;
         };
-        let thinking = slack::Thinking::new(&self.api, &msg.channel, root_ts, &slack::Status::Effort.text());
+        let thinking = slack::Thinking::new(&self.slack_api, &msg.channel, root_ts, &slack::Status::Effort.text()); // TODO(Task 12)
+        let agent = self.deps.agent.clone();
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = クリア
             let ctx = LogCtx {
                 session_id: Some(sid),
                 thread_key: Some(key.clone()),
             };
-            let agent = Agent::real();
             // None = このエージェントが effort に非対応。実体が1つの今は起きない
             let done = agent.set_effort(&target, &level, &key, &ctx).await == Some(true);
             let out = if done {
@@ -1993,7 +2079,7 @@ impl Bridge {
         };
         // 読むだけなら tmux を1回叩くだけ — spawn も shimmer も要らない
         let Some(name) = name else {
-            let out = match Agent::real().mode(&target, &ctx) {
+            let out = match self.deps.agent.mode(&target, &ctx) {
                 Some(m) => crate::t!("Permission mode: *{m}*", "権限モード: *{m}*"),
                 None => crate::t!("Couldn't read the permission mode.", "権限モードを読み取れませんでした。"),
             };
@@ -2001,15 +2087,16 @@ impl Bridge {
             return;
         };
         let (api, channel, root, key) = (
-            self.api.clone(),
+            self.slack_api.clone(), // TODO(Task 12): post_now
             msg.channel.clone(),
             root_ts.to_string(),
             key.clone(),
         );
-        let thinking = slack::Thinking::new(&self.api, &msg.channel, root_ts, &slack::Status::Mode.text());
+        let thinking = slack::Thinking::new(&self.slack_api, &msg.channel, root_ts, &slack::Status::Mode.text()); // TODO(Task 12)
+        let agent = self.deps.agent.clone();
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = クリア
-            let done = Agent::real().set_mode(&target, &name, &key, &ctx).await == Some(true);
+            let done = agent.set_mode(&target, &name, &key, &ctx).await == Some(true);
             let out = if done {
                 crate::t!("✅ Switched this thread's permission mode to *{name}*.", "✅ このスレッドの権限モードを *{name}* にしました。")
             } else {
@@ -2035,7 +2122,7 @@ impl Bridge {
             let h = self.workers.warm(sid);
             let window = SessionId::from(sid.to_string()).window_name();
             let alive = self
-                .tmux
+                .deps.agent
                 .pid_of(h.and_then(|h| h.window_id.as_deref()), &window);
             if alive.is_none() {
                 continue;
@@ -2044,7 +2131,7 @@ impl Bridge {
             // hook がまだ来ていない継承ワーカーは session id から探す
             let remembered = h.and_then(|h| h.transcript_path.clone());
             let last_activity_ms = self
-                .agent
+                .deps.agent
                 .last_activity_ms(remembered.as_deref(), sid)
                 .unwrap_or(0);
             threads.push(crate::bridge::render::StatusThread {
@@ -2066,7 +2153,7 @@ impl Bridge {
             ),
         );
         let (api, channel, root, key) = (
-            self.api.clone(),
+            self.slack_api.clone(), // TODO(Task 12): post_now
             msg.channel.clone(),
             root_ts.to_string(),
             key.clone(),
@@ -2085,7 +2172,8 @@ impl Bridge {
             .collect();
         // 集計は permalink とチャンネル名の解決でスレッド数ぶん Slack を叩く — 待つ間の shimmer
         let thinking =
-            slack::Thinking::new(&self.api, &msg.channel, root_ts, &slack::Status::Gathering.text());
+            slack::Thinking::new(&self.slack_api, &msg.channel, root_ts, &slack::Status::Gathering.text()); // TODO(Task 12)
+        let (slack, clock) = (self.deps.slack.clone(), self.deps.clock.clone());
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = クリア。どの経路で抜けても消える
             let ctx = LogCtx {
@@ -2095,7 +2183,7 @@ impl Bridge {
             // 名前はチャンネルごとに1回だけ解決する(同じ会話に何本もスレッドが立つ)
             let mut names: HashMap<String, Option<String>> = HashMap::new();
             for t in &mut threads {
-                t.permalink = match api.get_permalink(&t.channel_id, &t.thread_ts).await {
+                t.permalink = match slack.get_permalink(&t.channel_id, &t.thread_ts).await {
                     Ok(p) => Some(p),
                     Err(e) => {
                         ctx.debug(
@@ -2109,14 +2197,14 @@ impl Bridge {
                     }
                 };
                 if !names.contains_key(&t.channel_id) {
-                    let n = api.channel_display_name(&t.channel_id).await;
+                    let n = slack.channel_display_name(&t.channel_id).await;
                     names.insert(t.channel_id.clone(), n);
                 }
                 t.channel_name = names[&t.channel_id].clone();
             }
             let report = crate::bridge::render::StatusReport {
                 bridge_version: env!("CARGO_PKG_VERSION").to_string(),
-                now_ms: Host::now_ms(),
+                now_ms: clock.now_ms(),
                 home,
                 // 繋がり方は1つしかない(Remote は作らない)
                 mode: "local".to_string(),
@@ -2272,7 +2360,7 @@ impl Bridge {
                         );
                         return;
                     };
-                    match self.api.resolve_bot_id(&uid).await {
+                    match self.deps.slack.resolve_bot_id(&uid).await {
                         Ok(Some(b)) => b,
                         Ok(None) => {
                             let human = crate::t!(
@@ -2438,13 +2526,13 @@ impl Bridge {
         // 代償: URL が届くまでの間にこのチャンネルへ来た1通はコード扱いになり失敗の返事になる
         // (Owner は `login` を撃ち直せばよい)
         self.login_pending.insert(channel.clone(), user.clone());
-        let (api, cmd_tx, home) = (self.api.clone(), self.cmd_tx.clone(), Host::home());
+        let (api, cmd_tx, home) = (self.slack_api.clone(), self.cmd_tx.clone(), Host::home()); // TODO(Task 12): post_now
         // サインインは URL を出してからコードを待つ数十秒 — その間ずっと shimmer を出す
-        let thinking = slack::Thinking::new(&self.api, &channel, &reply_ts, &slack::Status::Login.text());
+        let thinking = slack::Thinking::new(&self.slack_api, &channel, &reply_ts, &slack::Status::Login.text()); // TODO(Task 12)
         // `thinking` は本文で触るので async move が丸ごと持っていく(どの経路で抜けても Drop = クリア)
+        let agent = self.deps.agent.clone();
         tokio::spawn(async move {
             let ctx = LogCtx::default();
-            let agent = Agent::real();
             let started = agent.login_begin(&home);
             let mut url = None;
             if let Err(e) = started {
@@ -2519,13 +2607,13 @@ impl Bridge {
             "bridge",
             &format!("login: submitting pasted code for {user} (channel {channel})"),
         );
-        let (api, cmd_tx) = (self.api.clone(), self.cmd_tx.clone());
+        let (api, cmd_tx) = (self.slack_api.clone(), self.cmd_tx.clone()); // TODO(Task 12): post_now
         // サインインの後半(貼られたコードの判定、最大 CODE_POLL_MAX 秒)も待ち時間 —
         // login_start の guard は URL を出した時点で落ちているので、ここで張り直す
-        let thinking = slack::Thinking::new(&self.api, &channel, &reply_ts, &slack::Status::Login.text());
+        let thinking = slack::Thinking::new(&self.slack_api, &channel, &reply_ts, &slack::Status::Login.text()); // TODO(Task 12)
+        let agent = self.deps.agent.clone();
         tokio::spawn(async move {
             let ctx = LogCtx::default();
-            let agent = Agent::real();
             let mut outcome = "timeout";
             if let Err(e) = agent.login_submit_code(&code) {
                 ctx.error(
@@ -2606,17 +2694,17 @@ impl Bridge {
         self.signing_out = true;
         // shimmer は `claude auth logout` が返るまで。この後のワーカー畳みは main 側
         // (CmdFx::LogoutFinished)なので、ここで持たせておけば **必ず** 消える
-        let thinking = slack::Thinking::new(&self.api, channel, root_ts, &slack::Status::Logout.text());
+        let thinking = slack::Thinking::new(&self.slack_api, channel, root_ts, &slack::Status::Logout.text()); // TODO(Task 12)
         let (cmd_tx, channel, thread_ts) = (
             self.cmd_tx.clone(),
             channel.to_string(),
             root_ts.to_string(),
         );
+        let agent = self.deps.agent.clone();
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = クリア
             let ctx = LogCtx::default();
             ctx.info("bridge", "logout: signing out (claude auth logout)");
-            let agent = Agent::real();
             let ok = match agent.logout().await {
                 Ok(()) => {
                     ctx.info("bridge", "logout: claude auth logout OK");
@@ -2672,18 +2760,18 @@ impl Bridge {
             bridge::NoticeTarget::Home(ch) => {
                 slack::Api::brief_call(
                     &format!("home notice post failed for {ch}"),
-                    self.api.post_message_no_unfurl(&ch, text, None),
+                    self.deps.slack.post_message_no_unfurl(&ch, text, None),
                     ctx,
                 )
                 .await;
             }
             // home チャンネルが無ければ Owner の DM に落とす。
             // DM は開き直しても同じ id が返るので、その場で開いて投げる
-            bridge::NoticeTarget::OwnerDm(owner) => match self.api.open_dm(&owner).await {
+            bridge::NoticeTarget::OwnerDm(owner) => match self.deps.slack.open_dm(&owner).await {
                 Ok(ch) => {
                     slack::Api::brief_call(
                         &format!("owner DM notice post failed for {owner}"),
-                        self.api.post_message_no_unfurl(&ch, text, None),
+                        self.deps.slack.post_message_no_unfurl(&ch, text, None),
                         ctx,
                     )
                     .await;
@@ -2724,7 +2812,7 @@ impl Bridge {
         if let Some((channel, root_ts)) = req {
             slack::Api::brief_call(
                 "restart: thinking status set failed",
-                self.api
+                self.deps.slack
                     .set_thinking_status(channel, root_ts, &slack::Status::Restart.text()),
                 ctx,
             )
@@ -2737,7 +2825,7 @@ impl Bridge {
                 let first = RestartPhase::Received.render(None);
                 slack::Api::brief_call(
                     &format!("slack-events: restart progress post failed for {channel}:{root_ts}"),
-                    self.api
+                    self.deps.slack
                         .post_message_no_unfurl(channel, &first, Some(root_ts)),
                     ctx,
                 )
@@ -2754,7 +2842,7 @@ impl Bridge {
             let (channel, thread) = key.split();
             slack::Api::brief_call(
                 &format!("restart notice failed key={key}"),
-                self.api
+                self.deps.slack
                     .post_message_no_unfurl(&channel, &restart_notice(), thread.as_deref()),
                 ctx,
             )
@@ -2769,7 +2857,7 @@ impl Bridge {
                 "thread_ts": root_ts,
                 "progress_ts": progress_ts,
             });
-            match self.dir.write_json_atomic("restart-marker.json", &marker) {
+            match self.deps.dir.write_json_atomic("restart-marker.json", &marker) {
                 Ok(()) => ctx.info("bridge", &format!(
                         "wrote restart marker (requester carrier for the ✅ reply) \
                          (requester {channel}:{root_ts})"
@@ -2793,7 +2881,7 @@ impl Bridge {
             let switching = RestartPhase::Switching.render(None);
             slack::Api::brief_call(
                 &format!("restart: progress checklist update failed for {channel}:{ts}"),
-                self.api.update_message(channel, ts, &switching),
+                self.deps.slack.update_message(channel, ts, &switching),
                 ctx,
             )
             .await;
@@ -2807,7 +2895,7 @@ impl Bridge {
         if let Some((channel, root_ts)) = req {
             slack::Api::brief_call(
                 "restart: thinking status clear failed",
-                self.api.set_thinking_status(channel, root_ts, ""),
+                self.deps.slack.set_thinking_status(channel, root_ts, ""),
                 ctx,
             )
             .await;
@@ -2828,7 +2916,7 @@ impl Bridge {
         let ctx = LogCtx::default();
         match fx {
             CmdFx::LoginFinished { channel, bound } => {
-                self.agent.login_kill();
+                self.deps.agent.login_kill();
                 self.login_pending.remove(&channel);
                 let Some(user) = bound else { return };
                 let mut access = self.access.clone();
@@ -2931,7 +3019,7 @@ impl Bridge {
     /// 変異後の access を採用して落とす。以後の gate / resolve_repo_path はこれを読む
     /// (保存に失敗しても採用はする — 今の答えと食い違う方が混乱する)。
     fn adopt_access(&mut self, access: bridge::Access, ctx: &LogCtx) {
-        if let Err(e) = access.save(&self.dir) {
+        if let Err(e) = access.save(&self.deps.dir) {
             ctx.error("bridge", &format!("access.json save failed: {e}"));
         }
         self.access = access;
@@ -2962,7 +3050,7 @@ impl Bridge {
 
     fn post(&self, channel: &str, thread_ts: &str, text: String, key: &ThreadKey) {
         let (api, channel, thread_ts, key) = (
-            self.api.clone(),
+            self.slack_api.clone(), // TODO(Task 12): post_now
             channel.to_string(),
             thread_ts.to_string(),
             key.clone(),
@@ -2973,7 +3061,7 @@ impl Bridge {
     }
 
     fn write_mcp(&self, sid: &str, ctx: &LogCtx) -> Option<String> {
-        match mcp::Mcp::write_config(&self.dir, self.mcp_port, sid, &self.mcp_token) {
+        match mcp::Mcp::write_config(&self.deps.dir, self.mcp_port, sid, &self.mcp_token) {
             Ok(p) => Some(p.to_string_lossy().to_string()),
             Err(e) => {
                 ctx.error("bridge", &format!("mcp config write failed: {e}"));
@@ -2999,7 +3087,7 @@ impl Bridge {
             let name = SessionId::from(sid.clone()).window_name();
             // 継承ワーカーと同じく window_id は覚えていない — 窓名で引く(spawn 直後に
             // automatic-rename を切ってあるので名前は残る)
-            let alive = self.tmux.pid_of(None, &name).is_some();
+            let alive = self.deps.agent.pid_of(None, &name).is_some();
             let key = bridge::PoolKey::of_cwd(&cwd);
             let ctx = LogCtx {
                 session_id: Some(sid.clone()),
@@ -3011,7 +3099,7 @@ impl Bridge {
                     if alive {
                         let stale = worker::PoolWorker {
                             session_id: sid.clone(),
-                            spawned_at_ms: Host::now_ms(),
+                            spawned_at_ms: self.deps.clock.now_ms(),
                             cwd: cwd.clone(),
                             resumed: false,
                         };
@@ -3040,7 +3128,7 @@ impl Bridge {
                 worker::PoolWorker {
                     session_id: sid,
                     // 猶予はこのプロセスから数え直す(前世代の時計で見捨てない)
-                    spawned_at_ms: Host::now_ms(),
+                    spawned_at_ms: self.deps.clock.now_ms(),
                     cwd,
                     resumed: false,
                 },
@@ -3067,7 +3155,7 @@ impl Bridge {
         let all = self.ledger.pending_keys();
         let alive = self.threads.surviving(&all, |sid| {
             let name = SessionId::from(sid.to_string()).window_name();
-            self.tmux.pid_of(None, &name).is_some()
+            self.deps.agent.pid_of(None, &name).is_some()
         });
         self.ledger.retain_keys(&alive);
         if all.is_empty() {
@@ -3112,7 +3200,7 @@ impl Bridge {
             self.drop_pool_worker(&sid, "de-targeted", ctx);
         }
         // 上限中は**起こす方だけ**やめる(解放は常に安全なので上で済ませてある)
-        if Host::now_ms() < self.limited_until_ms {
+        if self.deps.clock.now_ms() < self.limited_until_ms {
             ctx.info(
                 "bridge",
                 &format!(
@@ -3155,7 +3243,7 @@ impl Bridge {
                 continue;
             };
             // 窓名はプールも割当済みも同じ規則— 引き当てで改名しない
-            let window_id = match self.agent.spawn(&SpawnReq {
+            let window_id = match self.deps.agent.spawn(&SpawnReq {
                 session_id: sid.clone().into(),
                 cwd: cwd.clone(),
                 // 配達待ちの本文を持たない = 実体の待受プロンプトで起動する
@@ -3189,7 +3277,7 @@ impl Bridge {
                 key,
                 worker::PoolWorker {
                     session_id: sid,
-                    spawned_at_ms: Host::now_ms(),
+                    spawned_at_ms: self.deps.clock.now_ms(),
                     cwd,
                     resumed: nominated.is_some(),
                 },
@@ -3215,7 +3303,7 @@ impl Bridge {
         };
         let name = SessionId::from(sid.to_string()).window_name();
         let window_id = self.workers.window_of(sid);
-        match self.tmux.pid_of(window_id.as_deref(), &name) {
+        match self.deps.agent.pid_of(window_id.as_deref(), &name) {
             Some(pid) => {
                 ctx.info(
                     "bridge",
@@ -3234,7 +3322,7 @@ impl Bridge {
             ),
         }
         let target = Window::of(window_id.as_deref().unwrap_or(&name));
-        if let Err(e) = self.tmux.kill_window(&target) {
+        if let Err(e) = self.deps.agent.terminate(&target) {
             ctx.error("bridge", &format!("{why}: pool kill-window failed: {e}"));
         }
         self.workers.forget(sid);
@@ -3282,9 +3370,9 @@ impl Bridge {
     /// 手で編集したものを取り込む口はここだけ。
     fn reload_from_disk(&mut self) {
         let ctx = LogCtx::default();
-        let access = bridge::Access::load(&self.dir);
+        let access = bridge::Access::load(&self.deps.dir);
         self.adopt_access(access, &ctx);
-        self.threads = bridge::Threads::load(&self.dir);
+        self.threads = bridge::Threads::load(&self.deps.dir);
         ctx.info(
             "bridge",
             "access.json + threads.json reloaded from disk (SIGHUP)",
@@ -3303,7 +3391,7 @@ impl Bridge {
                 let (ch, sid) = (e.channel_id.as_deref()?, e.agent_id.as_deref()?);
                 let window_id = self.workers.window_of(sid);
                 let window = SessionId::from(sid.to_string()).window_name();
-                let pid = self.tmux.pid_of(window_id.as_deref(), &window)?;
+                let pid = self.deps.agent.pid_of(window_id.as_deref(), &window)?;
                 Some((ThreadKey::new(ch, tts), sid.to_string(), pid))
             })
             .collect();
@@ -3314,7 +3402,7 @@ impl Bridge {
             .into_iter()
             .filter_map(|(sid, window_id)| {
                 let name = SessionId::from(sid).window_name();
-                self.agent.pid_of(window_id.as_deref(), &name)
+                self.deps.agent.pid_of(window_id.as_deref(), &name)
             })
             .collect();
         ctx.info(
@@ -3358,7 +3446,7 @@ impl Bridge {
     /// 鍵を `gave_up_pool_keys` に記録し、**実体を畳んで在庫から消す**。
     /// 記録が再 spawn の止め金、削除が「存在しない在庫を status が数える」の防ぎ
     async fn give_up_stale_pools(&mut self, ctx: &LogCtx) {
-        let now = Host::now_ms();
+        let now = self.deps.clock.now_ms();
         let stale: Vec<PoolKey> = self
             .workers
             .pool_rows()
@@ -3414,7 +3502,7 @@ impl Bridge {
     /// 落とすので、ここは「空いた枠を埋める」だけ(Bun の `missing(targetKeys)` 収束と同じ役)。
     /// **間引きは必須** — tick は 500ms 刻みで、素通しすると毎回 tmux に問い合わせに行く。
     fn sweep_pools(&mut self, ctx: &LogCtx) {
-        let now = Host::now_ms();
+        let now = self.deps.clock.now_ms();
         if !self.workers.sweep_due(now) {
             return;
         }
@@ -3433,7 +3521,7 @@ impl Bridge {
     /// `run_drains` と同じ理由で同一 tick に2本入れない。60秒で1本ずつ減る速さで足りなく
     /// なったら、kill を spawn に逃がす。
     async fn cleanup_workers(&mut self) {
-        if !self.workers.cleanup_due(Host::now_ms()) {
+        if !self.workers.cleanup_due(self.deps.clock.now_ms()) {
             return;
         }
         self.reap_stray_windows().await;
@@ -3466,7 +3554,7 @@ impl Bridge {
             // 指名されたセッションの窓は「これから引き当てられる在庫」なので litter ではない
             .chain(self.pools.sessions().map(str::to_string))
             .collect();
-        let rows = self.tmux.rows();
+        let rows = self.deps.agent.windows();
         // **持ち主が1人も居ないのにワーカーの窓がある = 窓がゴミなのではなく、こちらが
         // 担当を見失っている**(threads.json が読めなかった等)。そのまま下の判定に落ちると
         // 「全部の窓が持ち主不明」= 全部閉じる、になる。2026-08-03 に実機で動いている
@@ -3508,7 +3596,7 @@ impl Bridge {
             // 殻でないなら claude が生きている可能性がある。窓だけ閉じると孤児として
             // 残るので、**pid 指名で落としてから**閉じる(terminate と同じ順序)
             row.pid.kill_graceful(tmux_mod::KILL_GRACE_MS).await;
-            if let Err(e) = self.tmux.kill_window(&Window::of(&row.id)) {
+            if let Err(e) = self.deps.agent.terminate(&Window::of(&row.id)) {
                 ctx.debug("bridge", &format!("cleanup: kill-window failed: {e}"));
             }
             self.workers.forget(&sid);
@@ -3518,7 +3606,7 @@ impl Bridge {
 
     /// 冷えたスレッドのワーカーを1本畳む。
     async fn evict_idle_worker(&mut self) {
-        let now = Host::now_ms();
+        let now = self.deps.clock.now_ms();
         let mut snaps: Vec<worker::IdleSnapshot> = Vec::new();
         let mut sid_of: HashMap<ThreadKey, String> = HashMap::new();
         // 人のクリックを待っているスレッド(perm_pending は reqId 引きなので鍵に直す)
@@ -3536,7 +3624,7 @@ impl Bridge {
             let h = self.workers.warm(sid);
             let window = SessionId::from(sid.to_string()).window_name();
             if self
-                .tmux
+                .deps.agent
                 .pid_of(h.and_then(|h| h.window_id.as_deref()), &window)
                 .is_none()
             {
@@ -3546,7 +3634,7 @@ impl Bridge {
             // idle の基準は transcript の mtime = 最後に**本当に働いた**時刻。ナレーションや
             // reply の時刻より広く、黙って考えている / 長いツールを回している最中も更新される
             let last = self
-                .agent
+                .deps.agent
                 .last_activity_ms(h.and_then(|h| h.transcript_path.as_deref()), sid);
             let eligible = last.is_some()
                 && !self.workers.is_starting(sid)
@@ -3625,7 +3713,7 @@ impl Bridge {
         // connector の無い Rust では tmux の claude pid が唯一の生存証明
         // (session_end の飛ばない kill -9 で死んだ在庫はここでしか気付けない)
         if self
-            .tmux
+            .deps.agent
             .pid_of(
                 self.workers.window_of(&sid).as_deref(),
                 &SessionId::from(sid.clone()).window_name(),
@@ -3694,7 +3782,7 @@ impl Bridge {
             .workers
             .window_of(&sid)
             .unwrap_or_else(|| SessionId::from(sid.clone()).window_name());
-        match self.tmux.deliver(&Window::of(&target), envelope) {
+        match self.deps.agent.send_text(&Window::of(&target), envelope) {
             // Dispatch::Deliver と同型の配達記録。
             // このパスは新規スレッドの割当てなので new は常に true
             Ok(()) => {
@@ -3722,8 +3810,9 @@ impl Bridge {
     /// これが唯一の答え手で、立ち上がりの期限は他に無い(`Claude::watch_spawn_screens`)。
     fn start_spawn_screen_watch(&self, w: &Window, what: String, ctx: &LogCtx) {
         let (tx, w, ctx) = (self.cmd_tx.clone(), w.clone(), ctx.clone());
+        let agent = self.deps.agent.clone();
         tokio::spawn(async move {
-            let out = Agent::real()
+            let out = agent
                 .watch_spawn_screens(&w, SPAWN_SCREEN_BUDGET_MS, SPAWN_SCREEN_POLL_MS, &ctx)
                 .await;
             // 普通に立ち上がった窓は毎回ここに来る — main を起こす価値があるのは拒絶だけ
@@ -3737,7 +3826,7 @@ impl Bridge {
     }
 
     fn spawn_worker(&mut self, req: &SpawnReq, key: &ThreadKey, ctx: &LogCtx, sid: &str) {
-        match self.agent.spawn(req) {
+        match self.deps.agent.spawn(req) {
             Ok(window) => {
                 self.start_spawn_screen_watch(&window, format!("thread={key}"), ctx);
                 let id = window.as_str().to_string();
@@ -3758,14 +3847,14 @@ impl Bridge {
             ctx.debug("bridge", &format!("{event} before its thread is known"));
             return;
         };
-        let m = self.lifecycle.record(key, event, Host::now_ms());
+        let m = self.lifecycle.record(key, event, self.deps.clock.now_ms());
         ctx.info("lifecycle", &m.message(key, event));
     }
 
     /// ack の付与は**待つ** — 投げっぱなしだと受領時の flip(👀 remove → 🤖 add)が
     /// 飛行中の add を追い越し、👀 が後から付き直して残る。失敗は握る(best-effort)。
     async fn react(&self, channel: &str, ts: &str, emoji: &str, key: &ThreadKey) {
-        if let Err(e) = self.api.add_reaction(channel, ts, emoji).await {
+        if let Err(e) = self.deps.slack.add_reaction(channel, ts, emoji).await {
             LogCtx {
                 session_id: None,
                 thread_key: Some(key.clone()),
@@ -3915,8 +4004,8 @@ impl Bridge {
             .and_then(|h| h.transcript_path.clone());
         let hit =
             match self
-                .agent
-                .session_limit_error(remembered.as_deref(), session_id, Host::now_ms())
+                .deps.agent
+                .session_limit_error(remembered.as_deref(), session_id, self.deps.clock.now_ms())
             {
                 Some(Ok(hit)) => hit,
                 // 履歴が読めない・見つからないのは「上限ではない」の証拠にならないが、これ以上
@@ -3987,7 +4076,7 @@ impl Bridge {
             .as_deref()
             .map(|s| SessionId::from(s.to_string()).window_name())
             .unwrap_or_default();
-        let state = self.workers.state_of(entry.as_ref(), &window, &self.agent);
+        let state = self.workers.state_of(entry.as_ref(), &window, self.deps.agent.as_ref());
         if state != inbound::WorkerState::Ready {
             ctx.info(
                 "bridge",
@@ -4017,7 +4106,7 @@ impl Bridge {
             .and_then(|h| h.window_id.clone())
             .unwrap_or(window);
         for (id, envelope) in &undisposed {
-            if let Err(e) = self.tmux.deliver(&Window::of(&target), envelope) {
+            if let Err(e) = self.deps.agent.send_text(&Window::of(&target), envelope) {
                 ctx.error(
                     "bridge",
                     &format!("turn-failure re-send failed for {id}: {e} — telling the user"),
@@ -4044,7 +4133,7 @@ impl Bridge {
     /// 通す(消えた根に `thread_ts` 付きで投げると Slack がチャンネル直下に落とす)。
     /// 呼び手は待たない — probe は数秒かかることがあり、main ループを吊ってはならない。
     fn post_error_frame(&self, channel: String, thread_ts: String, text: String) {
-        let api = self.api.clone();
+        let api = self.slack_api.clone(); // TODO(Task 12): post_now
         tokio::spawn(async move {
             let key = ThreadKey::new(&channel, &thread_ts);
             let ctx = LogCtx {
@@ -4090,11 +4179,11 @@ impl Bridge {
                     last_activity_ms: 0,
                     shown: false,
                     awaiting_perm: false,
-                    thinking: slack::Thinking::new(&self.api, &channel, &ts, ""),
+                    thinking: slack::Thinking::new(&self.slack_api, &channel, &ts, ""), // TODO(Task 12)
                 })
             }
         };
-        e.last_activity_ms = Host::now_ms();
+        e.last_activity_ms = self.deps.clock.now_ms();
         // 送るのは**見た目が変わるときだけ**。出ていた見張りを解除する(shown)か、
         // 新しく何かを出す(status 非空)か。turn 中の hook 連打は既に何も出ていなければ無送信
         let was_shown = std::mem::replace(&mut e.shown, false);
@@ -4114,7 +4203,7 @@ impl Bridge {
     ///   いちばん遅いものを採る(週の壁はセッションが低くても効く)
     /// - 80% / 90% を新しく跨いだら、生きているスレッドに1回ずつ警告する
     async fn usage_tick(&mut self) {
-        let now = Host::now_ms();
+        let now = self.deps.clock.now_ms();
         let due = self.usage_polled_at_ms
             + if self.usage_at_risk {
                 crate::bridge::command::UsageWatch::POLL_AT_RISK_MS
@@ -4131,8 +4220,8 @@ impl Bridge {
         }
         self.usage_polled_at_ms = now;
         let ctx = LogCtx::default();
-        let raw = match Agent::real()
-            .probe(self.agent.usage_argv(), Host::home())
+        let raw = match self.deps.agent
+            .probe(self.deps.agent.usage_argv(), Host::home())
             .await
         {
             Ok(raw) => raw,
@@ -4144,7 +4233,7 @@ impl Bridge {
                 return;
             }
         };
-        let Some(rows) = self.agent.usage_rows(&raw) else {
+        let Some(rows) = self.deps.agent.usage_rows(&raw) else {
             ctx.info(
                 "bridge",
                 "usage-monitor: /usage had no readable row — holding state",
@@ -4250,7 +4339,7 @@ impl Bridge {
                 let sid = e.agent_id.clone()?;
                 let channel = e.channel_id.clone()?;
                 let name = SessionId::from(sid).window_name();
-                self.tmux
+                self.deps.agent
                     .pid_of(None, &name)
                     .map(|_| ThreadKey::new(&channel, root_ts))
             })
@@ -4269,7 +4358,7 @@ impl Bridge {
     /// 同じく tick ごとに `set` を撃つ形にする
     fn stall_tick(&mut self) {
         self.save_ledger();
-        let now = Host::now_ms();
+        let now = self.deps.clock.now_ms();
         let acts: Vec<(ThreadKey, bridge::StallAction)> = self
             .stall
             .iter()
@@ -4336,7 +4425,7 @@ impl Bridge {
         let (channel, _) = key.split();
         let ack = slack::Api::ack_emoji(&self.access).to_string();
         for id in ids {
-            let (api, channel, ack) = (self.api.clone(), channel.clone(), ack.clone());
+            let (api, channel, ack) = (self.deps.slack.clone(), channel.clone(), ack.clone());
             tokio::spawn(async move {
                 api.flip_to_received(&channel, &id, &ack).await;
             });
@@ -4375,7 +4464,7 @@ impl Bridge {
                 session_id: Some(sid.clone()),
                 thread_key: Some(key.clone()),
             };
-            let Some((text, next)) = self.agent.new_history_lines(path, offset, &ctx) else {
+            let Some((text, next)) = self.deps.agent.new_history_lines(path, offset, &ctx) else {
                 continue;
             };
             self.workers.warm_mut(&sid).transcript_offset = next;
@@ -4410,7 +4499,7 @@ impl Bridge {
             };
             let window = SessionId::from(sid.clone()).window_name();
             // 聞こえる相手にだけ押す。Starting の分は user_prompt が流す道が生きている
-            if self.workers.state_of(entry.as_ref(), &window, &self.agent)
+            if self.workers.state_of(entry.as_ref(), &window, self.deps.agent.as_ref())
                 != inbound::WorkerState::Ready
             {
                 continue;
@@ -4442,8 +4531,8 @@ impl Bridge {
         let mut delivered = false;
         let mut i = 0;
         while i < queued.len() {
-            let text = Envelope::of(&queued[i], &root_ts);
-            match self.tmux.deliver(&Window::of(&window), &text) {
+            let text = Envelope::of(&queued[i], &root_ts, self.deps.clock.now_ms());
+            match self.deps.agent.send_text(&Window::of(&window), &text) {
                 Ok(()) => {
                     ctx.info("bridge", "flushed queued message");
                     delivered = true;
@@ -4485,7 +4574,7 @@ impl Bridge {
         let tool = p["tool_name"].as_str().unwrap_or_default();
         let input = &p["tool_input"];
         Some(
-            match crate::bridge::command::ToolPermission::decide(tool, input, self.dir.path()) {
+            match crate::bridge::command::ToolPermission::decide(tool, input, self.deps.dir.path()) {
                 crate::bridge::command::ToolPermission::Allow(because) => {
                     ctx.debug(
                         "bridge",
@@ -4552,7 +4641,7 @@ impl Bridge {
         // 消えたスレッド根に thread_ts 付きで投げると、Slack はそれを**チャンネル直下の
         // 発言**として落とす = チャンネルが荒れる。投げる前に根の生存を確かめ、消えていれば
         // プロンプトを出さずに deny する(DM は根がそうやって消えないので確認しない)。
-        if !channel.starts_with('D') && self.api.thread_root_gone(&channel, &thread_ts).await {
+        if !channel.starts_with('D') && self.deps.slack.thread_root_gone(&channel, &thread_ts).await {
             ctx.info(
                 "bridge",
                 &format!(
@@ -4567,10 +4656,10 @@ impl Bridge {
             return;
         }
         // reqId は Bridge の中だけで意味を持つ札。時刻 + pid + 連番で十分に一意
-        let req_id = format!("{:x}-{}", Host::now_ms(), self.perm_pending.len());
+        let req_id = format!("{:x}-{}", self.deps.clock.now_ms(), self.perm_pending.len());
         let input = ev.payload["tool_input"].clone();
         let prompt_ts = match self
-            .api
+            .deps.slack
             .post_perm_prompt(&channel, &thread_ts, &req_id, &tool, &input)
             .await
         {
@@ -4605,7 +4694,7 @@ impl Bridge {
                     .unwrap_or_default()
                     .to_string(),
                 prompt_ts,
-                deadline_ms: Host::now_ms() + PERM_WAIT_MS,
+                deadline_ms: self.deps.clock.now_ms() + PERM_WAIT_MS,
             },
         );
     }
@@ -4634,7 +4723,7 @@ impl Bridge {
             e.thinking.set("");
         }
         if rearm {
-            e.last_activity_ms = Host::now_ms();
+            e.last_activity_ms = self.deps.clock.now_ms();
         }
     }
 
@@ -4686,7 +4775,7 @@ impl Bridge {
             p.tool_name, click.action, click.by
         );
         if let Err(e) = self
-            .api
+            .deps.slack
             .update_message(&p.channel, &p.prompt_ts, &done)
             .await
         {
@@ -4697,7 +4786,7 @@ impl Bridge {
     /// 人が押さないまま満期。ワーカーは既に諦めて次へ進んでいるので、**残ったプロンプトを消す** —
     /// 残すと後から押された Allow が「効いたのに何も起きない」になる(#2)。
     async fn expire_perm_prompts(&mut self) {
-        let now = Host::now_ms();
+        let now = self.deps.clock.now_ms();
         let expired: Vec<String> = self
             .perm_pending
             .iter()
@@ -4724,7 +4813,7 @@ impl Bridge {
             // 張り直さない — いま「時間切れ」と言ったばかりなので、本当の活動が来るまで黙る
             self.resume_stall_after_perm(&key, false);
             self.sticky.on_perm_timeout(&key);
-            if let Err(e) = self.api.delete_message(&p.channel, &p.prompt_ts).await {
+            if let Err(e) = self.deps.slack.delete_message(&p.channel, &p.prompt_ts).await {
                 ctx.debug("bridge", &format!("perm prompt delete failed: {e}"));
             }
         }
@@ -4740,7 +4829,7 @@ impl Bridge {
             self.access.grant_channel_tool(scope, tool);
             (
                 "channel",
-                self.access.save(&self.dir).map_err(|e| e.to_string()),
+                self.access.save(&self.deps.dir).map_err(|e| e.to_string()),
             )
         };
         match saved {
@@ -4945,7 +5034,7 @@ impl Bridge {
             self.flush_sticky(&key, posted, body).await;
         }
         if let slack::StickyAction::Delete(ts) = self.sticky.settle(&key, d.kind) {
-            let (api, channel) = (self.api.clone(), d.channel_id.clone());
+            let (api, channel) = (self.deps.slack.clone(), d.channel_id.clone());
             tokio::spawn(async move {
                 if let Err(e) = api.delete_message(&channel, &ts).await {
                     ctx.debug("bridge", &format!("sticky delete failed: {e}"));
@@ -4955,7 +5044,7 @@ impl Bridge {
     }
 
     async fn flush_stickies(&mut self) {
-        for (key, posted, body) in self.sticky.take_dirty(Host::now_ms()) {
+        for (key, posted, body) in self.sticky.take_dirty(self.deps.clock.now_ms()) {
             self.flush_sticky(&key, posted, body).await;
         }
     }
@@ -4972,7 +5061,7 @@ impl Bridge {
         };
         match posted {
             Some(ts) => {
-                let api = self.api.clone();
+                let api = self.deps.slack.clone();
                 tokio::spawn(async move {
                     if let Err(e) = api.update_message(&channel, &ts, &body).await {
                         ctx.error("bridge", &format!("sticky update failed: {e}"));
@@ -4980,7 +5069,7 @@ impl Bridge {
                 });
             }
             None => match self
-                .api
+                .deps.slack
                 .post_message(&channel, &body, root.as_deref())
                 .await
             {
@@ -4994,7 +5083,7 @@ impl Bridge {
 /// 前のプロセスが `restart` で降りるときに残したマーカーを**消費**する(読んで消す)。
 /// 残すと、次の起動が身に覚えの無い「✅ 再起動が完了しました」を出す。
 /// 中断スレッドの自動再開はこの実装に無いので、再開の行は 0 件で閉じる。
-async fn consume_restart_marker(dir: &bridge::StateDir, api: &slack::Api) {
+async fn consume_restart_marker(dir: &bridge::StateDir, api: &dyn ports::SlackPort) {
     let ctx = LogCtx::default();
     let path = dir.restart_marker();
     let Ok(raw) = std::fs::read_to_string(&path) else {
@@ -5066,7 +5155,7 @@ impl Host {
         }
     }
 
-    /// 壁時計の epoch ミリ秒。[`bridge::now_ms`] の薄い口 — Bridge 側の計算は全部これを通る。
+    /// Wall-clock epoch ms for the wiring in `run()`. Bridge methods read `deps.clock` instead.
     pub fn now_ms() -> u64 {
         bridge::now_ms()
     }
@@ -5281,7 +5370,7 @@ impl Bridge {
         let (reload_tx, mut reload_rx) = mpsc::channel(4);
         // 親との link を張り直したときの合図(子だけが使う)
         let (relink_tx, mut relink_rx) = mpsc::channel(4);
-        consume_restart_marker(&dir, &api).await;
+        consume_restart_marker(&dir, api.as_ref()).await;
 
         // 子を迎えるなら、Slack のイベントは**畳む前に**こちらへ回す。誰の担当かを決めてから、
         // 自分の分だけ msg_tx / click_tx に戻る(= ローカル配達は直結と同じ変換を通る)
@@ -5399,8 +5488,7 @@ impl Bridge {
             }
         }
 
-        let access = bridge::Access::load(&dir);
-        if access.owner.is_empty() {
+        if bridge::Access::load(&dir).owner.is_empty() {
             LogCtx::default().info("bridge", "no owner in access.json — serving nobody");
         }
         // 起動時に1回だけ訊く。落ちても起動は止めない — コマンド判定が mention 抜きの形だけになる
@@ -5423,44 +5511,26 @@ impl Bridge {
         if let Some(fleet) = &fleet {
             *fleet.bot_user_id.lock().await = bot_user_id.clone();
         }
-        let mut b = Bridge {
-            // 台帳は threads.json の中(entry の `inflight`)なので、読んだ後に組み立てる
-            ledger: {
-                let threads = bridge::Threads::load(&dir);
-                bridge::Ledger::load(&threads)
+        let mut b = Bridge::new(
+            Deps {
+                slack: api.clone(),
+                agent: Arc::new(Claude::real()),
+                clock: Arc::new(ports::SystemClock),
+                dir,
             },
-            threads: bridge::Threads::load(&dir),
-            pools: bridge::Pools::load(&dir),
-            dir,
-            api,
-            access,
-            dedup: inbound::RecentDeliveries::new(),
-            workers: worker::Workers::default(),
-            pending: HashMap::new(),
-            lifecycle: bridge::Lifecycle::new(),
-            sticky: slack::StickyBoard::default(),
-            perm_pending: HashMap::new(),
-            narration: HashMap::new(),
-            agent: Agent::real(),
-            tmux: Tmux::real(),
-            hooks_file,
-            mcp_port,
-            mcp_token,
-            bot_user_id,
-            started_at_ms,
-            cmd_tx,
-            login_pending: HashMap::new(),
-            restarting: false,
-            signing_out: false,
-            limited_until_ms: 0,
-            usage_polled_at_ms: 0,
-            usage_at_risk: false,
-            usage_warned_pct: 0,
-            stall: HashMap::new(),
-            fleet: fleet.is_some(),
-        };
+            Config {
+                hooks_file,
+                mcp_port,
+                mcp_token,
+                bot_user_id,
+                started_at_ms,
+                fleet: fleet.is_some(),
+                cmd_tx,
+                slack_api: api, // TODO(Task 12)
+            },
+        );
         // 前の Bridge が落ちる前に残した login セッションを掃く
-        b.agent.login_kill();
+        b.deps.agent.login_kill();
         // 再起動でも Owner は access.json に残る。restart は在庫を畳まずに降りるので、
         // まず生き残りを拾い直し(restore_pools)、欠けた枠だけを起こす。指名済みの
         // セッションがある枠は新規 ID ではなく `--resume` で立ち上がる
@@ -5527,10 +5597,11 @@ impl Bridge {
     /// `/compact` を打ち込み、pane のスピナーを Slack の付箋に流す。付箋は**最初の進捗が出てから**作る — busy / no-session の
     /// 断りが1本で済むのはそのため。最後の1行は付箋があれば書き換え、無ければ新規投稿。
     ///
-    /// TUI を回すのはエージェント側(`Agent::compact`)。ここは**進捗を Slack に描く側**だけ —
+    /// TUI を回すのはエージェント側(`AgentPort::compact`)。ここは**進捗を Slack に描く側**だけ —
     /// 最長6分かかるので select ループの外(spawn)で回す。
     async fn run_compact(
-        api: Arc<slack::Api>,
+        api: ports::Slack,
+        agent: ports::AgentRef,
         channel: String,
         root: String,
         key: ThreadKey,
@@ -5542,7 +5613,6 @@ impl Bridge {
             session_id: Some(sid.clone()),
             thread_key: Some(key.clone()),
         };
-        let agent = Agent::real();
         // The agent sends each reading; this task draws them one at a time, in order.
         // Capacity 1 keeps the agent at most one reading ahead of the drawing.
         let (tx, mut rx) = mpsc::channel::<CompactProgress>(1);
@@ -5606,9 +5676,10 @@ impl Bridge {
     }
 
     /// 素の `effort`。今の level を TUI に訊くのはエージェント側
-    /// (`Agent::effort`)。ここは答えを1行にして投げるだけ。
+    /// (`AgentPort::effort`)。ここは答えを1行にして投げるだけ。
     async fn run_effort_show(
-        api: Arc<slack::Api>,
+        api: Arc<slack::Api>, // TODO(Task 12)
+        agent: ports::AgentRef,
         channel: String,
         root: String,
         key: ThreadKey,
@@ -5616,7 +5687,6 @@ impl Bridge {
         sid: String,
     ) {
         let failed = || crate::t!("Couldn't read the current effort level.", "今の effort を読み取れませんでした。");
-        let agent = Agent::real();
         // None = 非対応か、状態行が読めなかったか — どちらも同じ断りを返す
         let out = match agent.effort(&target, &key, &sid).await {
             Some(level) => crate::t!("Effort level: *{level}*", "effort: *{level}*"),
@@ -5627,20 +5697,25 @@ impl Bridge {
 }
 
 impl Envelope {
-    /// 受信メッセージ → 封筒テキスト。`ts` は**配達時点**の now、`thread_ts` は解決済みの根
+    /// 受信メッセージ → 封筒テキスト。`ts` は**配達時点**の now(`now_ms`)、`thread_ts` は解決済みの根
     /// (現行`threadTs || msg.ts` を渡す)。
-    pub fn of(msg: &InboundMsg, root_ts: &str) -> String {
-        Self::of_guarded(msg, root_ts, None)
+    pub fn of(msg: &InboundMsg, root_ts: &str, now_ms: u64) -> String {
+        Self::of_guarded(msg, root_ts, None, now_ms)
     }
 
     /// ループ遮断が立った配達だけ `loop_guard` を載せる(空文字 = 呼ぶ相手が居ない)。
-    pub fn of_guarded(msg: &InboundMsg, root_ts: &str, loop_guard: Option<String>) -> String {
+    pub fn of_guarded(
+        msg: &InboundMsg,
+        root_ts: &str,
+        loop_guard: Option<String>,
+        now_ms: u64,
+    ) -> String {
         Envelope {
             loop_guard,
             channel_id: msg.channel.clone(),
             message_id: msg.ts.clone(),
             user: msg.user.clone().unwrap_or_else(|| "unknown".to_string()),
-            ts: bridge::iso8601(Host::now_ms()),
+            ts: bridge::iso8601(now_ms),
             thread_ts: Some(root_ts.to_string()),
             text: msg.text.clone(),
             // 先読みダウンロードの結果はメッセージが持っている(queue 経由でも持ち越す)
@@ -5832,5 +5907,80 @@ mod tests {
             Bridge::safe_to_reap(&none, &human),
             "ワーカーの窓が無いなら掃除しても何も起きない"
         );
+    }
+
+    // ── flows through Bridge, with fakes for Slack, the agent and the clock ──
+
+    use crate::ports::fake::{FakeAgent, FakeClock, FakeSlack};
+
+    /// A fresh state dir with only the owner in access.json.
+    fn flow_deps(name: &str) -> (Deps, Arc<FakeSlack>, Arc<FakeAgent>, Arc<FakeClock>) {
+        let path = std::env::temp_dir().join(format!("agentgw-flow-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("access.json"), r#"{"owner":"U_OWNER"}"#).unwrap();
+        let slack = Arc::new(FakeSlack::default());
+        let agent = Arc::new(FakeAgent::default());
+        let clock = FakeClock::at(1_782_000_000_000);
+        let deps = Deps {
+            slack: slack.clone(),
+            agent: agent.clone(),
+            clock: clock.clone(),
+            dir: bridge::StateDir::at(path),
+        };
+        (deps, slack, agent, clock)
+    }
+
+    fn channel_msg(ts: &str, user: &str, text: &str) -> InboundMsg {
+        InboundMsg {
+            channel: "C1".into(),
+            channel_kind: inbound::ChannelKind::Channel,
+            ts: ts.into(),
+            thread_ts: None,
+            user: Some(user.into()),
+            is_bot: false,
+            bot_id: None,
+            text: text.into(),
+            files: vec![],
+            file_paths: vec![],
+            file_errors: vec![],
+            reaction: None,
+            deleted_ts: None,
+            edited: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_owner_message_in_a_new_thread_starts_an_agent_and_acks() {
+        let (d, slack, agent, _clock) = flow_deps("owner");
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.on_inbound(&channel_msg("1782000000.000100", "U_OWNER", "<@U_BOT> fix the tests"))
+            .await;
+        assert_eq!(agent.spawned.lock().unwrap().len(), 1, "one agent for the new thread");
+        assert!(
+            slack.calls().contains(&"react C1 1782000000.000100 eyes".to_string()),
+            "{:?}",
+            slack.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stranger_cannot_start_work() {
+        let (d, slack, agent, _clock) = flow_deps("stranger");
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.on_inbound(&channel_msg("1782000000.000100", "U_STRANGER", "<@U_BOT> rm -rf /"))
+            .await;
+        assert!(agent.spawned.lock().unwrap().is_empty());
+        assert!(slack.calls().is_empty(), "{:?}", slack.calls());
+    }
+
+    #[tokio::test]
+    async fn the_second_event_for_the_same_message_is_dropped() {
+        let (d, _slack, agent, _clock) = flow_deps("dedup");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let m = channel_msg("1782000000.000100", "U_OWNER", "<@U_BOT> hi");
+        b.on_inbound(&m).await;
+        b.on_inbound(&m).await;
+        assert_eq!(agent.spawned.lock().unwrap().len(), 1);
     }
 }

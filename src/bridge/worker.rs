@@ -1,12 +1,12 @@
 //! 生きているワーカーと在庫の台帳。
 //!
 //! **このファイルは tmux コマンドを1つも打たない。** 「どのスレッドにどのワーカーが居るか」の
-//! 記録だけを持つ。実際に窓を叩くのは [`crate::agent::Agent`] 越し。
+//! 記録だけを持つ。実際に窓を叩くのは [`crate::ports::AgentPort`] 越し。
 //!
 //! Slack へ投稿するもの・threads.json を書くものはここに置かない — あれは「台帳を見て
 //! Slack と agent に指示を出す」ので Bridge の仕事。
 
-use crate::agent::Agent;
+use crate::ports::AgentPort;
 use crate::bridge::inbound::WorkerState;
 use crate::bridge::state::{PoolKey, ThreadEntry, ThreadKey};
 use std::collections::{HashMap, HashSet};
@@ -53,7 +53,7 @@ pub struct PoolWorker {
     pub resumed: bool,
 }
 
-/// 生きているワーカーと在庫の台帳。tmux は叩かない — 叩くのは [`Agent`]。
+/// 生きているワーカーと在庫の台帳。tmux は叩かない — 叩くのは [`AgentPort`]。
 #[derive(Default)]
 pub struct Workers {
     /// session_id → 暖機の印
@@ -152,7 +152,7 @@ impl Workers {
         &self,
         entry: Option<&ThreadEntry>,
         window: &str,
-        agent: &Agent,
+        agent: &dyn AgentPort,
     ) -> WorkerState {
         let Some(sid) = entry.and_then(|e| e.agent_id.as_deref()) else {
             return WorkerState::Absent;
@@ -507,8 +507,8 @@ mod tests {
     }
 
     /// 窓は生きている(pane_pid が返る)fake tmux。
-    fn live_agent() -> Agent {
-        Agent::Claude(Claude::new(Tmux {
+    fn live_agent() -> Claude {
+        Claude::new(Tmux {
             run: Box::new(|args: &[&str]| {
                 if args.first() == Some(&"list-windows") {
                     Ok("@7 4242 claude w-sid-1\n".to_string())
@@ -516,14 +516,14 @@ mod tests {
                     Ok(String::new())
                 }
             }),
-        }))
+        })
     }
 
     /// 窓が無い fake tmux。
-    fn dead_agent() -> Agent {
-        Agent::Claude(Claude::new(Tmux {
+    fn dead_agent() -> Claude {
+        Claude::new(Tmux {
             run: Box::new(|_args: &[&str]| Ok(String::new())),
-        }))
+        })
     }
 
     fn entry_of(sid: &str) -> ThreadEntry {

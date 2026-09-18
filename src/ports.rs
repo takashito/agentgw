@@ -97,8 +97,6 @@ pub trait SlackPort: Send + Sync + 'static {
 /// say so is the caller's call.
 #[async_trait]
 pub trait AgentPort: Send + Sync + 'static {
-    /// The agent's name in logs and `status`.
-    fn id(&self) -> &'static str;
     fn spawn(&self, req: &SpawnReq) -> Result<Window, String>;
     /// Types `text` into the window and presses Enter.
     fn send_text(&self, w: &Window, text: &str) -> Result<(), String>;
@@ -338,9 +336,6 @@ pub mod fake {
 
     #[async_trait]
     impl AgentPort for FakeAgent {
-        fn id(&self) -> &'static str {
-            "fake"
-        }
         fn spawn(&self, req: &SpawnReq) -> Result<Window, String> {
             let n = self.next.fetch_add(1, Ordering::SeqCst);
             let id = format!("@{n}");

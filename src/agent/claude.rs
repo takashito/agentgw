@@ -69,6 +69,11 @@ impl Claude {
         Self { tmux }
     }
 
+    /// Claude on the real tmux.
+    pub fn real() -> Self {
+        Self::new(Tmux::real())
+    }
+
     /// 同ファイルの argv 固定テスト専用。**本番の経路はここを通らない** — 窓を叩くのは
     /// `Claude` のメソッド(`deliver` / `capture` / `login_*` / `drive` …)だけ。
     #[cfg(test)]
@@ -887,10 +892,6 @@ impl Claude {
 
 #[async_trait::async_trait]
 impl crate::ports::AgentPort for Claude {
-    fn id(&self) -> &'static str {
-        "claude"
-    }
-
     fn spawn(&self, req: &SpawnReq) -> Result<Window, String> {
         Claude::spawn(self, req)
     }
