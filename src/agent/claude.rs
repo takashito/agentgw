@@ -884,7 +884,8 @@ impl Claude {
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
             .output();
-        let out = tokio::time::timeout(PROBE_TIMEOUT, run).await.ok()?.ok()?;
+        // 見張りは Bridge の select ループの中で呼ばれる — 固まっても長く止めない(普段は1秒未満)
+        let out = tokio::time::timeout(AUTH_STATUS_TIMEOUT, run).await.ok()?.ok()?;
         Self::auth_status_signed_in(&String::from_utf8_lossy(&out.stdout))
     }
 
@@ -1131,6 +1132,8 @@ impl crate::agent::Agent for Claude {
 
 /// headless probe を諦める時刻(`ms = 60_000`)。
 const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+/// `claude auth status` is a local check; it answers in well under a second.
+const AUTH_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// ワーカーの `.jsonl` と、そこまで読んだ位置。
 ///
