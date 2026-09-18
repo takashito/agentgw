@@ -75,6 +75,7 @@ impl Default for SessionId {
 }
 
 /// ワーカーを1本起こす要求。
+#[derive(Clone)]
 pub struct SpawnReq {
     pub session_id: SessionId,
     pub cwd: String,
@@ -323,19 +324,15 @@ impl Agent {
 
     /// 会話を圧縮する。進捗は1つずつ `on_progress` に渡る — Slack に何を
     /// どう出すかは呼び手の判断で、実体は結末だけ返す。
-    pub async fn compact<F, Fut>(
+    pub async fn compact(
         &self,
         w: &Window,
         key: &ThreadKey,
         session_id: &str,
-        on_progress: F,
-    ) -> Option<CompactOutcome>
-    where
-        F: Fn(CompactProgress) -> Fut,
-        Fut: std::future::Future<Output = ()>,
-    {
+        progress: tokio::sync::mpsc::Sender<CompactProgress>,
+    ) -> Option<CompactOutcome> {
         match self {
-            Agent::Claude(c) => Some(c.compact(w, key, session_id, on_progress).await),
+            Agent::Claude(c) => Some(c.compact(w, key, session_id, progress).await),
         }
     }
 

@@ -1440,6 +1440,129 @@ impl SlackApi for Api {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::ports::SlackPort for Api {
+    async fn post_message(
+        &self,
+        channel: &str,
+        text: &str,
+        thread_ts: Option<&str>,
+    ) -> Result<String, String> {
+        Api::post_message(self, channel, text, thread_ts).await
+    }
+    async fn post_message_no_unfurl(
+        &self,
+        channel: &str,
+        text: &str,
+        thread_ts: Option<&str>,
+    ) -> Result<String, String> {
+        Api::post_message_no_unfurl(self, channel, text, thread_ts).await
+    }
+    async fn post_markdown(
+        &self,
+        channel: &str,
+        text: &str,
+        thread_ts: Option<&str>,
+    ) -> Result<String, String> {
+        Api::post_markdown(self, channel, text, thread_ts).await
+    }
+    async fn update_message(&self, channel: &str, ts: &str, text: &str) -> Result<(), String> {
+        Api::update_message(self, channel, ts, text).await
+    }
+    async fn update_markdown(&self, channel: &str, ts: &str, text: &str) -> Result<(), String> {
+        Api::update_markdown(self, channel, ts, text).await
+    }
+    async fn delete_message(&self, channel: &str, ts: &str) -> Result<(), String> {
+        Api::delete_message(self, channel, ts).await
+    }
+    async fn add_reaction(&self, channel: &str, ts: &str, emoji: &str) -> Result<(), String> {
+        Api::add_reaction(self, channel, ts, emoji).await
+    }
+    async fn remove_reaction(&self, channel: &str, ts: &str, emoji: &str) -> Result<(), String> {
+        Api::remove_reaction(self, channel, ts, emoji).await
+    }
+    async fn flip_to_received(&self, channel: &str, message_ts: &str, ack: &str) {
+        SlackOps::flip_to_received(self, channel, message_ts, ack).await
+    }
+    async fn post_perm_prompt(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        req_id: &str,
+        tool_name: &str,
+        tool_input: &serde_json::Value,
+    ) -> Result<String, String> {
+        Api::post_perm_prompt(self, channel, thread_ts, req_id, tool_name, tool_input).await
+    }
+    async fn open_dm(&self, user_id: &str) -> Result<String, String> {
+        Api::open_dm(self, user_id).await
+    }
+    async fn history(&self, channel: &str, limit: u16) -> Result<Vec<FetchedMsg>, String> {
+        Api::history(self, channel, limit).await
+    }
+    async fn replies(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        limit: u16,
+    ) -> Result<Vec<FetchedMsg>, String> {
+        Api::replies(self, channel, thread_ts, limit).await
+    }
+    async fn parent_thread_of(&self, channel: &str, ts: &str) -> Option<String> {
+        Api::parent_thread_of(self, channel, ts).await
+    }
+    async fn message_at(&self, channel: &str, ts: &str) -> Option<MessageAt> {
+        Api::message_at(self, channel, ts).await
+    }
+    async fn thread_root_gone(&self, channel: &str, thread_ts: &str) -> bool {
+        Api::thread_root_gone(self, channel, thread_ts).await
+    }
+    async fn get_permalink(&self, channel: &str, ts: &str) -> Result<String, String> {
+        Api::get_permalink(self, channel, ts).await
+    }
+    async fn channel_display_name(&self, channel: &str) -> Option<String> {
+        Api::channel_display_name(self, channel).await
+    }
+    async fn user_display_name(&self, user: &str) -> Option<String> {
+        Api::user_display_name(self, user).await
+    }
+    async fn auth_test(&self) -> Result<(String, Option<String>), String> {
+        Api::auth_test(self).await
+    }
+    async fn resolve_bot_id(&self, user_id: &str) -> Result<Option<String>, String> {
+        Api::resolve_bot_id(self, user_id).await
+    }
+    async fn file_info(&self, file_id: &str) -> Result<(String, String, u64), String> {
+        Api::file_info(self, file_id).await
+    }
+    async fn download_to(&self, url: &str, dest: &std::path::Path) -> Result<(), String> {
+        Api::download_to(self, url, dest).await
+    }
+    async fn download_attachment(
+        &self,
+        file_id: &str,
+        state_dir: &std::path::Path,
+    ) -> Result<String, String> {
+        SlackOps::download_attachment(self, file_id, state_dir).await
+    }
+    async fn upload_file(
+        &self,
+        channel: &str,
+        thread_ts: Option<&str>,
+        path: &std::path::Path,
+    ) -> Result<(), String> {
+        Api::upload_file(self, channel, thread_ts, path).await
+    }
+    async fn set_thinking_status(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        status: &str,
+    ) -> Result<(), String> {
+        Api::set_thinking_status(self, channel, thread_ts, status).await
+    }
+}
+
 // ── 処理中ステータス(shimmer)— Bridge が「考え中」を張る口 ─────────────────
 
 /// 処理中のあいだ張っておく assistant ステータス(`is thinking…` などの shimmer)。

@@ -6,6 +6,7 @@ version = 4
 name = "agentgw"
 version = "0.22.4"
 dependencies = [
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "chrono",

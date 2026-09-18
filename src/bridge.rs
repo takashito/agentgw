@@ -5543,48 +5543,41 @@ impl Bridge {
             thread_key: Some(key.clone()),
         };
         let agent = Agent::real();
-        // 進捗コールバックが `Fn` なので(理由は `Agent::compact` の doc)、畳む状態は内側可変で持つ。
-        // ponytail: 触るのはこのタスク1本だけ(直列)。`Mutex` は `tokio::spawn` の `Send` を満たす
-        // ためだけの器で、ロックは1文の中で必ず落ちる — await を跨いで持たない
-        let progress_ts: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-        let last_rendered = std::sync::Mutex::new(String::new());
-        // 進捗コールバックの future は毎回作り直されるので、束ねる状態は借用で渡す(参照は Copy)。
-        let (api_r, channel_r, root_r, ctx_r) = (&api, &channel, &root, &ctx);
-        let (ts_r, last_r) = (&progress_ts, &last_rendered);
-        let outcome =
-            agent
-                .compact(&target, &key, &sid, |st: CompactProgress| async move {
-                    let rendered = st.render();
-                    // 同じ絵を描き直さない(Slack の編集回数はタダではない)
-                    if rendered == *last_r.lock().expect("compact render state") {
-                        return;
-                    }
-                    last_r
-                        .lock()
-                        .expect("compact render state")
-                        .clone_from(&rendered);
-                    let ts = ts_r.lock().expect("compact progress ts").clone();
-                    let posted = match &ts {
-                        Some(ts) => api_r
-                            .update_message(channel_r, ts, &rendered)
-                            .await
-                            .map(|()| None),
-                        None => api_r
-                            .post_message_no_unfurl(channel_r, &rendered, Some(root_r))
-                            .await
-                            .map(Some),
-                    };
-                    match posted {
-                    Ok(Some(ts)) => *ts_r.lock().expect("compact progress ts") = Some(ts),
+        // The agent sends each reading; this task draws them one at a time, in order.
+        // Capacity 1 keeps the agent at most one reading ahead of the drawing.
+        let (tx, mut rx) = mpsc::channel::<CompactProgress>(1);
+        let draw = async {
+            let mut progress_ts: Option<String> = None;
+            let mut last_rendered = String::new();
+            while let Some(st) = rx.recv().await {
+                let rendered = st.render();
+                // 同じ絵を描き直さない(Slack の編集回数はタダではない)
+                if rendered == last_rendered {
+                    continue;
+                }
+                last_rendered.clone_from(&rendered);
+                let posted = match &progress_ts {
+                    Some(ts) => api
+                        .update_message(&channel, ts, &rendered)
+                        .await
+                        .map(|()| None),
+                    None => api
+                        .post_message_no_unfurl(&channel, &rendered, Some(&root))
+                        .await
+                        .map(Some),
+                };
+                match posted {
+                    Ok(Some(ts)) => progress_ts = Some(ts),
                     Ok(None) => {}
                     // 描き損ねても圧縮は続く
-                    Err(e) => ctx_r.error("bridge", &format!(
-                            "slack-events: compact progress render failed for {channel_r}:{root_r}: {e}"
-                        )),
+                    Err(e) => ctx.error("bridge", &format!(
+                        "slack-events: compact progress render failed for {channel}:{root}: {e}"
+                    )),
                 }
-                })
-                .await;
-        let progress_ts = progress_ts.into_inner().expect("compact progress ts");
+            }
+            progress_ts
+        };
+        let (outcome, progress_ts) = tokio::join!(agent.compact(&target, &key, &sid, tx), draw);
         // None = このエージェントが compact に非対応。実体が1つの今は起きない
         let final_text = match outcome {
             Some(CompactOutcome::Done) => crate::t!("✅ Compacted the context.", "✅ コンテキストを圧縮しました。"),

@@ -300,6 +300,7 @@ impl Tmux {
 }
 
 /// 棚卸しで見えた窓1つ。
+#[derive(Clone)]
 pub struct WindowRow {
     pub id: String,
     pub pid: Pid,

@@ -8,7 +8,7 @@
 //! **Slack へ出す文面は1つも持たない** — 描くのは Bridge の仕事(`command.rs`)。
 
 use super::screen::{Pane, SpawnOutcome, SpawnScreen, strip_modal_decoration};
-use super::tmux::{Pid, Tmux, Window};
+use super::tmux::{Pid, Tmux, Window, WindowRow};
 use super::{CompactOutcome, CompactProgress, LoginOutcome, ProbeErr, SpawnReq};
 use crate::bridge::inbound::WorkerState;
 use crate::bridge::state::{LogCtx, StateDir, ThreadKey};
@@ -562,26 +562,19 @@ impl Claude {
         unreachable!("the loop always returns at i == MAX_PRESSES")
     }
 
-    /// `/compact` を打ち込み、pane のスピナーを `on_progress` に1つずつ渡す
+    /// `/compact` を打ち込み、pane のスピナーを `progress` に1つずつ送る
     ///
     /// **Slack へは何も出さない** — 付箋を作るか編集するか、どんな文面にするかは Bridge の判断。
     /// ここが返すのは結末だけ。最長6分かかるので呼び手は select ループの外で回す。
     ///
-    /// `on_progress` は `Fn`(`AsyncFnMut` ではない)— 返す future が引数の寿命に依存しない形で
-    /// ないと、この future を `tokio::spawn` する時に slack-morphism の `Send` が
-    /// 高階の寿命で解けない(実測: "implementation of `Send` is not general enough")。
-    /// 呼び手は畳む状態を `RefCell` に置く。
-    pub async fn compact<F, Fut>(
+    /// The sender is dropped when this returns, which ends the caller's receiving loop.
+    pub async fn compact(
         &self,
         target: &Window,
         key: &ThreadKey,
         sid: &str,
-        on_progress: F,
-    ) -> CompactOutcome
-    where
-        F: Fn(CompactProgress) -> Fut,
-        Fut: std::future::Future<Output = ()>,
-    {
+        progress: tokio::sync::mpsc::Sender<CompactProgress>,
+    ) -> CompactOutcome {
         const MAX_MS: u64 = 6 * 60_000; // 詰まった圧縮が永遠にポーリングしないための天井
         const POLL: Duration = Duration::from_millis(800);
         const SUBMIT_RETRY_CAP: u32 = 4;
@@ -635,7 +628,8 @@ impl Claude {
                 // 現行 Bun はここで shimmer を秒数付きに張り直す。
                 // Rust 版は compact に専用 status を持たないので何もしない — 進捗は呼び手の
                 // sticky が見せる(user_compact のコメント参照。意図的逸脱)
-                on_progress(st).await;
+                // A receiver that went away only stops the drawing, not the compaction
+                let _ = progress.send(st).await;
             } else if seen || (lower.contains("compacted (ctrl+o") && !stale_done) {
                 // 終わりを名乗るのは**肯定的な合図**だけ: スピナーが消えるのを見届けたか、
                 // 新しい `Compacted` の印が出たか(速すぎてスピナーを1度も捉えられなかった時)。
@@ -888,6 +882,171 @@ impl Claude {
             ))),
             Ok(Ok(o)) => Ok(String::from_utf8_lossy(&o.stdout).into_owned()),
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::ports::AgentPort for Claude {
+    fn id(&self) -> &'static str {
+        "claude"
+    }
+
+    fn spawn(&self, req: &SpawnReq) -> Result<Window, String> {
+        Claude::spawn(self, req)
+    }
+
+    fn send_text(&self, w: &Window, text: &str) -> Result<(), String> {
+        self.tmux.deliver(w, text)
+    }
+
+    async fn watch_spawn_screens(
+        &self,
+        w: &Window,
+        budget_ms: u64,
+        poll_ms: u64,
+        ctx: &LogCtx,
+    ) -> SpawnOutcome {
+        Claude::watch_spawn_screens(self, w, budget_ms, poll_ms, ctx).await
+    }
+
+    fn pid_of(&self, window_id: Option<&str>, window_name: &str) -> Option<Pid> {
+        Claude::pid_of(self, window_id, window_name)
+    }
+
+    fn windows(&self) -> Vec<WindowRow> {
+        self.tmux.rows()
+    }
+
+    fn terminate(&self, w: &Window) -> Result<(), String> {
+        Claude::terminate(self, w)
+    }
+
+    fn interrupt(&self, w: &Window) -> Result<(), String> {
+        self.tmux.send_escape(w)
+    }
+
+    fn login_kill(&self) {
+        Claude::login_kill(self)
+    }
+
+    async fn compact(
+        &self,
+        w: &Window,
+        key: &ThreadKey,
+        session_id: &str,
+        progress: tokio::sync::mpsc::Sender<CompactProgress>,
+    ) -> Option<CompactOutcome> {
+        Some(Claude::compact(self, w, key, session_id, progress).await)
+    }
+
+    async fn effort(&self, w: &Window, key: &ThreadKey, session_id: &str) -> Option<&'static str> {
+        Claude::effort(self, w, key, session_id).await
+    }
+
+    async fn set_effort(
+        &self,
+        w: &Window,
+        level: &str,
+        key: &ThreadKey,
+        ctx: &LogCtx,
+    ) -> Option<bool> {
+        Some(Claude::set_effort(self, w, level, key, ctx).await)
+    }
+
+    fn mode(&self, w: &Window, ctx: &LogCtx) -> Option<&'static str> {
+        Some(Claude::mode(self, w, ctx))
+    }
+
+    async fn set_mode(&self, w: &Window, name: &str, key: &ThreadKey, ctx: &LogCtx) -> Option<bool> {
+        Some(Claude::set_mode(self, w, name, key, ctx).await)
+    }
+
+    async fn set_model(
+        &self,
+        w: &Window,
+        name: &str,
+        key: &ThreadKey,
+        ctx: &LogCtx,
+    ) -> Option<bool> {
+        Some(Claude::set_model(self, w, name, key, ctx).await)
+    }
+
+    fn session_cwd(&self, remembered: Option<&str>, session_id: &str) -> Option<String> {
+        Transcript::locate(remembered, session_id).and_then(|t| t.cwd())
+    }
+
+    fn session_history_exists(&self, remembered: Option<&str>, session_id: &str) -> bool {
+        Transcript::locate(remembered, session_id).is_some()
+    }
+
+    fn last_activity_ms(&self, remembered: Option<&str>, session_id: &str) -> Option<u64> {
+        Transcript::locate(remembered, session_id).and_then(|t| t.mtime_ms())
+    }
+
+    fn current_model(
+        &self,
+        remembered: Option<&str>,
+        session_id: &str,
+    ) -> Option<std::io::Result<Option<String>>> {
+        Transcript::locate(remembered, session_id).map(|t| t.model_id(256 * 1024))
+    }
+
+    fn session_limit_error(
+        &self,
+        remembered: Option<&str>,
+        session_id: &str,
+        now_ms: u64,
+    ) -> Option<std::io::Result<Option<crate::bridge::command::LimitHit>>> {
+        Transcript::locate(remembered, session_id).map(|t| t.limit_error(256 * 1024, now_ms))
+    }
+
+    fn model_alias(&self, model_id: &str) -> Option<&'static str> {
+        super::screen::ModelId::new(model_id).alias()
+    }
+
+    fn new_history_lines(&self, path: String, offset: u64, ctx: &LogCtx) -> Option<(String, u64)> {
+        let mut t = Transcript::at_offset(path, offset);
+        t.new_lines(ctx).map(|text| (text, t.offset()))
+    }
+
+    fn context_argv(&self, session_id: &str) -> Vec<String> {
+        Claude::context_argv(session_id)
+    }
+
+    fn usage_argv(&self) -> Vec<String> {
+        Claude::usage_argv()
+    }
+
+    async fn probe(&self, argv: Vec<String>, cwd: String) -> Result<String, ProbeErr> {
+        Claude::probe(self, argv, cwd).await
+    }
+
+    fn context_report(&self, raw: &str) -> Option<super::ContextReport> {
+        Pane::new(raw).context_report()
+    }
+
+    fn usage_rows(&self, raw: &str) -> Option<Vec<super::UsageRow>> {
+        Pane::new(raw).usage_rows()
+    }
+
+    fn login_begin(&self, cwd: &str) -> Result<(), String> {
+        Claude::login_begin(self, cwd)
+    }
+
+    fn login_url(&self) -> Option<String> {
+        Claude::login_url(self)
+    }
+
+    fn login_submit_code(&self, code: &str) -> Result<(), String> {
+        Claude::login_submit_code(self, code)
+    }
+
+    fn login_outcome(&self) -> LoginOutcome {
+        Claude::login_outcome(self)
+    }
+
+    async fn logout(&self) -> Result<(), ProbeErr> {
+        Claude::logout(self).await
     }
 }
 
