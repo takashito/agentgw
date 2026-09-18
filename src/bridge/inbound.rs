@@ -4,7 +4,8 @@
 //! `impl Access` here holds only the gate (`gate`, per-channel tool grants); `Access`
 //! itself is persisted state and lives in `state.rs`.
 
-use super::{Bridge, DRAIN_TIMEOUT_MS, Host, RETRY_NUM, Stall};
+use super::{Bridge, DRAIN_TIMEOUT_MS, Host, RETRY_NUM};
+use crate::bridge::turn::Stall;
 use crate::agent::tmux::Window;
 use crate::agent::{Envelope, SessionId, SpawnReq};
 use crate::bridge::state as bridge;
