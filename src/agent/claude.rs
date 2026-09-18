@@ -422,7 +422,16 @@ impl Claude {
         // 画面が消えるまで毎秒 Enter を撃ち続ける
         let mut confirm_answered = false;
         while std::time::Instant::now() < deadline {
-            match Pane::new(&self.capture(w, "spawn-screen", ctx)).spawn_screen() {
+            // **読めない窓は見張らない。** 窓が消えた(エージェントが終了した)なら、もう答える画面は
+            // 出ない。読み続けると1回ごとにエラーが1行ずつ積もる
+            let pane = match self.tmux.capture(w) {
+                Ok(pane) => pane,
+                Err(e) => {
+                    ctx.info("spawn", &format!("{w}: window is gone ({e}) — ending the watch"));
+                    break;
+                }
+            };
+            match Pane::new(&pane).spawn_screen() {
                 // 撃っても消えない画面。撃てば入力欄の中身を送ることになるので、撃たずに降りる
                 SpawnScreen::LoginRequired => {
                     ctx.error(
@@ -2120,6 +2129,27 @@ mod tests {
             .watch_spawn_screens(&Window::of("1-1"), 30, 1, &LogCtx::default())
             .await;
         assert_eq!(out, SpawnOutcome::UsageLimited);
+    }
+
+    /// A window that is gone (the agent exited, tmux has no server) can't show a start-up
+    /// screen any more. Keep polling it and every poll logs an error: with a pool agent that
+    /// died and was re-launched every 5 s, 30 watches at once filled a 17 GB log.
+    #[tokio::test]
+    async fn the_watch_ends_when_the_window_is_gone() {
+        let captures = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = captures.clone();
+        let c = claude_with(move |args| {
+            if args.first() == Some(&"capture-pane") {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Err("no server running on /tmp/tmux-0/default".to_string());
+            }
+            Ok(String::new())
+        });
+        let out = c
+            .watch_spawn_screens(&Window::of("1-1"), 2_000, 1, &LogCtx::default())
+            .await;
+        assert_eq!(out, SpawnOutcome::NoScreen);
+        assert_eq!(captures.load(std::sync::atomic::Ordering::SeqCst), 1, "one failed read is enough");
     }
 
     #[tokio::test]
