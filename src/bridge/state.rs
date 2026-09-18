@@ -577,7 +577,7 @@ pub struct Access {
     pub allowed_bots: Vec<String>,
     #[serde(rename = "homeChannel", skip_serializing_if = "Option::is_none")]
     pub home_channel: Option<String>,
-    /// Reaction name for the receive ack. If unset, slack::ack_emoji returns "eyes".
+    /// Reaction name for the receive ack. If unset, [`Access::ack_emoji`] returns "eyes".
     #[serde(rename = "ackReaction", skip_serializing_if = "Option::is_none")]
     pub ack_reaction: Option<String>,
     /// Body length limit per post. Both default and max are `slack::MAX_CHUNK_LIMIT`.
@@ -591,6 +591,11 @@ pub struct Access {
 }
 
 impl Access {
+    /// Emoji for the receive ack ("eyes" when unset).
+    pub fn ack_emoji(&self) -> &str {
+        self.ack_reaction.as_deref().unwrap_or("eyes")
+    }
+
     pub fn from_str(src: &str) -> serde_json::Result<Self> {
         serde_json::from_str(src)
     }
@@ -2061,4 +2066,11 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ack_emoji_defaults_to_eyes() {
+        let mut access = Access::default();
+        assert_eq!(access.ack_emoji(), "eyes");
+        access.ack_reaction = Some("spiral_note_pad".into());
+        assert_eq!(access.ack_emoji(), "spiral_note_pad");
+    }
 }

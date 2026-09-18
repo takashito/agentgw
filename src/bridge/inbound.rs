@@ -600,7 +600,7 @@ impl Bridge {
         self.react(
             &msg.channel,
             &msg.ts,
-            slack::Api::ack_emoji(&self.access),
+            self.access.ack_emoji(),
             &key,
         )
         .await;
@@ -1181,7 +1181,7 @@ impl Bridge {
         }
         self.milestone(Some(key), "received", ctx);
         let (channel, _) = key.split();
-        let ack = slack::Api::ack_emoji(&self.access).to_string();
+        let ack = self.access.ack_emoji().to_string();
         for id in ids {
             let (api, channel, ack) = (self.deps.slack.clone(), channel.clone(), ack.clone());
             tokio::spawn(async move {

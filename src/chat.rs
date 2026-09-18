@@ -372,6 +372,25 @@ pub mod fake {
     }
 
     impl FakeChat {
+        /// A fake whose thread root is **alive** (the normal state, where replies are not suppressed).
+        pub fn with_live_root() -> FakeChat {
+            let mut api = FakeChat::default();
+            api.msgs = vec![FetchedMsg {
+                ts: "1.0".into(),
+                user: "U1".into(),
+                text: "root".into(),
+                thread_ts: None,
+            }];
+            api
+        }
+
+        /// A fake where every call returns Err.
+        pub fn failing() -> FakeChat {
+            let mut api = FakeChat::default();
+            api.fail = true;
+            api
+        }
+
         pub fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
         }

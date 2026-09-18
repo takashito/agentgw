@@ -510,7 +510,7 @@ impl Bridge {
         let (hook_port, hook_token) = HookIntake::serve(&dir, hook_tx.clone()).await?;
         let (mcp_port, mcp_token) = mcp::Mcp::serve(
             &dir,
-            Arc::new(slack::ToolExec {
+            Arc::new(turn::ToolExec {
                 slack: api.clone(),
                 state_dir: dir.path().to_path_buf(),
                 dispo: dispo_tx,
