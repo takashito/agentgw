@@ -401,6 +401,8 @@ pub mod fake {
         pub failure_type: Mutex<Option<&'static str>>,
         /// What `signed_in` answers once set; unset means `Some(true)` (the usual case).
         pub signed_in: Mutex<Option<Option<bool>>>,
+        /// Sign-in codes handed to `login_submit_code`.
+        pub submitted_codes: Mutex<Vec<String>>,
         windows: Mutex<Vec<WindowRow>>,
         next: AtomicU64,
     }
@@ -554,7 +556,8 @@ pub mod fake {
         fn login_url(&self) -> Option<String> {
             Some("https://claude.ai/oauth".into())
         }
-        fn login_submit_code(&self, _c: &str) -> Result<(), String> {
+        fn login_submit_code(&self, c: &str) -> Result<(), String> {
+            self.submitted_codes.lock().unwrap().push(c.to_string());
             Ok(())
         }
         fn login_outcome(&self) -> LoginOutcome {

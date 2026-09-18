@@ -561,6 +561,13 @@ pub(super) struct SignIn {
     last_known: Option<bool>,
 }
 
+impl SignIn {
+    /// A sign-in started in `channel` is waiting for its pasted code.
+    pub(super) fn awaiting_code(&self, channel: &str) -> bool {
+        self.pending.contains_key(channel)
+    }
+}
+
 // ── running commands ─────────────────────────────────────────────────────────
 
 /// spawn したコマンドが main ループへ返す状態変更の便り。

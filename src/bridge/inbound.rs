@@ -368,10 +368,14 @@ impl Bridge {
             );
             return;
         }
-        // Owner がまだ居ないときのサインイン専用の抜け道。gate は
-        // owner 空を全部落とすので、**その手前**でなければサインインは永久に始められない。
-        // Owner が縛られた後はこの枝ごと素通りする(以後は普通の gate の世界)
-        if self.access.owner.is_empty() && !msg.is_bot && self.login_carve_out(msg) {
+        // サインイン専用の抜け道。gate は owner 空を全部落とすので、**その手前**でなければ
+        // 最初のサインインは永久に始められない。Owner が居ても、このチャンネルでサインインが
+        // コードを待っているなら通す — マシンのサインインし直し(Owner が居る状態で始まる)の
+        // コードがエージェントに流れてしまう(2026-09-18 に実機で発覚)
+        if (self.access.owner.is_empty() || self.sign_in.awaiting_code(&msg.channel))
+            && !msg.is_bot
+            && self.login_carve_out(msg)
+        {
             return;
         }
         // 編集・削除のイベントは**スレッドを教えてくれない**(ライブラリの型が

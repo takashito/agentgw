@@ -1708,4 +1708,25 @@ mod tests {
         settle().await;
         assert_eq!(said(&slack), 2);
     }
+
+    /// With an owner set, `login` on a signed-out machine starts the sign-in; the code the owner
+    /// pastes next in that channel must reach the sign-in, not the agent. (Seen 2026-09-18: the
+    /// code went to the agent as a normal message and the sign-in never finished.)
+    #[tokio::test]
+    async fn the_code_pasted_after_login_goes_to_the_sign_in_when_an_owner_is_set() {
+        let (d, _slack, agent, _clock) = flow_deps("login-code");
+        *agent.signed_in.lock().unwrap() = Some(Some(false));
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "<@U_BOT> login")).await;
+        let mut code = channel_msg("1782000002.000100", "U_OWNER", "abc-123#xyz");
+        code.thread_ts = Some("1782000001.000100".into());
+        b.on_inbound(&code).await;
+        settle().await;
+        assert_eq!(*agent.submitted_codes.lock().unwrap(), ["abc-123#xyz"]);
+        assert!(
+            !agent.delivered.lock().unwrap().iter().any(|(_, t)| t.contains("abc-123#xyz")),
+            "the code must not reach the agent"
+        );
+        assert!(agent.spawned.lock().unwrap().is_empty(), "no agent started for the code");
+    }
 }
