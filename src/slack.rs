@@ -956,6 +956,161 @@ impl Api {
         let size = f.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
         Ok((url.to_string(), name.to_string(), size))
     }
+
+    // ── Bridge が Slack を1本叩くときの共通の作法 ──
+
+    /// Socket Mode を張り、message イベントを正規化して流す。
+    /// AppMention は捨てる — 同じ発言が Message としても届く(dedup と二段構え)。
+    /// `fleet` が `Some` のとき(= 子を持つ親)は、**畳まずに生のまま**そちらへ渡す。
+    /// 誰の担当かを決めてから、自分の分だけ `tx` / `clicks` に戻ってくる — つまり
+    /// ローカル配達も直結と同じ変換([`inbound_of`])を通る。
+    pub async fn listen(
+        app_token: &str,
+        tx: tokio::sync::mpsc::Sender<InboundMsg>,
+        clicks: tokio::sync::mpsc::Sender<PermClick>,
+        fleet: Option<tokio::sync::mpsc::Sender<FleetEvent>>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let token = SlackApiToken::new(app_token.to_string().into());
+        let client = Arc::new(SlackClient::new(SlackClientHyperConnector::new()?));
+        let mut listener_env = SlackClientEventsListenerEnvironment::new(client.clone())
+            .with_error_handler(on_listener_error)
+            .with_user_state(tx)
+            .with_user_state(clicks);
+        if let Some(fleet) = fleet {
+            listener_env = listener_env.with_user_state(fleet);
+        }
+        let env = Arc::new(listener_env);
+        let callbacks = SlackSocketModeListenerCallbacks::new()
+            .with_hello_events(|hello, _client, _state| async move {
+                match connection_warning(hello.num_connections) {
+                    Some(w) => LogCtx::default().error("slack", &w),
+                    None => LogCtx::default()
+                        .info("slack", "socket mode: 1 connection (as it should be)"),
+                }
+            })
+            .with_push_events(on_push_event)
+            .with_interaction_events(on_interaction_event);
+        let listener =
+            SlackClientSocketModeListener::new(&SlackClientSocketModeConfig::new(), env, callbacks);
+        listener.listen_for(&token).await?;
+        LogCtx::default().info("slack", "socket mode connected");
+        listener.serve().await;
+        Ok(())
+    }
+
+    /// inbox に置く保存名。`name` は **Slack から来る外部入力**で、`a/b.txt` や `../../etc/passwd`
+    /// のようにパス区切りを含みうる — そのまま join すると inbox の外に書けてしまう
+    /// (現行が `{ts}-{fileId}{ext}` にして生の name をパスに使わないのはこれを避けるため)。
+    /// 最終成分だけを取り、残った区切り文字を落として**必ず1要素**にする。使えるものが
+    /// 残らなければ file_id だけ。
+    pub fn attachment_file_name(file_id: &str, name: &str) -> String {
+        // `Path::file_name()` は "a/b.txt" → "b.txt"、".." や "" → None。
+        // Unix では `\` が区切りでないので、その分は自前で落とす
+        let one = |s: &str| -> String {
+            // trim は `Path::new` に渡す**前**(" .. " を ".." として残さないため)
+            let base = std::path::Path::new(s.trim())
+                .file_name()
+                .map(|b| b.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            // `"` は封筒の属性(`file_paths="…"`)を壊すので落とす
+            let base = base.replace(['/', '\\', '"', '\0'], "");
+            match base.trim() {
+                // 除去の結果 "." / ".." に化けることがある(ダブルクォートで包んだ `".."` など)
+                "." | ".." => String::new(),
+                b => b.to_string(),
+            }
+        };
+        let id = one(file_id);
+        let id = if id.is_empty() {
+            "attachment".to_string()
+        } else {
+            id
+        };
+        match one(name) {
+            n if n.is_empty() => id,
+            n => format!("{id}-{n}"),
+        }
+    }
+
+    /// 受信 ack の絵文字(未設定は "eyes")。
+    pub fn ack_emoji(access: &bridge_state::Access) -> &str {
+        access.ack_reaction.as_deref().unwrap_or("eyes")
+    }
+
+    /// assistant ステータスを1本投げてログに残す。**best-effort, but never silent** —
+    /// 成功も失敗も残す。呼び手を待たせないのは呼び手側の責任。
+    pub async fn thinking(&self, channel: &str, thread_ts: &str, status: &str) {
+        let ctx = LogCtx {
+            session_id: None,
+            thread_key: Some(ThreadKey::new(channel, thread_ts)),
+        };
+        let what = if status.is_empty() {
+            "cleared".to_string()
+        } else {
+            format!("set \"{status}\"")
+        };
+        match self.set_thinking_status(channel, thread_ts, status).await {
+            Ok(()) => ctx.debug("bridge", &format!("thinking status {what}")),
+            Err(e) => ctx.debug("bridge", &format!("thinking status {what} failed: {e}")),
+        }
+    }
+
+    /// Bridge 直答の実投稿。既に spawn 済みの文脈から呼ぶ(probe の答えは60秒後に届く)。
+    /// 失敗はログだけ — コマンドの答えは未応答台帳の外の出来事。
+    pub async fn post_now(&self, channel: &str, thread_ts: &str, text: String, key: &ThreadKey) {
+        if let Err(e) = self
+            .post_message_no_unfurl(channel, &text, Some(thread_ts))
+            .await
+        {
+            LogCtx {
+                session_id: None,
+                thread_key: Some(key.clone()),
+            }
+            .error(
+                "bridge",
+                &format!("command post failed for {channel}:{thread_ts}: {e}"),
+            );
+        }
+    }
+
+    /// 再起動の道中の Slack 1本を5秒で見切る。ここで投げるものはどれも「出れば嬉しい」飾りで、
+    /// 1本の hang が marker 書きと exit(0) を止めてはならない(現行が allSettled で束ねているのと
+    /// 同じ趣旨)。失敗も時間切れもログして続ける。
+    pub async fn brief_call<T>(
+        label: &str,
+        call: impl std::future::Future<Output = Result<T, String>>,
+        ctx: &LogCtx,
+    ) -> Option<T> {
+        const CAP: std::time::Duration = std::time::Duration::from_secs(5);
+        match tokio::time::timeout(CAP, call).await {
+            Ok(Ok(v)) => Some(v),
+            Ok(Err(e)) => {
+                ctx.error("bridge", &format!("{label}: {e}"));
+                None
+            }
+            Err(_) => {
+                ctx.error(
+                    "bridge",
+                    &format!("{label}: timed out after {}s — carrying on", CAP.as_secs()),
+                );
+                None
+            }
+        }
+    }
+
+    fn fetched(m: &SlackHistoryMessage) -> FetchedMsg {
+        FetchedMsg {
+            ts: m.origin.ts.to_string(),
+            user: m
+                .sender
+                .user
+                .as_ref()
+                .map(|u| u.to_string())
+                .unwrap_or_else(|| "bot".to_string()),
+            text: m.content.text.clone().unwrap_or_default(),
+            thread_ts: m.origin.thread_ts.as_ref().map(|t| t.to_string()),
+        }
+    }
 }
 
 /// ダウンロードに許す時間。現行の `DOWNLOAD_TIMEOUT_MS` と同じ 60 秒で、
@@ -1124,51 +1279,52 @@ pub const THINKING_STATUS: &str = "is thinking…";
 /// 無音と見なすまでの間。現行 Bun の `deps.silenceMs` 既定値は 5s だが、
 /// **Rust 版は 3s**(2026-07-31 ユーザー判断 — ツール実行後に思考中が戻るまでが遅い)。
 pub const SILENCE_MS: u64 = 3_000;
-/// `status`。
-pub fn status_gathering() -> String {
-    crate::t!("Gathering…", "集計中…")
-}
-/// `context`。
-pub fn status_context() -> String {
-    crate::t!("Checking the context…", "コンテキストを確認中…")
-}
-/// `usage`。
-pub fn status_usage() -> String {
-    crate::t!("Checking usage…", "使用状況を確認中…")
-}
-// `compact` の専用ステータスは**意図的に持たない**(Bun からの逸脱 — ユーザー判断)。
-// 以前の実装は compact の間 `コンテキストを圧縮中…` を張り、tick ごとに `… {n}s` 付きへ
-// 張り直していた。Rust 版はこれを持たない — compact は進捗チェックリスト(sticky)を
-// 投稿して編集し続けるので、shimmer と二重で冗長だという判断(**移植漏れではない**)。
-// 配達の `is typing…` と無音の `is thinking…` は compact 実行中も従来どおり出る。
-/// `model`。
-pub fn status_model() -> String {
-    crate::t!("Switching the model…", "モデルを切り替え中…")
-}
-/// `effort <level>`。
-pub fn status_effort() -> String {
-    crate::t!("Setting the effort level…", "effort を設定中…")
+/// Slack's "…ing" status line. Use as `thinking.set(&Status::Login.text())`.
+///
+/// `compact` の専用ステータスは**意図的に持たない**(Bun からの逸脱 — ユーザー判断)。
+/// 以前の実装は compact の間 `コンテキストを圧縮中…` を張り、tick ごとに `… {n}s` 付きへ
+/// 張り直していた。Rust 版はこれを持たない — compact は進捗チェックリスト(sticky)を
+/// 投稿して編集し続けるので、shimmer と二重で冗長だという判断(**移植漏れではない**)。
+/// 配達の `is typing…` と無音の `is thinking…` は compact 実行中も従来どおり出る。
+#[derive(Clone, Copy, Debug)]
+pub enum Status {
+    /// `status`。
+    Gathering,
+    /// `context`。
+    Context,
+    /// `usage`。
+    Usage,
+    /// `model`。
+    Model,
+    /// `effort <level>`。
+    Effort,
+    /// `mode <名前>` の間だけ出す shimmer。
+    Mode,
+    /// `login` — 現行 Bun に原文が無い。上の語調に合わせて新規に決めたもの。
+    Login,
+    /// `logout` — 同上(新規)。
+    Logout,
+    /// `resume` — 同上(新規)。
+    Resume,
+    /// `restart` — 同上(新規)。
+    Restart,
 }
 
-/// `mode <名前>` の間だけ出す shimmer。
-pub fn status_mode() -> String {
-    crate::t!("Switching the permission mode…", "権限モードを切り替え中…")
-}
-/// `login` — 現行 Bun に原文が無い。上の語調に合わせて新規に決めたもの。
-pub fn status_login() -> String {
-    crate::t!("Signing in…", "サインイン中…")
-}
-/// `logout` — 同上(新規)。
-pub fn status_logout() -> String {
-    crate::t!("Signing out…", "サインアウト中…")
-}
-/// `resume` — 同上(新規)。
-pub fn status_resume() -> String {
-    crate::t!("Resuming the thread…", "スレッドを再開中…")
-}
-/// `restart` — 同上(新規)。
-pub fn status_restart() -> String {
-    crate::t!("Restarting…", "再起動中…")
+impl Status {
+    pub fn text(self) -> String {
+        match self {
+            Status::Gathering => crate::t!("Gathering…", "集計中…"),
+            Status::Context => crate::t!("Checking the context…", "コンテキストを確認中…"),
+            Status::Usage => crate::t!("Checking usage…", "使用状況を確認中…"),
+            Status::Model => crate::t!("Switching the model…", "モデルを切り替え中…"),
+            Status::Effort => crate::t!("Setting the effort level…", "effort を設定中…"),
+            Status::Mode => crate::t!("Switching the permission mode…", "権限モードを切り替え中…"),
+            Status::Login => crate::t!("Signing in…", "サインイン中…"),
+            Status::Logout => crate::t!("Signing out…", "サインアウト中…"),
+            Status::Resume => crate::t!("Resuming the thread…", "スレッドを再開中…"),
+            Status::Restart => crate::t!("Restarting…", "再起動中…"),
+        }
+    }
 }
 
 /// disposition を main の台帳へ流す。満杯なら待つ(落とすと台帳が消えないまま残る)。
@@ -2033,6 +2189,296 @@ impl StickyBoard {
             _ => StickyAction::Keep,
         }
     }
+
+    /// 付箋に出さないツール(ノイズと自前ツール)。
+    pub fn is_denied(name: &str) -> bool {
+        matches!(name, "TodoWrite" | "ToolSearch" | "advisor") || name.starts_with("mcp__agentgw__")
+    }
+
+    /// ツール入力から一番目立つ引数を1行に。
+    /// Slack のインラインコードに入れるので改行とバッククォートを落とし、70字で `…`。
+    pub fn summarize(name: &str, input: &serde_json::Value) -> String {
+        let get = |k: &str| {
+            input
+                .get(k)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        };
+        let raw = match name {
+            "Bash" => get("command"),
+            // NotebookEdit は file_path を持たない
+            "Edit" | "Write" | "Read" | "NotebookEdit" => {
+                get("file_path").or_else(|| get("notebook_path"))
+            }
+            "WebFetch" | "WebSearch" => get("url").or_else(|| get("query")),
+            "Skill" => get("skill"),
+            "Agent" => get("description"),
+            _ => [
+                "command",
+                "file_path",
+                "url",
+                "query",
+                "description",
+                "pattern",
+                "path",
+            ]
+            .iter()
+            .find_map(|k| get(k)),
+        };
+        let s = raw.unwrap_or_default().replace('\n', " ").replace('`', "");
+        if s.chars().count() > 70 {
+            s.chars().take(70).chain(['…']).collect()
+        } else {
+            s
+        }
+    }
+
+    /// 畳んでよいツールか(Read / Grep / Glob / Bash)。
+    pub fn is_foldable(name: &str) -> bool {
+        FOLD_READ.contains(&name) || FOLD_SEARCH.contains(&name) || name == "Bash"
+    }
+
+    /// `grep` 系を走らせた Bash 行は「Ran N commands」ではなく
+    /// 「Searched for N patterns」に数える。ワーカーのセッションには Grep/Glob ツールが無く、
+    /// コード検索は実際には Bash 越しの `grep`/`rg` で走るため。
+    ///
+    /// 判定は**起動したコマンド**(先頭トークン。先頭の `VAR=val` を捨て、絶対パスは基底名に)。
+    /// パイプの**フィルタ**として使う grep(`ps ax | grep x`)は主コマンドが ps なので数えない。
+    pub fn bash_is_search(command: &str) -> bool {
+        const SEARCH_CMDS: [&str; 7] = ["grep", "egrep", "fgrep", "rg", "ripgrep", "ag", "ack"];
+        let mut s = command.trim();
+        // 先頭の `LC_ALL=C ` 等を落とす
+        while let Some((head, rest)) = s.split_once(char::is_whitespace) {
+            let is_assign = head.split_once('=').is_some_and(|(k, _)| {
+                !k.is_empty() && k.chars().all(|c| c.is_alphanumeric() || c == '_')
+            });
+            if !is_assign {
+                break;
+            }
+            s = rest.trim_start();
+        }
+        let mut tokens = s.split_whitespace();
+        let Some(first) = tokens.next() else {
+            return false;
+        };
+        let base = first.rsplit('/').next().unwrap_or(first);
+        SEARCH_CMDS.contains(&base) || (base == "git" && tokens.next() == Some("grep"))
+    }
+
+    /// 畳んだ run の1行。
+    /// 0 件の節は落ちるので、Read だけの run は "Read 3 files" になる。
+    /// `•` の後の**空白2つ**は、畳まれていない `•` 行と桁を揃えるため。
+    pub fn fold_summary_line(reads: usize, searches: usize, cmds: usize) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if reads > 0 {
+            parts.push(format!(
+                "Read {reads} {}",
+                if reads == 1 { "file" } else { "files" }
+            ));
+        }
+        if searches > 0 {
+            parts.push(format!(
+                "Searched for {searches} {}",
+                if searches == 1 { "pattern" } else { "patterns" }
+            ));
+        }
+        if cmds > 0 {
+            parts.push(format!(
+                "Ran {cmds} {}",
+                if cmds == 1 { "command" } else { "commands" }
+            ));
+        }
+        format!("{TOOL_INDENT}•  {}", parts.join(", "))
+    }
+
+    /// subagent が走らせたツールの内訳。畳んだセクションの
+    /// 見出しに出して「何をした agent か」を一目で分かるようにする。**全ステータスを数える**ので、
+    /// 各節の合計は総数に一致する。分類に載らないものはツール名ごとに束ねる("WebFetch 2")。
+    ///
+    /// 受けるのは `(ツール名, summary)`。Bun は生の input を見るが、Bash の判定は先頭トークンしか
+    /// 使わないので 70 字クリップ済みの summary で足りる。
+    pub fn tool_breakdown(items: &[(&str, &str)]) -> String {
+        let (mut reads, mut searches, mut cmds, mut edits) = (0usize, 0usize, 0usize, 0usize);
+        // 出現順を保つ(HashMap だと "WebFetch 2, Skill 1" の順が不定になる)
+        let mut other: Vec<(String, usize)> = Vec::new();
+        for (name, summary) in items {
+            if *name == "Read" {
+                reads += 1;
+            } else if FOLD_SEARCH.contains(name) {
+                searches += 1;
+            } else if *name == "Bash" {
+                if Self::bash_is_search(summary) {
+                    searches += 1;
+                } else {
+                    cmds += 1;
+                }
+            } else if EDIT_TOOLS.contains(name) {
+                edits += 1;
+            } else {
+                match other.iter_mut().find(|(n, _)| n == name) {
+                    Some((_, c)) => *c += 1,
+                    None => other.push(((*name).to_string(), 1)),
+                }
+            }
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if reads > 0 {
+            parts.push(format!(
+                "Read {reads} {}",
+                if reads == 1 { "file" } else { "files" }
+            ));
+        }
+        if searches > 0 {
+            parts.push(format!(
+                "Searched for {searches} {}",
+                if searches == 1 { "pattern" } else { "patterns" }
+            ));
+        }
+        if cmds > 0 {
+            parts.push(format!(
+                "Ran {cmds} {}",
+                if cmds == 1 { "command" } else { "commands" }
+            ));
+        }
+        if edits > 0 {
+            parts.push(format!(
+                "Edited {edits} {}",
+                if edits == 1 { "file" } else { "files" }
+            ));
+        }
+        for (name, n) in other {
+            parts.push(format!("{name} {n}"));
+        }
+        parts.join(", ")
+    }
+
+    /// `room` バイトに収まる最長の prefix(**char 境界**)+ `…`。1文字も入らなければ空。
+    pub fn clip(line: &str, room: usize) -> String {
+        let budget = room.saturating_sub("…".len());
+        match line
+            .char_indices()
+            .map(|(i, c)| i + c.len_utf8())
+            .take_while(|&end| end <= budget)
+            .last()
+        {
+            Some(end) => format!("{}…", &line[..end]),
+            None => String::new(),
+        }
+    }
+
+    /// 出す行を組む(畳み込みまで)。ページ分割はこの後の仕事。
+    fn lines_of(items: &[RenderItem], perm_timed_out: bool) -> Vec<String> {
+        // subagent の中で走ったツールは**その場では描かない**。agent ごとに1つの
+        // セクションにまとめ、その agent の最初のツールがあった位置に1回だけ出す。
+        // 何十本もツールを走らせる subagent が付箋を埋め尽くすのを防ぐ。
+        let mut groups: Vec<(String, String, Vec<&RenderItem>)> = Vec::new(); // (agent_id, type, items)
+        for it in items {
+            let RenderItem::Tool { agent, .. } = it else {
+                continue;
+            };
+            let Some(id) = agent.agent_id.as_deref() else {
+                continue;
+            };
+            match groups.iter_mut().find(|(gid, _, _)| gid == id) {
+                Some((_, _, v)) => v.push(it),
+                None => groups.push((
+                    id.to_string(),
+                    agent
+                        .agent_type
+                        .clone()
+                        .unwrap_or_else(|| "subagent".to_string()),
+                    vec![it],
+                )),
+            }
+        }
+        let mut rendered_agents: Vec<String> = Vec::new();
+
+        // ── 1段目: 畳んで「出す行」を決める ─────────────────────────────
+        // 完了した Read/検索/Bash が**連続**したら1行にまとめる。走行中(◌)は
+        // 「いま何をしているか」なので畳まない。失敗(💥/🚫)も見えたまま残す。
+        let mut lines: Vec<String> = Vec::new();
+        let mut run: Vec<&RenderItem> = Vec::new();
+        for it in items {
+            if matches!(
+                it,
+                RenderItem::Tool { name, status: ToolStatus::Done, agent, .. }
+                    if agent.agent_id.is_none() && Self::is_foldable(name)
+            ) {
+                run.push(it);
+                continue;
+            }
+            Self::flush_fold_run(&mut run, &mut lines);
+            // `Agent` 行は、それが起こした subagent のセクションと1ブロックに畳む。
+            // 結び方は2通り: foreground は id が一致する。background/teammate は id 空間が違うので
+            // **起動名**(tool_input.name)と agent_type で結ぶ(由来)。
+            if let RenderItem::Tool { name, agent, .. } = it
+                && (name == "Agent" || name == "Task")
+            {
+                let key = agent
+                    .spawned_agent_id
+                    .as_deref()
+                    .filter(|id| {
+                        groups.iter().any(|(gid, _, _)| gid == id)
+                            && !rendered_agents.iter().any(|r| r == id)
+                    })
+                    .map(str::to_string)
+                    .or_else(|| {
+                        let nm = agent.launched_name.as_deref()?;
+                        groups
+                            .iter()
+                            .find(|(gid, ty, _)| {
+                                ty == nm && !rendered_agents.iter().any(|r| r == gid)
+                            })
+                            .map(|(gid, _, _)| gid.clone())
+                    });
+                if let Some(key) = key {
+                    rendered_agents.push(key.clone());
+                    if let Some((_, ty, rows)) = groups.iter().find(|(gid, _, _)| *gid == key) {
+                        // 行頭の • を ▾ に差し替え、独立セクションの見出しと同じ形にする
+                        let head = Self::render_item_line(it, false, false);
+                        let head = match head.strip_prefix(TOOL_INDENT) {
+                            Some(rest) => {
+                                let body = rest.split_once(' ').map(|(_, b)| b).unwrap_or(rest);
+                                format!("{TOOL_INDENT}{SUBAGENT_MARK} {body}")
+                            }
+                            None => head,
+                        };
+                        Self::push_agent_section(&mut lines, Some(head), ty, rows);
+                    }
+                    continue;
+                }
+                // 結ぶ相手がまだ居ない(agent が起動中 / ツールが1つも来ていない)→ 普通の行として描く
+            }
+            // subagent 自身のツール行: その agent のセクションを**1回だけ**、最初のツールの位置で出す
+            if let RenderItem::Tool { agent, .. } = it
+                && let Some(id) = agent.agent_id.as_deref()
+            {
+                if rendered_agents.iter().any(|r| r == id) {
+                    continue;
+                }
+                rendered_agents.push(id.to_string());
+                if let Some((_, ty, rows)) = groups.iter().find(|(gid, _, _)| gid == id) {
+                    Self::push_agent_section(&mut lines, None, ty, rows);
+                }
+                continue;
+            }
+            lines.push(Self::render_item_line(it, !lines.is_empty(), true));
+        }
+        Self::flush_fold_run(&mut run, &mut lines);
+        // 許可待ちの満期は**ツール行の下の注記**として最後に足す
+        // (行の並びは触らない。中断通知より前)
+        if perm_timed_out {
+            lines.push(perm_timeout_line());
+        }
+
+        lines
+    }
+
+    /// 1ページ目だけを描く(ページ繰りの要らない呼び手とテスト用)。
+    pub fn render_with(items: &[RenderItem], perm_timed_out: bool) -> String {
+        let lines = Self::lines_of(items, perm_timed_out);
+        Self::page(&lines, 0, false).0
+    }
 }
 
 // ── 処理中ステータス(shimmer)— Bridge が「考え中」を張る口 ─────────────────
@@ -2083,149 +2529,6 @@ impl Thinking {
 impl Drop for Thinking {
     fn drop(&mut self) {
         self.set(""); // 空文字 = クリア。送るだけ — 直列タスクが順番どおりに投げる
-    }
-}
-
-// ── Bridge が Slack を1本叩くときの共通の作法 ─────────────────────────────
-
-impl Api {
-    /// Socket Mode を張り、message イベントを正規化して流す。
-    /// AppMention は捨てる — 同じ発言が Message としても届く(dedup と二段構え)。
-    /// `fleet` が `Some` のとき(= 子を持つ親)は、**畳まずに生のまま**そちらへ渡す。
-    /// 誰の担当かを決めてから、自分の分だけ `tx` / `clicks` に戻ってくる — つまり
-    /// ローカル配達も直結と同じ変換([`inbound_of`])を通る。
-    pub async fn listen(
-        app_token: &str,
-        tx: tokio::sync::mpsc::Sender<InboundMsg>,
-        clicks: tokio::sync::mpsc::Sender<PermClick>,
-        fleet: Option<tokio::sync::mpsc::Sender<FleetEvent>>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let token = SlackApiToken::new(app_token.to_string().into());
-        let client = Arc::new(SlackClient::new(SlackClientHyperConnector::new()?));
-        let mut listener_env = SlackClientEventsListenerEnvironment::new(client.clone())
-            .with_error_handler(on_listener_error)
-            .with_user_state(tx)
-            .with_user_state(clicks);
-        if let Some(fleet) = fleet {
-            listener_env = listener_env.with_user_state(fleet);
-        }
-        let env = Arc::new(listener_env);
-        let callbacks = SlackSocketModeListenerCallbacks::new()
-            .with_hello_events(|hello, _client, _state| async move {
-                match connection_warning(hello.num_connections) {
-                    Some(w) => LogCtx::default().error("slack", &w),
-                    None => LogCtx::default()
-                        .info("slack", "socket mode: 1 connection (as it should be)"),
-                }
-            })
-            .with_push_events(on_push_event)
-            .with_interaction_events(on_interaction_event);
-        let listener =
-            SlackClientSocketModeListener::new(&SlackClientSocketModeConfig::new(), env, callbacks);
-        listener.listen_for(&token).await?;
-        LogCtx::default().info("slack", "socket mode connected");
-        listener.serve().await;
-        Ok(())
-    }
-
-    /// inbox に置く保存名。`name` は **Slack から来る外部入力**で、`a/b.txt` や `../../etc/passwd`
-    /// のようにパス区切りを含みうる — そのまま join すると inbox の外に書けてしまう
-    /// (現行が `{ts}-{fileId}{ext}` にして生の name をパスに使わないのはこれを避けるため)。
-    /// 最終成分だけを取り、残った区切り文字を落として**必ず1要素**にする。使えるものが
-    /// 残らなければ file_id だけ。
-    pub fn attachment_file_name(file_id: &str, name: &str) -> String {
-        // `Path::file_name()` は "a/b.txt" → "b.txt"、".." や "" → None。
-        // Unix では `\` が区切りでないので、その分は自前で落とす
-        let one = |s: &str| -> String {
-            // trim は `Path::new` に渡す**前**(" .. " を ".." として残さないため)
-            let base = std::path::Path::new(s.trim())
-                .file_name()
-                .map(|b| b.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            // `"` は封筒の属性(`file_paths="…"`)を壊すので落とす
-            let base = base.replace(['/', '\\', '"', '\0'], "");
-            match base.trim() {
-                // 除去の結果 "." / ".." に化けることがある(ダブルクォートで包んだ `".."` など)
-                "." | ".." => String::new(),
-                b => b.to_string(),
-            }
-        };
-        let id = one(file_id);
-        let id = if id.is_empty() {
-            "attachment".to_string()
-        } else {
-            id
-        };
-        match one(name) {
-            n if n.is_empty() => id,
-            n => format!("{id}-{n}"),
-        }
-    }
-
-    /// 受信 ack の絵文字(未設定は "eyes")。
-    pub fn ack_emoji(access: &bridge_state::Access) -> &str {
-        access.ack_reaction.as_deref().unwrap_or("eyes")
-    }
-
-    /// assistant ステータスを1本投げてログに残す。**best-effort, but never silent** —
-    /// 成功も失敗も残す。呼び手を待たせないのは呼び手側の責任。
-    pub async fn thinking(&self, channel: &str, thread_ts: &str, status: &str) {
-        let ctx = LogCtx {
-            session_id: None,
-            thread_key: Some(ThreadKey::new(channel, thread_ts)),
-        };
-        let what = if status.is_empty() {
-            "cleared".to_string()
-        } else {
-            format!("set \"{status}\"")
-        };
-        match self.set_thinking_status(channel, thread_ts, status).await {
-            Ok(()) => ctx.debug("bridge", &format!("thinking status {what}")),
-            Err(e) => ctx.debug("bridge", &format!("thinking status {what} failed: {e}")),
-        }
-    }
-
-    /// Bridge 直答の実投稿。既に spawn 済みの文脈から呼ぶ(probe の答えは60秒後に届く)。
-    /// 失敗はログだけ — コマンドの答えは未応答台帳の外の出来事。
-    pub async fn post_now(&self, channel: &str, thread_ts: &str, text: String, key: &ThreadKey) {
-        if let Err(e) = self
-            .post_message_no_unfurl(channel, &text, Some(thread_ts))
-            .await
-        {
-            LogCtx {
-                session_id: None,
-                thread_key: Some(key.clone()),
-            }
-            .error(
-                "bridge",
-                &format!("command post failed for {channel}:{thread_ts}: {e}"),
-            );
-        }
-    }
-
-    /// 再起動の道中の Slack 1本を5秒で見切る。ここで投げるものはどれも「出れば嬉しい」飾りで、
-    /// 1本の hang が marker 書きと exit(0) を止めてはならない(現行が allSettled で束ねているのと
-    /// 同じ趣旨)。失敗も時間切れもログして続ける。
-    pub async fn brief_call<T>(
-        label: &str,
-        call: impl std::future::Future<Output = Result<T, String>>,
-        ctx: &LogCtx,
-    ) -> Option<T> {
-        const CAP: std::time::Duration = std::time::Duration::from_secs(5);
-        match tokio::time::timeout(CAP, call).await {
-            Ok(Ok(v)) => Some(v),
-            Ok(Err(e)) => {
-                ctx.error("bridge", &format!("{label}: {e}"));
-                None
-            }
-            Err(_) => {
-                ctx.error(
-                    "bridge",
-                    &format!("{label}: timed out after {}s — carrying on", CAP.as_secs()),
-                );
-                None
-            }
-        }
     }
 }
 
@@ -2648,298 +2951,6 @@ impl FetchedMsg {
     }
 }
 
-impl StickyBoard {
-    /// 付箋に出さないツール(ノイズと自前ツール)。
-    pub fn is_denied(name: &str) -> bool {
-        matches!(name, "TodoWrite" | "ToolSearch" | "advisor") || name.starts_with("mcp__agentgw__")
-    }
-
-    /// ツール入力から一番目立つ引数を1行に。
-    /// Slack のインラインコードに入れるので改行とバッククォートを落とし、70字で `…`。
-    pub fn summarize(name: &str, input: &serde_json::Value) -> String {
-        let get = |k: &str| {
-            input
-                .get(k)
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-        };
-        let raw = match name {
-            "Bash" => get("command"),
-            // NotebookEdit は file_path を持たない
-            "Edit" | "Write" | "Read" | "NotebookEdit" => {
-                get("file_path").or_else(|| get("notebook_path"))
-            }
-            "WebFetch" | "WebSearch" => get("url").or_else(|| get("query")),
-            "Skill" => get("skill"),
-            "Agent" => get("description"),
-            _ => [
-                "command",
-                "file_path",
-                "url",
-                "query",
-                "description",
-                "pattern",
-                "path",
-            ]
-            .iter()
-            .find_map(|k| get(k)),
-        };
-        let s = raw.unwrap_or_default().replace('\n', " ").replace('`', "");
-        if s.chars().count() > 70 {
-            s.chars().take(70).chain(['…']).collect()
-        } else {
-            s
-        }
-    }
-
-    /// 畳んでよいツールか(Read / Grep / Glob / Bash)。
-    pub fn is_foldable(name: &str) -> bool {
-        FOLD_READ.contains(&name) || FOLD_SEARCH.contains(&name) || name == "Bash"
-    }
-
-    /// `grep` 系を走らせた Bash 行は「Ran N commands」ではなく
-    /// 「Searched for N patterns」に数える。ワーカーのセッションには Grep/Glob ツールが無く、
-    /// コード検索は実際には Bash 越しの `grep`/`rg` で走るため。
-    ///
-    /// 判定は**起動したコマンド**(先頭トークン。先頭の `VAR=val` を捨て、絶対パスは基底名に)。
-    /// パイプの**フィルタ**として使う grep(`ps ax | grep x`)は主コマンドが ps なので数えない。
-    pub fn bash_is_search(command: &str) -> bool {
-        const SEARCH_CMDS: [&str; 7] = ["grep", "egrep", "fgrep", "rg", "ripgrep", "ag", "ack"];
-        let mut s = command.trim();
-        // 先頭の `LC_ALL=C ` 等を落とす
-        while let Some((head, rest)) = s.split_once(char::is_whitespace) {
-            let is_assign = head.split_once('=').is_some_and(|(k, _)| {
-                !k.is_empty() && k.chars().all(|c| c.is_alphanumeric() || c == '_')
-            });
-            if !is_assign {
-                break;
-            }
-            s = rest.trim_start();
-        }
-        let mut tokens = s.split_whitespace();
-        let Some(first) = tokens.next() else {
-            return false;
-        };
-        let base = first.rsplit('/').next().unwrap_or(first);
-        SEARCH_CMDS.contains(&base) || (base == "git" && tokens.next() == Some("grep"))
-    }
-
-    /// 畳んだ run の1行。
-    /// 0 件の節は落ちるので、Read だけの run は "Read 3 files" になる。
-    /// `•` の後の**空白2つ**は、畳まれていない `•` 行と桁を揃えるため。
-    pub fn fold_summary_line(reads: usize, searches: usize, cmds: usize) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        if reads > 0 {
-            parts.push(format!(
-                "Read {reads} {}",
-                if reads == 1 { "file" } else { "files" }
-            ));
-        }
-        if searches > 0 {
-            parts.push(format!(
-                "Searched for {searches} {}",
-                if searches == 1 { "pattern" } else { "patterns" }
-            ));
-        }
-        if cmds > 0 {
-            parts.push(format!(
-                "Ran {cmds} {}",
-                if cmds == 1 { "command" } else { "commands" }
-            ));
-        }
-        format!("{TOOL_INDENT}•  {}", parts.join(", "))
-    }
-
-    /// subagent が走らせたツールの内訳。畳んだセクションの
-    /// 見出しに出して「何をした agent か」を一目で分かるようにする。**全ステータスを数える**ので、
-    /// 各節の合計は総数に一致する。分類に載らないものはツール名ごとに束ねる("WebFetch 2")。
-    ///
-    /// 受けるのは `(ツール名, summary)`。Bun は生の input を見るが、Bash の判定は先頭トークンしか
-    /// 使わないので 70 字クリップ済みの summary で足りる。
-    pub fn tool_breakdown(items: &[(&str, &str)]) -> String {
-        let (mut reads, mut searches, mut cmds, mut edits) = (0usize, 0usize, 0usize, 0usize);
-        // 出現順を保つ(HashMap だと "WebFetch 2, Skill 1" の順が不定になる)
-        let mut other: Vec<(String, usize)> = Vec::new();
-        for (name, summary) in items {
-            if *name == "Read" {
-                reads += 1;
-            } else if FOLD_SEARCH.contains(name) {
-                searches += 1;
-            } else if *name == "Bash" {
-                if Self::bash_is_search(summary) {
-                    searches += 1;
-                } else {
-                    cmds += 1;
-                }
-            } else if EDIT_TOOLS.contains(name) {
-                edits += 1;
-            } else {
-                match other.iter_mut().find(|(n, _)| n == name) {
-                    Some((_, c)) => *c += 1,
-                    None => other.push(((*name).to_string(), 1)),
-                }
-            }
-        }
-        let mut parts: Vec<String> = Vec::new();
-        if reads > 0 {
-            parts.push(format!(
-                "Read {reads} {}",
-                if reads == 1 { "file" } else { "files" }
-            ));
-        }
-        if searches > 0 {
-            parts.push(format!(
-                "Searched for {searches} {}",
-                if searches == 1 { "pattern" } else { "patterns" }
-            ));
-        }
-        if cmds > 0 {
-            parts.push(format!(
-                "Ran {cmds} {}",
-                if cmds == 1 { "command" } else { "commands" }
-            ));
-        }
-        if edits > 0 {
-            parts.push(format!(
-                "Edited {edits} {}",
-                if edits == 1 { "file" } else { "files" }
-            ));
-        }
-        for (name, n) in other {
-            parts.push(format!("{name} {n}"));
-        }
-        parts.join(", ")
-    }
-
-    /// `room` バイトに収まる最長の prefix(**char 境界**)+ `…`。1文字も入らなければ空。
-    pub fn clip(line: &str, room: usize) -> String {
-        let budget = room.saturating_sub("…".len());
-        match line
-            .char_indices()
-            .map(|(i, c)| i + c.len_utf8())
-            .take_while(|&end| end <= budget)
-            .last()
-        {
-            Some(end) => format!("{}…", &line[..end]),
-            None => String::new(),
-        }
-    }
-
-    /// 出す行を組む(畳み込みまで)。ページ分割はこの後の仕事。
-    fn lines_of(items: &[RenderItem], perm_timed_out: bool) -> Vec<String> {
-        // subagent の中で走ったツールは**その場では描かない**。agent ごとに1つの
-        // セクションにまとめ、その agent の最初のツールがあった位置に1回だけ出す。
-        // 何十本もツールを走らせる subagent が付箋を埋め尽くすのを防ぐ。
-        let mut groups: Vec<(String, String, Vec<&RenderItem>)> = Vec::new(); // (agent_id, type, items)
-        for it in items {
-            let RenderItem::Tool { agent, .. } = it else {
-                continue;
-            };
-            let Some(id) = agent.agent_id.as_deref() else {
-                continue;
-            };
-            match groups.iter_mut().find(|(gid, _, _)| gid == id) {
-                Some((_, _, v)) => v.push(it),
-                None => groups.push((
-                    id.to_string(),
-                    agent
-                        .agent_type
-                        .clone()
-                        .unwrap_or_else(|| "subagent".to_string()),
-                    vec![it],
-                )),
-            }
-        }
-        let mut rendered_agents: Vec<String> = Vec::new();
-
-        // ── 1段目: 畳んで「出す行」を決める ─────────────────────────────
-        // 完了した Read/検索/Bash が**連続**したら1行にまとめる。走行中(◌)は
-        // 「いま何をしているか」なので畳まない。失敗(💥/🚫)も見えたまま残す。
-        let mut lines: Vec<String> = Vec::new();
-        let mut run: Vec<&RenderItem> = Vec::new();
-        for it in items {
-            if matches!(
-                it,
-                RenderItem::Tool { name, status: ToolStatus::Done, agent, .. }
-                    if agent.agent_id.is_none() && Self::is_foldable(name)
-            ) {
-                run.push(it);
-                continue;
-            }
-            Self::flush_fold_run(&mut run, &mut lines);
-            // `Agent` 行は、それが起こした subagent のセクションと1ブロックに畳む。
-            // 結び方は2通り: foreground は id が一致する。background/teammate は id 空間が違うので
-            // **起動名**(tool_input.name)と agent_type で結ぶ(由来)。
-            if let RenderItem::Tool { name, agent, .. } = it
-                && (name == "Agent" || name == "Task")
-            {
-                let key = agent
-                    .spawned_agent_id
-                    .as_deref()
-                    .filter(|id| {
-                        groups.iter().any(|(gid, _, _)| gid == id)
-                            && !rendered_agents.iter().any(|r| r == id)
-                    })
-                    .map(str::to_string)
-                    .or_else(|| {
-                        let nm = agent.launched_name.as_deref()?;
-                        groups
-                            .iter()
-                            .find(|(gid, ty, _)| {
-                                ty == nm && !rendered_agents.iter().any(|r| r == gid)
-                            })
-                            .map(|(gid, _, _)| gid.clone())
-                    });
-                if let Some(key) = key {
-                    rendered_agents.push(key.clone());
-                    if let Some((_, ty, rows)) = groups.iter().find(|(gid, _, _)| *gid == key) {
-                        // 行頭の • を ▾ に差し替え、独立セクションの見出しと同じ形にする
-                        let head = Self::render_item_line(it, false, false);
-                        let head = match head.strip_prefix(TOOL_INDENT) {
-                            Some(rest) => {
-                                let body = rest.split_once(' ').map(|(_, b)| b).unwrap_or(rest);
-                                format!("{TOOL_INDENT}{SUBAGENT_MARK} {body}")
-                            }
-                            None => head,
-                        };
-                        Self::push_agent_section(&mut lines, Some(head), ty, rows);
-                    }
-                    continue;
-                }
-                // 結ぶ相手がまだ居ない(agent が起動中 / ツールが1つも来ていない)→ 普通の行として描く
-            }
-            // subagent 自身のツール行: その agent のセクションを**1回だけ**、最初のツールの位置で出す
-            if let RenderItem::Tool { agent, .. } = it
-                && let Some(id) = agent.agent_id.as_deref()
-            {
-                if rendered_agents.iter().any(|r| r == id) {
-                    continue;
-                }
-                rendered_agents.push(id.to_string());
-                if let Some((_, ty, rows)) = groups.iter().find(|(gid, _, _)| gid == id) {
-                    Self::push_agent_section(&mut lines, None, ty, rows);
-                }
-                continue;
-            }
-            lines.push(Self::render_item_line(it, !lines.is_empty(), true));
-        }
-        Self::flush_fold_run(&mut run, &mut lines);
-        // 許可待ちの満期は**ツール行の下の注記**として最後に足す
-        // (行の並びは触らない。中断通知より前)
-        if perm_timed_out {
-            lines.push(perm_timeout_line());
-        }
-
-        lines
-    }
-
-    /// 1ページ目だけを描く(ページ繰りの要らない呼び手とテスト用)。
-    pub fn render_with(items: &[RenderItem], perm_timed_out: bool) -> String {
-        let lines = Self::lines_of(items, perm_timed_out);
-        Self::page(&lines, 0, false).0
-    }
-}
-
 impl InboundMsg {
     /// Slack の message イベント → Bridge の語彙。返信できない形(中身も添付も無い・channel 無し)は None。
     /// Slack の push イベントを Bridge の語彙へ。落とすべきものは None。
@@ -3159,46 +3170,6 @@ impl InboundMsg {
     }
 }
 
-impl Api {
-    fn fetched(m: &SlackHistoryMessage) -> FetchedMsg {
-        FetchedMsg {
-            ts: m.origin.ts.to_string(),
-            user: m
-                .sender
-                .user
-                .as_ref()
-                .map(|u| u.to_string())
-                .unwrap_or_else(|| "bot".to_string()),
-            text: m.content.text.clone().unwrap_or_default(),
-            thread_ts: m.origin.thread_ts.as_ref().map(|t| t.to_string()),
-        }
-    }
-}
-
-#[cfg(test)]
-impl StickyBoard {
-    /// テスト用 — 差分の要らない行(input を見ない)。
-    fn upsert_tool_t(
-        &mut self,
-        key: &ThreadKey,
-        tool_use_id: &str,
-        name: &str,
-        summary: &str,
-        status: ToolStatus,
-        agent: &AgentRef,
-    ) {
-        self.upsert_tool(
-            key,
-            tool_use_id,
-            name,
-            summary,
-            status,
-            agent,
-            &serde_json::Value::Null,
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     /// **自分の2本までは正常**(slack-morphism の既定。実機の起動ログで確定)。
@@ -3216,6 +3187,29 @@ mod tests {
     }
 
     use super::*;
+
+    impl StickyBoard {
+        /// テスト用 — 差分の要らない行(input を見ない)。
+        fn upsert_tool_t(
+            &mut self,
+            key: &ThreadKey,
+            tool_use_id: &str,
+            name: &str,
+            summary: &str,
+            status: ToolStatus,
+            agent: &AgentRef,
+        ) {
+            self.upsert_tool(
+                key,
+                tool_use_id,
+                name,
+                summary,
+                status,
+                agent,
+                &serde_json::Value::Null,
+            );
+        }
+    }
 
     #[test]
     fn a_bash_row_that_is_really_a_search_counts_as_one() {
@@ -5104,11 +5098,11 @@ mod tests {
             "Bun の 5s から意図的に短縮(定数の doc 参照)"
         );
         let _ja = crate::i18n::pin(crate::i18n::Lang::Ja);
-        assert_eq!(status_gathering(), "集計中\u{2026}");
-        assert_eq!(status_login(), "サインイン中\u{2026}");
+        assert_eq!(Status::Gathering.text(), "集計中\u{2026}");
+        assert_eq!(Status::Login.text(), "サインイン中\u{2026}");
         drop(_ja);
         let _en = crate::i18n::pin(crate::i18n::Lang::En);
-        assert_eq!(status_restart(), "Restarting\u{2026}");
+        assert_eq!(Status::Restart.text(), "Restarting\u{2026}");
     }
 
     /// 空文字がクリア(Slack の約束)。FakeApi は素通しで記録するだけ。

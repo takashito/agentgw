@@ -1394,7 +1394,7 @@ impl Bridge {
             // ここで guard を持っても set と clear が連続して飛ぶだけで一度も描画されない。
             // 実際に待つのは「返事が捌けるか30秒」を待つドレイン側(現行 Bun に原文なし)
             let thinking =
-                slack::Thinking::new(&self.api, &msg.channel, root_ts, &slack::status_resume());
+                slack::Thinking::new(&self.api, &msg.channel, root_ts, &slack::Status::Resume.text());
             self.push_drain(key, sid, None, Some(thinking), ctx);
         }
     }
@@ -1596,7 +1596,7 @@ impl Bridge {
             key.clone(),
         );
         let thinking =
-            slack::Thinking::new(&self.api, &msg.channel, root_ts, &slack::status_context());
+            slack::Thinking::new(&self.api, &msg.channel, root_ts, &slack::Status::Context.text());
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = クリア(probe が失敗しても消える)
             let ctx = LogCtx {
@@ -1665,7 +1665,7 @@ impl Bridge {
             root_ts.to_string(),
             key.clone(),
         );
-        let thinking = slack::Thinking::new(&self.api, &msg.channel, root_ts, &slack::status_usage());
+        let thinking = slack::Thinking::new(&self.api, &msg.channel, root_ts, &slack::Status::Usage.text());
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = クリア
             let ctx = LogCtx {
@@ -1823,7 +1823,7 @@ impl Bridge {
             root_ts.to_string(),
             key.clone(),
         );
-        let thinking = slack::Thinking::new(&self.api, &msg.channel, root_ts, &slack::status_model());
+        let thinking = slack::Thinking::new(&self.api, &msg.channel, root_ts, &slack::Status::Model.text());
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = クリア(TUI が確定しなくても消える)
             let ctx = LogCtx {
@@ -1943,7 +1943,7 @@ impl Bridge {
             tokio::spawn(Self::run_effort_show(api, channel, root, key, target, sid));
             return;
         };
-        let thinking = slack::Thinking::new(&self.api, &msg.channel, root_ts, &slack::status_effort());
+        let thinking = slack::Thinking::new(&self.api, &msg.channel, root_ts, &slack::Status::Effort.text());
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = クリア
             let ctx = LogCtx {
@@ -2003,7 +2003,7 @@ impl Bridge {
             root_ts.to_string(),
             key.clone(),
         );
-        let thinking = slack::Thinking::new(&self.api, &msg.channel, root_ts, &slack::status_mode());
+        let thinking = slack::Thinking::new(&self.api, &msg.channel, root_ts, &slack::Status::Mode.text());
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = クリア
             let done = Agent::real().set_mode(&target, &name, &key, &ctx).await == Some(true);
@@ -2082,7 +2082,7 @@ impl Bridge {
             .collect();
         // 集計は permalink とチャンネル名の解決でスレッド数ぶん Slack を叩く — 待つ間の shimmer
         let thinking =
-            slack::Thinking::new(&self.api, &msg.channel, root_ts, &slack::status_gathering());
+            slack::Thinking::new(&self.api, &msg.channel, root_ts, &slack::Status::Gathering.text());
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = クリア。どの経路で抜けても消える
             let ctx = LogCtx {
@@ -2437,7 +2437,7 @@ impl Bridge {
         self.login_pending.insert(channel.clone(), user.clone());
         let (api, cmd_tx, home) = (self.api.clone(), self.cmd_tx.clone(), Host::home());
         // サインインは URL を出してからコードを待つ数十秒 — その間ずっと shimmer を出す
-        let thinking = slack::Thinking::new(&self.api, &channel, &reply_ts, &slack::status_login());
+        let thinking = slack::Thinking::new(&self.api, &channel, &reply_ts, &slack::Status::Login.text());
         // `thinking` は本文で触るので async move が丸ごと持っていく(どの経路で抜けても Drop = クリア)
         tokio::spawn(async move {
             let ctx = LogCtx::default();
@@ -2461,7 +2461,7 @@ impl Bridge {
                     // URL が出るまで最大 URL_POLL_MAX 秒 — Slack はそれより早く status を
                     // 失効させるので tick ごとに張り直す(compact と同じ理由)。
                     // 張り直さないと途中で shimmer が消えて「止まった」に見える
-                    thinking.set(&slack::status_login());
+                    thinking.set(&slack::Status::Login.text());
                     url = agent.login_url();
                     if url.is_some() {
                         break;
@@ -2519,7 +2519,7 @@ impl Bridge {
         let (api, cmd_tx) = (self.api.clone(), self.cmd_tx.clone());
         // サインインの後半(貼られたコードの判定、最大 CODE_POLL_MAX 秒)も待ち時間 —
         // login_start の guard は URL を出した時点で落ちているので、ここで張り直す
-        let thinking = slack::Thinking::new(&self.api, &channel, &reply_ts, &slack::status_login());
+        let thinking = slack::Thinking::new(&self.api, &channel, &reply_ts, &slack::Status::Login.text());
         tokio::spawn(async move {
             let ctx = LogCtx::default();
             let agent = Agent::real();
@@ -2536,7 +2536,7 @@ impl Bridge {
             } else {
                 for _ in 0..CODE_POLL_MAX {
                     tokio::time::sleep(LOGIN_POLL).await;
-                    thinking.set(&slack::status_login()); // 失効させない(URL 待ちと同じ)
+                    thinking.set(&slack::Status::Login.text()); // 失効させない(URL 待ちと同じ)
                     // scrollback ごと読む: "Login successful." を出した直後に CLI はシェルへ
                     // 戻り、次のポーリングまでに印が画面外へ流れる
                     match agent.login_outcome() {
@@ -2603,7 +2603,7 @@ impl Bridge {
         self.signing_out = true;
         // shimmer は `claude auth logout` が返るまで。この後のワーカー畳みは main 側
         // (CmdFx::LogoutFinished)なので、ここで持たせておけば **必ず** 消える
-        let thinking = slack::Thinking::new(&self.api, channel, root_ts, &slack::status_logout());
+        let thinking = slack::Thinking::new(&self.api, channel, root_ts, &slack::Status::Logout.text());
         let (cmd_tx, channel, thread_ts) = (
             self.cmd_tx.clone(),
             channel.to_string(),
@@ -2722,7 +2722,7 @@ impl Bridge {
             slack::Api::brief_call(
                 "restart: thinking status set failed",
                 self.api
-                    .set_thinking_status(channel, root_ts, &slack::status_restart()),
+                    .set_thinking_status(channel, root_ts, &slack::Status::Restart.text()),
                 ctx,
             )
             .await;
