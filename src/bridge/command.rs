@@ -27,7 +27,7 @@ mod bridge;
 use crate::bridge::state::WallClock;
 
 use crate::agent::UsageRow;
-use crate::agent::screen::MODEL_NAMES;
+use crate::agent::Agent;
 use std::path::Path;
 
 use super::Bridge;
@@ -120,12 +120,6 @@ impl<'a> Message<'a> {
         let mut words = cleaned.split_whitespace();
         let first = words.next().unwrap_or("");
         (first.to_lowercase() == verb).then(|| words.map(str::to_string).collect())
-    }
-
-    /// 本文**全体**が Bridge の本文コマンドのいずれかか。`Cmd::parse` と同じ判定 —
-    /// 「コマンドだったか」だけを知りたい所(stale ガード)のための入口。
-    pub fn is_body_command(&self) -> bool {
-        Cmd::parse(self).is_some()
     }
 
     /// 本文が**自分を**メンションしているか(`containsSelfMention`)。
@@ -272,8 +266,9 @@ impl Cmd {
     ];
 
     /// 本文**全体**がコマンドならそれを返す。引数を読まないと言われたか判らない5つ
-    /// (model / effort / mode / pwd / owner verb)は最後に形で見る。
-    pub fn parse(msg: &Message<'_>) -> Option<Cmd> {
+    /// (model / effort / mode / pwd / owner verb)は最後に形で見る。`model` / `effort` / `mode`
+    /// が受ける値は `agent` の語彙(Bridge が `deps.agent` を渡す)。
+    pub fn parse(msg: &Message<'_>, agent: &dyn Agent) -> Option<Cmd> {
         // 素のワードで発動するもの — 表の順に見る(均すのは1回でいい)
         let normalized = msg.normalized();
         if let Some((_, _, cmd)) = Self::WORDS
@@ -282,13 +277,13 @@ impl Cmd {
         {
             return Some(cmd);
         }
-        if let Some(m) = Self::value_of(msg, "model", &MODEL_NAMES) {
+        if let Some(m) = Self::value_of(msg, "model", |v| agent.canonical_model(v)) {
             return Some(Cmd::Model(m));
         }
-        if let Some(l) = Self::value_of(msg, "effort", &EFFORT_LEVELS) {
+        if let Some(l) = Self::value_of(msg, "effort", Self::listed(agent.effort_levels())) {
             return Some(Cmd::Effort(l));
         }
-        if let Some(m) = Self::value_of(msg, "mode", &MODE_NAMES) {
+        if let Some(m) = Self::value_of(msg, "mode", Self::listed(agent.modes())) {
             return Some(Cmd::Mode(m));
         }
         if let Some(mode) = Self::pwd(msg) {
@@ -323,9 +318,12 @@ impl Cmd {
     /// 「素の verb = 現在値の表示 / verb + **既知の値** = 設定」の形をした3つ
     /// (`model` / `effort` / `mode`)の共通パース。返りは
     /// None = コマンドでない / `Some(None)` = 素の verb / `Some(Some(値))` = 設定。
-    /// 大小文字は不問、知らない値はコマンドでない(文としてワーカーに届く)。
-    /// 672-680
-    fn value_of(msg: &Message<'_>, verb: &str, known: &[&str]) -> Option<Option<String>> {
+    /// 大小文字は不問、知らない値(`accept` が None を返す値)はコマンドでない(文としてワーカーに届く)。
+    fn value_of(
+        msg: &Message<'_>,
+        verb: &str,
+        accept: impl Fn(&str) -> Option<String>,
+    ) -> Option<Option<String>> {
         let args = msg.verb_args(verb)?;
         if args.len() > 1 {
             return None;
@@ -333,13 +331,12 @@ impl Cmd {
         let Some(raw) = args.first() else {
             return Some(None);
         };
-        // `sonet` は `sonnet` の綴り間違いとして受ける(model だけの救済だが、他の表に
-        // その語は無いので当てても結果は変わらない)
-        let value = match raw.to_lowercase().as_str() {
-            "sonet" => "sonnet".to_string(),
-            v => v.to_string(),
-        };
-        known.contains(&value.as_str()).then_some(Some(value))
+        accept(&raw.to_lowercase()).map(Some)
+    }
+
+    /// 一覧にある値だけを受ける `accept`(`effort` / `mode` 用)。
+    fn listed(known: &'static [&'static str]) -> impl Fn(&str) -> Option<String> {
+        move |v| known.contains(&v).then(|| v.to_string())
     }
 
     /// `pwd` コマンドとしてのパース。コマンドでなければ None を返し、「pwd の使い方を変える」は
@@ -436,13 +433,6 @@ pub struct OwnerCmd {
     pub verb: &'static str,
     pub args: Vec<String>,
 }
-
-/// `/effort` が受け取る level(2026-07-17 実機確認: スライダの5段 + `ultracode` / `auto`)。
-const EFFORT_LEVELS: [&str; 7] = ["low", "medium", "high", "xhigh", "max", "ultracode", "auto"];
-
-/// `mode` が受け取る権限モード。shift+tab の巡回で行ける4つだけを引数にする —
-/// `bypass` / `don't ask` は設定でしか入らず、Slack から踏ませたいものでもない。
-const MODE_NAMES: [&str; 4] = ["manual", "plan", "edit", "auto"];
 
 // ── 節4: 上限の見張り ──────────────────────────────────────────────────────
 
@@ -606,7 +596,7 @@ impl Bridge {
     pub(super) async fn handle_command(&mut self, msg: &InboundMsg, key: &ThreadKey, root_ts: &str) -> bool {
         // 検出は Cmd::parse が全部やる — どれでもなければコマンドではない
         let msg_body = crate::bridge::command::Message::new(&msg.text, self.bot_user_id.as_deref());
-        let Some(cmd) = crate::bridge::command::Cmd::parse(&msg_body) else {
+        let Some(cmd) = crate::bridge::command::Cmd::parse(&msg_body, self.deps.agent.as_ref()) else {
             return false;
         };
         let label = cmd.label();
@@ -684,7 +674,7 @@ impl Bridge {
                 self.post(
                     &msg.channel,
                     root_ts,
-                    bridge::help(self.fleet),
+                    bridge::help(self.fleet, self.deps.agent.as_ref()),
                     key,
                 );
             }
@@ -1008,23 +998,26 @@ mod tests {
 
     #[test]
     fn arg_commands_parse_by_shape() {
+        let agent = crate::agent::fake::FakeAgent::default();
+        let model = |v: &str| agent.canonical_model(v);
+        let modes = Cmd::listed(agent.modes());
         assert_eq!(
-            Cmd::value_of(&Message::new("model opus", None), "model", &MODEL_NAMES),
+            Cmd::value_of(&Message::new("model opus", None), "model", model),
             Some(Some("opus".into()))
         );
         assert_eq!(
-            Cmd::value_of(&Message::new("model sonet", None), "model", &MODEL_NAMES),
+            Cmd::value_of(&Message::new("model sonet", None), "model", model),
             Some(Some("sonnet".into()))
         );
         assert_eq!(
-            Cmd::value_of(&Message::new("model", None), "model", &MODEL_NAMES),
+            Cmd::value_of(&Message::new("model", None), "model", model),
             Some(None)
         );
         assert_eq!(
             Cmd::value_of(
                 &Message::new("model の説明をして", None),
                 "model",
-                &MODEL_NAMES
+                model
             ),
             None
         ); // 文は素通し
@@ -1032,24 +1025,24 @@ mod tests {
             Cmd::value_of(
                 &Message::new("effort xhigh", None),
                 "effort",
-                &EFFORT_LEVELS
+                Cmd::listed(agent.effort_levels())
             ),
             Some(Some("xhigh".into()))
         );
         assert_eq!(
-            Cmd::value_of(&Message::new("mode plan", None), "mode", &MODE_NAMES),
+            Cmd::value_of(&Message::new("mode plan", None), "mode", &modes),
             Some(Some("plan".into()))
         );
         assert_eq!(
-            Cmd::value_of(&Message::new("MODE", None), "mode", &MODE_NAMES),
+            Cmd::value_of(&Message::new("MODE", None), "mode", &modes),
             Some(None)
         );
         assert_eq!(
-            Cmd::value_of(&Message::new("mode bypass", None), "mode", &MODE_NAMES),
+            Cmd::value_of(&Message::new("mode bypass", None), "mode", &modes),
             None
         ); // 引数に無い = 文
         assert_eq!(
-            Cmd::value_of(&Message::new("mode を実装して", None), "mode", &MODE_NAMES),
+            Cmd::value_of(&Message::new("mode を実装して", None), "mode", &modes),
             None
         );
         assert!(
@@ -1089,11 +1082,10 @@ mod tests {
                 .unwrap(),
             ["/Users/Me"]
         );
-        assert!(
-            Message::new("restart", None).is_body_command()
-                && Message::new("pwd all", None).is_body_command()
-        );
-        assert!(!Message::new("restart してください", None).is_body_command());
+        let agent = crate::agent::fake::FakeAgent::default();
+        let is_command = |text: &str| Cmd::parse(&Message::new(text, None), &agent).is_some();
+        assert!(is_command("restart") && is_command("pwd all"));
+        assert!(!is_command("restart してください"));
     }
 
     #[test]

@@ -4,7 +4,7 @@
 use super::{CompactProgress, ContextReport, LoginOutcome, UsageRow};
 
 /// `/model` にそのまま渡す形のモデル名。**claude の語彙**なので
-/// ここが正 — コマンドの検出側(`command::parse_model_command`)もこの表を見る。
+/// ここが正 — `Claude::models` もこの表を返す。
 pub const MODEL_NAMES: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
 
 /// スライダの状態行に出る表示レベル。`auto` は**入らない** — auto の時は解決先の

@@ -346,6 +346,14 @@ pub trait Agent: Send + Sync + 'static {
         now_ms: u64,
     ) -> Option<std::io::Result<Option<LimitHit>>>;
     fn model_alias(&self, model_id: &str) -> Option<&'static str>;
+    /// The values `model` / `effort` / `mode` accept, in the order `help` lists them.
+    fn models(&self) -> &'static [&'static str];
+    fn effort_levels(&self) -> &'static [&'static str];
+    fn modes(&self) -> &'static [&'static str];
+    /// A typed model name → the name the agent knows (`sonet` → `sonnet`), or `None` if unknown.
+    fn canonical_model(&self, typed: &str) -> Option<String>;
+    /// The shell command that continues `session_id` in a terminal (`claude --resume …`).
+    fn resume_command(&self, cwd: Option<&str>, session_id: &str) -> String;
     /// Reads the history from `offset` on: `(text, new offset)`.
     fn new_history_lines(&self, path: String, offset: u64, ctx: &LogCtx)
     -> Option<(String, u64)>;
@@ -487,6 +495,22 @@ pub mod fake {
         }
         fn model_alias(&self, _m: &str) -> Option<&'static str> {
             None
+        }
+        // The vocabulary is Claude's own, so the fake answers exactly what Claude does.
+        fn models(&self) -> &'static [&'static str] {
+            super::claude::Claude::real().models()
+        }
+        fn effort_levels(&self) -> &'static [&'static str] {
+            super::claude::Claude::real().effort_levels()
+        }
+        fn modes(&self) -> &'static [&'static str] {
+            super::claude::Claude::real().modes()
+        }
+        fn canonical_model(&self, typed: &str) -> Option<String> {
+            super::claude::Claude::real().canonical_model(typed)
+        }
+        fn resume_command(&self, cwd: Option<&str>, session_id: &str) -> String {
+            super::claude::Claude::real().resume_command(cwd, session_id)
         }
         fn new_history_lines(&self, _p: String, _o: u64, _c: &LogCtx) -> Option<(String, u64)> {
             None

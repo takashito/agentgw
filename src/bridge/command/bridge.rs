@@ -635,7 +635,7 @@ fn with_warnings(message: &str, warnings: &[String]) -> String {
 /// 出していたが、この実装で `route` を実行するのは**子を迎える側**(`relay.rs` の
 /// `CommandCtx::route`)なので、条件もそちらに合わせる。`fleet=false` の出力は
 /// 現行の `remoteMode=false` と一致する。
-pub(super) fn help(fleet: bool) -> String {
+pub(super) fn help(fleet: bool, agent: &dyn crate::agent::Agent) -> String {
     fn section<C: std::fmt::Display>(lines: &mut Vec<String>, title: String, rows: Vec<(C, String)>) {
         lines.push(format!("*{title}*"));
         for (cmd, desc) in rows {
@@ -646,7 +646,7 @@ pub(super) fn help(fleet: bool) -> String {
 
     let mut lines: Vec<String> = vec![crate::t!("*agentgw commands*", "*agentgw のコマンド*"), String::new()];
 
-    for (title, rows) in super::agent::help_sections() {
+    for (title, rows) in super::agent::help_sections(agent) {
         section(&mut lines, title, rows);
     }
     if fleet {
@@ -857,7 +857,7 @@ mod tests {
 
     #[test]
     fn help_lists_every_command() {
-        let h = help(false);
+        let h = help(false, &crate::agent::fake::FakeAgent::default());
         for word in [
             "stop",
             "exit / bye / done",
@@ -888,7 +888,7 @@ mod tests {
     #[test]
     fn a_bridge_that_takes_children_lists_route() {
         // 実装は relay.rs の `CommandCtx::route` にあるのに一覧に出ていなかった
-        let h = help(true);
+        let h = help(true, &crate::agent::fake::FakeAgent::default());
         assert!(h.contains("route <machine>"));
         assert!(h.contains("hand this channel to a machine"));
         // マシンが居ても他の節は変わらない

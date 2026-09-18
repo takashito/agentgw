@@ -7,6 +7,7 @@
 use super::CmdFx;
 use crate::agent::screen::SpawnOutcome;
 use crate::agent::tmux::Window;
+use crate::agent::Agent;
 use crate::agent::screen::ModelId;
 use crate::agent::{
     CompactOutcome, CompactProgress, ContextCategory, ContextReport, LoginOutcome, ProbeErr,
@@ -142,7 +143,7 @@ impl Bridge {
                 transcript_missing: false,
                 worker_running: false,
             };
-            self.post(&msg.channel, root_ts, none.render(), key);
+            self.post(&msg.channel, root_ts, none.render(self.deps.agent.as_ref()), key);
             return;
         };
         // 履歴の在処は hook が運んできた道が第一(worktree に入ったワーカーは transcript ごと
@@ -178,7 +179,7 @@ impl Bridge {
                 if worker_running { "RUNNING" } else { "ABSENT" }
             ),
         );
-        self.post(&msg.channel, root_ts, info.render(), key);
+        self.post(&msg.channel, root_ts, info.render(self.deps.agent.as_ref()), key);
         if worker_running {
             ctx.info(
                 "bridge",
@@ -1198,8 +1199,8 @@ pub struct ResumeInfo {
 }
 
 impl ResumeInfo {
-    /// `resume` の答えを Slack mrkdwn で。
-    pub fn render(&self) -> String {
+    /// `resume` の答えを Slack mrkdwn で。続けるコマンドは `agent` が組む。
+    pub fn render(&self, agent: &dyn Agent) -> String {
         let info = self;
         let Some(sid) = info.session_id.as_deref().filter(|s| !s.is_empty()) else {
             return crate::t!(
@@ -1207,10 +1208,7 @@ impl ResumeInfo {
                 "このスレッドには、まだ再開できるセッションがありません。先にメッセージを送ってセッションを始めてください。"
             );
         };
-        let cmd = match info.cwd.as_deref().filter(|c| !c.is_empty()) {
-            Some(cwd) => format!("cd {cwd} && claude --resume {sid}"),
-            None => format!("claude --resume {sid}"),
-        };
+        let cmd = agent.resume_command(info.cwd.as_deref().filter(|c| !c.is_empty()), sid);
         let mut lines = vec![
             crate::t!(
                 "Run this to continue the session in your own terminal:",
@@ -1457,27 +1455,29 @@ impl UsageReport<'_> {
 }
 
 /// `help`'s sections for the commands in this file: (title, [(trigger, description)]).
-pub(super) fn help_sections() -> Vec<(String, Vec<(&'static str, String)>)> {
+/// The values `model` / `effort` / `mode` take come from the agent.
+pub(super) fn help_sections(agent: &dyn Agent) -> Vec<(String, Vec<(String, String)>)> {
+    let choice = |verb: &str, values: &[&str]| format!("{verb} [{}]", values.join("|"));
     vec![
         (
             crate::t!("In this thread", "このスレッドで"),
             vec![
-                ("stop", crate::t!("stop the current turn (a 🛑 reaction works too)", "実行中のターンを止める(🛑 のリアクションでも可)")),
-                ("exit / bye / done", crate::t!("end this thread's agent; your next message resumes it", "このスレッドのエージェントを終える。次に書けば再開する")),
-                ("compact", crate::t!("compact the context, with a progress bar", "コンテキストを圧縮する(進捗バー付き)")),
-                ("model [fable|opus|sonnet|haiku]", crate::t!("show or switch the model", "モデルを見る・切り替える")),
-                ("effort [low|medium|high|xhigh|max|ultracode|auto]", crate::t!("show or set the effort level", "effort を見る・決める")),
-                ("mode [manual|plan|edit|auto]", crate::t!("show or switch the permission mode", "権限モードを見る・切り替える")),
-                ("context / ctx", crate::t!("show this agent's context usage", "このエージェントのコンテキストの使用量")),
-                ("resume", crate::t!("show the command to continue this session in your own terminal (stops the agent here)", "このセッションを手元の端末で続けるコマンドを出す(ここのエージェントは止める)")),
+                ("stop".to_string(), crate::t!("stop the current turn (a 🛑 reaction works too)", "実行中のターンを止める(🛑 のリアクションでも可)")),
+                ("exit / bye / done".to_string(), crate::t!("end this thread's agent; your next message resumes it", "このスレッドのエージェントを終える。次に書けば再開する")),
+                ("compact".to_string(), crate::t!("compact the context, with a progress bar", "コンテキストを圧縮する(進捗バー付き)")),
+                (choice("model", agent.models()), crate::t!("show or switch the model", "モデルを見る・切り替える")),
+                (choice("effort", agent.effort_levels()), crate::t!("show or set the effort level", "effort を見る・決める")),
+                (choice("mode", agent.modes()), crate::t!("show or switch the permission mode", "権限モードを見る・切り替える")),
+                ("context / ctx".to_string(), crate::t!("show this agent's context usage", "このエージェントのコンテキストの使用量")),
+                ("resume".to_string(), crate::t!("show the command to continue this session in your own terminal (stops the agent here)", "このセッションを手元の端末で続けるコマンドを出す(ここのエージェントは止める)")),
             ],
         ),
         (
             crate::t!("Account", "アカウント"),
             vec![
-                ("login", crate::t!("sign Claude Code in to your account (in a DM)", "Claude Code を自分のアカウントでサインインする(DM で)")),
-                ("logout", crate::t!("sign out and stop every agent", "サインアウトして、すべてのエージェントを止める")),
-                ("usage / usg", crate::t!("show your Claude subscription usage", "Claude のサブスクリプションの使用状況")),
+                ("login".to_string(), crate::t!("sign Claude Code in to your account (in a DM)", "Claude Code を自分のアカウントでサインインする(DM で)")),
+                ("logout".to_string(), crate::t!("sign out and stop every agent", "サインアウトして、すべてのエージェントを止める")),
+                ("usage / usg".to_string(), crate::t!("show your Claude subscription usage", "Claude のサブスクリプションの使用状況")),
             ],
         ),
     ]
@@ -1496,6 +1496,7 @@ mod tests {
 
     #[test]
     fn resume_report_variants() {
+        let agent = crate::agent::fake::FakeAgent::default();
         let none = ResumeInfo {
             session_id: None,
             cwd: None,
@@ -1503,7 +1504,7 @@ mod tests {
             worker_running: false,
         };
         assert!(
-            none.render()
+            none.render(&agent)
                 .starts_with("This thread has no session to resume yet")
         );
         let full = ResumeInfo {
@@ -1512,7 +1513,7 @@ mod tests {
             transcript_missing: true,
             worker_running: true,
         };
-        let out = full.render();
+        let out = full.render(&agent);
         assert!(out.contains("cd /repo && claude --resume sid-1"));
         assert!(out.contains("⚠️ This session's history isn't on disk"));
         assert!(out.contains("The agent for this thread has been stopped"));

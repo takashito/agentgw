@@ -741,7 +741,7 @@ impl Bridge {
         // 諦めた後の `exit` が届いて二度目の別れを告げる。全コマンド経路の手前で落とす。
         // 普通のリクエストは無傷 — 遅れて配達される方が、本物の仕事を失うよりましだから
         let body = crate::bridge::command::Message::new(&msg.text, self.bot_user_id.as_deref());
-        if let Some(cmd) = crate::bridge::command::Cmd::parse(&body)
+        if let Some(cmd) = crate::bridge::command::Cmd::parse(&body, self.deps.agent.as_ref())
             && let Some(stale) = cmd.stale_reason(&msg.ts, self.started_at_ms, RETRY_NUM)
         {
             LogCtx {

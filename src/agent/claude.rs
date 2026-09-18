@@ -59,6 +59,13 @@ const WORKER_STARTUP_PROMPT: &str = "You are a Slack thread worker. There is no 
 const DELIVER_SUBMIT_RETRIES: u32 = 4;
 const DELIVER_SUBMIT_POLL: Duration = Duration::from_millis(200);
 
+/// `/effort` が受け取る level(2026-07-17 実機確認: スライダの5段 + `ultracode` / `auto`)。
+const EFFORT_LEVELS: [&str; 7] = ["low", "medium", "high", "xhigh", "max", "ultracode", "auto"];
+
+/// `mode` が受け取る権限モード。shift+tab の巡回で行ける4つだけを引数にする —
+/// `bypass` / `don't ask` は設定でしか入らず、Slack から踏ませたいものでもない。
+const MODE_NAMES: [&str; 4] = ["manual", "plan", "edit", "auto"];
+
 /// claude を tmux の窓で飼う実体。
 pub struct Claude {
     tmux: Tmux,
@@ -1005,6 +1012,38 @@ impl crate::agent::Agent for Claude {
 
     fn model_alias(&self, model_id: &str) -> Option<&'static str> {
         super::screen::ModelId::new(model_id).alias()
+    }
+
+    fn models(&self) -> &'static [&'static str] {
+        &super::screen::MODEL_NAMES
+    }
+
+    fn effort_levels(&self) -> &'static [&'static str] {
+        &EFFORT_LEVELS
+    }
+
+    fn modes(&self) -> &'static [&'static str] {
+        &MODE_NAMES
+    }
+
+    /// 大小文字は不問。`sonet` は `sonnet` の綴り間違いとして受ける。
+    fn canonical_model(&self, typed: &str) -> Option<String> {
+        let name = match typed.to_lowercase().as_str() {
+            "sonet" => "sonnet".to_string(),
+            v => v.to_string(),
+        };
+        super::screen::MODEL_NAMES
+            .contains(&name.as_str())
+            .then_some(name)
+    }
+
+    /// cwd は id と同じくらい大事 — claude は cwd ごとに履歴を仕舞うので、違う場所で
+    /// --resume すると見つからない。
+    fn resume_command(&self, cwd: Option<&str>, session_id: &str) -> String {
+        match cwd {
+            Some(cwd) => format!("cd {cwd} && claude --resume {session_id}"),
+            None => format!("claude --resume {session_id}"),
+        }
     }
 
     fn new_history_lines(&self, path: String, offset: u64, ctx: &LogCtx) -> Option<(String, u64)> {
