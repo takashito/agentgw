@@ -525,7 +525,7 @@ impl Bridge {
             self.post(
                 &channel,
                 &thread_ts,
-                crate::t!("Ending this session. Your next message here starts it again.", "このセッションを終えます。次にこのスレッドに書けば、また始まります。"),
+                crate::t!("Thanks for your work! Ending the Claude Code session.", "お疲れさまでした。Claude Code のセッションを終了します。"),
                 key,
             );
             ctx.info(
