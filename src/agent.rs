@@ -5,6 +5,7 @@
 //! 実体を足すときは match の対応漏れをコンパイラが指摘する。
 
 pub mod claude;
+pub mod screen;
 pub mod tmux;
 
 use crate::bridge::state::{LogCtx, ThreadKey};
@@ -288,7 +289,7 @@ impl Agent {
         budget_ms: u64,
         poll_ms: u64,
         ctx: &LogCtx,
-    ) -> claude::SpawnOutcome {
+    ) -> screen::SpawnOutcome {
         match self {
             Agent::Claude(c) => c.watch_spawn_screens(w, budget_ms, poll_ms, ctx).await,
         }
@@ -457,7 +458,7 @@ impl Agent {
     /// モデル id の短い呼び名(`sonnet` など)。無ければ id をそのまま出す。
     pub fn model_alias(&self, model_id: &str) -> Option<&'static str> {
         match self {
-            Agent::Claude(_) => claude::ModelId::new(model_id).alias(),
+            Agent::Claude(_) => screen::ModelId::new(model_id).alias(),
         }
     }
 
@@ -531,14 +532,14 @@ impl Agent {
     /// probe の出力から `/context` を読む。読めなければ `None`。
     pub fn context_report(&self, raw: &str) -> Option<ContextReport> {
         match self {
-            Agent::Claude(_) => claude::Pane::new(raw).context_report(),
+            Agent::Claude(_) => screen::Pane::new(raw).context_report(),
         }
     }
 
     /// probe の出力から `/usage` の上限行を読む。1本も無ければ `None`。
     pub fn usage_rows(&self, raw: &str) -> Option<Vec<UsageRow>> {
         match self {
-            Agent::Claude(_) => claude::Pane::new(raw).usage_rows(),
+            Agent::Claude(_) => screen::Pane::new(raw).usage_rows(),
         }
     }
 }

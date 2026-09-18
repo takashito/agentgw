@@ -25,7 +25,7 @@
 
 use chrono::{DateTime, Datelike, Local, Month, NaiveDate, NaiveDateTime, TimeDelta, Timelike};
 
-use crate::agent::claude::{MODEL_NAMES, ModelId};
+use crate::agent::screen::{MODEL_NAMES, ModelId};
 use crate::agent::{CompactProgress, ContextCategory, ContextReport, UsageRow};
 use std::path::Path;
 
@@ -1944,7 +1944,7 @@ mod tests {
     }
     // 描き方のテストが読み手を1つ呼ぶ(`renders_context_report`)。パーサ本体の網は
     // `agent/claude.rs` の `mod tests` に居る。
-    use crate::agent::claude::Pane;
+    use crate::agent::screen::Pane;
 
     /// 節目の跨ぎと、ゲートを解く時刻の選び方。
     #[test]

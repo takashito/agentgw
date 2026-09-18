@@ -12,7 +12,8 @@ pub mod inbound;
 pub mod state;
 pub mod worker;
 
-use crate::agent::claude::{HookIntake, SpawnOutcome};
+use crate::agent::claude::HookIntake;
+use crate::agent::screen::SpawnOutcome;
 use crate::agent::tmux::{self as tmux_mod, Pid, Tmux, Window};
 use crate::agent::{
     Agent, CompactOutcome, CompactProgress, Envelope, HookEvent, LoginOutcome, ProbeErr, SessionId,
