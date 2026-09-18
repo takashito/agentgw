@@ -53,44 +53,6 @@ pub fn envelope_guarded(
     .render()
 }
 
-/// 書き換えをワーカーに伝える文。
-/// `is_current` = いま処理中の依頼が書き換わった(捨てて新しい方をやる)/ そうでなければ
-/// 過去の依頼の改訂(いまの仕事は続け、手が空いてから)。
-pub fn edit_notice(edited_ts: &str, new_text: &str, had_files: bool, is_current: bool) -> String {
-    const SNIPPET_MAX: usize = 1000;
-    let trimmed = new_text.trim();
-    let content_desc = if trimmed.is_empty() {
-        if had_files {
-            "It now has no text (a file/attachment only).".to_string()
-        } else {
-            "Its new text is unavailable.".to_string()
-        }
-    } else if trimmed.chars().count() > SNIPPET_MAX {
-        let head: String = trimmed.chars().take(SNIPPET_MAX).collect();
-        format!("The new content is:\n\"\"\"\n{head}… (truncated)\n\"\"\"")
-    } else {
-        format!("The new content is:\n\"\"\"\n{trimmed}\n\"\"\"")
-    };
-    let lead = if is_current {
-        format!(
-            "[message_edited] The user EDITED the message you are CURRENTLY working on \
-             (id {edited_ts}) — they changed the request, so your in-progress turn was \
-             interrupted. Throw away the work you were doing for the OLD wording and handle the \
-             NEW content instead. {content_desc}"
-        )
-    } else {
-        format!(
-            "[message_edited] The user EDITED an earlier message (id {edited_ts}) that you had \
-             already moved past — they revised that request. Do NOT abandon your current work; \
-             once you are free, handle the revised request. {content_desc}"
-        )
-    };
-    format!(
-        "{lead}\n\nRespond to the now-edited request as you normally would; if the edit changes \
-         nothing you need to do, call no_reply."
-    )
-}
-
 /// 門番の答え — この1通をワーカーに渡すか。
 ///
 /// `Drop` の `&'static str` は落とした理由で、そのままログに出る(黙って捨てない)。
@@ -850,7 +812,7 @@ impl Bridge {
             && pending.iter().all(|id| num(id) <= num(edited_ts));
 
         let mut notice = msg.clone();
-        notice.text = crate::bridge::inbound::edit_notice(
+        notice.text = crate::chat::edit_notice(
             edited_ts,
             &msg.text,
             !msg.files.is_empty(),
@@ -1307,28 +1269,6 @@ impl Bridge {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// 書き換えの文は「いま処理中か」で言い方が変わる。処理中なら古い作業を捨てさせ、
-    /// 過去の依頼なら今の仕事を続けさせる。
-    #[test]
-    fn an_edit_tells_the_worker_to_redo_only_when_it_is_the_current_work() {
-        let now = edit_notice("1.2", "こっちでお願い", false, true);
-        assert!(now.contains("the message you are CURRENTLY working on (id 1.2)"));
-        assert!(now.contains("Throw away the work you were doing for the OLD wording"));
-        assert!(now.contains("The new content is:\n\"\"\"\nこっちでお願い\n\"\"\""));
-
-        let past = edit_notice("1.2", "こっちでお願い", false, false);
-        assert!(past.contains("EDITED an earlier message (id 1.2)"));
-        assert!(past.contains("Do NOT abandon your current work"));
-        // どちらも締めは同じ — 何も変わらないなら黙る
-        for n in [&now, &past] {
-            assert!(n.ends_with("if the edit changes nothing you need to do, call no_reply."));
-        }
-        // 本文が消えた編集は、添付だけになったのか読めないのかで言い分ける
-        assert!(edit_notice("1.2", "", true, true).contains("a file/attachment only"));
-        assert!(edit_notice("1.2", "", false, true).contains("Its new text is unavailable."));
-        assert!(edit_notice("1.2", &"あ".repeat(1500), false, true).contains("… (truncated)"));
-    }
 
     fn msg(kind: ChannelKind, user: Option<&str>, is_bot: bool) -> InboundMsg {
         InboundMsg {
