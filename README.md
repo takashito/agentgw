@@ -13,10 +13,10 @@
 
 </div>
 
-agentgw is a small service that connects one Slack bot to Claude Code on every machine you own. Post in a channel and a Claude Code worker starts **on the machine that channel belongs to**, in that project's directory, and answers in the thread — showing its progress as it goes and asking for your approval in Slack when it needs it.
+agentgw is a small service that connects one Slack bot to Claude Code on every machine you own. Post in a channel and a Claude Code agent starts **on the machine that channel belongs to**, in that project's directory, and answers in the thread — showing its progress as it goes and asking for your approval in Slack when it needs it.
 
 <p align="center">
-  <img src="assets/thread.svg" width="780" alt="A Slack thread: you ask agentgw to fix flaky tests; a live progress message lists the tools Claude Code runs; a permission request with Allow and Deny buttons; the worker replies with the fix.">
+  <img src="assets/thread.svg" width="780" alt="A Slack thread: you ask agentgw to fix flaky tests; a live progress message lists the tools Claude Code runs; a permission request with Allow and Deny buttons; the agent replies with the fix.">
 </p>
 
 ## Why agentgw?
@@ -27,11 +27,11 @@ Only you — the owner — can talk to the agents. They run on **your own Claude
 
 ### 🖧 Every machine, one bot
 
-The agents on your laptop, your NAS, your hypervisor and your build box all answer through **one Slack bot**. Each channel belongs to a machine and a project directory; `route` moves a channel, `status` shows the whole fleet and how each machine is linked, and `add-child` brings in a new machine with a single command. It's built for a homelab, not a single desk.
+The agents on your laptop, your NAS, your hypervisor and your build box all answer through **one Slack bot**. Each channel belongs to a machine and a project directory; `route` moves a channel, `status` shows the whole fleet and how each machine is linked, and `add-machine` brings in a new machine with a single command. It's built for a homelab, not a single desk.
 
 | Channel | Machine | Works in |
 |---|---|---|
-| `#laptop` | the Mac you carry (parent) | `~/code/app` |
+| `#laptop` | the Mac you carry (gateway) | `~/code/app` |
 | `#nas` | a storage box in the closet | `/srv/compose` |
 | `#proxmox` | the hypervisor | `/root/infra` |
 | `#build` | a Linux build box | `~/src/firmware` |
@@ -42,7 +42,7 @@ They keep a session you **already started** within reach. The rest is agentgw's 
 
 | | |
 |---|---|
-| 🏠 **Machines you don't sit at** | No terminal is open on the server in the closet, so nothing is waiting there. agentgw runs as a service on each machine and starts a worker — in the right directory — when a thread arrives. It starts again on its own after a reboot (on macOS, once you log in). |
+| 🏠 **Machines you don't sit at** | No terminal is open on the server in the closet, so nothing is waiting there. agentgw runs as a service on each machine and starts an agent — in the right directory — when a thread arrives. It starts again on its own after a reboot (on macOS, once you log in). |
 | 🧭 **Not remembering where things run** | With several machines and several repos on each, the friction is *which box, which directory, which session*. Map a channel once; after that, where you post is all that decides. |
 | 🔔 **Work that already arrives in Slack** | Alerts from monitoring, failures from CI. Let a bot's messages through with `allow-bot`, and its alert can start an investigation — with a guard against two bots answering each other forever. |
 | 📝 **A record where people look** | The request, every tool the agent ran, what you approved and what it concluded stay in the thread, searchable in Slack. |
@@ -56,13 +56,13 @@ It drives the **official Claude Code CLI**, on your hardware. Nothing is proxied
 <td width="50%" valign="top">
 
 **🧵 One thread, one session**<br>
-Each thread gets its own worker — a real Claude Code session in `tmux`. Reply to continue; sessions survive restarts and upgrades of agentgw.
+Each thread gets its own agent — a real Claude Code session in `tmux`. Reply to continue; sessions survive restarts and upgrades of agentgw.
 
 </td>
 <td width="50%" valign="top">
 
 **🖧 A fleet, one Slack app**<br>
-One **parent** holds the Slack connection. **Children** dial out to it, so they need no open ports. `route <machine>` assigns a channel.
+One **gateway** holds the Slack connection. Your other **machines** dial out to it, so they need no open ports. `route <machine>` assigns a channel.
 
 </td>
 </tr>
@@ -70,13 +70,13 @@ One **parent** holds the Slack connection. **Children** dial out to it, so they 
 <td valign="top">
 
 **🚀 Add a machine in one command**<br>
-`agentgw add-child user@host` ships the binary over ssh, installs the service, links it, and waits until the parent sees it.
+`agentgw add-machine user@host` ships the binary over ssh, installs the service, connects it, and waits until the gateway sees it.
 
 </td>
 <td valign="top">
 
 **🔌 Links that pick themselves**<br>
-Tries a direct connection (e.g. over Tailscale) first; if that doesn't come up, the parent keeps an ssh tunnel open instead.
+Tries a direct connection (e.g. over Tailscale) first; if that doesn't come up, the gateway keeps an ssh tunnel open instead.
 
 </td>
 </tr>
@@ -114,20 +114,20 @@ A single Rust binary per machine, running as a `launchd` agent or a `systemd` us
 
 ```mermaid
 flowchart LR
-    S(["Slack"]) <-->|Socket Mode| P["agentgw<br/>parent"]
-    P --> WP["Claude Code workers<br/>in tmux"]
-    C1["agentgw<br/>child: build-box"] -->|outbound WebSocket| P
-    C2["agentgw<br/>child: homelab"] -->|ssh tunnel| P
-    C1 --> W1["Claude Code workers<br/>in tmux"]
-    C2 --> W2["Claude Code workers<br/>in tmux"]
+    S(["Slack"]) <-->|Socket Mode| P["agentgw<br/>gateway"]
+    P --> WP["Claude Code agents<br/>in tmux"]
+    C1["agentgw<br/>machine: build-box"] -->|outbound WebSocket| P
+    C2["agentgw<br/>machine: homelab"] -->|ssh tunnel| P
+    C1 --> W1["Claude Code agents<br/>in tmux"]
+    C2 --> W2["Claude Code agents<br/>in tmux"]
 ```
 
 1. **You post** in a channel or thread.
-2. **The parent** receives it over Slack Socket Mode and passes it to the machine that owns the channel — or keeps it, if the channel has no owner.
-3. **That machine** hands it to the thread's worker, starting one in the channel's project directory if needed.
-4. **The worker** replies through agentgw's MCP tools, with progress and permission prompts along the way.
+2. **The gateway** receives it over Slack Socket Mode and passes it to the machine that owns the channel — or keeps it, if the channel has no owner.
+3. **That machine** hands it to the thread's agent, starting one in the channel's project directory if needed.
+4. **The agent** replies through agentgw's MCP tools, with progress and permission prompts along the way.
 
-Only the parent reads Slack's event stream. Children get the bot token over the link and keep it in memory only; the app token never leaves the parent.
+Only the gateway reads Slack's event stream. Other machines get the bot token over the link and keep it in memory only; the app token never leaves the gateway.
 
 ## Requirements
 
@@ -146,7 +146,7 @@ Only the parent reads Slack's event stream. Children get the bot token over the 
 
 Pick a workspace and click **Create**, then collect two tokens: **Install to Workspace** → *Bot User OAuth Token* (`xoxb-…`), and **Basic Information → App-Level Tokens** → a token with `connections:write` (`xapp-…`).
 
-**2. Install on the parent machine**
+**2. Install on the gateway machine**
 
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/takashito/agentgw/main/scripts/install.sh)"
@@ -161,7 +161,7 @@ It downloads the binary, installs the service, and asks for the two tokens.
 
 DM the bot **`login`**. It signs Claude Code on that machine in to **your** Claude account — you get a sign-in link, and paste the code back into the DM. The person who signs in becomes the **owner**, the only person the bot works for.
 
-> Already use an API key? If Claude Code on the machine is set up with one, workers use it. agentgw itself never sees model credentials.
+> Already use an API key? If Claude Code on the machine is set up with one, agents use it. agentgw itself never sees model credentials.
 
 **4. Use it**
 
@@ -195,25 +195,25 @@ Create an app **From a manifest** at [api.slack.com/apps](https://api.slack.com/
 
 ## Adding machines
 
-From the parent:
+From the gateway:
 
 ```bash
-agentgw add-child user@host                   # any ssh destination, ~/.ssh/config aliases included
-agentgw add-child user@host --name build-box  # name the machine (default: its hostname)
+agentgw add-machine user@host                   # any ssh destination, ~/.ssh/config aliases included
+agentgw add-machine user@host --name build-box  # name the machine (default: its hostname)
 ```
 
 Then assign channels to it — in the channel: `@agentgw route build-box`.
 
-`add-child` checks the remote OS, sends the matching binary and the installer, links the machine, starts the service and **waits until the parent sees it**. Run it again later to bring that machine to the parent's version.
+`add-machine` checks the remote OS, sends the matching binary and the installer, links the machine, starts the service and **waits until the gateway sees it**. Run it again later to bring that machine to the gateway's version.
 
 The link is chosen by trying, not guessing:
 
 | Link | How | Used when |
 |---|---|---|
-| **Direct** | The child dials the parent's public name (`AGENTGW_LINK_PUBLIC_URL`, or its Tailscale name) | The parent is reachable — e.g. `tailscale serve --bg 8787` on the parent |
-| **SSH tunnel** | The parent keeps `ssh -N -R` open to the child, which dials its own loopback | Direct didn't connect within 20 seconds |
+| **Direct** | The machine dials the gateway's public name (`AGENTGW_LINK_PUBLIC_URL`, or its Tailscale name) | The gateway is reachable — e.g. `tailscale serve --bg 8787` on the gateway |
+| **SSH tunnel** | The gateway keeps `ssh -N -R` open to the machine, which dials its own loopback | Direct didn't connect within 20 seconds |
 
-`agentgw status` on the parent lists each child and its link.
+`agentgw status` on the gateway lists each machine and how it is connected.
 
 ## Slack commands
 
@@ -222,34 +222,36 @@ Mention the bot (`@agentgw <command>`), or type in a thread it's working in.
 | Command | What it does |
 |---|---|
 | `stop` | Stop the current turn (a 🛑 reaction works too) |
-| `exit` · `bye` · `done` | End this thread's worker; your next message resumes it |
+| `exit` · `bye` · `done` | End this thread's agent; your next message resumes it |
 | `compact` | Compact the context, with a progress bar |
 | `model [fable\|opus\|sonnet\|haiku]` | Show or switch the model |
 | `effort [low\|medium\|high\|xhigh\|max\|…]` | Show or set the effort level |
 | `mode [manual\|plan\|edit\|auto]` | Show or switch the permission mode |
-| `context` | This worker's context usage |
+| `context` | This agent's context usage |
 | `resume` | The command to continue this session in your own terminal |
 | `usage` | Your Claude subscription usage |
-| `status` | Version, active threads and warm workers |
+| `status` | Version, active threads and warm agents |
 | `route [machine]` | Show routing, or assign this channel to a machine |
 | `pwd [absolute path]` | Show or set this channel's project directory |
-| `warm on\|off` | Keep a worker pre-started for this channel |
+| `warm on\|off` | Keep an agent started ahead of time for this channel |
 | `set-home` | Send notices (online, offline, errors) to this channel |
 | `allow-bot @bot` · `remove-bot @bot` | Let another bot's messages start work |
-| `login` · `logout` | Sign Claude Code in to your account (by DM) · sign out and stop all workers |
+| `login` · `logout` | Sign Claude Code in to your account (by DM) · sign out and stop all agents |
 | `help` | All commands |
 
 ## CLI
 
 ```bash
-agentgw status             # role, children and their links, channel routing
-agentgw add-child <ssh>    # add or upgrade a machine
-agentgw restart            # swap in a new binary; running workers keep going
-agentgw shutdown           # stop the service and its workers
-agentgw start              # start the service
-agentgw uninstall          # remove the service definition (tokens and state are kept)
+agentgw status               # role, machines and how they connect, channel routing
+agentgw add-machine <ssh>    # add or upgrade a machine
+agentgw restart              # swap in a new binary; running agents keep going
+agentgw shutdown             # stop the service and its agents
+agentgw start                # start the service
+agentgw uninstall            # remove the service definition (tokens and state are kept)
 agentgw --version
 ```
+
+agentgw speaks English. For Japanese — in Slack, the CLI and the installer — add `AGENTGW_LANG=ja` to `~/.local/state/agentgw/.env` and run `agentgw restart`.
 
 <details>
 <summary><b>Files on disk</b></summary>
@@ -261,26 +263,26 @@ Every machine uses the same layout.
 | `~/.local/bin/agentgw` | The binary |
 | `~/.local/state/agentgw/` | State — override with `AGENTGW_STATE_DIR` |
 | ├ `.env` | Settings and tokens (mode 600) |
-| ├ `access.json` | Owner, notice channel, routing, project directories, warm workers |
+| ├ `access.json` | Owner, notice channel, routing, project directories, warm agents |
 | ├ `threads.json` | Which Slack thread belongs to which session |
 | ├ `plugin-debug.log` | Main log (rotated to `.1`) |
 | ├ `logs/` | Per-thread and per-session logs, plus `service.out.log` / `service.err.log` |
 | └ `inbox/` | Downloaded Slack attachments |
 | `~/Library/LaunchAgents/com.agentgw.bridge.plist` | Service definition (macOS) |
 | `~/.config/systemd/user/agentgw-bridge.service` | Service definition (Linux) |
-| `$TMPDIR/agentgw-agentgw/` | Hook and MCP config handed to workers (regenerated on start) |
-| tmux session `agentgw-workers` | One window per worker |
+| `$TMPDIR/agentgw-agentgw/` | Hook and MCP config handed to agents (regenerated on start) |
+| tmux session `agentgw-workers` | One window per agent |
 
 </details>
 
 ## Security
 
-- **Only the owner can start work or run commands** — the person who signed Claude Code in with `login`. In a thread that's already running, other people's messages reach the worker as context only.
+- **Only the owner can start work or run commands** — the person who signed Claude Code in with `login`. In a thread that's already running, other people's messages reach the agent as context only.
 - **Agents run on your own credentials** — your Claude subscription, or an API key set up for Claude Code on that machine. agentgw never handles model credentials.
-- **Workers run as the user that installed agentgw** and can do anything that user can. Install under a dedicated account (e.g. `agentgw add-child agent@host`) rather than `root`.
-- **Tokens stay local**, in `.env` with mode 600. Children never get the app token; they hold the bot token in memory only.
-- **The link secret is a password.** Whoever has it can join as a child and receive that machine's messages. `add-child` sends it over ssh stdin, never on a command line.
-- **Children open no ports.** The parent's listener binds `0.0.0.0:8787` by default without TLS — keep it behind Tailscale or an ssh tunnel, or set `AGENTGW_LINK_LISTEN=127.0.0.1:8787`.
+- **Agents run as the user that installed agentgw** and can do anything that user can. Install under a dedicated account (e.g. `agentgw add-machine agent@host`) rather than `root`.
+- **Tokens stay local**, in `.env` with mode 600. Other machines never get the app token; they hold the bot token in memory only.
+- **The link secret is a password.** Whoever has it can join as a machine and receive that machine's messages. `add-machine` sends it over ssh stdin, never on a command line.
+- **Machines open no ports.** The gateway's listener binds `0.0.0.0:8787` by default without TLS — keep it behind Tailscale or an ssh tunnel, or set `AGENTGW_LINK_LISTEN=127.0.0.1:8787`.
 - **macOS signing.** Run from a terminal, the installer creates a self-signed code-signing identity once, so macOS permission grants survive upgrades.
 
 ## Limitations
@@ -288,7 +290,7 @@ Every machine uses the same layout.
 - **Slack and Claude Code only.** No other chat platforms or agent CLIs.
 - **One owner per install.** It isn't a multi-user service: other people can follow a thread and add context, but can't start work or run commands.
 - **macOS and Linux only.** No Windows. Prebuilt binaries cover Apple Silicon and x86_64 Linux.
-- **One process per Slack app.** Two agentgw parents on the same app token split Slack's events between them — give each its own app.
+- **One process per Slack app.** Two agentgw gateways on the same app token split Slack's events between them — give each its own app.
 
 ## Troubleshooting
 
@@ -299,8 +301,8 @@ Every machine uses the same layout.
 | Allow / Deny buttons do nothing | Turn on **Interactivity** in the Slack app |
 | You can't DM the bot | Turn on **App Home → Messages Tab** in the Slack app |
 | Only some messages get answered | Another process is using the same app token |
-| A child shows as offline | `agentgw status` on the parent; `service.err.log` on the child |
-| A worker can't use new tool options after an upgrade | Run `/mcp` in that worker — it keeps the tool list it started with |
+| A machine shows as offline | `agentgw status` on the gateway; `service.err.log` on that machine |
+| An agent can't use new tool options after an upgrade | Run `/mcp` in that agent — it keeps the tool list it started with |
 
 ## Development
 

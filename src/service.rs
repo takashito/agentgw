@@ -217,13 +217,15 @@ impl Tokens {
     /// 取り違えは実際に起きる(どちらも「Slack のトークン」に見える)。接頭辞で両方向を弾く。
     pub fn validate(&self) -> Result<(), String> {
         if !self.bot.starts_with("xoxb-") {
-            return Err(format!(
+            return Err(crate::t!(
+                "The bot token should start with xoxb- (got {:?}). Did you swap it with the app token?",
                 "bot token は xoxb- で始まるはず(受け取ったのは {:?})— app token と取り違えていませんか",
                 self.bot.chars().take(8).collect::<String>()
             ));
         }
         if !self.app.starts_with("xapp-") {
-            return Err(format!(
+            return Err(crate::t!(
+                "The app token should start with xapp- (got {:?}). Did you swap it with the bot token?",
                 "app token は xapp- で始まるはず(受け取ったのは {:?})— bot token と取り違えていませんか",
                 self.app.chars().take(8).collect::<String>()
             ));
@@ -257,14 +259,14 @@ impl RestartStep {
     /// `pid` = サービスマネージャに聞いた本体 pid(None = 走っていない)。
     /// `alive` = その pid がまだ居るか。`waited_ms` = SIGUSR1 を送ってからの経過。
     pub fn next(pid: Option<u32>, alive: bool, waited_ms: u64, timeout_ms: u64) -> RestartStep {
-        let Some(pid) = pid else {
-            return RestartStep::Force("走っている Bridge の pid が引けない".to_string());
-        };
+        if pid.is_none() {
+            return RestartStep::Force(crate::t!("agentgw isn't running", "agentgw が動いていません"));
+        }
         if !alive {
             return RestartStep::Gone;
         }
         if waited_ms >= timeout_ms {
-            return RestartStep::Force(format!("pid {pid} が {timeout_ms}ms 待っても降りない"));
+            return RestartStep::Force(crate::t!("it was still running after {timeout_ms}ms", "{timeout_ms}ms 待っても止まりませんでした"));
         }
         RestartStep::KeepWaiting
     }
@@ -359,14 +361,14 @@ impl Service {
             return Self::run_ctl(prog, &argv);
         }
         let Ok(o) = Self::ctl_command(prog).args(&argv).output() else {
-            eprintln!("{prog} が実行できません");
+            eprintln!("{}", crate::t!("Couldn't run {prog}", "{prog} が実行できません"));
             return -1;
         };
         match Self::status_line(mac, &String::from_utf8_lossy(&o.stdout)) {
             Some(line) => println!("{line}"),
             // 定義ファイルがあるかは見れば分かる。推測で並べない
-            None if job.exists() => println!("サービス: 止まっています"),
-            None => println!("サービス: install していません"),
+            None if job.exists() => println!("{}", crate::t!("Service: stopped", "サービス: 止まっています")),
+            None => println!("{}", crate::t!("Service: not installed", "サービス: install していません")),
         }
         o.status.code().unwrap_or(-1)
     }
@@ -419,7 +421,7 @@ impl Service {
         match Self::ctl_command(cmd).args(args).status() {
             Ok(s) => s.code().unwrap_or(-1),
             Err(e) => {
-                eprintln!("{cmd} が実行できません: {e}");
+                eprintln!("{}", crate::t!("Couldn't run {cmd}: {e}", "{cmd} が実行できません: {e}"));
                 -1
             }
         }
@@ -504,9 +506,14 @@ impl Service {
         };
         if has("SLACK_BOT_TOKEN") && has("SLACK_APP_TOKEN") {
             println!(
-                "このマシンは親として設定済みです。.env は書き換えません。\n  \
-                 設定ファイル: {}",
-                env_file.display()
+                "{}",
+                crate::t!(
+                    "This machine is already set up as the gateway. Leaving .env as it is.\n  \
+                     Settings: {}",
+                    "このマシンはゲートウェイとして設定済みです。.env は書き換えません。\n  \
+                     設定ファイル: {}",
+                    env_file.display()
+                )
             );
             return Ok(());
         }
@@ -515,39 +522,61 @@ impl Service {
             || (has("AGENTGW_LINK_LISTEN") && has("AGENTGW_LINK_TOKEN"))
         {
             println!(
-                "このマシンは子として設定済みです。.env は書き換えません。\n  \
-                 設定ファイル: {}",
-                env_file.display()
+                "{}",
+                crate::t!(
+                    "This machine is already connected to a gateway. Leaving .env as it is.\n  \
+                     Settings: {}",
+                    "このマシンはゲートウェイにつながる設定済みです。.env は書き換えません。\n  \
+                     設定ファイル: {}",
+                    env_file.display()
+                )
             );
             return Ok(());
         }
         if !std::io::stdin().is_terminal() {
-            return Err(format!(
-                "端末ではないので役割を訊けません。{} に、親なら SLACK_BOT_TOKEN= と \
-                 SLACK_APP_TOKEN= を、子なら接続文字列を `agentgw link` で\
-                 書いてから install し直してください",
+            return Err(crate::t!(
+                "There's no terminal to ask which role this machine plays. For the gateway, put \
+                 SLACK_BOT_TOKEN= and SLACK_APP_TOKEN= in {} and run install again; for any other \
+                 machine, run `agentgw add-machine` on the gateway instead.",
+                "端末が無いので、このマシンの役割を訊けません。ゲートウェイにするなら {} に \
+                 SLACK_BOT_TOKEN= と SLACK_APP_TOKEN= を書いて install し直してください。\
+                 ほかのマシンは、ゲートウェイで `agentgw add-machine` を実行して加えます。",
                 env_file.display()
             ));
         }
         println!(
-            "\nこのマシンの役割は?\n  \
-             1) 親 — Slack に直接つなぐ(Slack app 1つにつき1台だけ)\n  \
-             2) 子 — 別のマシンの親にぶら下がる"
+            "{}",
+            crate::t!(
+                "\nWhat role does this machine play?\n  \
+                 1) Gateway — connects to Slack (one per Slack app)\n  \
+                 2) Machine — works for a gateway on another machine",
+                "\nこのマシンの役割を選んでください。\n  \
+                 1) ゲートウェイ — Slack につなぐ(Slack アプリ1つにつき1台)\n  \
+                 2) マシン — 別のマシンのゲートウェイの下で動く"
+            )
         );
         match Self::prompt("> ").as_str() {
             "1" | "" => Self::ask_parent(state_dir),
             "2" => Self::ask_child(state_dir),
-            other => Err(format!("1 か 2 を選んでください(受け取ったのは {other:?})")),
+            other => Err(crate::t!("Choose 1 or 2 (got {other:?})", "1 か 2 を選んでください(受け取ったのは {other:?})")),
         }
     }
 
     /// 子として設定する — 親が出した接続文字列1本と、このマシンの名前。
     fn ask_child(state_dir: &StateDir) -> Result<(), String> {
-        let raw = Self::prompt("  親から渡された接続文字列 (SCLINK1-…): ");
+        let raw = Self::prompt(&crate::t!(
+            "  Connection string from the gateway (SCLINK1-…): ",
+            "  ゲートウェイから受け取った接続文字列 (SCLINK1-…): "
+        ));
         let conn = crate::bridge::relay::link::decode_connection(&raw)?;
         // 名前は自動で決めない(衝突したマシンは互いの Slack メッセージを奪い合う)
         let name = crate::bridge::link::prompt_bridge_id()
-            .ok_or_else(|| "このマシンの名前が要ります(`route <名前>` の指名先)".to_string())?;
+            .ok_or_else(|| {
+                crate::t!(
+                    "This machine needs a name (it's what `route <name>` points at)",
+                    "このマシンの名前が要ります(`route <名前>` の指名先)"
+                )
+            })?;
         let env_file = state_dir.join(".env");
         let before = std::fs::read_to_string(&env_file).unwrap_or_default();
         let after = crate::bridge::link::apply_connection(&before, &conn, &name);
@@ -556,8 +585,12 @@ impl Service {
         crate::bridge::state::write_atomic_mode(&env_file, &after, Some(0o600))
             .map_err(|e| format!("{}: {e}", env_file.display()))?;
         println!(
-            "子「{name}」として書きました: {} (chmod 600)",
-            env_file.display()
+            "{}",
+            crate::t!(
+                "Saved as machine \"{name}\": {} (chmod 600)",
+                "マシン「{name}」として保存しました: {} (chmod 600)",
+                env_file.display()
+            )
         );
         Ok(())
     }
@@ -571,17 +604,26 @@ impl Service {
         // (Interactivity を忘れるとボタンが届かない、DM タブを忘れると login できない)
         let url = SlackApp::create_url();
         println!(
-            "Slack アプリがまだ無ければ、次の URL で設定済みのまま作れます:\n  {url}\n\
-             作ったら (1) ワークスペースにインストールして Bot User OAuth Token(xoxb-…)を、\n\
-             (2) Basic Information → App-Level Tokens で connections:write のトークン(xapp-…)を作って、\n\
-             下に貼ってください。\n"
+            "{}",
+            crate::t!(
+                "No Slack app yet? This link creates one with everything pre-configured:\n  {url}\n\
+                 Then (1) install it to your workspace and copy the Bot User OAuth Token (xoxb-…), and\n\
+                 (2) under Basic Information → App-Level Tokens, create a token with connections:write (xapp-…).\n\
+                 Paste both below.\n",
+                "Slack アプリがまだ無ければ、次の URL で設定済みのまま作れます:\n  {url}\n\
+                 作ったら (1) ワークスペースにインストールして Bot User OAuth Token(xoxb-…)を、\n\
+                 (2) Basic Information → App-Level Tokens で connections:write のトークン(xapp-…)を作って、\n\
+                 下に貼ってください。\n"
+            )
         );
         SlackApp::open_in_browser(&url);
-        println!("Slack のトークンを貼ってください。");
+        println!("{}", crate::t!("Paste your Slack tokens.", "Slack のトークンを貼ってください。"));
         let bot = Self::prompt("  bot token (xoxb-…): ");
         let app = Self::prompt("  app token (xapp-…): ");
         if bot.is_empty() || app.is_empty() {
-            return Err(format!(
+            return Err(crate::t!(
+                "No tokens were entered. To install without prompts, put SLACK_BOT_TOKEN= and \
+                 SLACK_APP_TOKEN= in {} and run install again.",
                 "トークンが入力されませんでした。非対話で入れるなら {} に \
                  SLACK_BOT_TOKEN= と SLACK_APP_TOKEN= を書いてから install し直してください",
                 env_file.display()
@@ -610,7 +652,14 @@ impl Service {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&env_file, std::fs::Permissions::from_mode(0o600));
         }
-        println!("トークンを書きました: {} (chmod 600)", env_file.display());
+        println!(
+            "{}",
+            crate::t!(
+                "Saved the tokens: {} (chmod 600)",
+                "トークンを保存しました: {} (chmod 600)",
+                env_file.display()
+            )
+        );
         Ok(())
     }
 
@@ -618,8 +667,13 @@ impl Service {
     pub fn run(cmd: &str, rest: &[String]) -> i32 {
         if !cfg!(target_os = "macos") && !cfg!(target_os = "linux") {
             eprintln!(
-                "このプラットフォームにはサービスの実装がありません(macOS=launchd / Linux=systemd)。\
-                 `agentgw serve` を手で起こしてください"
+                "{}",
+                crate::t!(
+                    "There's no service support for this platform (macOS uses launchd, Linux uses \
+                     systemd). Run `agentgw serve` yourself.",
+                    "このプラットフォームにはサービスの実装がありません(macOS=launchd / Linux=systemd)。\
+                     `agentgw serve` を手で起こしてください"
+                )
             );
             return 2;
         }
@@ -655,7 +709,7 @@ impl Service {
             "uninstall" => Self::uninstall(mac, &job),
             "restart" => Self::graceful_restart(mac, &job),
             other => {
-                eprintln!("知らないサブコマンドです: {other}");
+                eprintln!("{}", crate::t!("Unknown command: {other}", "知らないサブコマンドです: {other}"));
                 2
             }
         }
@@ -676,8 +730,8 @@ impl Service {
             );
         }
         match std::fs::remove_file(job) {
-            Ok(()) => println!("消しました: {}", job.display()),
-            Err(e) => println!("消すものがありません({}): {e}", job.display()),
+            Ok(()) => println!("{}", crate::t!("Removed {}", "消しました: {}", job.display())),
+            Err(e) => println!("{}", crate::t!("Nothing to remove ({}): {e}", "消すものがありません({}): {e}", job.display())),
         }
         if !mac {
             Self::run_ctl(
@@ -685,7 +739,7 @@ impl Service {
                 &Action::systemctl_argv("daemon-reload", &Self::unit()),
             );
         }
-        println!("トークンと状態ディレクトリはそのままです。");
+        println!("{}", crate::t!("Your tokens and the state directory are left in place.", "トークンと状態ディレクトリはそのままです。"));
         0
     }
 
@@ -698,7 +752,7 @@ impl Service {
         let program = match std::env::current_exe() {
             Ok(p) => p.to_string_lossy().to_string(),
             Err(e) => {
-                eprintln!("install: 自分の実行パスが引けません: {e}");
+                eprintln!("install: {}", crate::t!("couldn't find my own path: {e}", "自分の実行パスが引けません: {e}"));
                 return 1;
             }
         };
@@ -720,24 +774,23 @@ impl Service {
             spec.systemd_unit()
         };
         if let Err(e) = crate::bridge::state::write_atomic_at(job, &text) {
-            eprintln!("install: {} が書けません: {e}", job.display());
+            eprintln!("install: {}", crate::t!("couldn't write {}: {e}", "{} が書けません: {e}", job.display()));
             return 1;
         }
         // 「.env は書き換えません」の直後に来る行。**何を書いたのかを言い分ける** —
         // どちらも「設定」と呼ぶと、書かないと言った直後に書いたことになって読めない
-        println!("サービスの定義は書き直しました: {}", job.display());
-        println!(
-            "  サービス名: {}",
-            if mac { Self::label() } else { Self::unit() }
-        );
-        println!("  状態の置き場: {}", spec.state_dir);
+        println!("{}", crate::t!("Wrote the service definition: {}", "サービスの定義を書きました: {}", job.display()));
+        let name = if mac { Self::label() } else { Self::unit() };
+        println!("{}", crate::t!("  Service name: {name}", "  サービス名: {name}"));
+        let state = &spec.state_dir;
+        println!("{}", crate::t!("  State directory: {state}", "  状態を置くディレクトリ: {state}"));
         if mac {
             // **この定義が今すぐ効くのは、次に起動したときだけ。** launchd は起動時の定義を
             // 握ったままなので restart では古い方が起き直る。ただしそれを毎回説くのは
             // うるさい — 効かせ方は1行で足りる。
             // 呼び手が直後に起こし直すなら**言わない** — 読んだ人が同じことを手で打つ
             if !rest.iter().any(|a| a == "--no-restart-hint") {
-                println!("  反映するには: agentgw shutdown && agentgw start");
+                println!("{}", crate::t!("  To apply it: agentgw shutdown && agentgw start", "  反映するには: agentgw shutdown && agentgw start"));
             }
         } else {
             Self::run_ctl(
@@ -752,8 +805,13 @@ impl Service {
             let user = std::env::var("USER").unwrap_or_default();
             if Self::run_ctl("loginctl", &["enable-linger".to_string(), user.clone()]) != 0 {
                 println!(
-                    "NOTE: linger を有効にできませんでした。ログアウト後も動かすなら1回だけ:\n  \
-                     sudo loginctl enable-linger {user}"
+                    "{}",
+                    crate::t!(
+                        "NOTE: couldn't enable linger. To keep agentgw running after you log out, run once:\n  \
+                         sudo loginctl enable-linger {user}",
+                        "NOTE: linger を有効にできませんでした。ログアウト後も動かすなら1回だけ:\n  \
+                         sudo loginctl enable-linger {user}"
+                    )
                 );
             }
         }
@@ -763,9 +821,13 @@ impl Service {
     /// SIGUSR1 を送って降りるのを待つ。待ちきれなければサービスマネージャの強制再起動に落とす
     fn graceful_restart(mac: bool, job: &Path) -> i32 {
         let force = |why: &str| -> i32 {
+            let manager = if mac { "launchd" } else { "systemd" };
             println!(
-                "  行儀よく降りられませんでした({why})— {} に強制的に再起動させます",
-                if mac { "launchd" } else { "systemd" }
+                "{}",
+                crate::t!(
+                    "  agentgw didn't stop on its own ({why}), so {manager} will restart it",
+                    "  agentgw が自分で止まれなかったので({why})、{manager} に再起動させます"
+                )
             );
             if mac {
                 Self::run_ctl(
@@ -784,19 +846,19 @@ impl Service {
             }
         };
         let Some(pid) = Self::service_pid() else {
-            return force("走っている Bridge の pid が引けない");
+            return force(&crate::t!("agentgw isn't running", "agentgw が動いていません"));
         };
         // **ワーカーは畳まれない。** 畳むのは shutdown と logout だけで、maintenance restart は
         // 在庫をそのまま残す(後継が pools.json の指名で拾い直す)。ここで「片付けてから降ります」と
         // 言っていたせいで、デプロイを「会話が切れるから」と遠慮する読み方が生まれた
-        println!("  再起動します(走っているワーカーはそのまま、Bridge だけ入れ替わります)");
+        println!("{}", crate::t!("  Restarting agentgw. Running agents keep going.", "  agentgw を再起動します。動いているエージェントはそのまま続きます。"));
         if !std::process::Command::new("kill")
             .args(["-USR1", &pid.to_string()])
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
         {
-            return force(&format!("pid {pid} への SIGUSR1 が失敗"));
+            return force(&crate::t!("couldn't signal it to stop", "止める合図を送れませんでした"));
         }
         let mut waited = 0u64;
         loop {
@@ -807,7 +869,7 @@ impl Service {
                 GRACEFUL_RESTART_TIMEOUT_MS,
             ) {
                 RestartStep::Gone => {
-                    println!("  入れ替わりました");
+                    println!("{}", crate::t!("  Restarted.", "  再起動しました。"));
                     return 0;
                 }
                 RestartStep::Force(why) => return force(&why),

@@ -60,8 +60,13 @@ const RETRY_NUM: u32 = 0;
 /// 同じ失敗が2度出るなら本物なので、ループを見せるより人に伝える。
 const TURN_FAILURE_RETRY_CAP: u32 = 1;
 
-/// セッションの無いスレッドに返す1行(全コマンド共通の原文)。
-const NO_SESSION: &str = "このスレッドにはまだ実行中のセッションがありません。一度メッセージを送ってセッションを開始してからお試しください。";
+/// セッションの無いスレッドに返す1行(全コマンド共通)。
+fn no_session() -> String {
+    crate::t!(
+        "This thread has no session running yet. Send a message to start one first.",
+        "このスレッドには、まだ動いているセッションがありません。先にメッセージを送ってセッションを始めてください。"
+    )
+}
 
 /// spawn したコマンドが main ループへ返す状態変更の便り。
 ///
@@ -129,8 +134,12 @@ const CODE_POLL_MAX: u32 = 30;
 /// 再開します」だが、Rust の restart が降ろすのは Bridge だけで、ワーカーも在庫も畳まない
 /// (後継が継承する)。止めていないものを「再開する」と言うのは二重に嘘 — 自動再開の仕組みも
 /// まだ無い(`maintenance_restart` の ponytail 注記)。事実だけを言う。
-const RESTART_NOTICE: &str = "🙏 メンテナンスのため Bridge を数秒だけ再起動します。作業中のワーカーは止めないので、\
-     処理はそのまま続きます。";
+fn restart_notice() -> String {
+    crate::t!(
+        "🙏 agentgw is restarting for a few seconds. Running agents aren't stopped, so their work continues.",
+        "🙏 agentgw を数秒だけ再起動します。動いているエージェントは止めないので、作業はそのまま続きます。"
+    )
+}
 
 /// プール worker が MCP を上げるまでの猶予(worker.ts の `MCP_INIT_TIMEOUT_MS` と同値)。
 /// これを超えたら諦める(= 実体ごと畳んで在庫から消す)。
@@ -740,7 +749,7 @@ impl Bridge {
                         self.post_error_frame(
                             msg.channel.clone(),
                             root_ts.clone(),
-                            format!("ワーカーに渡せませんでした: {e}"),
+                            crate::t!("Couldn't hand this to the agent: {e}", "エージェントに渡せませんでした: {e}"),
                         );
                     }
                 }
@@ -928,11 +937,13 @@ impl Bridge {
                 self.post(
                     &msg.channel,
                     root_ts,
-                    format!(
-                        "既にサインイン済みです（Owner: <@{}>）。別のアカウントに切り替えるには、\
-                         一度 `logout` を送ってから `login` してください。",
-                        self.access.owner
-                    ),
+                    {
+                        let owner = &self.access.owner;
+                        crate::t!(
+                            "Already signed in (owner: <@{owner}>). To switch accounts, send `logout`, then `login`.",
+                            "既にサインインしています(Owner: <@{owner}>)。アカウントを切り替えるには、`logout` のあとに `login` を送ってください。"
+                        )
+                    },
                     key,
                 );
             }
@@ -1261,7 +1272,7 @@ impl Bridge {
             self.post(
                 &msg.channel,
                 root_ts,
-                "いま中断するものはありません。".to_string(),
+                crate::t!("Nothing is running right now.", "いま止めるものはありません。"),
                 key,
             );
             return;
@@ -1383,7 +1394,7 @@ impl Bridge {
             // ここで guard を持っても set と clear が連続して飛ぶだけで一度も描画されない。
             // 実際に待つのは「返事が捌けるか30秒」を待つドレイン側(現行 Bun に原文なし)
             let thinking =
-                slack::Thinking::new(&self.api, &msg.channel, root_ts, slack::STATUS_RESUME);
+                slack::Thinking::new(&self.api, &msg.channel, root_ts, &slack::status_resume());
             self.push_drain(key, sid, None, Some(thinking), ctx);
         }
     }
@@ -1545,7 +1556,7 @@ impl Bridge {
             self.post(
                 &channel,
                 &thread_ts,
-                "おつかれ様でした、セッションを終了します。".to_string(),
+                crate::t!("Ending this session. Your next message here starts it again.", "このセッションを終えます。次にこのスレッドに書けば、また始まります。"),
                 key,
             );
             ctx.info(
@@ -1566,7 +1577,7 @@ impl Bridge {
                 "bridge",
                 &format!("context: no bound session for thread tts={root_ts} — nothing to probe"),
             );
-            self.post(&msg.channel, root_ts, NO_SESSION.to_string(), key);
+            self.post(&msg.channel, root_ts, no_session(), key);
             return;
         };
         let cwd = entry
@@ -1585,7 +1596,7 @@ impl Bridge {
             key.clone(),
         );
         let thinking =
-            slack::Thinking::new(&self.api, &msg.channel, root_ts, slack::STATUS_CONTEXT);
+            slack::Thinking::new(&self.api, &msg.channel, root_ts, &slack::status_context());
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = クリア(probe が失敗しても消える)
             let ctx = LogCtx {
@@ -1612,7 +1623,7 @@ impl Bridge {
                                      output for {channel}:{root}"
                                 ),
                             );
-                            "コンテキストの取得結果を読み取れませんでした。".to_string()
+                            crate::t!("Couldn't read the context usage.", "コンテキストの使用量を読み取れませんでした。")
                         }
                     }
                 }
@@ -1628,14 +1639,14 @@ impl Bridge {
                             "slack-events: context command probe failed for {channel}:{root}: {e}"
                         ),
                     );
-                    "コンテキストの取得に失敗しました。もう一度お試しください。".to_string()
+                    crate::t!("Couldn't get the context usage. Try again.", "コンテキストの使用量を取得できませんでした。もう一度試してください。")
                 }
                 Err(ProbeErr::Errored(e)) => {
                     ctx.error(
                         "bridge",
                         &format!("slack-events: context command errored for {channel}:{root}: {e}"),
                     );
-                    "コンテキストの取得中にエラーが発生しました。".to_string()
+                    crate::t!("Something went wrong while getting the context usage.", "コンテキストの使用量を取得する途中でエラーが起きました。")
                 }
             };
             api.post_now(&channel, &root, out, &key).await;
@@ -1654,7 +1665,7 @@ impl Bridge {
             root_ts.to_string(),
             key.clone(),
         );
-        let thinking = slack::Thinking::new(&self.api, &msg.channel, root_ts, slack::STATUS_USAGE);
+        let thinking = slack::Thinking::new(&self.api, &msg.channel, root_ts, &slack::status_usage());
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = クリア
             let ctx = LogCtx {
@@ -1681,7 +1692,7 @@ impl Bridge {
                                      output for {channel}:{root}"
                                 ),
                             );
-                            "使用状況の取得結果を読み取れませんでした。".to_string()
+                            crate::t!("Couldn't read your usage.", "使用状況を読み取れませんでした。")
                         }
                     }
                 }
@@ -1693,14 +1704,14 @@ impl Bridge {
                             "slack-events: usage command probe failed for {channel}:{root}: {e}"
                         ),
                     );
-                    "使用状況の取得に失敗しました。もう一度お試しください。".to_string()
+                    crate::t!("Couldn't get your usage. Try again.", "使用状況を取得できませんでした。もう一度試してください。")
                 }
                 Err(ProbeErr::Errored(e)) => {
                     ctx.error(
                         "bridge",
                         &format!("slack-events: usage command errored for {channel}:{root}: {e}"),
                     );
-                    "使用状況の取得中にエラーが発生しました。".to_string()
+                    crate::t!("Something went wrong while getting your usage.", "使用状況を取得する途中でエラーが起きました。")
                 }
             };
             api.post_now(&channel, &root, out, &key).await;
@@ -1724,7 +1735,7 @@ impl Bridge {
                 "bridge",
                 &format!("{label}: no bound session for thread tts={root_ts} — {no_session_tail}"),
             );
-            return Err(NO_SESSION.to_string());
+            return Err(no_session());
         };
         let name = SessionId::from(sid.clone()).window_name();
         let window_id = self.workers.window_of(&sid);
@@ -1738,8 +1749,9 @@ impl Bridge {
                     pending.len()
                 ),
             );
-            return Err(format!(
-                "いま処理中です。`stop` で止めてから `{label}` してください。"
+            return Err(crate::t!(
+                "The agent is busy. Send `stop` first, then `{label}`.",
+                "エージェントが作業中です。`stop` で止めてから `{label}` を送ってください。"
             ));
         }
         Ok((Window::of(window_id.as_deref().unwrap_or(&name)), sid))
@@ -1811,7 +1823,7 @@ impl Bridge {
             root_ts.to_string(),
             key.clone(),
         );
-        let thinking = slack::Thinking::new(&self.api, &msg.channel, root_ts, slack::STATUS_MODEL);
+        let thinking = slack::Thinking::new(&self.api, &msg.channel, root_ts, &slack::status_model());
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = クリア(TUI が確定しなくても消える)
             let ctx = LogCtx {
@@ -1822,9 +1834,9 @@ impl Bridge {
             // None = このエージェントが model 切替に非対応。実体が1つの今は起きない
             let done = agent.set_model(&target, &name, &key, &ctx).await == Some(true);
             let out = if done {
-                format!("✅ このスレッドのモデルを *{name}* に切り替えました。")
+                crate::t!("✅ Switched this thread's model to *{name}*.", "✅ このスレッドのモデルを *{name}* に切り替えました。")
             } else {
-                "モデルの切替に失敗しました。もう一度お試しください。".to_string()
+                crate::t!("Couldn't switch the model. Try again.", "モデルを切り替えられませんでした。もう一度試してください。")
             };
             api.post_now(&channel, &root, out, &key).await;
         });
@@ -1839,7 +1851,7 @@ impl Bridge {
                 "bridge",
                 &format!("model: no bound session for thread tts={root_ts} — no current model"),
             );
-            self.post(&msg.channel, root_ts, NO_SESSION.to_string(), key);
+            self.post(&msg.channel, root_ts, no_session(), key);
             return;
         };
         let short: String = sid.chars().take(8).collect();
@@ -1850,7 +1862,7 @@ impl Bridge {
             .warm(&sid)
             .and_then(|h| h.transcript_path.clone());
         let found = self.agent.current_model(remembered.as_deref(), &sid);
-        const FAILED: &str = "現在のモデルを取得できませんでした。";
+        let failed = || crate::t!("Couldn't read the current model.", "今のモデルを読み取れませんでした。");
         let out = match found {
             None => {
                 ctx.info(
@@ -1860,7 +1872,7 @@ impl Bridge {
                          cannot read current model"
                     ),
                 );
-                FAILED.to_string()
+                failed()
             }
             Some(read) => match read {
                 Err(e) => {
@@ -1868,7 +1880,7 @@ impl Bridge {
                         "bridge",
                         &format!("model: transcript read failed for session={short}: {e}"),
                     );
-                    FAILED.to_string()
+                    failed()
                 }
                 Ok(model) => match model {
                     None => {
@@ -1876,7 +1888,7 @@ impl Bridge {
                             "bridge",
                             &format!("model: no model id in transcript tail of session={short}"),
                         );
-                        FAILED.to_string()
+                        failed()
                     }
                     Some(model) => {
                         ctx.info(
@@ -1884,8 +1896,8 @@ impl Bridge {
                             &format!("model: current={model} session={short} key={key}"),
                         );
                         match self.agent.model_alias(&model) {
-                            Some(alias) => format!("現在のモデル: *{alias}* (`{model}`)"),
-                            None => format!("現在のモデル: `{model}`"),
+                            Some(alias) => crate::t!("Model: *{alias}* (`{model}`)", "モデル: *{alias}*(`{model}`)"),
+                            None => crate::t!("Model: `{model}`", "モデル: `{model}`"),
                         }
                     }
                 },
@@ -1931,7 +1943,7 @@ impl Bridge {
             tokio::spawn(Self::run_effort_show(api, channel, root, key, target, sid));
             return;
         };
-        let thinking = slack::Thinking::new(&self.api, &msg.channel, root_ts, slack::STATUS_EFFORT);
+        let thinking = slack::Thinking::new(&self.api, &msg.channel, root_ts, &slack::status_effort());
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = クリア
             let ctx = LogCtx {
@@ -1942,9 +1954,9 @@ impl Bridge {
             // None = このエージェントが effort に非対応。実体が1つの今は起きない
             let done = agent.set_effort(&target, &level, &key, &ctx).await == Some(true);
             let out = if done {
-                format!("✅ このスレッドの effort level を *{level}* に設定しました。")
+                crate::t!("✅ Set this thread's effort level to *{level}*.", "✅ このスレッドの effort を *{level}* にしました。")
             } else {
-                "effort level の設定に失敗しました。もう一度お試しください。".to_string()
+                crate::t!("Couldn't set the effort level. Try again.", "effort を設定できませんでした。もう一度試してください。")
             };
             api.post_now(&channel, &root, out, &key).await;
         });
@@ -1979,8 +1991,8 @@ impl Bridge {
         // 読むだけなら tmux を1回叩くだけ — spawn も shimmer も要らない
         let Some(name) = name else {
             let out = match Agent::real().mode(&target, &ctx) {
-                Some(m) => format!("現在の権限モード: *{m}*"),
-                None => "現在の権限モードを取得できませんでした。".to_string(),
+                Some(m) => crate::t!("Permission mode: *{m}*", "権限モード: *{m}*"),
+                None => crate::t!("Couldn't read the permission mode.", "権限モードを読み取れませんでした。"),
             };
             self.post(&msg.channel, root_ts, out, key);
             return;
@@ -1991,14 +2003,14 @@ impl Bridge {
             root_ts.to_string(),
             key.clone(),
         );
-        let thinking = slack::Thinking::new(&self.api, &msg.channel, root_ts, slack::STATUS_MODE);
+        let thinking = slack::Thinking::new(&self.api, &msg.channel, root_ts, &slack::status_mode());
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = クリア
             let done = Agent::real().set_mode(&target, &name, &key, &ctx).await == Some(true);
             let out = if done {
-                format!("✅ このスレッドの権限モードを *{name}* にしました。")
+                crate::t!("✅ Switched this thread's permission mode to *{name}*.", "✅ このスレッドの権限モードを *{name}* にしました。")
             } else {
-                "権限モードの切替に失敗しました。もう一度お試しください。".to_string()
+                crate::t!("Couldn't switch the permission mode. Try again.", "権限モードを切り替えられませんでした。もう一度試してください。")
             };
             api.post_now(&channel, &root, out, &key).await;
         });
@@ -2070,7 +2082,7 @@ impl Bridge {
             .collect();
         // 集計は permalink とチャンネル名の解決でスレッド数ぶん Slack を叩く — 待つ間の shimmer
         let thinking =
-            slack::Thinking::new(&self.api, &msg.channel, root_ts, slack::STATUS_GATHERING);
+            slack::Thinking::new(&self.api, &msg.channel, root_ts, &slack::status_gathering());
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = クリア。どの経路で抜けても消える
             let ctx = LogCtx {
@@ -2135,7 +2147,7 @@ impl Bridge {
         };
         match mode {
             PwdMode::Current => {
-                entry(&self.access, &msg.channel).render("このチャンネルのプロジェクトパス")
+                entry(&self.access, &msg.channel).render(&crate::t!("Project directory for this channel", "このチャンネルの作業ディレクトリ"))
             }
             PwdMode::All => {
                 let all: Vec<_> = self
@@ -2218,11 +2230,14 @@ impl Bridge {
                 };
                 let Some(channel) = ch else {
                     let usage = if dm && oc.args.len() < 2 {
-                        "DM のワーカーは常に事前起動されます。チャンネルを指定してください: `warm on|off <#channel>`"
+                        crate::t!(
+                            "The agent for DMs is always started ahead of time. Name a channel: `warm on|off <#channel>`",
+                            "DM のエージェントは常に先に起動しています。チャンネルを指定してください: `warm on|off <#channel>`"
+                        )
                     } else {
-                        "使い方: `warm on|off [<#channel>]`"
+                        crate::t!("Usage: `warm on|off [<#channel>]`", "使い方: `warm on|off [<#channel>]`")
                     };
-                    self.post(&msg.channel, root_ts, usage.to_string(), key);
+                    self.post(&msg.channel, root_ts, usage, key);
                     return;
                 };
                 bridge::AccessOp::SetWarm { channel, on }
@@ -2230,8 +2245,11 @@ impl Bridge {
             // Home は実在のチャンネルでなければならない — 打たれたその場所が Home になる
             "set-home" => {
                 if dm || !crate::bridge::command::SlackId::is_channel(&msg.channel) {
-                    let refusal = "`set-home` は Home にしたい *チャンネル* で実行してください（DM は Home にできません）。";
-                    self.post(&msg.channel, root_ts, refusal.to_string(), key);
+                    let refusal = crate::t!(
+                        "Run `set-home` in the *channel* you want notices in. A DM can't be the notice channel.",
+                        "`set-home` は、通知を出したい *チャンネル* で実行してください。DM は通知先にできません。"
+                    );
+                    self.post(&msg.channel, root_ts, refusal, key);
                     return;
                 }
                 bridge::AccessOp::SetHome(msg.channel.clone())
@@ -2246,7 +2264,7 @@ impl Bridge {
                         self.post(
                             &msg.channel,
                             root_ts,
-                            format!("使い方: `{verb} <@bot>`"),
+                            crate::t!("Usage: `{verb} <@bot>`", "使い方: `{verb} <@bot>`"),
                             key,
                         );
                         return;
@@ -2254,8 +2272,9 @@ impl Bridge {
                     match self.api.resolve_bot_id(&uid).await {
                         Ok(Some(b)) => b,
                         Ok(None) => {
-                            let human = format!(
-                                "{verb} は BOT を指定してください（それは人間のメンションでした）。"
+                            let human = crate::t!(
+                                "`{verb}` needs a bot — that mention is a person.",
+                                "`{verb}` にはボットを指定してください。今のメンションは人です。"
                             );
                             self.post(&msg.channel, root_ts, human, key);
                             return;
@@ -2367,8 +2386,10 @@ impl Bridge {
                 self.post(
                     ch,
                     &reply_ts,
-                    "この bot はまだサインインされていません。`login` と送るとサインインを開始します。"
-                        .to_string(),
+                    crate::t!(
+                        "Claude Code isn't signed in yet. Send `login` to sign in.",
+                        "Claude Code はまだサインインしていません。`login` と送るとサインインを始めます。"
+                    ),
                     &key,
                 );
             }
@@ -2396,8 +2417,10 @@ impl Bridge {
             self.post(
                 &channel,
                 &reply_ts,
-                "別のサインインが進行中です。少し待ってからもう一度 `login` と送ってください。"
-                    .to_string(),
+                crate::t!(
+                    "Another sign-in is in progress. Wait a moment, then send `login` again.",
+                    "別のサインインが進行中です。少し待ってから、もう一度 `login` と送ってください。"
+                ),
                 &key,
             );
             return;
@@ -2414,7 +2437,7 @@ impl Bridge {
         self.login_pending.insert(channel.clone(), user.clone());
         let (api, cmd_tx, home) = (self.api.clone(), self.cmd_tx.clone(), Host::home());
         // サインインは URL を出してからコードを待つ数十秒 — その間ずっと shimmer を出す
-        let thinking = slack::Thinking::new(&self.api, &channel, &reply_ts, slack::STATUS_LOGIN);
+        let thinking = slack::Thinking::new(&self.api, &channel, &reply_ts, &slack::status_login());
         // `thinking` は本文で触るので async move が丸ごと持っていく(どの経路で抜けても Drop = クリア)
         tokio::spawn(async move {
             let ctx = LogCtx::default();
@@ -2438,7 +2461,7 @@ impl Bridge {
                     // URL が出るまで最大 URL_POLL_MAX 秒 — Slack はそれより早く status を
                     // 失効させるので tick ごとに張り直す(compact と同じ理由)。
                     // 張り直さないと途中で shimmer が消えて「止まった」に見える
-                    thinking.set(slack::STATUS_LOGIN);
+                    thinking.set(&slack::status_login());
                     url = agent.login_url();
                     if url.is_some() {
                         break;
@@ -2461,14 +2484,16 @@ impl Bridge {
                         bound: None,
                     })
                     .await;
-                api.post_now(&channel, &reply_ts, "サインインを開始できませんでした。少し待ってからもう一度 `login` と送ってください。"
-                        .to_string(), &key)
+                api.post_now(&channel, &reply_ts, crate::t!(
+                        "Couldn't start the sign-in. Wait a moment, then send `login` again.",
+                        "サインインを始められませんでした。少し待ってから、もう一度 `login` と送ってください。"
+                    ), &key)
                 .await;
                 return;
             };
-            api.post_now(&channel, &reply_ts, format!(
-                    "🔐 サインインを開始しました。\n下の URL をブラウザで開いて認証し、\
-                     表示されたコードを *次のメッセージ* としてこのスレッドに貼り付けてください:\n{url}"
+            api.post_now(&channel, &reply_ts, crate::t!(
+                    "🔐 Open this link in your browser and sign in to Claude, then paste the code it shows as your *next message* in this thread:\n{url}",
+                    "🔐 このリンクをブラウザで開いて Claude にサインインし、表示されたコードを、このスレッドの *次のメッセージ* として貼ってください:\n{url}"
                 ), &key)
             .await;
             ctx.info(
@@ -2494,7 +2519,7 @@ impl Bridge {
         let (api, cmd_tx) = (self.api.clone(), self.cmd_tx.clone());
         // サインインの後半(貼られたコードの判定、最大 CODE_POLL_MAX 秒)も待ち時間 —
         // login_start の guard は URL を出した時点で落ちているので、ここで張り直す
-        let thinking = slack::Thinking::new(&self.api, &channel, &reply_ts, slack::STATUS_LOGIN);
+        let thinking = slack::Thinking::new(&self.api, &channel, &reply_ts, &slack::status_login());
         tokio::spawn(async move {
             let ctx = LogCtx::default();
             let agent = Agent::real();
@@ -2511,7 +2536,7 @@ impl Bridge {
             } else {
                 for _ in 0..CODE_POLL_MAX {
                     tokio::time::sleep(LOGIN_POLL).await;
-                    thinking.set(slack::STATUS_LOGIN); // 失効させない(URL 待ちと同じ)
+                    thinking.set(&slack::status_login()); // 失効させない(URL 待ちと同じ)
                     // scrollback ごと読む: "Login successful." を出した直後に CLI はシェルへ
                     // 戻り、次のポーリングまでに印が画面外へ流れる
                     match agent.login_outcome() {
@@ -2530,7 +2555,10 @@ impl Bridge {
             // セッションの片付けと pending の削除、Owner の書き込みは main の仕事
             let (text, bound) = if outcome == "success" {
                 (
-                    "ログイン完了 ✅ — あなたをこの bot の Owner に設定しました。",
+                    crate::t!(
+                        "Signed in ✅ — you're now the owner of this bot.",
+                        "サインインしました ✅ — あなたがこのボットの Owner になりました。"
+                    ),
                     Some(user),
                 )
             } else {
@@ -2541,7 +2569,10 @@ impl Bridge {
                     ),
                 );
                 (
-                    "サインインに失敗しました（コードが無効か期限切れの可能性があります）。もう一度 `login` と送ってやり直してください。",
+                    crate::t!(
+                        "Sign-in failed — the code may be wrong or expired. Send `login` to try again.",
+                        "サインインできませんでした。コードが違うか、期限が切れた可能性があります。`login` と送ってやり直してください。"
+                    ),
                     None,
                 )
             };
@@ -2572,7 +2603,7 @@ impl Bridge {
         self.signing_out = true;
         // shimmer は `claude auth logout` が返るまで。この後のワーカー畳みは main 側
         // (CmdFx::LogoutFinished)なので、ここで持たせておけば **必ず** 消える
-        let thinking = slack::Thinking::new(&self.api, channel, root_ts, slack::STATUS_LOGOUT);
+        let thinking = slack::Thinking::new(&self.api, channel, root_ts, &slack::status_logout());
         let (cmd_tx, channel, thread_ts) = (
             self.cmd_tx.clone(),
             channel.to_string(),
@@ -2691,7 +2722,7 @@ impl Bridge {
             slack::Api::brief_call(
                 "restart: thinking status set failed",
                 self.api
-                    .set_thinking_status(channel, root_ts, slack::STATUS_RESTART),
+                    .set_thinking_status(channel, root_ts, &slack::status_restart()),
                 ctx,
             )
             .await;
@@ -2721,7 +2752,7 @@ impl Bridge {
             slack::Api::brief_call(
                 &format!("restart notice failed key={key}"),
                 self.api
-                    .post_message_no_unfurl(&channel, RESTART_NOTICE, thread.as_deref()),
+                    .post_message_no_unfurl(&channel, &restart_notice(), thread.as_deref()),
                 ctx,
             )
             .await;
@@ -2843,8 +2874,10 @@ impl Bridge {
                 self.post(
                     &channel,
                     &thread_ts,
-                    "ログアウトしました。再度使うには `login` を送ってサインインしてください。"
-                        .to_string(),
+                    crate::t!(
+                        "Signed out. Send `login` to sign in again.",
+                        "サインアウトしました。また使うときは `login` と送ってサインインしてください。"
+                    ),
                     &key,
                 );
             }
@@ -2878,7 +2911,10 @@ impl Bridge {
                             ),
                         );
                         self.post_notice(
-                            "⚠️ ワーカーがサインイン画面で止まりました。`login` と送ってサインインし直してください。",
+                            &crate::t!(
+                                "⚠️ An agent stopped at Claude's sign-in screen. Send `login` to sign in again.",
+                                "⚠️ エージェントが Claude のサインイン画面で止まりました。`login` と送ってサインインし直してください。"
+                            ),
                             &ctx,
                         )
                         .await;
@@ -3449,9 +3485,9 @@ impl Bridge {
                 continue;
             }
             let why = if row.is_empty_shell() {
-                "claude が終了して殻だけ残った"
+                "claude exited and left an empty window"
             } else if !owned.contains(&sid) {
-                "どのスレッドにも在庫にも属していない"
+                "belongs to no thread and no warm pool"
             } else {
                 continue;
             };
@@ -4263,7 +4299,7 @@ impl Bridge {
                     }
                     .info(
                         "bridge",
-                        "slack-events: stall watchdog fired — setting 思考中 status",
+                        "slack-events: stall watchdog fired — setting the thinking status",
                     );
                 }
                 bridge::StallAction::Nothing => {}
@@ -5127,7 +5163,7 @@ async fn pump_relay(
         // ここまで来たらリンクは諦めている。**ワーカーには触らない** — 走っているものは
         // 走り続ける。人が設定を直して再起動するまで、新しい Slack メッセージが来ないだけ
         link::FromRelay::Fatal(f) => {
-            LogCtx::default().error("bridge", &format!("remote link: {} — 新しいメッセージは届きません(走っているワーカーはそのままです)", f.message()));
+            LogCtx::default().error("bridge", &format!("remote link: {} — no new messages will arrive (running workers keep going)", f.message()));
         }
     }
 }
@@ -5185,7 +5221,7 @@ impl Bridge {
                         Some(link::FromRelay::Fatal(f)) => {
                             LogCtx::default().error(
                                 "bridge",
-                                &format!("remote link: {} — 直るまで繋ぎ直し続けます", f.message()),
+                                &format!("remote link: {} — retrying until it is fixed", f.message()),
                             );
                             continue;
                         }
@@ -5198,7 +5234,7 @@ impl Bridge {
             // 親が迎えに来る。**待つのは同じ** — 最初の Ready まで Slack には何も書けない
             link::Mode::AwaitParent => {
                 let Some(listen) = wiring.inlet.clone() else {
-                    return Err("親を迎える口の設定がありません".into());
+                    return Err("AGENTGW_LINK_LISTEN is not set, so the gateway has nowhere to connect".into());
                 };
                 let (tx, mut rx) = mpsc::channel(64);
                 let inlet = Arc::new(crate::bridge::relay::Inlet {
@@ -5356,7 +5392,7 @@ impl Bridge {
                 });
             }
             (link::Mode::Relay { .. } | link::Mode::AwaitParent, None) => {
-                unreachable!("親経由のモードは必ず受け皿を持つ")
+                unreachable!("a machine behind a gateway always has a receiver")
             }
         }
 
@@ -5498,9 +5534,7 @@ impl Bridge {
         target: Window,
         sid: String,
     ) {
-        const DONE: &str = "✅ コンテキストの圧縮が完了しました。";
-        const NOTHING: &str = "圧縮するほどのコンテキストがまだありません（履歴が短いため）。";
-        const FAILED: &str = "コンテキストの圧縮に失敗しました。もう一度お試しください。";
+
         let ctx = LogCtx {
             session_id: Some(sid.clone()),
             thread_key: Some(key.clone()),
@@ -5550,14 +5584,20 @@ impl Bridge {
         let progress_ts = progress_ts.into_inner().expect("compact progress ts");
         // None = このエージェントが compact に非対応。実体が1つの今は起きない
         let final_text = match outcome {
-            Some(CompactOutcome::Done) => DONE,
-            Some(CompactOutcome::Nothing) => NOTHING,
-            Some(CompactOutcome::Failed) | None => FAILED,
+            Some(CompactOutcome::Done) => crate::t!("✅ Compacted the context.", "✅ コンテキストを圧縮しました。"),
+            Some(CompactOutcome::Nothing) => crate::t!(
+                "There isn't enough history to compact yet.",
+                "圧縮するほどの履歴がまだありません。"
+            ),
+            Some(CompactOutcome::Failed) | None => crate::t!(
+                "Couldn't compact the context. Try again.",
+                "コンテキストを圧縮できませんでした。もう一度試してください。"
+            ),
         };
         let posted = match &progress_ts {
-            Some(ts) => api.update_message(&channel, ts, final_text).await,
+            Some(ts) => api.update_message(&channel, ts, &final_text).await,
             None => api
-                .post_message_no_unfurl(&channel, final_text, Some(&root))
+                .post_message_no_unfurl(&channel, &final_text, Some(&root))
                 .await
                 .map(|_| ()),
         };
@@ -5579,12 +5619,12 @@ impl Bridge {
         target: Window,
         sid: String,
     ) {
-        const FAILED: &str = "現在の effort level を取得できませんでした。";
+        let failed = || crate::t!("Couldn't read the current effort level.", "今の effort を読み取れませんでした。");
         let agent = Agent::real();
         // None = 非対応か、状態行が読めなかったか — どちらも同じ断りを返す
         let out = match agent.effort(&target, &key, &sid).await {
-            Some(level) => format!("現在の effort level: *{level}*"),
-            None => FAILED.to_string(),
+            Some(level) => crate::t!("Effort level: *{level}*", "effort: *{level}*"),
+            None => failed(),
         };
         api.post_now(&channel, &root, out, &key).await;
     }

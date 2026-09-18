@@ -1053,7 +1053,7 @@ impl Access {
                 if !access.allowed_bots.contains(&id) {
                     access.allowed_bots.push(id.clone());
                 }
-                format!("{id} を許可 bot に追加。")
+                crate::t!("Added {id} to the allowed bots.", "{id} を許可 bot に追加しました。")
             }
             AccessOp::BotRemove(id) => {
                 if !crate::bridge::command::SlackId::is_bot(&id) {
@@ -1062,9 +1062,9 @@ impl Access {
                 let had = access.allowed_bots.contains(&id);
                 access.allowed_bots.retain(|x| *x != id);
                 if had {
-                    format!("{id} を許可 bot から削除。")
+                    crate::t!("Removed {id} from the allowed bots.", "{id} を許可 bot から外しました。")
                 } else {
-                    format!("{id} は許可 bot ではありません。")
+                    crate::t!("{id} is not an allowed bot.", "{id} は許可 bot ではありません。")
                 }
             }
             AccessOp::SetRepo { channel, path } => {
@@ -1074,14 +1074,15 @@ impl Access {
                     ));
                 }
                 if !path.starts_with('/') {
-                    return Err(format!(
-                        "repo_path は絶対パスで指定してください: \"{path}\""
+                    return Err(crate::t!(
+                        "The project path must be absolute: \"{path}\"",
+                        "プロジェクトのパスは絶対パスで指定してください: \"{path}\""
                     ));
                 }
                 access.routes.entry(channel.clone()).or_default().repo_path = Some(path.clone());
                 // `<#C…>` は押せる `#channel-name` に化ける — Owner には自分が打った名前が見える
                 // (生の内部 id ではなく)。。
-                format!("<#{channel}> をプロジェクト `{path}` に紐付けました。")
+                crate::t!("<#{channel}> now uses the project directory `{path}`.", "<#{channel}> をプロジェクト `{path}` に紐付けました。")
             }
             AccessOp::SetWarm { channel, on } => {
                 // warm pool のキーは cwd なので、repo を持つチャンネルにしか意味がない
@@ -1095,15 +1096,17 @@ impl Access {
                 let has_repo = !route.repo_path.as_deref().unwrap_or("").is_empty();
                 route.warm = Some(on);
                 if !has_repo {
-                    warnings.push(format!("<#{channel}> はまだプロジェクトに紐付いていません（そのチャンネルで `pwd ＜絶対パス＞` を設定するまで、この設定は効きません）。"));
+                    warnings.push(crate::t!("<#{channel}> has no project yet. This takes effect once you set one with `pwd <absolute path>` in that channel.", "<#{channel}> はまだプロジェクトに紐付いていません。そのチャンネルで `pwd ＜絶対パス＞` を設定すると効きます。"));
                 }
                 if on {
-                    format!(
-                        "<#{channel}> のワーカーを事前に起動しておきます（最初のメッセージが速くなります）。"
+                    crate::t!(
+                        "An agent for <#{channel}> will be started ahead of time, so the first message gets a faster reply.",
+                        "<#{channel}> のエージェントを前もって起動しておきます。最初のメッセージへの返事が速くなります。"
                     )
                 } else {
-                    format!(
-                        "<#{channel}> のワーカー事前起動をやめました（最初のメッセージは起動を待つぶん遅くなります）。"
+                    crate::t!(
+                        "Agents for <#{channel}> will no longer be started ahead of time. The first message waits for one to start.",
+                        "<#{channel}> のエージェントを前もって起動するのをやめました。最初のメッセージは起動を待つぶん遅くなります。"
                     )
                 }
             }
@@ -1111,7 +1114,7 @@ impl Access {
                 let ch = channel.trim();
                 if ch.is_empty() {
                     access.home_channel = None;
-                    "Home チャンネルの設定を解除しました。".to_string()
+                    crate::t!("The home channel is no longer set.", "Home チャンネルの設定を解除しました。")
                 } else {
                     if !crate::bridge::command::SlackId::is_channel(ch) {
                         return Err(format!(
@@ -1119,7 +1122,7 @@ impl Access {
                         ));
                     }
                     access.home_channel = Some(ch.to_string());
-                    format!("<#{ch}> を Home チャンネルに設定しました。")
+                    crate::t!("<#{ch}> is now the home channel.", "<#{ch}> を Home チャンネルに設定しました。")
                 }
             }
         };
@@ -2687,7 +2690,7 @@ SPACES = padded ";
             })
             .unwrap();
         assert_eq!(a.routes["C1"].repo_path.as_deref(), Some("/repo"));
-        assert_eq!(msg, "<#C1> をプロジェクト `/repo` に紐付けました。");
+        assert_eq!(msg, "<#C1> now uses the project directory `/repo`.");
         assert!(warns.is_empty());
         assert_eq!(prev.routes.len(), 0); // prev は不変
         // 相対パスは拒否
@@ -2706,14 +2709,14 @@ SPACES = padded ";
             })
             .unwrap();
         assert_eq!(a2.routes["C2"].warm, Some(true));
-        assert!(msg2.contains("事前に起動しておきます"));
+        assert!(msg2.contains("started ahead of time"));
         assert_eq!(warns2.len(), 1);
         // bot allow は重複しない
         let (a3, _, _) = prev.apply(AccessOp::BotAllow("B9".into())).unwrap();
         let (a4, _, _) = a3.apply(AccessOp::BotAllow("B9".into())).unwrap();
         assert_eq!(a4.allowed_bots, vec!["B9"]);
         let (_, msg5, _) = a4.apply(AccessOp::BotRemove("B0".into())).unwrap();
-        assert_eq!(msg5, "B0 は許可 bot ではありません。");
+        assert_eq!(msg5, "B0 is not an allowed bot.");
     }
 
     #[test]

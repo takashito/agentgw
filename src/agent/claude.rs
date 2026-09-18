@@ -559,7 +559,7 @@ impl Claude {
             }
             tokio::time::sleep(SETTLE).await;
         }
-        unreachable!("ループは i == MAX_PRESSES で必ず返る")
+        unreachable!("the loop always returns at i == MAX_PRESSES")
     }
 
     /// `/compact` を打ち込み、pane のスピナーを `on_progress` に1つずつ渡す

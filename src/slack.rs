@@ -1125,31 +1125,51 @@ pub const THINKING_STATUS: &str = "is thinking…";
 /// **Rust 版は 3s**(2026-07-31 ユーザー判断 — ツール実行後に思考中が戻るまでが遅い)。
 pub const SILENCE_MS: u64 = 3_000;
 /// `status`。
-pub const STATUS_GATHERING: &str = "集計中…";
+pub fn status_gathering() -> String {
+    crate::t!("Gathering…", "集計中…")
+}
 /// `context`。
-pub const STATUS_CONTEXT: &str = "コンテキストを確認中…";
+pub fn status_context() -> String {
+    crate::t!("Checking the context…", "コンテキストを確認中…")
+}
 /// `usage`。
-pub const STATUS_USAGE: &str = "使用状況を確認中…";
+pub fn status_usage() -> String {
+    crate::t!("Checking usage…", "使用状況を確認中…")
+}
 // `compact` の専用ステータスは**意図的に持たない**(Bun からの逸脱 — ユーザー判断)。
 // 以前の実装は compact の間 `コンテキストを圧縮中…` を張り、tick ごとに `… {n}s` 付きへ
 // 張り直していた。Rust 版はこれを持たない — compact は進捗チェックリスト(sticky)を
 // 投稿して編集し続けるので、shimmer と二重で冗長だという判断(**移植漏れではない**)。
 // 配達の `is typing…` と無音の `is thinking…` は compact 実行中も従来どおり出る。
 /// `model`。
-pub const STATUS_MODEL: &str = "モデルを切替中…";
+pub fn status_model() -> String {
+    crate::t!("Switching the model…", "モデルを切り替え中…")
+}
 /// `effort <level>`。
-pub const STATUS_EFFORT: &str = "effort level を設定中…";
+pub fn status_effort() -> String {
+    crate::t!("Setting the effort level…", "effort を設定中…")
+}
 
 /// `mode <名前>` の間だけ出す shimmer。
-pub const STATUS_MODE: &str = "権限モードを切替中…";
+pub fn status_mode() -> String {
+    crate::t!("Switching the permission mode…", "権限モードを切り替え中…")
+}
 /// `login` — 現行 Bun に原文が無い。上の語調に合わせて新規に決めたもの。
-pub const STATUS_LOGIN: &str = "サインイン中…";
+pub fn status_login() -> String {
+    crate::t!("Signing in…", "サインイン中…")
+}
 /// `logout` — 同上(新規)。
-pub const STATUS_LOGOUT: &str = "サインアウト中…";
+pub fn status_logout() -> String {
+    crate::t!("Signing out…", "サインアウト中…")
+}
 /// `resume` — 同上(新規)。
-pub const STATUS_RESUME: &str = "スレッドを再開中…";
+pub fn status_resume() -> String {
+    crate::t!("Resuming the thread…", "スレッドを再開中…")
+}
 /// `restart` — 同上(新規)。
-pub const STATUS_RESTART: &str = "再起動中…";
+pub fn status_restart() -> String {
+    crate::t!("Restarting…", "再起動中…")
+}
 
 /// disposition を main の台帳へ流す。満杯なら待つ(落とすと台帳が消えないまま残る)。
 async fn notify(
@@ -1532,7 +1552,12 @@ const TOOL_INDENT: &str = "\u{A0}\u{A0}\u{A0}";
 /// 許可プロンプトが誰にも押されないまま満期になったときに付箋へ足す1行
 /// TOOL_INDENT を付けて、止まったツール行の
 /// **下の注記**として読ませる。
-const PERM_TIMEOUT_LINE: &str = "\u{A0}\u{A0}\u{A0}⚠️ ツール許可待ちタイムアウト";
+fn perm_timeout_line() -> String {
+    crate::t!(
+        "\u{A0}\u{A0}\u{A0}⚠️ No answer to the permission request — timed out",
+        "\u{A0}\u{A0}\u{A0}⚠️ ツール許可の返事が無く、タイムアウトしました"
+    )
+}
 
 /// 1枚の付箋の予算(バイト)。Slack の本文上限に対して余裕をとった値。
 const STICKY_BUDGET: usize = 3800;
@@ -2902,7 +2927,7 @@ impl StickyBoard {
         // 許可待ちの満期は**ツール行の下の注記**として最後に足す
         // (行の並びは触らない。中断通知より前)
         if perm_timed_out {
-            lines.push(PERM_TIMEOUT_LINE.to_string());
+            lines.push(perm_timeout_line());
         }
 
         lines
@@ -3553,7 +3578,7 @@ mod tests {
         timed.upsert_tool_t(&k, "t1", "Bash", "rm -rf /tmp/x", ToolStatus::Pending, &a);
         timed.on_perm_timeout(&k);
         let (_, out) = timed.take_final(&k).expect("付箋が出ていない");
-        assert!(out.contains("⚠️ ツール許可待ちタイムアウト"), "{out}");
+        assert!(out.contains("⚠️ No answer to the permission request — timed out"), "{out}");
         assert!(out.contains("◌ Bash"), "行は触らず ◌ のまま: {out}");
         assert!(!out.contains("🚫"), "満期で行を落としてはいけない: {out}");
 
@@ -3563,7 +3588,7 @@ mod tests {
         let (_, out) = lone
             .take_final(&ThreadKey::parse("k2"))
             .expect("付箋が出ていない");
-        assert!(out.contains("⚠️ ツール許可待ちタイムアウト"), "{out}");
+        assert!(out.contains("⚠️ No answer to the permission request — timed out"), "{out}");
 
         // Deny: その行だけ 🚫。注記は出さない
         let mut denied = StickyBoard::default();
@@ -5078,17 +5103,12 @@ mod tests {
             SILENCE_MS, 3_000,
             "Bun の 5s から意図的に短縮(定数の doc 参照)"
         );
-        assert_eq!(STATUS_GATHERING, "集計中\u{2026}");
-        assert_eq!(STATUS_CONTEXT, "コンテキストを確認中\u{2026}");
-        assert_eq!(STATUS_USAGE, "使用状況を確認中\u{2026}");
-        // compact の文言は**意図的に持たない**(定数の並びのコメント参照)
-        assert_eq!(STATUS_MODEL, "モデルを切替中\u{2026}");
-        assert_eq!(STATUS_EFFORT, "effort level を設定中\u{2026}");
-        // Bun に原文が無く今回決めたもの(実装者判断で動かさない)
-        assert_eq!(STATUS_LOGIN, "サインイン中\u{2026}");
-        assert_eq!(STATUS_LOGOUT, "サインアウト中\u{2026}");
-        assert_eq!(STATUS_RESUME, "スレッドを再開中\u{2026}");
-        assert_eq!(STATUS_RESTART, "再起動中\u{2026}");
+        let _ja = crate::i18n::pin(crate::i18n::Lang::Ja);
+        assert_eq!(status_gathering(), "集計中\u{2026}");
+        assert_eq!(status_login(), "サインイン中\u{2026}");
+        drop(_ja);
+        let _en = crate::i18n::pin(crate::i18n::Lang::En);
+        assert_eq!(status_restart(), "Restarting\u{2026}");
     }
 
     /// 空文字がクリア(Slack の約束)。FakeApi は素通しで記録するだけ。

@@ -13,13 +13,21 @@ fn refuse_other_bots_state_dir() {
     if !dir.path().join("bridge.sock").exists() {
         return;
     }
+    let dir = dir.path().display();
     eprintln!(
-        "{} は別の実装のボットの置き場です(bridge.sock があります)。\n\
-         同じ Slack app に2本目が繋がると、Slack はイベントを複製せず半分ずつ振り分けるので、\n\
-         どちらのボットも動いたり動かなかったりします。何もしていません。\n\n\
-         置き場を指定してやり直してください:\n  \
-         AGENTGW_STATE_DIR=$HOME/.local/state/slack-channel-rs-dev agentgw …",
-        dir.path().display()
+        "{}",
+        agentgw::t!(
+            "{dir} belongs to a different bot (it has a bridge.sock).\n\
+             A second process on the same Slack app makes Slack split events between the two,\n\
+             so both bots would half-work. Nothing was done.\n\n\
+             Point agentgw at its own state directory and try again:\n  \
+             AGENTGW_STATE_DIR=$HOME/.local/state/agentgw-dev agentgw …",
+            "{dir} は別の実装のボットの置き場です(bridge.sock があります)。\n\
+             同じ Slack app に2本目が繋がると、Slack はイベントを複製せず半分ずつ振り分けるので、\n\
+             どちらのボットも動いたり動かなかったりします。何もしていません。\n\n\
+             置き場を指定してやり直してください:\n  \
+             AGENTGW_STATE_DIR=$HOME/.local/state/agentgw-dev agentgw …"
+        )
     );
     std::process::exit(1);
 }
@@ -45,7 +53,7 @@ async fn main() {
             std::process::exit(agentgw::bridge::link::cli(&rest, &dir));
         }
         // 子を1台足す(届ける → 繋ぐ → 入れて起こす)
-        "add-child" => {
+        "add-machine" => {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             std::process::exit(agentgw::fleet::cli(&rest).await);
         }
@@ -67,17 +75,29 @@ async fn main() {
         _ => {
             // ユーザーが読む行。**内部の事情(実装言語・課題番号)は出さない** —
             // 打ち間違えた人が要るのは正しい使い方だけ。名前は実際のコマンド名と揃える
+            let v = env!("CARGO_PKG_VERSION");
             eprintln!(
-                "agentgw {}\n\
-                 \n\
-                 まず:   install            このマシンを設定して起動する(親か子かを訊きます)\n\
-                 ふだん: status | restart | shutdown | start | uninstall\n\
-                 \n\
-                 子を足すとき:\n\
-                   親で: add-child user@host          届けて・繋いで・起こすまで1本で\n\
-                 \n\
-                 serve はサービスが呼ぶ本体です(手で打つ必要はありません)。",
-                env!("CARGO_PKG_VERSION")
+                "{}",
+                agentgw::t!(
+                    "agentgw {v}\n\
+                     \n\
+                     First:      install  set up this machine (as the gateway or as a machine) and start it\n\
+                     Day to day: status | restart | shutdown | start | uninstall\n\
+                     \n\
+                     Add a machine (run on the gateway):\n  \
+                     add-machine user@host   install agentgw on another machine and connect it here\n\
+                     \n\
+                     `serve` is what the service runs; you don't need to type it.",
+                    "agentgw {v}\n\
+                     \n\
+                     まず:   install            このマシンを設定して起動する(ゲートウェイかマシンかを訊きます)\n\
+                     ふだん: status | restart | shutdown | start | uninstall\n\
+                     \n\
+                     マシンを足すとき(ゲートウェイで):\n  \
+                     add-machine user@host   ほかのマシンに agentgw を入れて、ここにつなぐ\n\
+                     \n\
+                     serve はサービスが呼ぶ本体です(手で打つ必要はありません)。"
+                )
             );
             std::process::exit(2);
         }

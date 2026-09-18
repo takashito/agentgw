@@ -19,7 +19,7 @@ pub fn ssh_capture(target: &str, command: &str) -> Result<String, String> {
             command,
         ])
         .output()
-        .map_err(|e| format!("ssh が実行できません: {e}"))?;
+        .map_err(|e| crate::t!("Couldn't run ssh: {e}", "ssh が実行できません: {e}"))?;
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
@@ -31,10 +31,10 @@ pub fn ssh_run(target: &str, command: &str) -> Result<(), String> {
     let st = Command::new("ssh")
         .args(["-o", "BatchMode=yes", target, command])
         .status()
-        .map_err(|e| format!("ssh が実行できません: {e}"))?;
+        .map_err(|e| crate::t!("Couldn't run ssh: {e}", "ssh が実行できません: {e}"))?;
     st.success()
         .then_some(())
-        .ok_or_else(|| format!("{target} で失敗しました: {command}"))
+        .ok_or_else(|| crate::t!("Failed on {target}: {command}", "{target} で失敗しました: {command}"))
 }
 
 /// 相手で対話つきに回す。
@@ -46,10 +46,10 @@ pub fn ssh_interactive(target: &str, command: &str) -> Result<(), String> {
     let st = Command::new("ssh")
         .args(["-t", target, command])
         .status()
-        .map_err(|e| format!("ssh が実行できません: {e}"))?;
+        .map_err(|e| crate::t!("Couldn't run ssh: {e}", "ssh が実行できません: {e}"))?;
     st.success()
         .then_some(())
-        .ok_or_else(|| format!("{target} で失敗しました: {command}"))
+        .ok_or_else(|| crate::t!("Failed on {target}: {command}", "{target} で失敗しました: {command}"))
 }
 
 /// 標準入力から食わせる。
@@ -62,16 +62,16 @@ pub fn ssh_stdin(target: &str, command: &str, stdin: &str) -> Result<String, Str
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("ssh が実行できません: {e}"))?;
+        .map_err(|e| crate::t!("Couldn't run ssh: {e}", "ssh が実行できません: {e}"))?;
     child
         .stdin
         .as_mut()
-        .ok_or("ssh の標準入力が開けません")?
+        .ok_or_else(|| crate::t!("Couldn't open ssh's stdin", "ssh の標準入力が開けません"))?
         .write_all(stdin.as_bytes())
-        .map_err(|e| format!("ssh に渡せません: {e}"))?;
+        .map_err(|e| crate::t!("Couldn't write to ssh: {e}", "ssh に渡せません: {e}"))?;
     let out = child
         .wait_with_output()
-        .map_err(|e| format!("ssh の終了を待てません: {e}"))?;
+        .map_err(|e| crate::t!("Couldn't wait for ssh: {e}", "ssh の終了を待てません: {e}"))?;
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
@@ -87,10 +87,10 @@ pub fn scp(local: &Path, target: &str, remote_path: &str) -> Result<(), String> 
             &format!("{target}:{remote_path}"),
         ])
         .status()
-        .map_err(|e| format!("scp が実行できません: {e}"))?;
+        .map_err(|e| crate::t!("Couldn't run scp: {e}", "scp が実行できません: {e}"))?;
     st.success()
         .then_some(())
-        .ok_or_else(|| format!("{remote_path} に置けませんでした"))
+        .ok_or_else(|| crate::t!("Couldn't copy to {remote_path}", "{remote_path} に置けませんでした"))
 }
 
 /// 手元の文字列を相手のファイルに書く(install.sh を送るのに使う)。
@@ -119,14 +119,14 @@ pub fn gh_download(
     let out = Command::new("gh")
         .args(args)
         .output()
-        .map_err(|e| format!("gh が実行できません: {e}"))?;
+        .map_err(|e| crate::t!("Couldn't run gh: {e}", "gh が実行できません: {e}"))?;
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
     let path = out_dir.join(format!("agentgw-{triple}"));
     path.exists()
         .then_some(path)
-        .ok_or_else(|| format!("release に agentgw-{triple} がありません"))
+        .ok_or_else(|| crate::t!("The release has no agentgw-{triple}", "release に agentgw-{triple} がありません"))
 }
 
 /// `tailscale status --json`。入っていない / 落ちていれば `None`。

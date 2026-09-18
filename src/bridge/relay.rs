@@ -835,15 +835,16 @@ impl Delivery {
     /// 担当マシンが留守のときに言うこと。**その場で言う。預からない。**
     /// 1時間後に、もう関心を失った人へ届く返事は、正直に断るより悪い。
     pub fn offline_notice(bridge_id: &str, connected: &[String]) -> String {
-        format!(
-            "このチャンネルの担当マシン *{bridge_id}* は、いまオフラインです。\n\
-             メッセージは預かりません — そのマシンが戻ってから、もう一度送ってください。\n\
-             現在つながっているマシン: {}",
-            if connected.is_empty() {
-                "(現在つながっているマシンはありません)".to_string()
-            } else {
-                connected.join(", ")
-            }
+        let online = if connected.is_empty() {
+            crate::t!("none", "なし")
+        } else {
+            connected.join(", ")
+        };
+        crate::t!(
+            "*{bridge_id}*, the machine for this channel, is offline. Your message wasn't kept — \
+             send it again once {bridge_id} is back.\nOnline now: {online}",
+            "このチャンネルを受け持つマシン *{bridge_id}* はオフラインです。メッセージは保存していないので、\
+             {bridge_id} が戻ってからもう一度送ってください。\nオンラインのマシン: {online}"
         )
     }
 }
@@ -942,11 +943,12 @@ impl CommandCtx<'_> {
 
     /// Owner の検査。**要求が well-formed かは、その人が要求してよいかの後**。
     /// 書き手の分からないメッセージ(bot)も断る。
-    fn refuse_if_not_owner(&self, command: &str, what: &str) -> Option<String> {
+    fn refuse_if_not_owner(&self, command: &str) -> Option<String> {
         match (self.user_id, self.owner_user_id) {
             (Some(u), Some(o)) if u == o => None,
-            _ => Some(format!(
-                "`{command}` を使えるのは Owner だけです。({what}できるのは Owner のみ)"
+            _ => Some(crate::t!(
+                "Only the owner can use `{command}`.",
+                "`{command}` を使えるのは Owner だけです。"
             )),
         }
     }
@@ -982,7 +984,7 @@ impl CommandCtx<'_> {
             // 文の中に紛れた `route` は文であってコマンドではない
             return RouteOutcome::NotACommand;
         }
-        if let Some(reply) = ctx.refuse_if_not_owner("route", "このチャンネルの担当マシンを変更")
+        if let Some(reply) = ctx.refuse_if_not_owner("route")
         {
             return RouteOutcome::Refused(reply);
         }
@@ -995,27 +997,33 @@ impl CommandCtx<'_> {
         // 扱いは同じ — 基準は「今ここに居るか」だけ。行き先の無い担当を黙って作らない。
         if !connected.iter().any(|c| c == bridge_id) {
             let here = if connected.is_empty() {
-                "(なし)".to_string()
+                crate::t!("none", "なし")
             } else {
                 connected.join(", ")
             };
-            return RouteOutcome::UnknownBridge(format!(
-                "*{bridge_id}* というマシンは、いまこの Relay につながっていません。\n\
-                 担当に指定できるのは *いま接続しているマシン* だけです\
-                 (打ち間違い、あるいはそのマシンがまだ起動していないのでは?)。\n\
-                 いまつながっているマシン: {here}"
+            return RouteOutcome::UnknownBridge(crate::t!(
+                "No machine named *{bridge_id}* is connected. A channel can only be handed to a \
+                 machine that's online — check the name, or start agentgw on that machine.\n\
+                 Online now: {here}",
+                "*{bridge_id}* という名前のマシンはつながっていません。チャンネルを任せられるのは\
+                 オンラインのマシンだけです。名前を確かめるか、そのマシンで agentgw を起動してください。\n\
+                 オンラインのマシン: {here}"
             ));
         }
 
-        let mut lines = vec![format!("このチャンネルの担当を *{bridge_id}* にしました。")];
+        let mut lines = vec![crate::t!(
+            "This channel is now handled by *{bridge_id}*.",
+            "このチャンネルは *{bridge_id}* が受け持つようになりました。"
+        )];
         if let Some(before) = routes.get(ctx.channel_id).filter(|b| *b != bridge_id) {
             // 正直な部分: 新しいマシンは Slack のスレッドを読み直せるが、前のマシンが**何をしたか**
             // (どのファイルを読み、何を試し、何を書き換えたか)は知りようがない。そう言っておくから、
             // 切り替えは他のことについて黙っていられる。
-            lines.push(format!(
-                "(担当を *{before}* から変更しました。走行中のスレッドは新しいマシンで再開されます。\
-                 そのマシンはスレッドを読み直して話の流れは把握できますが、\
-                 *前のマシンが実際に行った作業の詳細は引き継がれません*。)"
+            lines.push(crate::t!(
+                "(It was *{before}* before. Running threads continue on *{bridge_id}*, which reads \
+                 the thread to catch up — but *it can't see what {before} actually did*.)",
+                "(前は *{before}* でした。進行中のスレッドは *{bridge_id}* で続きます。スレッドは読み直して\
+                 流れを把握しますが、*{before} が実際に行った作業の中身は分かりません*。)"
             ));
         }
         RouteOutcome::Set {
@@ -1034,20 +1042,27 @@ pub fn route_table(here: &str, routes: &Routes, connected: &[String], self_id: &
     let online = |id: &str| connected.iter().any(|c| c == id);
     let mark = |id: &str| {
         if online(id) {
-            "🟢"
+            "🟢".to_string()
         } else {
-            "🔴 オフライン"
+            crate::t!("🔴 offline", "🔴 オフライン")
         }
     };
-    // 1つの行き先を一言で(担当が無ければ親)
+    // 1つの行き先を一言で(担当が無ければゲートウェイ)
     let dest = |id: Option<&String>| match id {
         Some(id) => format!("*{id}* {}", mark(id)),
-        None => format!("担当なし(親の *{self_id}* が受けます){}", mark(self_id)),
+        None => {
+            let m = mark(self_id);
+            crate::t!(
+                "not assigned — the gateway *{self_id}* handles it {m}",
+                "未設定(ゲートウェイの *{self_id}* が受け持ちます){m}"
+            )
+        }
     };
 
-    let mut out = vec![format!(
-        "*ここ(<#{here}>)の担当*: {}",
-        dest(routes.get(here))
+    let this = dest(routes.get(here));
+    let mut out = vec![crate::t!(
+        "*This channel (<#{here}>)*: {this}",
+        "*このチャンネル(<#{here}>)*: {this}"
     )];
 
     let others: Vec<String> = routes
@@ -1056,9 +1071,12 @@ pub fn route_table(here: &str, routes: &Routes, connected: &[String], self_id: &
         .map(|(ch, id)| format!("• <#{ch}> → {}", dest(Some(id))))
         .collect();
     out.push(String::new());
-    out.push("*ほかのチャンネル*".to_string());
+    out.push(crate::t!("*Other channels*", "*ほかのチャンネル*"));
     if others.is_empty() {
-        out.push("(担当を決めたチャンネルはありません — どこも親が受けます)".to_string());
+        out.push(crate::t!(
+            "(none assigned — the gateway handles every channel)",
+            "(割り当てたチャンネルはありません。どのチャンネルもゲートウェイが受け持ちます)"
+        ));
     } else {
         out.extend(others);
     }
@@ -1078,13 +1096,17 @@ pub fn route_table(here: &str, routes: &Routes, connected: &[String], self_id: &
         .iter()
         .map(|m| {
             let dot = if online(m) { "🟢" } else { "🔴" };
-            let parent = if m == self_id { "(親)" } else { "" };
-            format!("{dot} {m}{parent}")
+            let gateway = if m == self_id {
+                crate::t!(" (gateway)", "(ゲートウェイ)")
+            } else {
+                String::new()
+            };
+            format!("{dot} {m}{gateway}")
         })
         .collect::<Vec<_>>()
         .join(" · ");
     out.push(String::new());
-    out.push(format!("*マシン*: {line}"));
+    out.push(crate::t!("*Machines*: {line}", "*マシン*: {line}"));
     out.join("\n")
 }
 
@@ -1105,19 +1127,19 @@ impl CommandCtx<'_> {
             Some(args) if args.is_empty() => {}
             _ => return SetHomeOutcome::NotACommand,
         }
-        if let Some(reply) = ctx.refuse_if_not_owner("set-home", "Home チャンネルを変更") {
+        if let Some(reply) = ctx.refuse_if_not_owner("set-home") {
             return SetHomeOutcome::Refused(reply);
         }
         if ctx.is_dm() {
-            return SetHomeOutcome::NeedsChannel(
-                "`set-home` は Home にしたい *チャンネル* で `@ボット set-home` と実行してください\
-                 (DM は Home にできません)。"
-                    .to_string(),
-            );
+            return SetHomeOutcome::NeedsChannel(crate::t!(
+                "Run `set-home` in the *channel* you want notices in. A DM can't be the notice channel.",
+                "`set-home` は、通知を出したい *チャンネル* で実行してください。DM は通知先にできません。"
+            ));
         }
-        SetHomeOutcome::Set(format!(
-            "<#{}> を Home チャンネルにしました(接続中のすべてのマシンに反映します)。",
-            ctx.channel_id
+        let ch = ctx.channel_id;
+        SetHomeOutcome::Set(crate::t!(
+            "Notices from every machine will now go to <#{ch}>.",
+            "これからは、すべてのマシンの通知を <#{ch}> に出します。"
         ))
     }
 }
@@ -1172,7 +1194,7 @@ impl DmOnboardingCtx<'_> {
     pub fn decide(&self) -> DmOnboarding {
         let ctx = self;
         let list = if ctx.connected.is_empty() {
-            "(なし)".to_string()
+            crate::t!("none", "なし")
         } else {
             ctx.connected.join(", ")
         };
@@ -1187,12 +1209,15 @@ impl DmOnboardingCtx<'_> {
             if ctx.connected.iter().any(|c| c == name) {
                 return DmOnboarding::Selected {
                     bridge_id: name.to_string(),
-                    reply: format!("この DM の担当を *{name}* にしました。"),
+                    reply: crate::t!(
+                        "*{name}* will handle this DM.",
+                        "この DM は *{name}* が受け持ちます。"
+                    ),
                 };
             }
-            let shown = if name.is_empty() { "それ" } else { name };
-            return DmOnboarding::SelectRetry(format!(
-                "*{shown}* は接続中のマシンにありません。マシン名だけを返信してください。\n接続中: {list}"
+            return DmOnboarding::SelectRetry(crate::t!(
+                "There's no online machine named *{name}*. Reply with just a machine name.\nOnline now: {list}",
+                "*{name}* という名前のオンラインのマシンはありません。マシンの名前だけを返信してください。\nオンラインのマシン: {list}"
             ));
         }
 
@@ -1208,9 +1233,10 @@ impl DmOnboardingCtx<'_> {
         // ② Owner が既に居る: トークンの DM は名乗り直しにならず、秘密も先へ渡さない。
         if ctx.current_owner.is_some() {
             return match token {
-                Some(true) => DmOnboarding::AlreadyConfigured(
-                    "このボットのオーナーは既に設定済みです。".to_string(),
-                ),
+                Some(true) => DmOnboarding::AlreadyConfigured(crate::t!(
+                    "This bot already has an owner.",
+                    "このボットには既に Owner がいます。"
+                )),
                 _ => DmOnboarding::NotOnboarding,
             };
         }
@@ -1218,10 +1244,10 @@ impl DmOnboardingCtx<'_> {
         // ③ まだ Owner が居ない。
         match token {
             None => DmOnboarding::NotOnboarding, // 設定前の普通の DM
-            Some(false) => DmOnboarding::BadToken(
-                "接続文字列が正しくありません(このボットのものではないか、貼り付けが途中で切れています)。"
-                    .to_string(),
-            ),
+            Some(false) => DmOnboarding::BadToken(crate::t!(
+                "That connection string doesn't match this bot — it belongs to another bot, or the paste was cut off.",
+                "接続文字列がこのボットのものと一致しません。別のボットのものか、貼り付けが途中で切れています。"
+            )),
             Some(true) => {
                 let Some(owner) = ctx.user_id else {
                     return DmOnboarding::NotOnboarding;
@@ -1229,23 +1255,27 @@ impl DmOnboardingCtx<'_> {
                 match ctx.connected.len() {
                     0 => DmOnboarding::ClaimedNoMachine {
                         owner_user_id: owner.to_string(),
-                        reply: "あなたをオーナーにしました。ただし、まだ接続中のマシンがありません — \
-                                先にマシンを繋いでください。"
-                            .to_string(),
+                        reply: crate::t!(
+                            "You're now the owner. No machine is connected yet — add one with `agentgw add-machine`.",
+                            "あなたが Owner になりました。まだつながっているマシンがありません。`agentgw add-machine` でマシンを加えてください。"
+                        ),
                     },
                     1 => DmOnboarding::ClaimedAuto {
                         owner_user_id: owner.to_string(),
                         bridge_id: ctx.connected[0].clone(),
-                        reply: format!(
-                            "あなたをオーナーにしました。この DM は、接続中の唯一のマシン *{}* が担当します。",
-                            ctx.connected[0]
-                        ),
+                        reply: {
+                            let only = &ctx.connected[0];
+                            crate::t!(
+                                "You're now the owner. *{only}*, the only machine online, will handle this DM.",
+                                "あなたが Owner になりました。この DM は、ただ1台オンラインの *{only}* が受け持ちます。"
+                            )
+                        },
                     },
                     _ => DmOnboarding::ClaimedPending {
                         owner_user_id: owner.to_string(),
-                        reply: format!(
-                            "あなたをオーナーにしました。この DM をどのマシンに担当させますか? \
-                             マシン名だけを返信してください。\n接続中: {list}"
+                        reply: crate::t!(
+                            "You're now the owner. Which machine should handle this DM? Reply with just its name.\nOnline now: {list}",
+                            "あなたが Owner になりました。この DM をどのマシンに任せますか? マシンの名前だけを返信してください。\nオンラインのマシン: {list}"
                         ),
                     },
                 }
@@ -1317,7 +1347,7 @@ impl Presence {
             if e.down_due_ms.is_some_and(|due| now_ms >= due) {
                 e.down_due_ms = None;
                 e.up = false;
-                out.push(format!("🔴 *Slack Bridge ( {id} ) disconnected*"));
+                out.push(crate::t!("🔴 Lost the connection to *{id}*", "🔴 *{id}* との接続が切れました"));
             }
         }
         out.sort();
@@ -1350,15 +1380,18 @@ pub type Tunnels = HashMap<String, Tunnel>;
 /// 子1台の経路を一言で。
 pub fn route_of(id: &str, tunnels: &Tunnels) -> String {
     match tunnels.get(id) {
-        None => "直結".to_string(),
+        None => crate::t!("direct", "直結"),
         Some(Tunnel {
             target,
             error: None,
-        }) => format!("ssh トンネル ({target})"),
+        }) => crate::t!("ssh tunnel ({target})", "ssh トンネル({target})"),
         Some(Tunnel {
             target,
             error: Some(why),
-        }) => format!("ssh トンネル ({target}) — 張れていません: {why}"),
+        }) => crate::t!(
+            "ssh tunnel ({target}) — down: {why}",
+            "ssh トンネル({target})— つながっていません: {why}"
+        ),
     }
 }
 
@@ -1374,7 +1407,7 @@ pub fn format_fleet(
 ) -> String {
     let label = |id: Option<&str>| -> String {
         match id {
-            None => "(未設定)".to_string(),
+            None => crate::t!("(not set)", "(未設定)"),
             Some(id) => match names.get(id) {
                 Some(n) => format!("{n} ({id})"),
                 None => id.to_string(),
@@ -1383,29 +1416,32 @@ pub fn format_fleet(
     };
     // 見出しは**何のことか**を書く。生の `owner:` `home:` は、それが人なのか
     // チャンネルなのか、何に効くのかを読み手に一言も言っていなかった
+    // **分かったのは「この口が答えたか」だけ。** 生死を名乗ると、launchd が running と
+    // 言っている隣で「動いていません」と出て食い違う(再起動の直後は口が開く前のことが多い)
+    let listen = &f.listen;
+    let answer = if connected.is_some() {
+        crate::t!("answering", "応答あり")
+    } else {
+        crate::t!("not answering", "応答なし")
+    };
+    let owner = label(f.owner.as_deref());
+    let home = label(f.home.as_deref());
     let mut out = vec![
-        "● この Bridge".to_string(),
-        format!(
-            "  待ち受け:      {}   ({})",
-            f.listen,
-            // **分かったのは「この口が答えたか」だけ。** Bridge の生死を名乗ると、
-            // launchd が running と言っている隣で「動いていません」と出て食い違う
-            // (再起動の直後は、まだ口が開いていないだけのことが多い)
-            if connected.is_some() {
-                "応答あり"
-            } else {
-                "応答なし"
-            }
+        crate::t!("● This gateway", "● このゲートウェイ"),
+        crate::t!(
+            "  Accepts machines on: {listen}   ({answer})",
+            "  マシンを受け付ける場所: {listen}   ({answer})"
         ),
-        format!("  使える人:      {}", label(f.owner.as_deref())),
-        format!("  通知の宛先:    {}", label(f.home.as_deref())),
+        crate::t!("  Owner:               {owner}", "  Owner:                  {owner}"),
+        crate::t!("  Notices go to:       {home}", "  通知の宛先:             {home}"),
         String::new(),
     ];
     if let Some(conn) = connected {
+        let n = conn.len();
         out.push(if conn.is_empty() {
-            "● 今つながっている子 — なし".to_string()
+            crate::t!("● Machines connected — none", "● つながっているマシン — なし")
         } else {
-            format!("● 今つながっている子 — {}", conn.len())
+            crate::t!("● Machines connected — {n}", "● つながっているマシン — {n}")
         });
         out.extend(
             conn.iter()
@@ -1413,15 +1449,16 @@ pub fn format_fleet(
         );
         out.push(String::new());
     }
+    let n = f.routes.len();
     if f.routes.is_empty() {
-        out.push("● チャンネルの担当(route)— なし".to_string());
+        out.push(crate::t!("● Channels assigned (route) — none", "● チャンネルの割り当て(route)— なし"));
     } else {
-        out.push(format!("● チャンネルの担当(route)— {}", f.routes.len()));
+        out.push(crate::t!("● Channels assigned (route) — {n}", "● チャンネルの割り当て(route)— {n}"));
         for (ch, id) in &f.routes {
             let mark = match connected {
-                None => "",
-                Some(c) if c.iter().any(|x| x == id) => "  ● つながっています",
-                Some(_) => "  ○ 居ません",
+                None => String::new(),
+                Some(c) if c.iter().any(|x| x == id) => crate::t!("  ● online", "  ● オンライン"),
+                Some(_) => crate::t!("  ○ offline", "  ○ オフライン"),
             };
             out.push(format!("  {} → {id}{mark}", label(Some(ch))));
         }
@@ -1642,7 +1679,7 @@ impl link_watch::LinkRead for WebSocket {
         match self.recv().await {
             Some(Ok(Message::Text(t))) => link_watch::Frame::Text(t.to_string()),
             Some(Ok(Message::Close(_))) | None => {
-                link_watch::Frame::Closed("相手が閉じました".to_string())
+                link_watch::Frame::Closed("closed by the other side".to_string())
             }
             Some(Ok(_)) => link_watch::Frame::Other,
             Some(Err(e)) => link_watch::Frame::Closed(e.to_string()),
@@ -2134,7 +2171,7 @@ impl Fleet {
             if bridge_id == self.self_id {
                 rlog(
                     "error",
-                    &format!("AGENTGW_CHILD_URLS に自分の名前({bridge_id})が居ます — 飛ばします"),
+                    &format!("AGENTGW_CHILD_URLS lists this machine's own name ({bridge_id}) — skipping it"),
                 );
                 continue;
             }
@@ -2157,7 +2194,7 @@ impl Fleet {
                     // 話し合いでは解決しない断り。**ループで埋めない** — 1回、大きな声で
                     rlog(
                         "error",
-                        &format!("dial {bridge_id}: {why} — 繋ぎ直しません"),
+                        &format!("dial {bridge_id}: {why} — not retrying"),
                     );
                     return;
                 }
@@ -2176,7 +2213,7 @@ impl Fleet {
             Ok(r) => r,
             Err(e) => {
                 rlog("error", &format!("dial {bridge_id}: {e}"));
-                return Err("この URL には繋げません");
+                return Err("unusable URL");
             }
         };
         let (mut socket, _) = match tokio_tungstenite::connect_async(request).await {
@@ -2184,8 +2221,8 @@ impl Fleet {
             Err(e) => {
                 if let tokio_tungstenite::tungstenite::Error::Http(resp) = &e {
                     match resp.status().as_u16() {
-                        401 => return Err("鍵が違います(AGENTGW_LINK_TOKEN を揃えてください)"),
-                        426 => return Err("link プロトコルの版が違います(新しい版で両方を再起動)"),
+                        401 => return Err("wrong key (AGENTGW_LINK_TOKEN must match)"),
+                        426 => return Err("incompatible versions (upgrade both machines)"),
                         _ => {}
                     }
                 }
@@ -2373,27 +2410,42 @@ impl Cli {
         let wiring = match Wiring::resolve(|k| env.get(k).cloned()) {
             Ok(w) => w,
             Err(why) => {
-                return format!(
-                    "役割: 決められません — {}",
-                    why.lines().next().unwrap_or("")
-                );
+                let why = why.lines().next().unwrap_or("");
+                return crate::t!("Role: can't tell — {why}", "役割: 判定できません — {why}");
             }
         };
         let name = wiring
             .self_id
             .as_deref()
-            .map(|n| format!("「{n}」"))
+            .map(|n| crate::t!(" \"{n}\"", "「{n}」"))
             .unwrap_or_default();
         match (&wiring.upstream, &wiring.children, &wiring.inlet) {
             (Mode::Direct { .. }, Some(l), _) => {
-                format!("役割: 親{name} — Slack 直結 / 子を迎える口 {}", l.addr)
+                let addr = l.addr;
+                crate::t!(
+                    "Role: gateway{name} — connected to Slack, accepts machines on {addr}",
+                    "役割: ゲートウェイ{name} — Slack に接続、マシンを {addr} で受け付け"
+                )
             }
-            (Mode::Direct { .. }, None, _) => format!("役割: 単独{name} — Slack 直結、子は無し"),
-            (Mode::Relay { url, .. }, ..) => format!("役割: 子{name} — 親 {url} へ dial"),
+            (Mode::Direct { .. }, None, _) => crate::t!(
+                "Role: gateway{name} — connected to Slack, no other machines",
+                "役割: ゲートウェイ{name} — Slack に接続、ほかのマシンなし"
+            ),
+            (Mode::Relay { url, .. }, ..) => crate::t!(
+                "Role: machine{name} — connects to the gateway at {url}",
+                "役割: マシン{name} — ゲートウェイ {url} につなぐ"
+            ),
             (Mode::AwaitParent, _, Some(l)) => {
-                format!("役割: 子{name} — 親の接続を {} で待つ", l.addr)
+                let addr = l.addr;
+                crate::t!(
+                    "Role: machine{name} — waits for the gateway to connect on {addr}",
+                    "役割: マシン{name} — ゲートウェイからの接続を {addr} で待つ"
+                )
             }
-            (Mode::AwaitParent, _, None) => format!("役割: 子{name} — 親待ち(口が未設定)"),
+            (Mode::AwaitParent, _, None) => crate::t!(
+                "Role: machine{name} — waits for the gateway, but has no address to listen on",
+                "役割: マシン{name} — ゲートウェイを待っているが、受け付ける場所が未設定"
+            ),
         }
     }
 
@@ -2414,9 +2466,13 @@ impl Cli {
             .collect();
         if open.is_empty() {
             // 記録が無いことしか分からない — 起動直後と未起動を見分けられない
-            "開いている口: まだありません(起動した直後か、起動していません)".to_string()
+            crate::t!(
+                "Local ports: none yet (agentgw just started, or isn't running)",
+                "ローカルのポート: まだありません(起動した直後か、動いていません)"
+            )
         } else {
-            format!("開いている口: {}", open.join(" / "))
+            let open = open.join(" / ");
+            crate::t!("Local ports: {open}", "ローカルのポート: {open}")
         }
     }
 
@@ -2544,7 +2600,7 @@ mod tests {
         let line = |pairs: &[(&str, &str)]| Cli::role_line(&env(pairs));
 
         let solo = line(&[("SLACK_APP_TOKEN", "xapp-1"), ("SLACK_BOT_TOKEN", "xoxb-1")]);
-        assert!(solo.starts_with("役割: 単独"), "{solo}");
+        assert!(solo.starts_with("Role: gateway — connected to Slack, no other machines"), "{solo}");
 
         let parent = line(&[
             ("SLACK_APP_TOKEN", "xapp-1"),
@@ -2553,7 +2609,7 @@ mod tests {
             ("AGENTGW_LINK_LISTEN", "127.0.0.1:8787"),
             ("AGENTGW_LINK_TOKEN", "k"),
         ]);
-        assert!(parent.contains("親「mac」"), "{parent}");
+        assert!(parent.contains("Role: gateway \"mac\""), "{parent}");
         assert!(parent.contains("127.0.0.1:8787"), "{parent}");
 
         let dialing = line(&[
@@ -2561,7 +2617,7 @@ mod tests {
             ("AGENTGW_RELAY_TOKEN", "k"),
             ("AGENTGW_BRIDGE_ID", "laptop"),
         ]);
-        assert!(dialing.contains("子「laptop」"), "{dialing}");
+        assert!(dialing.contains("Role: machine \"laptop\""), "{dialing}");
         assert!(dialing.contains("wss://p.example"), "{dialing}");
 
         let awaiting = line(&[
@@ -2569,11 +2625,11 @@ mod tests {
             ("AGENTGW_LINK_TOKEN", "k"),
             ("AGENTGW_BRIDGE_ID", "laptop"),
         ]);
-        assert!(awaiting.contains("待つ"), "{awaiting}");
+        assert!(awaiting.contains("waits for the gateway"), "{awaiting}");
 
         // 起動できない設定こそ status で理由が要る(ログを開かずに分かるように)
         let broken = line(&[]);
-        assert!(broken.starts_with("役割: 決められません"), "{broken}");
+        assert!(broken.starts_with("Role: can't tell"), "{broken}");
     }
 
     fn ok_admit(path: &str) -> Admit {
@@ -3002,9 +3058,9 @@ mod tests {
     fn the_notices_name_the_machines_that_are_here() {
         let some = vec!["desktop".to_string(), "vps".to_string()];
         assert!(
-            Delivery::offline_notice("laptop", &some).contains("*laptop* は、いまオフラインです")
+            Delivery::offline_notice("laptop", &some).contains("*laptop*, the machine for this channel, is offline")
         );
-        assert!(Delivery::offline_notice("laptop", &some).contains("預かりません"));
+        assert!(Delivery::offline_notice("laptop", &some).contains("wasn't kept"));
         assert!(Delivery::offline_notice("laptop", &some).contains("desktop, vps"));
     }
 
@@ -3196,8 +3252,8 @@ mod tests {
         match got {
             RouteOutcome::Set { bridge_id, reply } => {
                 assert_eq!(bridge_id, "desktop");
-                assert!(reply.contains("担当を *desktop* にしました"));
-                assert!(!reply.contains("引き継がれません")); // 初回は注記なし
+                assert!(reply.contains("This channel is now handled by *desktop*."));
+                assert!(!reply.contains("before")); // 初回は注記なし
             }
             other => panic!("{other:?}"),
         }
@@ -3214,8 +3270,8 @@ mod tests {
         );
         match got {
             RouteOutcome::Set { reply, .. } => {
-                assert!(reply.contains("*desktop* から変更"));
-                assert!(reply.contains("実際に行った作業の詳細は引き継がれません"));
+                assert!(reply.contains("It was *desktop* before"));
+                assert!(reply.contains("it can't see what desktop actually did"));
             }
             other => panic!("{other:?}"),
         }
@@ -3250,7 +3306,7 @@ mod tests {
         match got {
             RouteOutcome::UnknownBridge(reply) => {
                 assert!(
-                    reply.contains("*laptop* というマシンは、いまこの Relay につながっていません")
+                    reply.contains("No machine named *laptop* is connected.")
                 );
                 assert!(reply.contains("desktop, vps"));
             }
@@ -3272,12 +3328,12 @@ mod tests {
         };
         // 打ったチャンネルが先頭
         assert!(
-            reply.starts_with("*ここ(<#C1>)の担当*: *desktop* 🟢"),
+            reply.starts_with("*This channel (<#C1>)*: *desktop* 🟢"),
             "{reply}"
         );
         // ほかのチャンネル。居ないマシンの担当はオフラインと言う
         assert!(
-            reply.contains("• <#C2> → *laptop* 🔴 オフライン"),
+            reply.contains("• <#C2> → *laptop* 🔴 offline"),
             "{reply}"
         );
         assert!(
@@ -3286,7 +3342,7 @@ mod tests {
         );
         // マシン: 親の印、route にだけ居る(= 居ない)マシンも出す
         assert!(
-            reply.contains("*マシン*: 🟢 desktop · 🔴 laptop · 🟢 vps(親)"),
+            reply.contains("*Machines*: 🟢 desktop · 🔴 laptop · 🟢 vps (gateway)"),
             "{reply}"
         );
     }
@@ -3303,7 +3359,7 @@ mod tests {
             panic!("{got:?}")
         };
         assert!(
-            reply.starts_with("*ここ(<#C9>)の担当*: 担当なし(親の *vps* が受けます)🟢"),
+            reply.starts_with("*This channel (<#C9>)*: not assigned — the gateway *vps* handles it 🟢"),
             "{reply}"
         );
         assert!(reply.contains("• <#C1> → *desktop* 🟢"), "{reply}");
@@ -3320,7 +3376,7 @@ mod tests {
         let RouteOutcome::List(reply) = got else {
             panic!("{got:?}")
         };
-        assert!(reply.contains("どこも親が受けます"), "{reply}");
+        assert!(reply.contains("the gateway handles every channel"), "{reply}");
     }
 
     /// **名指しの無い `route` は断りもしない。** bot が入っていない会話への闖入になる。
@@ -3367,7 +3423,7 @@ mod tests {
     fn set_home_takes_the_channel_it_was_typed_in() {
         match CommandCtx::set_home(&ctx("C1", "<@U_BOT> set-home", Some(OWNER))) {
             SetHomeOutcome::Set(reply) => {
-                assert!(reply.contains("<#C1> を Home チャンネルにしました"))
+                assert!(reply.contains("Notices from every machine will now go to <#C1>."))
             }
             other => panic!("{other:?}"),
         }
@@ -3377,7 +3433,7 @@ mod tests {
     fn set_home_in_a_dm_has_nothing_to_set() {
         match CommandCtx::set_home(&ctx("D1", "set-home", Some(OWNER))) {
             SetHomeOutcome::NeedsChannel(reply) => {
-                assert!(reply.contains("DM は Home にできません"))
+                assert!(reply.contains("A DM can't be the notice channel."))
             }
             other => panic!("{other:?}"),
         }
@@ -3448,7 +3504,7 @@ mod tests {
             } => {
                 assert_eq!(owner_user_id, OWNER);
                 assert_eq!(bridge_id, "desktop");
-                assert!(reply.contains("唯一のマシン *desktop*"));
+                assert!(reply.contains("*desktop*, the only machine online"));
             }
             other => panic!("{other:?}"),
         }
@@ -3458,7 +3514,7 @@ mod tests {
     fn several_machines_ask_which_one() {
         match DmOnboardingCtx::decide(&dm(&conn_string(), &here(), None)) {
             DmOnboarding::ClaimedPending { reply, .. } => {
-                assert!(reply.contains("マシン名だけを返信"));
+                assert!(reply.contains("Reply with just its name"));
                 assert!(reply.contains("desktop, vps"));
             }
             other => panic!("{other:?}"),
@@ -3469,7 +3525,7 @@ mod tests {
     fn no_machine_means_there_is_nothing_to_bind_yet() {
         match DmOnboardingCtx::decide(&dm(&conn_string(), &[], None)) {
             DmOnboarding::ClaimedNoMachine { reply, .. } => {
-                assert!(reply.contains("先にマシンを繋いでください"))
+                assert!(reply.contains("add one with `agentgw add-machine`"))
             }
             other => panic!("{other:?}"),
         }
@@ -3504,7 +3560,7 @@ mod tests {
     fn an_existing_owner_is_not_reclaimed() {
         match DmOnboardingCtx::decide(&dm(&conn_string(), &here(), Some("U_SOMEONE"))) {
             DmOnboarding::AlreadyConfigured(reply) => {
-                assert!(reply.contains("既に設定済み"))
+                assert!(reply.contains("already has an owner"))
             }
             other => panic!("{other:?}"),
         }
@@ -3568,7 +3624,7 @@ mod tests {
         p.on_disconnect("desktop", 1_000);
         assert!(p.due(1_000).is_empty());
         assert!(p.due(5_999).is_empty());
-        assert_eq!(p.due(6_000), ["🔴 *Slack Bridge ( desktop ) disconnected*"]);
+        assert_eq!(p.due(6_000), ["🔴 Lost the connection to *desktop*"]);
         assert!(p.due(9_999).is_empty()); // 2度は言わない
     }
 
@@ -3609,26 +3665,23 @@ mod tests {
             &Tunnels::new(),
             &names,
         );
-        assert!(out.contains("(応答あり)"), "{out}");
-        assert!(out.contains("● 今つながっている子 — 1"), "{out}");
-        assert!(
-            out.contains("#dev (C1) → desktop  ● つながっています"),
-            "{out}"
-        );
-        assert!(out.contains("C2 → laptop  ○ 居ません"), "{out}"); // 名前が引けなければ生の id
+        assert!(out.contains("(answering)"), "{out}");
+        assert!(out.contains("● Machines connected — 1"), "{out}");
+        assert!(out.contains("#dev (C1) → desktop  ● online"), "{out}");
+        assert!(out.contains("C2 → laptop  ○ offline"), "{out}"); // 名前が引けなければ生の id
     }
 
     /// **走っていない**と**設定が無い**を混ぜない — route 表はどちらでも出す。
     #[test]
     fn an_offline_bridge_still_shows_what_is_configured() {
         let out = format_fleet(&a_view(), None, &Tunnels::new(), &HashMap::new());
-        assert!(out.contains("(応答なし)"), "{out}");
-        assert!(!out.contains("今つながっている子"), "{out}");
-        assert!(out.contains("● チャンネルの担当(route)— 2"), "{out}");
+        assert!(out.contains("(not answering)"), "{out}");
+        assert!(!out.contains("Machines connected"), "{out}");
+        assert!(out.contains("● Channels assigned (route) — 2"), "{out}");
         assert!(out.contains("C1 → desktop"), "{out}");
         // 生死不明のときに印は付けない
-        assert!(!out.contains("つながっています"), "{out}");
-        assert!(!out.contains("居ません"), "{out}");
+        assert!(!out.contains("● online"), "{out}");
+        assert!(!out.contains("○ offline"), "{out}");
     }
 
     #[test]
@@ -3649,11 +3702,8 @@ mod tests {
             &tunnels,
             &HashMap::new(),
         );
-        assert!(out.contains("  ● laptop — 直結"), "{out}");
-        assert!(
-            out.contains("  ● desktop — ssh トンネル (me@desktop)"),
-            "{out}"
-        );
+        assert!(out.contains("  ● laptop — direct"), "{out}");
+        assert!(out.contains("  ● desktop — ssh tunnel (me@desktop)"), "{out}");
     }
 
     #[test]
@@ -3668,7 +3718,7 @@ mod tests {
         );
         assert_eq!(
             route_of("desktop", &tunnels),
-            "ssh トンネル (me@desktop) — 張れていません: Permission denied (publickey)"
+            "ssh tunnel (me@desktop) — down: Permission denied (publickey)"
         );
     }
 
@@ -3681,10 +3731,10 @@ mod tests {
             routes: Routes::new(),
         };
         let out = format_fleet(&view, Some(&[]), &Tunnels::new(), &HashMap::new());
-        assert!(out.contains("使える人:      (未設定)"), "{out}");
-        assert!(out.contains("通知の宛先:    (未設定)"), "{out}");
-        assert!(out.contains("● 今つながっている子 — なし"), "{out}");
-        assert!(out.contains("● チャンネルの担当(route)— なし"), "{out}");
+        assert!(out.contains("Owner:               (not set)"), "{out}");
+        assert!(out.contains("Notices go to:       (not set)"), "{out}");
+        assert!(out.contains("● Machines connected — none"), "{out}");
+        assert!(out.contains("● Channels assigned (route) — none"), "{out}");
     }
 
     #[test]

@@ -120,7 +120,7 @@ async fn beat_within<S: LinkRead>(socket: &mut S, watch: &mut IdleWatch, window_
         Ok(Frame::Closed(why)) => Beat::Gone(why),
         Err(_) => match watch.on_idle() {
             Idle::Ping => Beat::Ping,
-            Idle::Dead => Beat::Gone(format!("ping に {window_ms}ms 返事がありません")),
+            Idle::Dead => Beat::Gone(format!("no reply to ping within {window_ms}ms")),
         },
     }
 }
@@ -134,7 +134,7 @@ where
         use tokio_tungstenite::tungstenite::protocol::Message as M;
         match self.next().await {
             Some(Ok(M::Text(t))) => Frame::Text(t.to_string()),
-            Some(Ok(M::Close(_))) | None => Frame::Closed("相手が閉じました".to_string()),
+            Some(Ok(M::Close(_))) | None => Frame::Closed("closed by the other side".to_string()),
             Some(Ok(_)) => Frame::Other, // ping/pong などは tungstenite が処理する
             Some(Err(e)) => Frame::Closed(e.to_string()),
         }
@@ -167,13 +167,13 @@ impl Fatal {
     pub fn message(&self) -> &'static str {
         match self {
             Fatal::BadToken => {
-                "Relay に断られました(api トークンが違います)。接続文字列を貼り直してください"
+                "the gateway rejected the key; add this machine again with `agentgw add-machine`"
             }
             Fatal::WrongVersion => {
-                "Relay と link プロトコルの版が違います。新しい版を入れて再起動してください"
+                "this machine and the gateway run incompatible versions; upgrade both"
             }
             Fatal::BadBridgeId => {
-                "Relay に断られました(Bridge ID が使えません)。AGENTGW_BRIDGE_ID を見直してください"
+                "the gateway rejected this machine's name; check AGENTGW_BRIDGE_ID"
             }
         }
     }
@@ -394,19 +394,19 @@ pub(crate) fn build_request(
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let mut request = target
         .into_client_request()
-        .map_err(|e| format!("dial 先として読めません({target}): {e}"))?;
+        .map_err(|e| format!("not a usable address ({target}): {e}"))?;
     let headers = request.headers_mut();
     headers.insert(
         "authorization",
         format!("Bearer {api_token}")
             .parse()
-            .map_err(|_| "api トークンをヘッダに載せられません".to_string())?,
+            .map_err(|_| "the key can't go in a header".to_string())?,
     );
     headers.insert(
         "sec-websocket-protocol",
         link::LINK_SUBPROTOCOL
             .parse()
-            .map_err(|_| "subprotocol をヘッダに載せられません".to_string())?,
+            .map_err(|_| "the subprotocol can't go in a header".to_string())?,
     );
     Ok(request)
 }
@@ -465,33 +465,47 @@ impl Mode {
 
         // **1つの子につき link は1本。** 両方向あると同じイベントが二重に配られる
         if wants_relay && listens {
-            return Err(
-                "AGENTGW_RELAY_URL と AGENTGW_LINK_LISTEN の両方が設定されています。\n\
-                 親との link は**どちらか一方向だけ**です — 自分から dial する(AGENTGW_RELAY_URL)か、\n\
-                 親に迎えに来てもらう(AGENTGW_LINK_LISTEN)か。両方あると同じイベントが二重に届きます。"
-                    .to_string(),
-            );
+            return Err(crate::t!(
+                "Both AGENTGW_RELAY_URL and AGENTGW_LINK_LISTEN are set in .env. Keep one: \
+                 AGENTGW_RELAY_URL if this machine connects to the gateway, AGENTGW_LINK_LISTEN if \
+                 the gateway connects to this machine. With both, every message arrives twice.",
+                ".env に AGENTGW_RELAY_URL と AGENTGW_LINK_LISTEN の両方があります。どちらか一方にしてください。\
+                 このマシンからゲートウェイにつなぐなら AGENTGW_RELAY_URL、ゲートウェイからこのマシンに\
+                 つなぐなら AGENTGW_LINK_LISTEN です。両方あると、メッセージが2回ずつ届きます。"
+            ));
         }
         if app.is_some() && wants_relay {
-            return Err(
-                "SLACK_APP_TOKEN と AGENTGW_RELAY_URL の両方が設定されています。\n                 直結と Relay 経由は**同時に有効にできません** — 両方が Slack に繋がると、\n                 Slack はイベントを複製せず半分ずつ振り分け、担当していないマシンに着地した\n                 メッセージが誰にも処理されなくなります。\n                 Relay 経由にするなら .env の SLACK_APP_TOKEN をコメントアウトしてください。"
-                    .to_string(),
-            );
+            return Err(crate::t!(
+                ".env has both SLACK_APP_TOKEN and AGENTGW_RELAY_URL. This machine can either connect \
+                 to Slack itself (as the gateway) or go through a gateway, not both — Slack would split \
+                 messages between the two, and some would never be answered. To go through a gateway, \
+                 comment out SLACK_APP_TOKEN.",
+                ".env に SLACK_APP_TOKEN と AGENTGW_RELAY_URL の両方があります。このマシンは、自分で Slack に\
+                 つなぐ(ゲートウェイになる)か、ゲートウェイを通すかのどちらかです。両方だと Slack が\
+                 メッセージを振り分けてしまい、返事の来ないものが出ます。ゲートウェイを通すなら、\
+                 SLACK_APP_TOKEN をコメントアウトしてください。"
+            ));
         }
         if wants_relay {
             let (Some(url), Some(api_token)) = (url, token) else {
-                return Err(
-                    "Relay 経由の設定が途中です — AGENTGW_RELAY_URL と AGENTGW_RELAY_TOKEN の\n                     両方が要ります(`agentgw link <接続文字列>` が両方書きます)。"
-                        .to_string(),
-                );
+                return Err(crate::t!(
+                    "The connection to the gateway is only half set up: .env needs both \
+                     AGENTGW_RELAY_URL and AGENTGW_RELAY_TOKEN. Run `agentgw add-machine` on the \
+                     gateway to set both.",
+                    "ゲートウェイへの接続の設定が途中です。.env に AGENTGW_RELAY_URL と \
+                     AGENTGW_RELAY_TOKEN の両方が必要です。ゲートウェイで `agentgw add-machine` を\
+                     実行すると両方が書かれます。"
+                ));
             };
             // **自動命名はしない。** ホスト名にも `default` にも落とさない —
             // 名前が衝突したマシンは、互いの Slack メッセージを奪い合う
             let Some(bridge_id) = id else {
-                return Err(
-                    "AGENTGW_BRIDGE_ID がありません。このマシンの名前を明示してください\n                     (自動では決めません — 名前が衝突すると、マシン同士が互いの\n                     Slack メッセージを奪い合います)。"
-                        .to_string(),
-                );
+                return Err(crate::t!(
+                    "This machine has no name. Set AGENTGW_BRIDGE_ID in .env. It isn't chosen \
+                     automatically: two machines with the same name would take each other's messages.",
+                    "このマシンに名前がありません。.env に AGENTGW_BRIDGE_ID を書いてください。\
+                     名前は自動では決めません。同じ名前のマシンが2台あると、互いのメッセージを取り合うためです。"
+                ));
             };
             return Ok(Mode::Relay {
                 url,
@@ -508,10 +522,12 @@ impl Mode {
                 app_token,
                 bot_token,
             }),
-            _ => Err(
-                "Slack のトークンがありません。直結なら SLACK_APP_TOKEN と SLACK_BOT_TOKEN、\n                 Relay 経由なら `agentgw link <接続文字列>` を実行してください。"
-                    .to_string(),
-            ),
+            _ => Err(crate::t!(
+                "There are no Slack tokens in .env. For the gateway, run `agentgw install` and paste \
+                 them; for any other machine, run `agentgw add-machine` on the gateway.",
+                ".env に Slack のトークンがありません。ゲートウェイなら `agentgw install` でトークンを\
+                 入れてください。ほかのマシンは、ゲートウェイで `agentgw add-machine` を実行して加えます。"
+            )),
         }
     }
 }
@@ -580,27 +596,32 @@ impl Wiring {
                 inlet: Some(Listen {
                     addr: parse_listen(&listen)?,
                     token: v("AGENTGW_LINK_TOKEN").ok_or_else(|| {
-                        "AGENTGW_LINK_LISTEN があるのに AGENTGW_LINK_TOKEN がありません。\n\
-                         鍵の無い口は開けません(親が出した接続文字列の中の鍵です)。"
-                            .to_string()
+                        crate::t!(
+                            ".env has AGENTGW_LINK_LISTEN but no AGENTGW_LINK_TOKEN. The gateway's \
+                             secret key is required to accept its connection.",
+                            ".env に AGENTGW_LINK_LISTEN はありますが、AGENTGW_LINK_TOKEN がありません。\
+                             ゲートウェイからの接続を受けるには、ゲートウェイの秘密鍵が必要です。"
+                        )
                     })?,
                 }),
             });
         }
         let Some(token) = v("AGENTGW_LINK_TOKEN") else {
-            return Err(
-                "AGENTGW_LINK_LISTEN があるのに AGENTGW_LINK_TOKEN がありません。\n\
-                 鍵の無い口は開けません(`agentgw add-child` が1本作ります)。"
-                    .to_string(),
-            );
+            return Err(crate::t!(
+                ".env has AGENTGW_LINK_LISTEN but no AGENTGW_LINK_TOKEN. Machines can't connect \
+                 without a secret key; `agentgw add-machine` creates one.",
+                ".env に AGENTGW_LINK_LISTEN はありますが、AGENTGW_LINK_TOKEN がありません。秘密鍵が\
+                 無いとマシンはつながれません。`agentgw add-machine` を実行すると作られます。"
+            ));
         };
         // 名前が無い親は `route <自分の id>` の指名先になれない。自動では決めない
         if self_id.is_none() {
-            return Err(
-                "子を迎えるには AGENTGW_BRIDGE_ID(このマシンの名前)が要ります — \
-                 route の指名先になるので、自動では決めません。"
-                    .to_string(),
-            );
+            return Err(crate::t!(
+                "To accept machines, this gateway needs a name: set AGENTGW_BRIDGE_ID in .env. \
+                 `route` uses it, so it isn't chosen automatically.",
+                "マシンを受け入れるには、このゲートウェイに名前が必要です。.env に AGENTGW_BRIDGE_ID を\
+                 書いてください。`route` で使う名前なので、自動では決めません。"
+            ));
         }
         Ok(Wiring {
             upstream,
@@ -622,17 +643,20 @@ impl Wiring {
 /// [`Listen::is_exposed`] が真になり、起動時に1行警告が出る。
 fn parse_listen(listen: &str) -> Result<std::net::SocketAddr, String> {
     let (host, port) = listen.rsplit_once(':').ok_or_else(|| {
-        format!("AGENTGW_LINK_LISTEN は host:port の形で書いてください(例 0.0.0.0:8787)— 読めません: {listen}")
+        crate::t!(
+            "AGENTGW_LINK_LISTEN must be host:port (e.g. 0.0.0.0:8787), not {listen}",
+            "AGENTGW_LINK_LISTEN は host:port の形で書いてください(例: 0.0.0.0:8787)。今の値: {listen}"
+        )
     })?;
     let host = host.trim_matches(['[', ']']);
     let port: u16 = port
         .parse()
-        .map_err(|_| format!("AGENTGW_LINK_LISTEN の port が読めません: {port}"))?;
+        .map_err(|_| crate::t!("AGENTGW_LINK_LISTEN has an invalid port: {port}", "AGENTGW_LINK_LISTEN のポートが正しくありません: {port}"))?;
     let ip: std::net::IpAddr = if host == "localhost" {
         std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
     } else {
         host.parse()
-            .map_err(|_| format!("AGENTGW_LINK_LISTEN の host が読めません: {host}"))?
+            .map_err(|_| crate::t!("AGENTGW_LINK_LISTEN has an invalid host: {host}", "AGENTGW_LINK_LISTEN のホストが正しくありません: {host}"))?
     };
     Ok(std::net::SocketAddr::new(ip, port))
 }
@@ -731,7 +755,7 @@ pub fn cli(args: &[String], dir: &crate::bridge::state::StateDir) -> i32 {
         Some("-") | None if !std::io::stdin().is_terminal() => {
             let mut buf = String::new();
             if std::io::stdin().read_to_string(&mut buf).is_err() {
-                eprintln!("link: 標準入力が読めません");
+                eprintln!("link: {}", crate::t!("couldn't read standard input", "標準入力を読めません"));
                 return 1;
             }
             buf
@@ -739,8 +763,13 @@ pub fn cli(args: &[String], dir: &crate::bridge::state::StateDir) -> i32 {
         Some(s) if s != "-" => s.to_string(),
         _ => {
             eprintln!(
-                "usage: agentgw link <接続文字列>\n\
-                        agentgw link --name <名前> -   (標準入力から。ssh 越しはこちら)"
+                "{}",
+                crate::t!(
+                    "usage: agentgw link <connection string>\n       \
+                     agentgw link --name <name> -   (read from standard input)",
+                    "usage: agentgw link <接続文字列>\n       \
+                     agentgw link --name <名前> -   (標準入力から読む)"
+                )
             );
             return 2;
         }
@@ -763,8 +792,11 @@ pub fn cli(args: &[String], dir: &crate::bridge::state::StateDir) -> i32 {
             Some(id) => id,
             None => {
                 eprintln!(
-                    "link: このマシンの名前が要ります。`--name <名前>` を付けるか \n\
-                     AGENTGW_BRIDGE_ID を設定してください(自動では決めません)。"
+                    "link: {}",
+                    crate::t!(
+                        "this machine needs a name. Pass `--name <name>` or set AGENTGW_BRIDGE_ID.",
+                        "このマシンに名前が必要です。`--name <名前>` を付けるか、AGENTGW_BRIDGE_ID を設定してください。"
+                    )
                 );
                 return 1;
             }
@@ -774,15 +806,19 @@ pub fn cli(args: &[String], dir: &crate::bridge::state::StateDir) -> i32 {
     let before = std::fs::read_to_string(&env_path).unwrap_or_default();
     let after = apply_connection(&before, &conn, &bridge_id);
     if let Err(e) = crate::bridge::state::write_atomic_mode(&env_path, &after, Some(0o600)) {
-        eprintln!("link: {} が書けません: {e}", env_path.display());
+        eprintln!("link: {}", crate::t!("couldn't write {}: {e}", "{} に書けません: {e}", env_path.display()));
         return 1;
     }
-    println!("書きました: {}", env_path.display());
+    println!("{}", crate::t!("Saved: {}", "保存しました: {}", env_path.display()));
     println!("  AGENTGW_RELAY_URL={}", conn.url);
     println!("  AGENTGW_BRIDGE_ID={bridge_id}");
     if before.lines().any(|l| l.starts_with("SLACK_APP_TOKEN=")) {
         println!(
-            "  SLACK_APP_TOKEN はコメントにしました(直結と Relay 経由は同時に有効にできません)"
+            "{}",
+            crate::t!(
+                "  Commented out SLACK_APP_TOKEN: this machine now goes through the gateway instead of connecting to Slack itself.",
+                "  SLACK_APP_TOKEN をコメントアウトしました。このマシンは自分で Slack につながず、ゲートウェイを通します。"
+            )
         );
     }
     0
@@ -798,14 +834,12 @@ pub(crate) fn prompt_bridge_id() -> Option<String> {
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
-    print!(
-        "このマシンの名前(Bridge ID){}: ",
-        if host.is_empty() {
-            String::new()
-        } else {
-            format!(" [{host}]")
-        }
-    );
+    let default = if host.is_empty() {
+        String::new()
+    } else {
+        format!(" [{host}]")
+    };
+    print!("{}", crate::t!("Name for this machine{default}: ", "このマシンの名前{default}: "));
     let _ = std::io::stdout().flush();
     let mut line = String::new();
     std::io::stdin().read_line(&mut line).ok()?;
@@ -888,7 +922,7 @@ mod tests {
         let Beat::Gone(why) = beat_within(&mut s, &mut w, 10).await else {
             panic!("2窓目は Gone のはず");
         };
-        assert!(why.contains("返事がありません"), "{why}");
+        assert!(why.contains("no reply to ping"), "{why}");
     }
 
     /// 届いたら本文を返し、**番人を数え直す** — 生きている link を切らないための要。
@@ -915,8 +949,8 @@ mod tests {
     /// 版違いだけは「このマシンを新しくして再起動すれば治る」と言い分ける。
     #[test]
     fn a_version_mismatch_says_a_restart_can_heal_it() {
-        assert!(Fatal::WrongVersion.message().contains("再起動"));
-        assert!(Fatal::BadToken.message().contains("接続文字列"));
+        assert!(Fatal::WrongVersion.message().contains("upgrade"));
+        assert!(Fatal::BadToken.message().contains("add-machine"));
         assert!(Fatal::BadBridgeId.message().contains("AGENTGW_BRIDGE_ID"));
     }
 
@@ -992,7 +1026,7 @@ mod tests {
         );
         // URL だけ / トークンだけ = 設定が途中。分かる文面で断る
         let half = Mode::resolve(env(&[("AGENTGW_RELAY_URL", "wss://r")])).unwrap_err();
-        assert!(half.contains("途中"), "{half}");
+        assert!(half.contains("half set up"), "{half}");
     }
 
     /// **自動命名しない。** `default` に落ちると、複数マシンが揃って衝突する。
@@ -1004,7 +1038,7 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(e.contains("AGENTGW_BRIDGE_ID"), "{e}");
-        assert!(e.contains("奪い合"), "{e}");
+        assert!(e.contains("take each other's messages"), "{e}");
     }
 
     /// ** **: 両方揃った設定は起動しない。黙って両方繋ぐと split-brain が戻る。
@@ -1018,7 +1052,7 @@ mod tests {
             ("AGENTGW_BRIDGE_ID", "desktop"),
         ]))
         .unwrap_err();
-        assert!(e.contains("同時に有効にできません"), "{e}");
+        assert!(e.contains("not both"), "{e}");
         assert!(e.contains("SLACK_APP_TOKEN"), "{e}");
     }
 
@@ -1133,7 +1167,7 @@ mod tests {
             ("AGENTGW_LINK_TOKEN".into(), "k".into()),
         ])
         .unwrap_err();
-        assert!(e.contains("どちらか一方向"), "{e}");
+        assert!(e.contains("Keep one"), "{e}");
     }
 
     /// Slack のトークンが無く、口だけある = **親に迎えに来てもらう子**。

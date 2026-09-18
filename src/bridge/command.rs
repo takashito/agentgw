@@ -738,14 +738,20 @@ impl ResumeInfo {
     pub fn render(&self) -> String {
         let info = self;
         let Some(sid) = info.session_id.as_deref().filter(|s| !s.is_empty()) else {
-            return "このスレッドにはまだ再開できるセッションがありません。一度メッセージを送ってセッションを開始してからお試しください。".to_string();
+            return crate::t!(
+                "This thread has no session to resume yet. Send a message to start one first.",
+                "このスレッドには、まだ再開できるセッションがありません。先にメッセージを送ってセッションを始めてください。"
+            );
         };
         let cmd = match info.cwd.as_deref().filter(|c| !c.is_empty()) {
             Some(cwd) => format!("cd {cwd} && claude --resume {sid}"),
             None => format!("claude --resume {sid}"),
         };
         let mut lines = vec![
-            "以下のコマンドで Claude セッションを再開できます。".to_string(),
+            crate::t!(
+                "Run this to continue the session in your own terminal:",
+                "手元の端末でセッションを続けるには、次を実行してください。"
+            ),
             String::new(),
             "```".to_string(),
             cmd,
@@ -753,11 +759,17 @@ impl ResumeInfo {
         ];
         if info.transcript_missing {
             lines.push(String::new());
-            lines.push("⚠️ このセッションの履歴がディスク上に見つかりませんでした。再開に失敗するかもしれません。".to_string());
+            lines.push(crate::t!(
+                "⚠️ This session's history isn't on disk, so resuming may fail.",
+                "⚠️ このセッションの履歴がディスクに見つからないので、再開できないかもしれません。"
+            ));
         }
         if info.worker_running {
             lines.push(String::new());
-            lines.push("本セッションは終了します。".to_string());
+            lines.push(crate::t!(
+                "The agent for this thread has been stopped so the session can continue there.",
+                "続きを手元で進められるよう、このスレッドのエージェントは止めました。"
+            ));
         }
         lines.join("\n")
     }
@@ -811,9 +823,9 @@ impl StatusThread {
             Some(p) => format!("<{p}|{label}>"),
             None => label,
         };
-        match Self::idle_label(now_ms, self.last_activity_ms).as_str() {
-            "不明" => format!("　{text}"),
-            idle => format!("`{idle}`　{text}"),
+        match Self::idle_label(now_ms, self.last_activity_ms) {
+            None => format!("　{text}"),
+            Some(idle) => format!("`{idle}`　{text}"),
         }
     }
 
@@ -822,18 +834,20 @@ impl StatusThread {
     ///
     /// **原文からの意図的差分**: 「前」を付ける。裸の `4分` は何の4分か判らない
     /// (2026-07-31 ユーザー指摘)。移植漏れではない。
-    fn idle_label(now_ms: u64, last_activity_ms: u64) -> String {
+    /// `None` = 最後に動いた時刻が分からない。
+    fn idle_label(now_ms: u64, last_activity_ms: u64) -> Option<String> {
         if last_activity_ms == 0 {
-            return "不明".to_string();
+            return None;
         }
         let mins = now_ms.saturating_sub(last_activity_ms) / 60_000;
         if mins < 1 {
-            return "たった今".to_string();
+            return Some(crate::t!("just now", "たった今"));
         }
         if mins < 60 {
-            return format!("{mins}分前");
+            return Some(crate::t!("{mins}m ago", "{mins}分前"));
         }
-        format!("{:.1}時間前", mins as f64 / 60.0)
+        let hours = format!("{:.1}", mins as f64 / 60.0);
+        Some(crate::t!("{hours}h ago", "{hours}時間前"))
     }
 
     /// mrkdwn のリンク文字列には `<` `>` `|` を置けない(リンクの区切り文字)。スレッドの話題は
@@ -871,7 +885,7 @@ impl StatusThread {
         // `\s+` → ' ' + trim を一手で
         let t = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
         if t.is_empty() {
-            return "（無題）".to_string();
+            return crate::t!("(untitled)", "(無題)");
         }
         // 現物は UTF-16 単位で 50 を数えるが、ここは文字数(絵文字を割らない方が安全)
         if t.chars().count() > 50 {
@@ -892,7 +906,7 @@ impl StatusReport {
     /// 隣り合うリポは接頭辞を共有するので区別が消える)。
     fn short_path(p: Option<&str>, home: &str) -> String {
         let Some(p) = p.filter(|s| !s.is_empty()) else {
-            return "(不明)".to_string();
+            return crate::t!("(unknown)", "(不明)");
         };
         match p.strip_prefix(home).filter(|_| !home.is_empty()) {
             Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("~{rest}"),
@@ -915,13 +929,13 @@ impl StatusReport {
         } else {
             format!(" · {}", r.mode)
         };
-        lines.push(format!("🟢 *agentgw* · Bridge `{version}`{mode}"));
+        lines.push(format!("🟢 *agentgw* `{version}`{mode}"));
         // 素の空行だと Slack は段落の隙間しか空けず、下の箇条書きの余白に負けて
         // 見出しが本文にくっついて見える。全角スペース1つの行なら高さのある行として残る
         lines.push("　".to_string());
 
         if r.threads.is_empty() {
-            lines.push("*アクティブスレッド* — なし".to_string());
+            lines.push(crate::t!("*Active threads* — none", "*動いているスレッド* — なし"));
         } else {
             // チャンネルごとに束ねる。現物の Map と同じく**挿入順**を保つ(下の整列は安定ソート)
             let mut groups: Vec<(&str, Vec<&StatusThread>)> = Vec::new();
@@ -931,7 +945,8 @@ impl StatusReport {
                     None => groups.push((&t.channel_id, vec![t])),
                 }
             }
-            lines.push(format!("*アクティブスレッド* — {}本", r.threads.len()));
+            let n = r.threads.len();
+            lines.push(crate::t!("*Active threads* — {n}", "*動いているスレッド* — {n}"));
             // DM が先、次に賑やかなチャンネル順。同点は channel id で決める。
             let dm_rank = |ch: &str| u8::from(!ch.starts_with('D'));
             groups.sort_by(|a, b| {
@@ -971,9 +986,10 @@ impl StatusReport {
         lines.push(String::new());
         // 現行と同じ、待っているフォルダだけの一覧
         if r.pools.is_empty() {
-            lines.push("*Warm Pool* — なし".to_string());
+            lines.push(crate::t!("*Warm agents* — none", "*待機中のエージェント* — なし"));
         } else {
-            lines.push(format!("*Warm Pool* — {}本待機", r.pools.len()));
+            let n = r.pools.len();
+            lines.push(crate::t!("*Warm agents* — {n}", "*待機中のエージェント* — {n}"));
             // 1行1件だと縦に伸びるだけ — パスは等幅チップにして横に並べる
             lines.push(
                 r.pools
@@ -1018,9 +1034,9 @@ impl PwdEntry {
         let entry = self;
         let label = entry.label_text();
         let note = if entry.is_fallback {
-            " — ルート未設定（Home フォールバック）"
+            crate::t!(" — not set; using the default directory", " — 未設定のため既定のディレクトリ")
         } else {
-            ""
+            String::new()
         };
         format!(
             "● {heading}\n<#{}>{label}{note}\n  `{}`",
@@ -1031,9 +1047,9 @@ impl PwdEntry {
     /// 設定済みの全チャンネル → パス(`pwd all` の形)。`home` はルート未設定のチャンネル / DM が
     /// 落ちる Home フォールバック。
     pub fn render_all(entries: &[PwdEntry], home: &str) -> String {
-        let mut lines = vec!["● 設定済みチャンネル → プロジェクトパス".to_string()];
+        let mut lines = vec![crate::t!("● Project directories by channel", "● チャンネルごとの作業ディレクトリ")];
         if entries.is_empty() {
-            lines.push("  • ルートは未設定です。".to_string());
+            lines.push(crate::t!("  • None set.", "  • まだ設定していません。"));
         } else {
             for e in entries {
                 lines.push(format!(
@@ -1045,7 +1061,7 @@ impl PwdEntry {
             }
         }
         lines.push(String::new());
-        lines.push(format!("_ルート未設定のチャンネル / DM は Home: `{home}`_"));
+        lines.push(crate::t!("_Channels without one, and DMs, use `{home}`_", "_設定していないチャンネルと DM は `{home}` を使います_"));
         lines.join("\n")
     }
 }
@@ -1173,9 +1189,10 @@ impl CompactProgress {
         if let Some(pct) = p.percent {
             // 確定: /usage が描くのと同じバー。% はその後ろ
             let pct = pct.min(100);
-            return format!(
-                "🗜️ コンテキストを圧縮中…{elapsed}\n`{}` {pct}%",
-                UsageReport::bar(f64::from(pct), CELLS)
+            let bar = UsageReport::bar(f64::from(pct), CELLS);
+            return crate::t!(
+                "🗜️ Compacting the context…{elapsed}\n`{bar}` {pct}%",
+                "🗜️ コンテキストを圧縮中…{elapsed}\n`{bar}` {pct}%"
             );
         }
         // 不定: 経過秒とともにバーの上を流れる光る窓
@@ -1197,7 +1214,10 @@ impl CompactProgress {
                 }
             })
             .collect();
-        format!("🗜️ コンテキストを圧縮中…{elapsed}{tok}\n`{bar}`")
+        crate::t!(
+            "🗜️ Compacting the context…{elapsed}{tok}\n`{bar}`",
+            "🗜️ コンテキストを圧縮中…{elapsed}{tok}\n`{bar}`"
+        )
     }
 }
 
@@ -1231,11 +1251,23 @@ pub enum RestartPhase {
 /// Bun の表にあった「Bridge を更新」と「中断していたスレッドの処理を再開」は**持たない**:
 /// Rust はバイナリ1個で更新機能が無く(差し替えは install script の仕事)、自動再開も無いので、
 /// どちらも毎回「何もせず done」になる飾りだった。
-const RESTART_STEPS: [(RestartPhase, &str); 3] = [
-    (RestartPhase::Received, "再起動を開始します"),
-    (RestartPhase::Switching, "Bridge を停止"),
-    (RestartPhase::Online, "Bridge がオンラインに復帰"),
+const RESTART_STEPS: [RestartPhase; 3] = [
+    RestartPhase::Received,
+    RestartPhase::Switching,
+    RestartPhase::Online,
 ];
+
+impl RestartPhase {
+    /// チェックリストの1行の文言。
+    fn step_label(self) -> String {
+        match self {
+            RestartPhase::Received => crate::t!("Restart requested", "再起動を受け付けました"),
+            RestartPhase::Switching => crate::t!("Stopping agentgw", "agentgw を止めています"),
+            RestartPhase::Online => crate::t!("agentgw is back online", "agentgw がオンラインに戻りました"),
+            RestartPhase::Done | RestartPhase::Failed => String::new(),
+        }
+    }
+}
 
 /// 与えられた進捗点でチェックリスト全体を描く:
 ///   - `completed_through` までの行 → `•`(done)
@@ -1255,7 +1287,7 @@ impl RestartPhase {
             RestartPhase::Failed => 0,
             p => RESTART_STEPS
                 .iter()
-                .position(|(k, _)| *k == p)
+                .position(|k| *k == p)
                 .map_or(0, |i| i + 1),
         };
         let active = (completed_through != RestartPhase::Done).then_some(done_count);
@@ -1264,7 +1296,8 @@ impl RestartPhase {
         let mut lines: Vec<String> = RESTART_STEPS
             .iter()
             .enumerate()
-            .map(|(i, (_, label))| {
+            .map(|(i, step)| {
+                let label = step.step_label();
                 if i < done_count {
                     format!("• {label}")
                 } else if active == Some(i) {
@@ -1279,12 +1312,10 @@ impl RestartPhase {
             })
             .collect();
         if completed_through == RestartPhase::Done {
-            lines.push("✅ 再起動が完了しました".into());
+            lines.push(crate::t!("✅ Restart complete", "✅ 再起動が完了しました"));
         } else if failed {
-            lines.push(format!(
-                "💥 再起動に失敗しました{}",
-                failed_reason.map(|r| format!(" — {r}")).unwrap_or_default()
-            ));
+            let why = failed_reason.map(|r| format!(" — {r}")).unwrap_or_default();
+            lines.push(crate::t!("💥 Restart failed{why}", "💥 再起動に失敗しました{why}"));
         }
         lines.join("\n")
     }
@@ -1497,70 +1528,90 @@ impl std::fmt::Display for TurnFailureClass {
 
 impl TurnFailureClass {
     /// `error` フレームの `error_type` を**部分一致・大小無視**で引く表。
-    const TABLE: &'static [(&'static str, TurnFailureClass, &'static str)] = &[
+    /// (`error_type` に含まれる語, 扱い, 英語, 日本語)
+    const TABLE: &'static [(&'static str, TurnFailureClass, &'static str, &'static str)] = &[
         (
             "rate_limit",
             TurnFailureClass::Retry,
-            "Claude 側が混み合っていて、返信を作れませんでした。少し待ってからもう一度送ってください。",
+            "Claude is busy right now, so no reply was written. Wait a moment and send it again.",
+            "Claude が混み合っていて、返信を書けませんでした。少し待ってからもう一度送ってください。",
         ),
         (
             "overloaded",
             TurnFailureClass::Retry,
-            "Claude 側の一時的な障害で、返信を作れませんでした。少し待ってからもう一度送ってください。",
+            "Claude had a temporary problem, so no reply was written. Wait a moment and send it again.",
+            "Claude 側の一時的な不具合で、返信を書けませんでした。少し待ってからもう一度送ってください。",
         ),
         (
             "server_error",
             TurnFailureClass::Retry,
-            "Claude 側の一時的な障害で、返信を作れませんでした。少し待ってからもう一度送ってください。",
+            "Claude had a temporary problem, so no reply was written. Wait a moment and send it again.",
+            "Claude 側の一時的な不具合で、返信を書けませんでした。少し待ってからもう一度送ってください。",
         ),
         (
             "authentication_failed",
             TurnFailureClass::TellUser,
-            "サインインが切れているため、返信を作れませんでした。DM で `login` と送ってサインインし直してください。",
+            "Claude Code is signed out, so no reply was written. DM the bot `login` to sign in again.",
+            "Claude Code のサインインが切れていて、返信を書けませんでした。ボットに `login` と DM してサインインし直してください。",
         ),
         (
             "oauth_org_not_allowed",
             TurnFailureClass::TellUser,
-            "組織の設定でこのアカウントの利用が許可されていないため、返信を作れませんでした。管理者に確認してください。",
+            "Your organization doesn't allow this account to use Claude Code, so no reply was written. Ask your admin.",
+            "組織の設定で、このアカウントは Claude Code を使えません。返信を書けなかったので、管理者に確認してください。",
         ),
         (
             "billing_error",
             TurnFailureClass::TellUser,
-            "お支払い（課金）の問題で、返信を作れませんでした。Claude の課金設定を確認してください。",
+            "There's a billing problem with your Claude account, so no reply was written. Check your billing settings.",
+            "Claude のアカウントの支払いに問題があり、返信を書けませんでした。支払いの設定を確認してください。",
         ),
         (
             "max_output_tokens",
             TurnFailureClass::TellUser,
-            "答えが長すぎて出力の上限に達したため、返信を作れませんでした。範囲を絞ってもう一度聞いてください。",
+            "The answer hit the output limit before it was finished. Ask for a narrower part.",
+            "答えが長すぎて、出力の上限を超えました。範囲を絞って聞き直してください。",
         ),
         (
             "invalid_request",
             TurnFailureClass::TellUser,
-            "リクエストが大きすぎる（または不正な）ため、返信を作れませんでした。`compact` で会話を圧縮するか、短く送り直してください。",
+            "The request was too large (or invalid). Run `compact` to shrink the conversation, or send a shorter message.",
+            "依頼が大きすぎるか、正しくありません。`compact` で会話を圧縮するか、短くして送り直してください。",
         ),
         (
             "model_not_found",
             TurnFailureClass::TellUser,
-            "指定されたモデルが見つからないため、返信を作れませんでした。モデル設定を確認してください。",
+            "The selected model doesn't exist, so no reply was written. Check the model with `model`.",
+            "選んだモデルが見つからず、返信を書けませんでした。`model` でモデルを確認してください。",
         ),
     ];
 
     /// ターン失敗を分類し、**同時に**人が動ける言葉にする(`turnFailure`)。
     ///
     /// 10番目の `unknown`、そして知らない型・**空の型**はすべて `Retry` に落ちる — 空は実際に
-    /// 起きる(現行が 2026-07-14 に実機で観測、次のターンは同じ資格で成功した)。何も飲み込まない:
+    /// 起きる(2026-07-14 に実機で観測、次のターンは同じ資格で成功した)。何も飲み込まない:
     /// 生のキーワードは唯一の手掛かりなので文面に残す。
     pub fn of(reason: &str) -> (TurnFailureClass, String) {
         let r = reason.to_lowercase();
-        if let Some((_, klass, text)) = Self::TABLE.iter().find(|(needle, ..)| r.contains(needle)) {
+        if let Some((_, klass, en, ja)) = Self::TABLE.iter().find(|(needle, ..)| r.contains(needle)) {
+            let text = match crate::i18n::lang() {
+                crate::i18n::Lang::En => en,
+                crate::i18n::Lang::Ja => ja,
+            };
             return (*klass, (*text).to_string());
         }
         (
             TurnFailureClass::Retry,
             if reason.is_empty() {
-                "返信の作成に失敗しました。もう一度送ってください。".to_string()
+                crate::t!(
+                    "No reply was written. Send it again.",
+                    "返信を書けませんでした。もう一度送ってください。"
+                )
             } else {
-                format!("返信の作成に失敗しました（`{reason}`）。もう一度送ってください。")
+                crate::t!(
+                    "No reply was written (`{reason}`). Send it again.",
+                    "返信を書けませんでした(`{reason}`)。もう一度送ってください。"
+                )
             },
         )
     }
@@ -1617,17 +1668,18 @@ impl Notice {
                 reset,
                 projected_hit,
             } => {
-                // 文面は現行の原文
-                let mut lines = vec![format!(
-                    "⚠️ 利用上限が近づいています — Current session: *{pct}% used*"
+                let mut lines = vec![crate::t!(
+                    "⚠️ You're close to your usage limit — current session *{pct}% used*",
+                    "⚠️ 利用上限が近づいています — 今のセッションで *{pct}%* 使用"
                 )];
                 if !reset.is_empty() {
-                    lines.push(format!("リセット予定: {reset}"));
+                    lines.push(crate::t!("Resets {reset}", "リセット: {reset}"));
                 }
                 if let Some(hit) = projected_hit {
-                    lines.push(format!(
-                        "このペースだと約 {} に上限到達の見込みです。",
-                        hit.reset_like()
+                    let at = hit.reset_like();
+                    lines.push(crate::t!(
+                        "At this pace you'll hit the limit around {at}.",
+                        "このペースだと {at} ごろに上限に達します。"
                     ));
                 }
                 lines.join("\n")
@@ -1668,185 +1720,156 @@ impl Notice {
     /// `CommandCtx::route`)なので、条件もそちらに合わせる。`fleet=false` の出力は
     /// 現行の `remoteMode=false` と一致する。
     fn help(fleet: bool) -> String {
-        fn group(lines: &mut Vec<String>, title: &str) {
-            lines.push(format!("━━ {title} ━━"));
-            lines.push(String::new());
-        }
-        fn section(lines: &mut Vec<String>, title: &str, rows: &[(&str, &str)]) {
-            lines.push(format!("● {title}"));
+        fn section(lines: &mut Vec<String>, title: String, rows: Vec<(&str, String)>) {
+            lines.push(format!("*{title}*"));
             for (cmd, desc) in rows {
                 lines.push(format!("  • `{cmd}` — {desc}"));
             }
             lines.push(String::new());
         }
 
-        let mut lines: Vec<String> = vec!["● agentgw コマンド一覧".to_string(), String::new()];
+        let mut lines: Vec<String> = vec![crate::t!("*agentgw commands*", "*agentgw のコマンド*"), String::new()];
 
-        group(&mut lines, "Claude Code 関連");
         section(
             &mut lines,
-            "このスレッド",
-            &[
-                (
-                    "stop",
-                    "実行中のターンを即停止（🛑 などの絵文字リアクションでも可）",
-                ),
-                (
-                    "exit / bye / done",
-                    "このスレッドのワーカーを終了（スレッドは保持し、次のメッセージで再開）",
-                ),
-                (
-                    "compact",
-                    "このスレッドのコンテキストを圧縮（/compact）— 進捗バーを表示",
-                ),
-                ("model", "このスレッドのワーカーの現在のモデルを表示"),
-                (
-                    "model fable|opus|sonnet|haiku",
-                    "このスレッドのワーカーのモデルを切替（/model）",
-                ),
-                (
-                    "effort",
-                    "このスレッドのワーカーの現在の effort level を表示",
-                ),
-                (
-                    "effort low|medium|high|xhigh|max|ultracode|auto",
-                    "このスレッドのワーカーの effort level を設定（/effort）",
-                ),
-                ("mode", "このスレッドのワーカーの現在の権限モードを表示"),
-                (
-                    "mode manual|plan|edit|auto",
-                    "このスレッドのワーカーの権限モードを切替（shift+tab）",
-                ),
-                (
-                    "context / ctx",
-                    "このスレッドのワーカーのコンテキスト使用量を表示",
-                ),
-                (
-                    "resume",
-                    "このスレッドのセッションを手元の Claude Code で再開するコマンドを表示（ワーカーは終了）",
-                ),
+            crate::t!("In this thread", "このスレッドで"),
+            vec![
+                ("stop", crate::t!("stop the current turn (a 🛑 reaction works too)", "実行中のターンを止める(🛑 のリアクションでも可)")),
+                ("exit / bye / done", crate::t!("end this thread's agent; your next message resumes it", "このスレッドのエージェントを終える。次に書けば再開する")),
+                ("compact", crate::t!("compact the context, with a progress bar", "コンテキストを圧縮する(進捗バー付き)")),
+                ("model [fable|opus|sonnet|haiku]", crate::t!("show or switch the model", "モデルを見る・切り替える")),
+                ("effort [low|medium|high|xhigh|max|ultracode|auto]", crate::t!("show or set the effort level", "effort を見る・決める")),
+                ("mode [manual|plan|edit|auto]", crate::t!("show or switch the permission mode", "権限モードを見る・切り替える")),
+                ("context / ctx", crate::t!("show this agent's context usage", "このエージェントのコンテキストの使用量")),
+                ("resume", crate::t!("show the command to continue this session in your own terminal (stops the agent here)", "このセッションを手元の端末で続けるコマンドを出す(ここのエージェントは止める)")),
             ],
         );
         section(
             &mut lines,
-            "アカウント",
-            &[
-                ("login", "サインイン（Owner 未設定の DM から）"),
-                ("logout", "サインアウト（全ワーカーと Warm Pool を破棄）"),
-                (
-                    "usage / usg",
-                    "Claude アカウントの使用状況（サブスク上限）を表示",
-                ),
+            crate::t!("Account", "アカウント"),
+            vec![
+                ("login", crate::t!("sign Claude Code in to your account (in a DM)", "Claude Code を自分のアカウントでサインインする(DM で)")),
+                ("logout", crate::t!("sign out and stop every agent", "サインアウトして、すべてのエージェントを止める")),
+                ("usage / usg", crate::t!("show your Claude subscription usage", "Claude のサブスクリプションの使用状況")),
             ],
         );
-
-        group(&mut lines, "Slack Plugin 関連");
         if fleet {
             section(
                 &mut lines,
-                "チャンネルの担当マシン",
-                &[
-                    ("route ＜マシンID＞", "このチャンネルの担当マシンを決める"),
-                    (
-                        "route",
-                        "ここの担当と、ほかのチャンネル・マシンの様子を表示",
-                    ),
+                crate::t!("Machines", "マシン"),
+                vec![
+                    ("route <machine>", crate::t!("hand this channel to a machine", "このチャンネルをマシンに任せる")),
+                    ("route", crate::t!("show which machine handles this channel and the others", "このチャンネルとほかのチャンネルを受け持つマシンを見る")),
                 ],
             );
         }
         section(
             &mut lines,
-            "Bridge（サービス）",
-            &[
-                (
-                    "status",
-                    "Bridge の稼働状況（版・動作中スレッド・Warm Pool）を表示",
-                ),
-                ("restart", "Bridge を安全に再起動（コード更新の反映）"),
+            crate::t!("Channels", "チャンネル"),
+            vec![
+                ("pwd", crate::t!("show this channel's project directory", "このチャンネルの作業ディレクトリを見る")),
+                ("pwd <absolute path>", crate::t!("set this channel's project directory", "このチャンネルの作業ディレクトリを決める")),
+                ("pwd all", crate::t!("show every channel's project directory", "すべてのチャンネルの作業ディレクトリを見る")),
+                ("warm on|off [<#channel>]", crate::t!("keep an agent started ahead of time for a channel (this one if none is given)", "チャンネルのエージェントを先に起動しておくか(省くとこのチャンネル)")),
+                ("set-home", crate::t!("send notices to this channel", "通知をこのチャンネルに出す")),
             ],
         );
         section(
             &mut lines,
-            "チャンネルとリポジトリ",
-            &[
-                ("pwd", "このチャンネルのプロジェクトパスを表示"),
-                ("pwd ＜絶対パス＞", "このチャンネルのプロジェクトパスを設定"),
-                ("pwd all", "全チャンネルのプロジェクトパスを表示"),
-                (
-                    "warm on|off [<#channel>]",
-                    "そのチャンネルのワーカーを事前に起動しておくか（引数なしで現在のチャンネル）",
-                ),
-                ("set-home", "このチャンネルをホームチャンネルに設定"),
+            "agentgw".to_string(),
+            vec![
+                ("status", crate::t!("version, active threads and warm agents", "版・動いているスレッド・待機中のエージェント")),
+                ("restart", crate::t!("restart agentgw (picks up a new version)", "agentgw を再起動する(新しい版を読み込む)")),
             ],
         );
         section(
             &mut lines,
-            "ボット許可",
-            &[
-                ("allow-bot <@bot>", "指定ボットからのメッセージを許可"),
-                ("remove-bot <@bot>", "ボット許可を解除"),
+            crate::t!("Other bots", "ほかのボット"),
+            vec![
+                ("allow-bot <@bot>", crate::t!("let a bot's messages start work", "そのボットの投稿で作業を始められるようにする")),
+                ("remove-bot <@bot>", crate::t!("stop letting that bot's messages through", "そのボットの投稿を通さないようにする")),
             ],
         );
         section(
             &mut lines,
-            "ヘルプ",
-            &[("help / ヘルプ / ?", "このコマンド一覧を表示")],
+            crate::t!("Help", "ヘルプ"),
+            vec![("help / ?", crate::t!("show this list", "この一覧を出す"))],
         );
 
         if lines.last().is_some_and(String::is_empty) {
             lines.pop();
         }
         lines.push(String::new());
-        lines.push("_コマンドはメッセージ全体がそのコマンド（引数を取るものは引数まで含めて）のときだけ発動します。文中に含むだけでは発動せず、普通のメッセージとして届きます。_".to_string());
+        lines.push(crate::t!(
+            "_A command only runs when it's the whole message (with its arguments). Inside a sentence it's just part of a normal message._",
+            "_コマンドは、メッセージ全体がそのコマンド(引数を含む)のときだけ動きます。文の中に書いたときは、普通のメッセージとして届きます。_"
+        ));
         lines.join("\n")
     }
 
-    /// DM で `pwd <path>` と打たれたときの答え。DM のワーカーは常に Home で動く —
-    /// 設定するルートが無いので、黙って何もしない代わりにそう言う。
+    /// DM で `pwd <path>` と打たれたときの答え。DM のエージェントは常に既定のディレクトリで
+    /// 動く — 設定するものが無いので、黙って何もしない代わりにそう言う。
     fn pwd_dm_set_refusal() -> String {
-        "DM のワーカーは常に Home で動くので、パスは設定できません（設定できるのはチャンネルだけです）。".to_string()
-    }
-
-    /// usage 上限中に来た依頼へ返す1本(`formatLimitReply` 原文)。
-    /// `now_ms` は遮断判定(呼び出し側の `on_inbound`)の担当なので原文どおり文面には出ない。
-    /// ホスト = Asia/Tokyo はこのリポの usage 機能全体の前提 — 固定 +9:00 で足すだけ。
-    fn limited(limited_until_ms: u64) -> String {
-        format!(
-            "⏸️ Claude Code の利用上限に達しています。{}（Asia/Tokyo）頃のリセットまで新しい依頼を受けられません。リセット後にもう一度送ってください。",
-            WallClock::tokyo(limited_until_ms).format("%-m/%-d %H:%M")
+        crate::t!(
+            "Agents in DMs always work in the default directory; only channels can have their own.",
+            "DM のエージェントは常に既定のディレクトリで動きます。作業ディレクトリを決められるのはチャンネルだけです。"
         )
     }
 
-    /// home への起動通知に付く要約(`formatStartupSummary` 原文)。
-    /// pool の行だけ先頭に半角スペース2つが付く(原文どおり)。
+    /// usage 上限中に来た依頼へ返す1本。ホスト = Asia/Tokyo はこのリポの usage 機能全体の
+    /// 前提 — 固定 +9:00 で足すだけ。
+    fn limited(limited_until_ms: u64) -> String {
+        let at = WallClock::tokyo(limited_until_ms).format("%-m/%-d %H:%M");
+        crate::t!(
+            "⏸️ You've reached your Claude Code usage limit. New requests are paused until it resets around {at} (Asia/Tokyo) — send yours again after that.",
+            "⏸️ Claude Code の利用上限に達しました。{at}(Asia/Tokyo)ごろのリセットまで新しい依頼は受け付けません。リセット後にもう一度送ってください。"
+        )
+    }
+
+    /// home への起動通知に付く要約。
     fn startup(pools: &[String], pending_count: u32) -> String {
-        let mut lines = vec![format!("• warm pool {} 個を起動", pools.len())];
+        let n = pools.len();
+        let mut lines = vec![crate::t!("• Started {n} warm agent(s)", "• 待機用のエージェントを {n} 個起動")];
         lines.extend(pools.iter().map(|cwd| format!("  • {cwd}")));
         if pending_count > 0 {
-            lines.push(format!("• 未完スレッド {pending_count} 件を自動再開"));
+            lines.push(crate::t!(
+                "• Resumed {pending_count} unfinished thread(s)",
+                "• 途中だったスレッドを {pending_count} 件再開"
+            ));
         }
         lines.join("\n")
     }
 
-    /// home への起動通知本文(原文)。
+    /// home への起動通知。
     fn online(
-        bridge_label: &str,
+        label: &str,
         connected_as: &str,
         version: &str,
-        pid: u32,
+        _pid: u32,
         pools: &[String],
         pending_count: u32,
     ) -> String {
-        format!(
-            "🟢 *Slack Bridge ( {bridge_label} ) online* — connected as {connected_as} (v{version}, pid {pid})\n{}",
-            Self::startup(pools, pending_count)
+        let summary = Self::startup(pools, pending_count);
+        crate::t!(
+            "🟢 *{label}* is online — as {connected_as}, agentgw v{version}\n{summary}",
+            "🟢 *{label}* がオンラインになりました — {connected_as} として、agentgw v{version}\n{summary}"
         )
     }
 
-    /// home への終了通知本文(原文)。
-    fn offline(bridge_label: &str, version: &str, pid: u32, reason: &str) -> String {
-        format!(
-            "🔴 *Slack Bridge ( {bridge_label} ) offline* — reason: {reason} (v{version}, pid {pid})"
+    /// home への終了通知。`reason` は止まった理由の内部の名前なので、人の言葉にしてから出す。
+    fn offline(label: &str, version: &str, _pid: u32, reason: &str) -> String {
+        let why = if reason.starts_with("signal:") {
+            crate::t!("stopped by the system", "システムに止められたため")
+        } else {
+            match reason {
+                "restart" => crate::t!("restarting", "再起動のため"),
+                "logout" => crate::t!("signed out", "サインアウトしたため"),
+                other => other.to_string(),
+            }
+        };
+        crate::t!(
+            "🔴 *{label}* is going offline ({why}) — agentgw v{version}",
+            "🔴 *{label}* がオフラインになります({why})— agentgw v{version}"
         )
     }
 }
@@ -2134,23 +2157,20 @@ mod tests {
         use TurnFailureClass::*;
         let (k, t) = TurnFailureClass::of("API Error: rate_limit_error");
         assert_eq!(k, Retry);
-        assert!(t.contains("混み合っていて"), "{t}");
+        assert!(t.contains("Claude is busy"), "{t}");
 
         let (k, t) = TurnFailureClass::of("BILLING_ERROR");
         assert_eq!(k, TellUser);
-        assert!(t.contains("お支払い（課金）の問題"), "{t}");
+        assert!(t.contains("billing problem"), "{t}");
 
         let (k, t) = TurnFailureClass::of("unknown");
         assert_eq!(k, Retry);
-        assert_eq!(
-            t,
-            "返信の作成に失敗しました（`unknown`）。もう一度送ってください。"
-        );
+        assert_eq!(t, "No reply was written (`unknown`). Send it again.");
 
         // 実機で起きた「型が空のまま」— 飲み込まず、キーワード無しの文面で言う
         let (k, t) = TurnFailureClass::of("");
         assert_eq!(k, Retry);
-        assert_eq!(t, "返信の作成に失敗しました。もう一度送ってください。");
+        assert_eq!(t, "No reply was written. Send it again.");
     }
 
     #[test]
@@ -2160,9 +2180,9 @@ mod tests {
             pending: 0,
         }
         .render();
-        assert!(out.contains("warm pool 2 個を起動"));
+        assert!(out.contains("Started 2 warm agent(s)"));
         assert!(out.contains("/home/orchestrator"));
-        assert!(!out.contains("未完スレッド"));
+        assert!(!out.contains("unfinished"));
     }
 
     #[test]
@@ -2172,7 +2192,7 @@ mod tests {
             pending: 1,
         }
         .render();
-        assert!(out.contains("未完スレッド 1 件を自動再開"));
+        assert!(out.contains("Resumed 1 unfinished thread(s)"));
     }
 
     #[test]
@@ -2186,10 +2206,8 @@ mod tests {
             pending: 0,
         }
         .render();
-        assert!(out.starts_with(
-            "🟢 *Slack Bridge ( myhost ) online* — connected as botname (v1.2.3, pid 12345)"
-        ));
-        assert!(out.contains("warm pool 1 個を起動"));
+        assert!(out.starts_with("🟢 *myhost* is online — as botname, agentgw v1.2.3\n"), "{out}");
+        assert!(out.contains("Started 1 warm agent(s)"));
     }
 
     #[test]
@@ -2201,10 +2219,7 @@ mod tests {
             reason: "restart".to_string(),
         }
         .render();
-        assert_eq!(
-            out,
-            "🔴 *Slack Bridge ( myhost ) offline* — reason: restart (v1.2.3, pid 12345)"
-        );
+        assert_eq!(out, "🔴 *myhost* is going offline (restarting) — agentgw v1.2.3");
     }
 
     #[test]
@@ -2217,7 +2232,7 @@ mod tests {
         assert!(out.contains("6/28 17:30"), "{out}");
         assert_eq!(
             out,
-            "⏸️ Claude Code の利用上限に達しています。6/28 17:30（Asia/Tokyo）頃のリセットまで新しい依頼を受けられません。リセット後にもう一度送ってください。"
+            "⏸️ You've reached your Claude Code usage limit. New requests are paused until it resets around 6/28 17:30 (Asia/Tokyo) — send yours again after that."
         );
         // 分が0埋めされる例
         let out = Notice::Limited {
@@ -2342,7 +2357,7 @@ mod tests {
         };
         assert!(
             none.render()
-                .starts_with("このスレッドにはまだ再開できるセッションがありません")
+                .starts_with("This thread has no session to resume yet")
         );
         let full = ResumeInfo {
             session_id: Some("sid-1".into()),
@@ -2352,19 +2367,18 @@ mod tests {
         };
         let out = full.render();
         assert!(out.contains("cd /repo && claude --resume sid-1"));
-        assert!(out.contains("⚠️ このセッションの履歴がディスク上に見つかりませんでした"));
-        assert!(out.contains("本セッションは終了します。"));
+        assert!(out.contains("⚠️ This session's history isn't on disk"));
+        assert!(out.contains("The agent for this thread has been stopped"));
     }
 
     #[test]
     fn idle_and_paths() {
-        assert_eq!(StatusThread::idle_label(10_000, 0), "不明");
-        assert_eq!(StatusThread::idle_label(60_000, 30_000), "たった今");
-        assert_eq!(StatusThread::idle_label(46 * 60_000, 60_000), "45分前");
-        assert_eq!(
-            StatusThread::idle_label(10 * 60 * 60_000, 36 * 60_000),
-            "9.4時間前"
-        );
+        let _en = crate::i18n::pin(crate::i18n::Lang::En);
+        let idle = |now, last| StatusThread::idle_label(now, last);
+        assert_eq!(idle(10_000, 0), None);
+        assert_eq!(idle(60_000, 30_000).as_deref(), Some("just now"));
+        assert_eq!(idle(46 * 60_000, 60_000).as_deref(), Some("45m ago"));
+        assert_eq!(idle(10 * 60 * 60_000, 36 * 60_000).as_deref(), Some("9.4h ago"));
         assert_eq!(
             StatusReport::short_path(Some("/Users/t/dev/x"), "/Users/t"),
             "~/dev/x"
@@ -2373,7 +2387,7 @@ mod tests {
             StatusReport::short_path(Some("/opt/x"), "/Users/t"),
             "/opt/x"
         );
-        assert_eq!(StatusReport::short_path(None, "/Users/t"), "(不明)");
+        assert_eq!(StatusReport::short_path(None, "/Users/t"), "(unknown)");
     }
 
     #[test]
@@ -2408,24 +2422,24 @@ mod tests {
         let out = r.render();
         // 版と mode は1行(単独の `mode: local` 行はログの断片に見える)
         // 名乗りはバイナリ名そのまま。見出しの下は全角スペース1つの行(素の空行では隙間が足りない)
-        assert!(out.starts_with("🟢 *agentgw* · Bridge `0.1.0-rs` · local\n　\n"));
-        assert!(out.contains("*アクティブスレッド* — 2本"));
+        assert!(out.starts_with("🟢 *agentgw* `0.1.0-rs` · local\n　\n"));
+        assert!(out.contains("*Active threads* — 2"));
         // DM が先、mention は link text から剥がれる
         assert!(out.find("@taito").unwrap() < out.find("general").unwrap());
         assert!(!out.contains("UBOT"));
         // 経過時間は行頭の等幅チップ、その後ろが飛び先つきの話題
         assert!(
-            out.contains("\n<#C1|general> · `~/dev/x`\n`1分前`　<https://s/p1|READMEを要約して>")
+            out.contains("\n<#C1|general> · `~/dev/x`\n`1m ago`　<https://s/p1|READMEを要約して>")
         );
         // 時刻が判らないスレッドはチップを置かず、頭を揃えるだけ
-        assert!(out.contains("\n@taito\n　（無題）\n"));
-        assert!(out.contains("*Warm Pool* — なし"));
+        assert!(out.contains("\n@taito\n　(untitled)\n"));
+        assert!(out.contains("*Warm agents* — none"));
         // 空スレッド
         let empty = StatusReport {
             threads: vec![],
             ..r
         };
-        assert!(empty.render().contains("*アクティブスレッド* — なし"));
+        assert!(empty.render().contains("*Active threads* — none"));
     }
 
     /// Warm Pool 節の最小構成。threads は空でよい(節どうしは独立)。
@@ -2448,23 +2462,23 @@ mod tests {
             ..sample_report()
         };
         let out = r.render();
-        assert!(out.contains("*Warm Pool* — 2本待機"));
-        assert!(out.contains("\n\n*Warm Pool")); // 上の節との間に空行
+        assert!(out.contains("*Warm agents* — 2"));
+        assert!(out.contains("\n\n*Warm agents")); // 上の節との間に空行
         assert!(out.contains("\n`/repo/a`　`~/dev/b`")); // 横一列 / $HOME は畳む
     }
 
     #[test]
     fn status_report_warm_pool_empty_unchanged() {
-        assert!(sample_report().render().contains("*Warm Pool* — なし"));
+        assert!(sample_report().render().contains("*Warm agents* — none"));
     }
 
     /// regex を使わない手書きのトークン走査(3つの replace)の網。
     #[test]
     fn link_text_strips_tokens_and_truncates() {
-        assert_eq!(StatusThread::link_text(None), "（無題）");
+        assert_eq!(StatusThread::link_text(None), "(untitled)");
         assert_eq!(
             StatusThread::link_text(Some("<@U1> <#C1|general>")),
-            "（無題）"
+            "(untitled)"
         ); // 全部トークン → 空
         assert_eq!(StatusThread::link_text(Some("a<b\nc  d")), "ab c d"); // 閉じない `<` は消えるだけ(隙間は空かない)
         assert_eq!(
@@ -2485,14 +2499,14 @@ mod tests {
             is_fallback: true,
         };
         assert_eq!(
-            e.render("このチャンネル"),
-            "● このチャンネル\n<#C1>（dev） — ルート未設定（Home フォールバック）\n  `/dev/x`"
+            e.render("This channel"),
+            "● This channel\n<#C1>（dev） — not set; using the default directory\n  `/dev/x`"
         );
         assert!(PwdEntry::render_all(&[e], "/home").contains("  • <#C1>（dev） → `/dev/x`"));
-        assert!(PwdEntry::render_all(&[], "/home").contains("ルートは未設定です。"));
+        assert!(PwdEntry::render_all(&[], "/home").contains("None set."));
         assert!(
             PwdEntry::render_all(&[], "/home")
-                .ends_with("_ルート未設定のチャンネル / DM は Home: `/home`_")
+                .ends_with("_Channels without one, and DMs, use `/home`_")
         );
     }
 
@@ -2503,9 +2517,9 @@ mod tests {
             "stop",
             "exit / bye / done",
             "compact",
-            "model fable|opus|sonnet|haiku",
-            "effort low|medium|high|xhigh|max|ultracode|auto",
-            "mode manual|plan|edit|auto",
+            "model [fable|opus|sonnet|haiku]",
+            "effort [low|medium|high|xhigh|max|ultracode|auto]",
+            "mode [manual|plan|edit|auto]",
             "context / ctx",
             "resume",
             "login",
@@ -2513,26 +2527,27 @@ mod tests {
             "usage / usg",
             "status",
             "restart",
-            "pwd ＜絶対パス＞",
+            "pwd <absolute path>",
             "warm on|off [<#channel>]",
             "set-home",
             "allow-bot <@bot>",
-            "help / ヘルプ / ?",
+            "remove-bot <@bot>",
+            "help / ?",
         ] {
             assert!(h.contains(word), "{word}");
         }
-        assert!(!h.contains("route ＜マシンID＞")); // 子が居ないマシンに担当表は無い
-        assert!(h.ends_with("普通のメッセージとして届きます。_"));
+        assert!(!h.contains("route <machine>")); // マシンが居ないゲートウェイに担当表は無い
+        assert!(h.ends_with("just part of a normal message._"));
     }
 
     #[test]
     fn a_bridge_that_takes_children_lists_route() {
         // 実装は relay.rs の `CommandCtx::route` にあるのに一覧に出ていなかった
         let h = Notice::Help { fleet: true }.render();
-        assert!(h.contains("route ＜マシンID＞"));
-        assert!(h.contains("チャンネルの担当マシン"));
-        // 子が居ても他の節は変わらない
-        assert!(h.contains("status") && h.contains("help / ヘルプ / ?"));
+        assert!(h.contains("route <machine>"));
+        assert!(h.contains("hand this channel to a machine"));
+        // マシンが居ても他の節は変わらない
+        assert!(h.contains("status") && h.contains("help / ?"));
     }
 
     const CONTEXT_RAW: &str = "\
@@ -2695,7 +2710,7 @@ some preamble\n\n**Model:** claude-opus-4-8[1m]\n**Tokens:** 43.8k / 1m (4%)\n\n
         };
         let out = p.render();
         assert!(!out.contains('\0'));
-        assert!(out.starts_with("🗜️ コンテキストを圧縮中… 3s · 876 tokens\n"));
+        assert!(out.starts_with("🗜️ Compacting the context… 3s · 876 tokens\n"));
         // 矢印があれば数字の直前に付く(空白は挟まない)
         let with_dir = CompactProgress {
             tokens_dir: Some('↑'),
@@ -2704,7 +2719,7 @@ some preamble\n\n**Model:** claude-opus-4-8[1m]\n**Tokens:** 43.8k / 1m (4%)\n\n
         assert!(
             with_dir
                 .render()
-                .starts_with("🗜️ コンテキストを圧縮中… 3s · ↑876 tokens\n")
+                .starts_with("🗜️ Compacting the context… 3s · ↑876 tokens\n")
         );
     }
 
@@ -2807,12 +2822,10 @@ some preamble\n\n**Model:** claude-opus-4-8[1m]\n**Tokens:** 43.8k / 1m (4%)\n\n
     #[test]
     fn restart_checklist_renders() {
         let first = RestartPhase::Received.render(None);
-        assert!(first.starts_with("• 再起動を開始します\n◌ Bridge を停止…"));
+        assert!(first.starts_with("• Restart requested\n◌ Stopping agentgw…"), "{first}");
         let done = RestartPhase::Done.render(None);
-        // 持たない機能の行(更新・自動再開)は表から消えている
-        assert!(!done.contains("更新") && !done.contains("再開"));
-        assert!(done.ends_with("• Bridge がオンラインに復帰\n✅ 再起動が完了しました"));
-        let failed = RestartPhase::Received.render(Some("再起動できませんでした"));
+        assert!(done.ends_with("• agentgw is back online\n✅ Restart complete"), "{done}");
+        let failed = RestartPhase::Received.render(Some("could not restart"));
         assert!(failed.contains("💥"));
     }
 }

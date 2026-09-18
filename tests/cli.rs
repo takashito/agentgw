@@ -24,11 +24,11 @@ fn agentgw(args: &[&str]) -> (i32, String) {
 }
 
 #[test]
-fn add_child_answers_with_its_own_usage() {
+fn add_machine_answers_with_its_own_usage() {
     // 引数なしなら add-child 自身の usage。**全体の usage に落ちたら分岐が消えている**
-    let (code, text) = agentgw(&["add-child"]);
+    let (code, text) = agentgw(&["add-machine"]);
     assert_eq!(code, 2, "{text}");
-    assert!(text.contains("usage: agentgw add-child"), "{text}");
+    assert!(text.contains("usage: agentgw add-machine"), "{text}");
 }
 
 #[test]
@@ -48,5 +48,5 @@ fn version_names_the_binary() {
 fn unknown_commands_fall_to_the_overall_usage() {
     let (code, text) = agentgw(&["invite"]);
     assert_eq!(code, 2, "invite は畳んだ: {text}");
-    assert!(text.contains("add-child user@host"), "{text}");
+    assert!(text.contains("add-machine user@host"), "{text}");
 }

@@ -71,9 +71,12 @@ pub fn choose_source(has_gh: bool, dist: Option<PathBuf>, version: &str) -> Resu
         });
     }
     dist.map(Source::Dist).ok_or_else(|| {
-        "送るバイナリがありません。`gh auth login` で release から落とせるようにするか、\n\
-         `cargo dist` で手元に焼いてから、もう一度。"
-            .to_string()
+        crate::t!(
+            "No agentgw binary to send. Either run `gh auth login` so it can be downloaded from a release,\n\
+             or build one with `cargo dist`, then try again.",
+            "送るバイナリがありません。`gh auth login` で release から落とせるようにするか、\n\
+             `cargo dist` で手元に焼いてから、もう一度。"
+        )
     })
 }
 
@@ -188,7 +191,7 @@ pub async fn cli(args: &[String]) -> i32 {
             s if s.starts_with("--name=") => name = Some(s["--name=".len()..].to_string()),
             s if s.starts_with("--from=") => from = Some(s["--from=".len()..].to_string()),
             s if s.starts_with('-') => {
-                eprintln!("知らない引数です: {s}");
+                eprintln!("{}", crate::t!("Unknown option: {s}", "知らない引数です: {s}"));
                 return 2;
             }
             s => target = Some(s.to_string()),
@@ -196,10 +199,17 @@ pub async fn cli(args: &[String]) -> i32 {
     }
     let Some(target) = target else {
         eprintln!(
-            "usage: agentgw add-child <ssh先> [--name <名前>] [--from <バイナリ>]\n\
-             \n\
-             例: agentgw add-child user@host\n\
-             ssh 先は ~/.ssh/config の別名でも構いません(鍵も踏み台もそちらに任せます)。"
+            "{}",
+            crate::t!(
+                "usage: agentgw add-machine <ssh destination> [--name <name>] [--from <binary>]\n\
+                 \n\
+                 Example: agentgw add-machine user@host\n\
+                 The destination can be a ~/.ssh/config alias; keys and jump hosts come from your ssh config.",
+                "usage: agentgw add-machine <ssh先> [--name <名前>] [--from <バイナリ>]\n\
+                 \n\
+                 例: agentgw add-machine user@host\n\
+                 ssh 先は ~/.ssh/config の別名でも構いません(鍵も踏み台もそちらに任せます)。"
+            )
         );
         return 2;
     };
@@ -209,7 +219,7 @@ pub async fn cli(args: &[String]) -> i32 {
             0
         }
         Err(why) => {
-            eprintln!("add-child: {why}");
+            eprintln!("add-machine: {why}");
             1
         }
     }
@@ -220,10 +230,10 @@ async fn add_child(target: &str, name: Option<&str>, from: Option<&str>) -> Resu
     let dir = StateDir::resolve();
 
     // 1. 相手を見る
-    println!("==> {target} を見る");
+    println!("{}", crate::t!("==> Checking {target}", "==> {target} を確認しています"));
     let uname = remote::ssh_capture(target, "uname -sm")?;
     let triple = triple_for(&uname)
-        .ok_or_else(|| format!("{uname} 用のバイナリは用意していません(手で入れてください)"))?;
+        .ok_or_else(|| crate::t!("There is no prebuilt binary for {uname}. Build and install agentgw there by hand.", "{uname} 用のバイナリは配布していません。そのマシンでビルドして入れてください。"))?;
     println!("  {uname} ({triple})");
 
     // 名前は明示が最優先。無ければ相手のホスト名を使う(**自動命名の推測はここだけ**)
@@ -235,9 +245,9 @@ async fn add_child(target: &str, name: Option<&str>, from: Option<&str>) -> Resu
             .to_string(),
     };
     if child.is_empty() {
-        return Err("このマシンの名前が決められません。--name <名前> を付けてください".into());
+        return Err(crate::t!("Couldn't work out this machine's name. Pass --name <name>.", "このマシンの名前が決められません。--name <名前> を付けてください"));
     }
-    println!("  名前: {child}");
+    println!("{}", crate::t!("  Name: {child}", "  名前: {child}"));
 
     // 2. 送る物を選ぶ(release が先、cargo dist の成果物が後)
     let staging = std::env::temp_dir().join(format!("agentgw-add-{}", std::process::id()));
@@ -248,7 +258,7 @@ async fn add_child(target: &str, name: Option<&str>, from: Option<&str>) -> Resu
             match choose_source(remote::gh_ready(), dist, env!("CARGO_PKG_VERSION"))? {
                 Source::Release { tag } => {
                     std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
-                    println!("==> GitHub release {tag} から取る");
+                    println!("{}", crate::t!("==> Downloading release {tag} from GitHub", "==> GitHub から {tag} をダウンロードしています"));
                     remote::gh_download(
                         &gh_download_args(&tag, triple, &staging),
                         &staging,
@@ -256,7 +266,7 @@ async fn add_child(target: &str, name: Option<&str>, from: Option<&str>) -> Resu
                     )?
                 }
                 Source::Dist(p) => {
-                    println!("==> 手元の成果物を送る");
+                    println!("{}", crate::t!("==> Using the binary built on this machine", "==> このマシンでビルドしたバイナリを使います"));
                     p
                 }
             }
@@ -264,7 +274,7 @@ async fn add_child(target: &str, name: Option<&str>, from: Option<&str>) -> Resu
     };
 
     // 3. 届ける(バイナリと install.sh)
-    println!("==> {target} に届ける");
+    println!("{}", crate::t!("==> Copying agentgw to {target}", "==> {target} に agentgw をコピーしています"));
     let remote_bin = ".local/bin/agentgw";
     remote::ssh_run(target, "mkdir -p ~/.local/bin")?;
     // 走っているバイナリは上書きできない。先に退けてから置く
@@ -299,11 +309,11 @@ async fn add_child(target: &str, name: Option<&str>, from: Option<&str>) -> Resu
 
     let mut transport = match candidate {
         Some(url) => {
-            println!("==> 直結を試す ({url})");
+            println!("{}", crate::t!("==> Trying a direct connection to {url}", "==> {url} への直結を試しています"));
             Transport::Direct { url }
         }
         None => {
-            println!("==> 公開名が無いので ssh トンネルで繋ぐ");
+            println!("{}", crate::t!("==> This gateway has no public address, so {child} will connect over an ssh tunnel", "==> このゲートウェイには公開アドレスが無いので、{child} を ssh トンネルでつなぎます"));
             set_tunnel(&dir, &child, Some(target))?;
             Transport::Tunnel {
                 remote_port: TUNNEL_PORT,
@@ -321,7 +331,7 @@ async fn add_child(target: &str, name: Option<&str>, from: Option<&str>) -> Resu
     )?;
 
     // 6. 子を起こして、親から見えるかを確かめる
-    println!("==> {target} に入れて起こす");
+    println!("{}", crate::t!("==> Installing and starting agentgw on {target}", "==> {target} に agentgw をインストールして起動しています"));
     let installed = remote::ssh_interactive(
         target,
         &format!("{state_prefix}~/.local/bin/agentgw-install.sh --from ~/{remote_bin}"),
@@ -333,7 +343,7 @@ async fn add_child(target: &str, name: Option<&str>, from: Option<&str>) -> Resu
     if !wait_connected(&inlet, &child).await {
         // 直結が駄目だったなら、トンネルに落ちてもう一度
         if matches!(transport, Transport::Direct { .. }) {
-            println!("==> 直結では繋がりませんでした。ssh トンネルに切り替えます");
+            println!("{}", crate::t!("==> The direct connection didn't work. Switching to an ssh tunnel.", "==> 直結ではつながりませんでした。ssh トンネルに切り替えます。"));
             set_tunnel(&dir, &child, Some(target))?;
             transport = Transport::Tunnel {
                 remote_port: TUNNEL_PORT,
@@ -348,16 +358,21 @@ async fn add_child(target: &str, name: Option<&str>, from: Option<&str>) -> Resu
             )?;
             remote::ssh_run(target, &format!("{state_prefix}~/{remote_bin} restart"))?;
             if !wait_connected(&inlet, &child).await {
-                return Err(format!(
-                    "{child} が親に繋がりません。直結も ssh トンネルも駄目でした。\n\
-                     子のログ: ssh {target} 'tail ~/.local/state/agentgw/plugin-debug.log'"
+                return Err(crate::t!(
+                    "{child} can't reach the gateway, either directly or over an ssh tunnel.\n\
+                     Its log: ssh {target} 'tail ~/.local/state/agentgw/plugin-debug.log'",
+                    "{child} がゲートウェイにつながりません。直結でも ssh トンネルでもだめでした。\n\
+                     {child} のログ: ssh {target} 'tail ~/.local/state/agentgw/plugin-debug.log'"
                 ));
             }
         } else {
-            return Err(format!(
-                "{child} が親に繋がりません(ssh トンネル)。\n\
-                 親のログ: grep tunnel ~/.local/state/agentgw/plugin-debug.log\n\
-                 子のログ: ssh {target} 'tail ~/.local/state/agentgw/plugin-debug.log'"
+            return Err(crate::t!(
+                "{child} can't reach the gateway over the ssh tunnel.\n\
+                 This machine's log: grep tunnel ~/.local/state/agentgw/plugin-debug.log\n\
+                 {child}'s log: ssh {target} 'tail ~/.local/state/agentgw/plugin-debug.log'",
+                "{child} が ssh トンネル経由でゲートウェイにつながりません。\n\
+                 このマシンのログ: grep tunnel ~/.local/state/agentgw/plugin-debug.log\n\
+                 {child} のログ: ssh {target} 'tail ~/.local/state/agentgw/plugin-debug.log'"
             ));
         }
     } else if matches!(transport, Transport::Direct { .. }) {
@@ -367,13 +382,12 @@ async fn add_child(target: &str, name: Option<&str>, from: Option<&str>) -> Resu
     }
 
     let how = match &transport {
-        Transport::Direct { url } => format!("直結 ({url})"),
-        Transport::Tunnel { remote_port } => {
-            format!("ssh トンネル (子の 127.0.0.1:{remote_port})")
-        }
+        Transport::Direct { url } => crate::t!("directly ({url})", "直結({url})"),
+        Transport::Tunnel { .. } => crate::t!("over an ssh tunnel", "ssh トンネル経由"),
     };
-    Ok(format!(
-        "\n{child} が繋がりました — {how}\nSlack で `route {child}` と言えば、このマシンが担当になります。"
+    Ok(crate::t!(
+        "\n{child} is connected {how}.\nTo hand a Slack channel to it, type `route {child}` in that channel.",
+        "\n{child} がつながりました({how})。\nSlack のチャンネルを任せるには、そのチャンネルで `route {child}` と打ってください。"
     ))
 }
 
@@ -391,7 +405,12 @@ fn ensure_inlet(dir: &StateDir) -> Result<Inlet, String> {
         .get("AGENTGW_BRIDGE_ID")
         .cloned()
         .filter(|s| !s.trim().is_empty())
-        .ok_or("このマシンの名前がありません(.env の AGENTGW_BRIDGE_ID)。先に install を通してください")?;
+        .ok_or_else(|| {
+            crate::t!(
+                "This machine has no name yet (AGENTGW_BRIDGE_ID in .env). Run `agentgw install` first.",
+                "このマシンにはまだ名前がありません(.env の AGENTGW_BRIDGE_ID)。先に `agentgw install` を実行してください。"
+            )
+        })?;
     if minted {
         RelayCli::write_env(
             dir,
@@ -400,8 +419,14 @@ fn ensure_inlet(dir: &StateDir) -> Result<Inlet, String> {
                 ("AGENTGW_LINK_TOKEN", token.clone()),
             ],
         )
-        .map_err(|e| format!(".env が書けません: {e}"))?;
-        println!("==> 子を迎える口と鍵を作りました({listen})。読ませるため起こし直します");
+        .map_err(|e| crate::t!("Couldn't write .env: {e}", ".env が書けません: {e}"))?;
+        println!(
+            "{}",
+            crate::t!(
+                "==> This gateway now accepts machines on {listen}, with a new secret key. Restarting to apply it.",
+                "==> このゲートウェイがマシンを受け入れるようにしました({listen}、新しい秘密鍵)。反映のため再起動します。"
+            )
+        );
         crate::service::Service::run("restart", &[]);
     }
     Ok(Inlet {
@@ -442,11 +467,18 @@ fn set_tunnel(dir: &StateDir, child: &str, target: Option<&str>) -> Result<(), S
         return Ok(());
     }
     RelayCli::write_env(dir, &[("AGENTGW_TUNNELS", after)])
-        .map_err(|e| format!(".env が書けません: {e}"))?;
-    match target {
-        Some(t) => println!("  親が {child} へのトンネルを張ります(ssh {t})。親を起こし直します"),
-        None => println!("  {child} へのトンネルは要らなくなりました。親を起こし直します"),
-    }
+        .map_err(|e| crate::t!("Couldn't write .env: {e}", ".env が書けません: {e}"))?;
+    let line = match target {
+        Some(t) => crate::t!(
+            "  This gateway will keep an ssh tunnel open to {child} (ssh {t}). Restarting to apply it.",
+            "  このゲートウェイが {child} への ssh トンネルを張り続けます(ssh {t})。反映のため再起動します。"
+        ),
+        None => crate::t!(
+            "  {child} no longer needs an ssh tunnel. Restarting to apply it.",
+            "  {child} への ssh トンネルは不要になりました。反映のため再起動します。"
+        ),
+    };
+    println!("{line}");
     crate::service::Service::run("restart", &[]);
     Ok(())
 }
@@ -503,11 +535,11 @@ pub async fn keep_tunnel(
                 LogCtx::default().info(
                     "relay",
                     &format!(
-                        "tunnel {child}: up via ssh {target} (子の 127.0.0.1:{TUNNEL_PORT} → {parent_addr})"
+                        "tunnel {child}: up via ssh {target} (child 127.0.0.1:{TUNNEL_PORT} -> {parent_addr})"
                     ),
                 );
             } else {
-                LogCtx::default().error("relay", &format!("tunnel {child}: {why} — 張り直します"));
+                LogCtx::default().error("relay", &format!("tunnel {child}: {why} — retrying"));
             }
             was_ok = Some(ok);
         }
