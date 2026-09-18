@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="596" viewBox="0 0 820 596" role="img" aria-labelledby="title desc">
+  <title id="title">agentgw in a Slack thread</title>
+  <desc id="desc">A Slack thread: you ask agentgw to fix flaky tests, a live progress message lists the tools Claude Code is using, a permission request with Allow and Deny buttons appears, and the worker replies with the fix.</desc>
+  <style>
+    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .name { fill: #ffffff; font-size: 15px; font-weight: 700; }
+    .app { fill: #ababad; font-size: 10px; font-weight: 700; }
+    .time { fill: #ababad; font-size: 12px; }
+    .body { fill: #d1d2d3; font-size: 15px; }
+    .dim { fill: #ababad; font-size: 14px; }
+    .tool { fill: #d1d2d3; font-size: 14px; }
+    .code { fill: #e8912d; font-size: 13px; }
+    .btn { fill: #ffffff; font-size: 13px; font-weight: 700; }
+    .btn-plain { fill: #d1d2d3; font-size: 13px; font-weight: 700; }
+    .mention { fill: #1d9bd1; font-size: 15px; }
+  </style>
+
+  <!-- window -->
+  <rect x="0.5" y="0.5" width="819" height="595" rx="12" fill="#1a1d21" stroke="#35373b"/>
+  <rect x="0.5" y="0.5" width="819" height="44" rx="12" fill="#222529"/>
+  <rect x="0.5" y="32" width="819" height="13" fill="#222529"/>
+  <circle cx="22" cy="22" r="6" fill="#ff5f57"/>
+  <circle cx="42" cy="22" r="6" fill="#febc2e"/>
+  <circle cx="62" cy="22" r="6" fill="#28c840"/>
+  <text x="96" y="27" class="name" style="font-size:14px">Thread</text>
+  <text x="152" y="27" class="dim" style="font-size:13px"># build-box</text>
+  <line x1="0" y1="44.5" x2="820" y2="44.5" stroke="#35373b"/>
+
+  <!-- you -->
+  <rect x="24" y="64" width="36" height="36" rx="6" fill="#4a8f6f"/>
+  <text x="42" y="88" text-anchor="middle" class="name" style="font-size:16px">Y</text>
+  <text x="74" y="78" class="name">you</text>
+  <text x="108" y="78" class="time">10:42</text>
+  <text x="74" y="100" class="body"><tspan class="mention">@agentgw</tspan> the auth tests are flaky on CI — find out why and fix it</text>
+
+  <!-- agentgw: progress -->
+  <rect x="24" y="126" width="36" height="36" rx="6" fill="#d97757"/>
+  <text x="42" y="150" text-anchor="middle" class="name" style="font-size:15px">ag</text>
+  <text x="74" y="140" class="name">agentgw</text>
+  <rect x="140" y="128" width="30" height="16" rx="3" fill="#35373b"/>
+  <text x="155" y="140" text-anchor="middle" class="app">APP</text>
+  <text x="180" y="140" class="time">10:42</text>
+
+  <rect x="74" y="152" width="720" height="118" rx="6" fill="#222529" stroke="#35373b"/>
+  <rect x="74" y="152" width="4" height="118" rx="2" fill="#d97757"/>
+  <text x="92" y="176" class="tool">•  Read 4 files</text>
+  <text x="92" y="200" class="tool">•  Grep <tspan class="mono code">SessionCache</tspan></text>
+  <text x="92" y="224" class="tool">•  Bash <tspan class="mono code">cargo test auth -- --test-threads=8</tspan></text>
+  <text x="92" y="248" class="tool">◌  Edit <tspan class="mono code">src/auth/session.rs</tspan></text>
+  <text x="780" y="248" text-anchor="end" class="dim" style="font-size:12px">working… 1m 12s</text>
+
+  <!-- agentgw: permission request -->
+  <rect x="74" y="284" width="720" height="140" rx="6" fill="#222529" stroke="#35373b"/>
+  <text x="92" y="310" class="body">🔒 <tspan style="font-weight:700;fill:#ffffff">Permission requested</tspan> — <tspan class="mono code">Bash</tspan></text>
+  <rect x="92" y="324" width="684" height="40" rx="4" fill="#1a1d21" stroke="#35373b"/>
+  <text x="106" y="349" class="mono code">git push origin fix/flaky-auth-tests</text>
+  <rect x="92" y="378" width="72" height="32" rx="4" fill="#007a5a"/>
+  <text x="128" y="399" text-anchor="middle" class="btn">Allow</text>
+  <rect x="174" y="378" width="138" height="32" rx="4" fill="none" stroke="#565856"/>
+  <text x="243" y="399" text-anchor="middle" class="btn-plain">Allow for thread</text>
+  <rect x="322" y="378" width="146" height="32" rx="4" fill="none" stroke="#565856"/>
+  <text x="395" y="399" text-anchor="middle" class="btn-plain">Allow for Channel</text>
+  <rect x="478" y="378" width="66" height="32" rx="4" fill="none" stroke="#e01e5a"/>
+  <text x="511" y="399" text-anchor="middle" class="btn" style="fill:#e01e5a">Deny</text>
+
+  <!-- agentgw: answer -->
+  <rect x="24" y="444" width="36" height="36" rx="6" fill="#d97757"/>
+  <text x="42" y="468" text-anchor="middle" class="name" style="font-size:15px">ag</text>
+  <text x="74" y="458" class="name">agentgw</text>
+  <rect x="140" y="446" width="30" height="16" rx="3" fill="#35373b"/>
+  <text x="155" y="458" text-anchor="middle" class="app">APP</text>
+  <text x="180" y="458" class="time">10:45</text>
+  <text x="74" y="484" class="body">Found it: <tspan class="mono code">SessionCache</tspan> was a process-wide static, so tests running in</text>
+  <text x="74" y="506" class="body">parallel evicted each other's sessions. Each test now gets its own cache.</text>
+  <text x="74" y="534" class="body"><tspan style="font-weight:700;fill:#ffffff">200 runs</tspan> of <tspan class="mono code">cargo test auth</tspan> pass. Pushed <tspan class="mono code">fix/flaky-auth-tests</tspan>.</text>
+  <rect x="74" y="552" width="46" height="24" rx="12" fill="#222529" stroke="#35373b"/>
+  <text x="97" y="569" text-anchor="middle" class="dim" style="font-size:13px">✅ 1</text>
+</svg>
