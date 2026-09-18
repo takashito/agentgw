@@ -31,8 +31,8 @@ agentgw は、1つの Slack ボットと、自分のすべてのマシンの Cla
 
 | チャンネル | マシン | 作業する場所 |
 |---|---|---|
-| `#laptop` | 持ち歩く Mac(ゲートウェイ) | `~/code/app` |
-| `#nas` | 押し入れのストレージ | `/srv/compose` |
+| `#nas` | 押し入れのストレージ(ゲートウェイ) | `/srv/compose` |
+| `#laptop` | 持ち歩く Mac | `~/code/app` |
 | `#proxmox` | ハイパーバイザー | `/root/infra` |
 | `#build` | Linux のビルド機 | `~/src/firmware` |
 
@@ -147,6 +147,8 @@ Slack のイベントを読むのはゲートウェイだけです。ほかの�
 ワークスペースを選んで **Create** を押し、トークンを2つ用意します。**Install to Workspace** → *Bot User OAuth Token*(`xoxb-…`)と、**Basic Information → App-Level Tokens** → `connections:write` の権限のトークン(`xapp-…`)。
 
 **2. ゲートウェイにするマシンに入れる**
+
+常に動いているマシンを選んでください(家のサーバー、NAS、小さな VM など)。すべてがゲートウェイを通るので、ゲートウェイが眠るとどのマシンも応えなくなります。持ち歩くノート PC は、ゲートウェイにつなぐマシンの1台にするのがおすすめです。スリープすると外れ、起きると戻り、ほかのマシンには影響しません。
 
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/takashito/agentgw/main/scripts/install.sh)"

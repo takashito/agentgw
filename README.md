@@ -31,8 +31,8 @@ The agents on your laptop, your NAS, your hypervisor and your build box all answ
 
 | Channel | Machine | Works in |
 |---|---|---|
-| `#laptop` | the Mac you carry (gateway) | `~/code/app` |
-| `#nas` | a storage box in the closet | `/srv/compose` |
+| `#nas` | a storage box in the closet (gateway) | `/srv/compose` |
+| `#laptop` | the Mac you carry | `~/code/app` |
 | `#proxmox` | the hypervisor | `/root/infra` |
 | `#build` | a Linux build box | `~/src/firmware` |
 
@@ -147,6 +147,8 @@ Only the gateway reads Slack's event stream. Other machines get the bot token ov
 Pick a workspace and click **Create**, then collect two tokens: **Install to Workspace** → *Bot User OAuth Token* (`xoxb-…`), and **Basic Information → App-Level Tokens** → a token with `connections:write` (`xapp-…`).
 
 **2. Install on the gateway machine**
+
+Pick a machine that stays on — a home server, a NAS or a small VM. Everything goes through the gateway, so when it sleeps every machine goes quiet. A laptop you carry around works better as one of the machines: it drops off when it sleeps and comes back when it wakes, without affecting the others.
 
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/takashito/agentgw/main/scripts/install.sh)"
