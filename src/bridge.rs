@@ -4777,7 +4777,7 @@ impl Bridge {
         // **subagent の中で走ったツールにだけ**付く(main セッションでは無い)。
         // 起こした側の id は tool_response に載り、foreground は camelCase、
         // background/teammate は snake_case で来る。両方受ける。
-        let agent = slack::AgentRef {
+        let agent = slack::sticky::AgentRef {
             agent_id: p["agent_id"].as_str().map(str::to_string),
             agent_type: p["agent_type"].as_str().map(str::to_string),
             // 拾うのは **Agent/Task の PostToolUse だけ**。他のツールの結果に同名の
