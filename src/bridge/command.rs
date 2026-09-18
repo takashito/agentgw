@@ -445,14 +445,6 @@ const MODE_NAMES: [&str; 4] = ["manual", "plan", "edit", "auto"];
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct WallClock(NaiveDateTime);
 
-/// `year()` / `hour()` / `format()` — 暦の読み書きは `chrono` のものをそのまま使う。
-impl std::ops::Deref for WallClock {
-    type Target = NaiveDateTime;
-    fn deref(&self) -> &NaiveDateTime {
-        &self.0
-    }
-}
-
 impl WallClock {
     /// タイムゾーンは **Asia/Tokyo 固定**。表示側([`Notice::Limited`])が既にそうなっており
     /// (文面に「（Asia/Tokyo）」と書いてある)、Bridge も TUI も同じホストの同じゾーンで動く。
@@ -649,6 +641,14 @@ impl WallClock {
     }
 }
 
+/// `year()` / `hour()` / `format()` — 暦の読み書きは `chrono` のものをそのまま使う。
+impl std::ops::Deref for WallClock {
+    type Target = NaiveDateTime;
+    fn deref(&self) -> &NaiveDateTime {
+        &self.0
+    }
+}
+
 /// 1回の `/usage` 読み取りから立てたバーンレート予測。
 ///
 /// `enough_data` が false のときは(現行同様)警告もロックもしてはいけない。
@@ -795,24 +795,6 @@ pub struct StatusThread {
     pub channel_name: Option<String>,
 }
 
-/// `status` の描画に要るものを全部載せたスナップショット。時計も含むので、描画は純関数のまま。
-///
-/// `pool` は cwd だけ持つ(現行の `poolKey` は不透明な内部キーで表示しない、
-/// `version` は版 skew を作らないこの実装には無い)。
-pub struct StatusReport {
-    pub bridge_version: String,
-    /// 時計はスナップショットが運ぶ(描画を純関数のまま固定 now でテストできる)
-    pub now_ms: u64,
-    /// $HOME。長い絶対パスを `~` に畳んで読みやすくするため
-    pub home: String,
-    /// この Bridge の繋がり方(`local (label)` など)
-    pub mode: String,
-    /// **実際に動いている**ワーカーのスレッドだけ
-    pub threads: Vec<StatusThread>,
-    /// 在庫中の Warm Pool worker が待っている作業ディレクトリ
-    pub pools: Vec<String>,
-}
-
 impl StatusThread {
     /// 1本ぶんの行: 経過時間の等幅チップ + 話題のリンク。読む人が探すのは「どれが古いか」で、
     /// 左端に短い固定幅の塊が並ぶと目で追える(桁揃えの代わり)。判らない時刻は書かない —
@@ -894,6 +876,24 @@ impl StatusThread {
             t
         }
     }
+}
+
+/// `status` の描画に要るものを全部載せたスナップショット。時計も含むので、描画は純関数のまま。
+///
+/// `pool` は cwd だけ持つ(現行の `poolKey` は不透明な内部キーで表示しない、
+/// `version` は版 skew を作らないこの実装には無い)。
+pub struct StatusReport {
+    pub bridge_version: String,
+    /// 時計はスナップショットが運ぶ(描画を純関数のまま固定 now でテストできる)
+    pub now_ms: u64,
+    /// $HOME。長い絶対パスを `~` に畳んで読みやすくするため
+    pub home: String,
+    /// この Bridge の繋がり方(`local (label)` など)
+    pub mode: String,
+    /// **実際に動いている**ワーカーのスレッドだけ
+    pub threads: Vec<StatusThread>,
+    /// 在庫中の Warm Pool worker が待っている作業ディレクトリ
+    pub pools: Vec<String>,
 }
 
 /// StatusReport を Slack mrkdwn で。純関数(時計は report の now_ms)。
@@ -1246,17 +1246,6 @@ pub enum RestartPhase {
     Failed,
 }
 
-/// 固定の行の集合、順番どおり。`completed_through` は**完全に done な最後の行**を指し、
-/// その次の行が進行中。両 Bridge がこの表を共有するのでメッセージは跳ねない。
-/// Bun の表にあった「Bridge を更新」と「中断していたスレッドの処理を再開」は**持たない**:
-/// Rust はバイナリ1個で更新機能が無く(差し替えは install script の仕事)、自動再開も無いので、
-/// どちらも毎回「何もせず done」になる飾りだった。
-const RESTART_STEPS: [RestartPhase; 3] = [
-    RestartPhase::Received,
-    RestartPhase::Switching,
-    RestartPhase::Online,
-];
-
 impl RestartPhase {
     /// チェックリストの1行の文言。
     fn step_label(self) -> String {
@@ -1267,16 +1256,14 @@ impl RestartPhase {
             RestartPhase::Done | RestartPhase::Failed => String::new(),
         }
     }
-}
 
-/// 与えられた進捗点でチェックリスト全体を描く:
-///   - `completed_through` までの行 → `•`(done)
-///   - その次の1行 → `◌ …`(進行中)、`failed_reason` があれば `💥`
-///   - それ以降 → `◌`(未着手)
-///   - done なら末尾に `✅ 再起動が完了しました`、失敗なら `💥 再起動に失敗しました — <理由>`
-///
-/// `RestartPhase::Done` は全行 done、`Failed` は**最初の行**を failed に。
-impl RestartPhase {
+    /// 与えられた進捗点でチェックリスト全体を描く:
+    ///   - `completed_through` までの行 → `•`(done)
+    ///   - その次の1行 → `◌ …`(進行中)、`failed_reason` があれば `💥`
+    ///   - それ以降 → `◌`(未着手)
+    ///   - done なら末尾に `✅ 再起動が完了しました`、失敗なら `💥 再起動に失敗しました — <理由>`
+    ///
+    /// `RestartPhase::Done` は全行 done、`Failed` は**最初の行**を failed に。
     pub fn render(&self, failed_reason: Option<&str>) -> String {
         let completed_through = *self;
         let failed = completed_through == RestartPhase::Failed || failed_reason.is_some();
@@ -1320,6 +1307,17 @@ impl RestartPhase {
         lines.join("\n")
     }
 }
+
+/// 固定の行の集合、順番どおり。`completed_through` は**完全に done な最後の行**を指し、
+/// その次の行が進行中。両 Bridge がこの表を共有するのでメッセージは跳ねない。
+/// Bun の表にあった「Bridge を更新」と「中断していたスレッドの処理を再開」は**持たない**:
+/// Rust はバイナリ1個で更新機能が無く(差し替えは install script の仕事)、自動再開も無いので、
+/// どちらも毎回「何もせず done」になる飾りだった。
+const RESTART_STEPS: [RestartPhase; 3] = [
+    RestartPhase::Received,
+    RestartPhase::Switching,
+    RestartPhase::Online,
+];
 
 // ── 節6: 上限の見張り───────────
 
@@ -1517,15 +1515,6 @@ pub enum TurnFailureClass {
     TellUser,
 }
 
-impl std::fmt::Display for TurnFailureClass {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Retry => "retry",
-            Self::TellUser => "tell-user",
-        })
-    }
-}
-
 impl TurnFailureClass {
     /// `error` フレームの `error_type` を**部分一致・大小無視**で引く表。
     /// (`error_type` に含まれる語, 扱い, 英語, 日本語)
@@ -1614,6 +1603,15 @@ impl TurnFailureClass {
                 )
             },
         )
+    }
+}
+
+impl std::fmt::Display for TurnFailureClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Retry => "retry",
+            Self::TellUser => "tell-user",
+        })
     }
 }
 
