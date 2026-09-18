@@ -5,7 +5,7 @@
 pub mod add_machine;
 pub mod ssh;
 
-use crate::bridge::gateway::wire;
+use crate::bridge::gateway::link;
 use crate::state_dir::{StateDir, set_env_keys};
 use crate::service::{Action, JobSpec, Service};
 use std::io::Write;
@@ -188,7 +188,7 @@ fn ask_child(state_dir: &StateDir) -> Result<(), String> {
         "  Connection string from the gateway (SCLINK1-…): ",
         "  ゲートウェイから受け取った接続文字列 (SCLINK1-…): "
     ));
-    let conn = crate::bridge::gateway::wire::decode_connection(&raw)?;
+    let conn = crate::bridge::gateway::link::decode_connection(&raw)?;
     // Never pick the name automatically (machines with the same name steal each other's Slack messages)
     let name = prompt_bridge_id()
         .ok_or_else(|| {
@@ -391,7 +391,7 @@ pub fn install(mac: bool, job: &Path, rest: &[String]) -> i32 {
 /// Having someone write three values by hand is three chances to get one wrong, so everything comes
 /// from one connection string. Commenting out `SLACK_APP_TOKEN` is the key — if it stays,
 /// [`Mode::resolve`](crate::bridge::machine::Mode::resolve) refuses to start (rightly).
-pub fn apply_connection(env_text: &str, conn: &wire::Invite, bridge_id: &str) -> String {
+pub fn apply_connection(env_text: &str, conn: &link::Invite, bridge_id: &str) -> String {
     // Close the direct connection. **Comment it out rather than delete it** — for the day you want it back
     let folded: Vec<String> = env_text
         .lines()
@@ -408,6 +408,19 @@ pub fn apply_connection(env_text: &str, conn: &wire::Invite, bridge_id: &str) ->
             ("AGENTGW_BRIDGE_ID", bridge_id.to_string()),
         ],
     )
+}
+
+/// `agentgw install` / `agentgw uninstall` — returns the process exit code.
+pub fn run(cmd: &str, rest: &[String]) -> i32 {
+    if !Service::supported() {
+        return 2;
+    }
+    let mac = cfg!(target_os = "macos");
+    let job = Service::job_path();
+    match cmd {
+        "install" => install(mac, &job, rest),
+        _ => uninstall(mac, &job),
+    }
 }
 
 /// `agentgw link [--name <name>] [<connection-string>|-]` — puts one connection string into `.env`.
@@ -456,7 +469,7 @@ pub fn cli(args: &[String], dir: &StateDir) -> i32 {
             return 2;
         }
     };
-    let conn = match wire::decode_connection(&raw) {
+    let conn = match link::decode_connection(&raw) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("link: {e}");
@@ -683,8 +696,8 @@ mod tests {
 
     // ── rewriting .env ─────────────────────────────────────────────────────
 
-    fn conn() -> wire::Invite {
-        wire::Invite {
+    fn conn() -> link::Invite {
+        link::Invite {
             url: "wss://relay.example".into(),
             api_token: "s3cret".into(),
         }
@@ -716,7 +729,7 @@ mod tests {
         let once = apply_connection("", &conn(), "desktop");
         let twice = apply_connection(
             &once,
-            &wire::Invite {
+            &link::Invite {
                 url: "wss://new".into(),
                 api_token: "new".into(),
             },

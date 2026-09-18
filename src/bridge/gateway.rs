@@ -3,14 +3,14 @@
 //!
 //! Sections:
 //!
-//! 1. Protocol (`mod wire`)     frames / connection string (`Invite`) / subprotocol — pure data
+//! 1. Protocol (`mod link`)     frames / connection string (`Invite`) / subprotocol — pure data
 //! 2. Admission                 `Admit`
 //! 3. Connection book           `Conn` / `LinkServer`
 //! 4. Reading what arrives and where it goes `Event` / `Click` / `Delivery` / `NoticeCooldown`
 //! 5. Command decisions         `CommandCtx` / `DmOnboardingCtx`
 //! 6. presence                  `Presence` / `FleetView`
 //! 7. Gateway side              `Fleet` (axum handlers, the life of one link, gateway→machine dial)
-//! 8. Machine side              `Inlet` (opened only when the gateway comes to fetch this machine)
+//! 8. Link watch                `IdleWatch` / `beat` — both ends read the link through it (the only I/O shared with `machine.rs`)
 //! 9. CLI                       `Cli` (the fleet section of `status`)
 //!
 //! **Sections 1–6 are pure functions** (they know no clock, socket or agent). That's why every
@@ -18,7 +18,7 @@
 //! were separate files grep could check that; now that they share a module, this ordering and how the tests run are the guard.
 
 // ── Section 1: protocol ─────────────────────────────────────
-pub mod wire {
+pub mod link {
     //! The Relay ⇄ Bridge link protocol — the frames carried over WebSocket and the connection
     //! string that says where to dial. Pure data, no I/O (it's a contract **both** Relay and Bridge
     //! read, so mixing in even one line of either side's convenience would make it two-faced).
@@ -239,6 +239,31 @@ pub mod wire {
             .ok()
     }
 
+    /// Build the request carrying the three upgrade parts (path / `Authorization` / `Sec-WebSocket-Protocol`).
+    pub fn build_request(
+        target: &str,
+        api_token: &str,
+    ) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request, String> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = target
+            .into_client_request()
+            .map_err(|e| format!("not a usable address ({target}): {e}"))?;
+        let headers = request.headers_mut();
+        headers.insert(
+            "authorization",
+            format!("Bearer {api_token}")
+                .parse()
+                .map_err(|_| "the key can't go in a header".to_string())?,
+        );
+        headers.insert(
+            "sec-websocket-protocol",
+            LINK_SUBPROTOCOL
+                .parse()
+                .map_err(|_| "the subprotocol can't go in a header".to_string())?,
+        );
+        Ok(request)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -436,11 +461,28 @@ pub mod wire {
             assert!(b64url_decode("a").is_none()); // 4n+1 is not a valid encoding
             assert!(b64url_decode("ab+d").is_none()); // standard base64 characters are refused
         }
+
+        #[test]
+        fn the_request_carries_the_three_things_the_upgrade_needs() {
+            let req = build_request("wss://relay.example/bridge/desktop", "s3cret").unwrap();
+            assert_eq!(req.uri().path(), "/bridge/desktop");
+            assert_eq!(req.headers().get("authorization").unwrap(), "Bearer s3cret");
+            assert_eq!(
+                req.headers().get("sec-websocket-protocol").unwrap(),
+                LINK_SUBPROTOCOL
+            );
+        }
+
+        #[test]
+        fn a_url_that_is_not_a_websocket_target_is_refused_rather_than_dialled() {
+            assert!(build_request("not a url", "s").is_err());
+            assert!(build_request("", "s").is_err());
+        }
     }
 }
 
 use crate::log::LogCtx;
-use wire::LINK_SUBPROTOCOL;
+use link::LINK_SUBPROTOCOL;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
@@ -525,10 +567,10 @@ impl Admit {
             return Admit::Unauthorized;
         }
         // (3) Only now read the name. The reachability check gives no name (its own path).
-        if path == wire::PROBE_PATH {
+        if path == link::PROBE_PATH {
             return Admit::Probe;
         }
-        match wire::bridge_id_of_path(path) {
+        match link::bridge_id_of_path(path) {
             Some(id) => Admit::Ok(id.to_string()),
             None => Admit::BadPath,
         }
@@ -563,8 +605,8 @@ impl Conn {
     }
 
     /// Send one frame. `false` = that link is already dead (the receiver is gone).
-    pub fn send(&self, frame: &wire::LinkFrame) -> bool {
-        self.0.send(wire::encode(frame)).is_ok()
+    pub fn send(&self, frame: &link::LinkFrame) -> bool {
+        self.0.send(link::encode(frame)).is_ok()
     }
 
     /// **Is it the same link** (identity, not content equality). The key that keeps an old link's
@@ -668,7 +710,7 @@ impl LinkServer {
 
     /// Send a frame to one machine. `false` = it wasn't there (including dropping between looking up the
     /// table and sending). **Never pretend it arrived.**
-    pub fn send_to(&self, bridge_id: &str, frame: &wire::LinkFrame) -> bool {
+    pub fn send_to(&self, bridge_id: &str, frame: &link::LinkFrame) -> bool {
         let conn = self.bridges.lock().unwrap().get(bridge_id).cloned();
         conn.is_some_and(|c| c.send(frame))
     }
@@ -1220,7 +1262,7 @@ impl DmOnboardingCtx<'_> {
             None
         } else {
             Some(
-                wire::decode_connection(text).is_ok_and(|c| secret_eq(&c.api_token, ctx.api_token)),
+                link::decode_connection(text).is_ok_and(|c| secret_eq(&c.api_token, ctx.api_token)),
             )
         };
 
@@ -1464,7 +1506,6 @@ pub fn format_fleet(
 // ── Section 7: gateway side ───────────────────────────────────────
 // From here down is I/O. It only wires up and runs what sections 1–6 decided, and makes no decisions itself.
 
-use crate::bridge::machine as link_watch;
 use crate::chat::InboundMsg;
 use crate::bridge::state::Access;
 use crate::state_dir::StateDir;
@@ -1560,7 +1601,7 @@ impl Fleet {
             self.presence.lock().await.on_connect(bridge_id);
         }
         // The first frame on acceptance — the bot token and the current home
-        let _ = conn.send(&wire::LinkFrame::Ready {
+        let _ = conn.send(&link::LinkFrame::Ready {
             bot_token: self.bot_token.clone(),
             home: self.home(),
         });
@@ -1655,7 +1696,7 @@ impl Fleet {
                 }
             }
             Delivery::Forward(bridge_id) => {
-                let frame = wire::LinkFrame::Event {
+                let frame = link::LinkFrame::Event {
                     name: name.to_string(),
                     event: raw.clone(),
                 };
@@ -1852,7 +1893,7 @@ impl Fleet {
             SetHomeOutcome::Set(reply) => {
                 let home = channel.to_string();
                 self.edit_access(move |a| a.home_channel = Some(home)).await;
-                let frame = wire::LinkFrame::Event {
+                let frame = link::LinkFrame::Event {
                     name: "message".to_string(),
                     event: ev.raw.clone(),
                 };
@@ -1900,7 +1941,7 @@ impl Fleet {
         };
         let sent = self.links.send_to(
             bridge_id,
-            &wire::LinkFrame::Linked {
+            &link::LinkFrame::Linked {
                 owner_user_id: owner,
                 channel: channel.to_string(),
                 thread_ts: thread_ts.to_string(),
@@ -1935,7 +1976,7 @@ impl Fleet {
             Delivery::Forward(bridge_id) => {
                 let ok = self
                     .links
-                    .send_to(&bridge_id, &wire::LinkFrame::Action { action, body });
+                    .send_to(&bridge_id, &link::LinkFrame::Action { action, body });
                 rlog(
                     if ok { "debug" } else { "info" },
                     &format!(
@@ -1996,11 +2037,11 @@ impl Fleet {
     /// Once connected it's registered in [`LinkServer`], so delivery, presence and the set-home broadcast
     /// treat it exactly the same as a link dialed by the machine.
     async fn dial_child(self: Arc<Self>, bridge_id: String, url: String) {
-        let mut backoff = crate::bridge::machine::RECONNECT_MIN_MS;
+        let mut backoff = RECONNECT_MIN_MS;
         loop {
             match self.dial_child_once(&bridge_id, &url).await {
                 // The handshake got through. The next reconnect may start from the short wait
-                Ok(true) => backoff = crate::bridge::machine::RECONNECT_MIN_MS,
+                Ok(true) => backoff = RECONNECT_MIN_MS,
                 Ok(false) => {}
                 Err(why) => {
                     // A refusal that talking won't fix. **Don't fill the log in a loop** — say it once, loudly
@@ -2012,7 +2053,7 @@ impl Fleet {
                 }
             }
             tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
-            backoff = (backoff * 2).min(crate::bridge::machine::RECONNECT_MAX_MS);
+            backoff = (backoff * 2).min(RECONNECT_MAX_MS);
         }
     }
 
@@ -2020,8 +2061,8 @@ impl Fleet {
     async fn dial_child_once(&self, bridge_id: &str, url: &str) -> Result<bool, &'static str> {
         use futures_util::SinkExt;
         // **One key.** Whichever side dials, it presents the same `AGENTGW_LINK_TOKEN`
-        let target = format!("{url}{}", wire::path_for(&self.self_id));
-        let request = match crate::bridge::machine::build_request(&target, &self.token) {
+        let target = format!("{url}{}", link::path_for(&self.self_id));
+        let request = match link::build_request(&target, &self.token) {
             Ok(r) => r,
             Err(e) => {
                 rlog("error", &format!("dial {bridge_id}: {e}"));
@@ -2048,7 +2089,7 @@ impl Fleet {
 
         // The machine we fetched can vanish silently too (if its VM suspends, no FIN comes).
         // Without probing, we'd hold a dead machine and keep throwing deliveries away
-        let mut watch = link_watch::IdleWatch::default();
+        let mut watch = IdleWatch::default();
         loop {
             use tokio_tungstenite::tungstenite::protocol::Message as M;
             tokio::select! {
@@ -2062,14 +2103,14 @@ impl Fleet {
                     None => break,
                 },
                 // **Receive only through `beat`.** Waiting on `next()` directly hangs forever on a half-open socket
-                incoming = link_watch::beat(&mut socket, &mut watch) => match incoming {
-                    link_watch::Beat::Text(_) | link_watch::Beat::Alive => {} // it shouldn't send anything
-                    link_watch::Beat::Ping => {
+                incoming = beat(&mut socket, &mut watch) => match incoming {
+                    Beat::Text(_) | Beat::Alive => {} // it shouldn't send anything
+                    Beat::Ping => {
                         if socket.send(M::Ping(Default::default())).await.is_err() {
                             break;
                         }
                     }
-                    link_watch::Beat::Gone(why) => {
+                    Beat::Gone(why) => {
                         rlog("info", &format!("dial {bridge_id}: link closed ({why})"));
                         break;
                     }
@@ -2150,15 +2191,15 @@ async fn on_upgrade(
 }
 
 /// The axum-side reader. It only bridges the difference — the watch clock and state machine live only in `link::beat`.
-impl link_watch::LinkRead for WebSocket {
-    async fn read_frame(&mut self) -> link_watch::Frame {
+impl LinkRead for WebSocket {
+    async fn read_frame(&mut self) -> Frame {
         match self.recv().await {
-            Some(Ok(Message::Text(t))) => link_watch::Frame::Text(t.to_string()),
+            Some(Ok(Message::Text(t))) => Frame::Text(t.to_string()),
             Some(Ok(Message::Close(_))) | None => {
-                link_watch::Frame::Closed("closed by the other side".to_string())
+                Frame::Closed("closed by the other side".to_string())
             }
-            Some(Ok(_)) => link_watch::Frame::Other,
-            Some(Err(e)) => link_watch::Frame::Closed(e.to_string()),
+            Some(Ok(_)) => Frame::Other,
+            Some(Err(e)) => Frame::Closed(e.to_string()),
         }
     }
 }
@@ -2173,7 +2214,7 @@ async fn on_socket(fleet: Arc<Fleet>, bridge_id: String, mut socket: WebSocket) 
     // **Don't hold on to a machine that vanished silently.** After the handshake the machine sends nothing,
     // so silence is normal on this connection. Without Ping probes it's indistinguishable from half-open: a missing machine
     // keeps showing as "connected" in `status`, and deliveries to it vanish into thin air
-    let mut watch = link_watch::IdleWatch::default();
+    let mut watch = IdleWatch::default();
     loop {
         tokio::select! {
             outgoing = rx.recv() => match outgoing {
@@ -2186,14 +2227,14 @@ async fn on_socket(fleet: Arc<Fleet>, bridge_id: String, mut socket: WebSocket) 
                 None => break,
             },
             // **Receive only through `beat`.** Waiting on `recv()` directly hangs forever on a half-open socket
-            incoming = link_watch::beat(&mut socket, &mut watch) => match incoming {
-                link_watch::Beat::Text(_) | link_watch::Beat::Alive => {} // it shouldn't send anything
-                link_watch::Beat::Ping => {
+            incoming = beat(&mut socket, &mut watch) => match incoming {
+                Beat::Text(_) | Beat::Alive => {} // it shouldn't send anything
+                Beat::Ping => {
                     if socket.send(Message::Ping(Default::default())).await.is_err() {
                         break;
                     }
                 }
-                link_watch::Beat::Gone(why) => {
+                Beat::Gone(why) => {
                     rlog("info", &format!("{bridge_id}: link closed ({why})"));
                     break;
                 }
@@ -2255,7 +2296,7 @@ pub(super) async fn bind_link_port(addr: std::net::SocketAddr, what: &str) -> Op
 async fn serve_children_on(fleet: Arc<Fleet>, listener: tokio::net::TcpListener) {
     let app = Router::new()
         .route("/status", get(on_status))
-        .route(wire::PROBE_PATH, get(on_upgrade))
+        .route(link::PROBE_PATH, get(on_upgrade))
         .route("/bridge/{id}", get(on_upgrade))
         .with_state(fleet);
     if let Err(e) = axum::serve(listener, app).await {
@@ -2355,6 +2396,127 @@ pub async fn keep_tunnel(
     }
 }
 
+// ── Section 8: the link watch (both ends read the link through it) ─────────────────
+
+pub const RECONNECT_MIN_MS: u64 = 1_000;
+pub const RECONNECT_MAX_MS: u64 = 30_000;
+
+/// After this much silence, send one Ping. If the next window is silent too, treat it as dead and disconnect.
+pub const LINK_IDLE_MS: u64 = 30_000;
+
+/// What to do when a silent window closes.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Idle {
+    /// Check that it's alive.
+    Ping,
+    /// The previous Ping got no answer. Disconnect and reconnect.
+    Dead,
+}
+
+/// The watchman checking the link isn't dead. **The only way to detect half-open.**
+///
+/// When the peer vanishes without a FIN (network loss, suspend, a dropped NAT entry), the socket stays
+/// `ESTAB` and receiving **never returns**. No Close and no Err arrive, so no receive loop can
+/// exit, and the reconnect beyond it is never reached (2026-08-03: a machine went silent for 74 minutes).
+/// For WebSocket Ping, both tungstenite and axum **only answer received Pings with Pong** and never
+/// send their own. TCP keepalive is off by default too. So the only way is to poke from our side.
+#[derive(Default)]
+pub struct IdleWatch {
+    pinged: bool,
+}
+
+impl IdleWatch {
+    /// Something arrived / was sent. Alive.
+    pub fn on_traffic(&mut self) {
+        self.pinged = false;
+    }
+
+    /// The window closed with no traffic.
+    pub fn on_idle(&mut self) -> Idle {
+        if self.pinged {
+            Idle::Dead
+        } else {
+            self.pinged = true;
+            Idle::Ping
+        }
+    }
+}
+
+/// The result of reading one frame from the link. Returned by the implementor of [`LinkRead`].
+pub enum Frame {
+    /// A payload.
+    Text(String),
+    /// Not a payload (Pong etc.). Its content is irrelevant, but **the fact it arrived** proves liveness.
+    Other,
+    /// The peer closed / broke. The reason is a line for humans.
+    Closed(String),
+}
+
+/// A reader of one frame. **No timeout here** — the watchman ([`beat`]) wraps it from outside.
+///
+/// axum and tungstenite differ only in the name of their read method, so implementations just bridge that.
+/// **The watch clock and state machine exist only once, in [`beat`]** (to prevent a repeat of when they were copied to 4 places).
+pub trait LinkRead {
+    fn read_frame(&mut self) -> impl std::future::Future<Output = Frame> + Send;
+}
+
+/// The result of a watched receive.
+///
+/// **Don't swallow `Ping`.** Ignoring it means never noticing a link whose peer silently vanished
+/// (half-open). Exhaustive matching enforces that.
+pub enum Beat {
+    /// A payload arrived.
+    Text(String),
+    /// Something other than a payload arrived. Alive.
+    Alive,
+    /// Silence continued. **The caller sends one Ping and waits for the next.**
+    Ping,
+    /// Disconnected, with a reason. The caller leaves the loop.
+    Gone(String),
+}
+
+/// **Every link receive goes through this.** Waiting on a bare `next()` / `recv()` directly
+/// never returns when the peer vanishes without a FIN, since neither Close nor Err arrives
+/// (2026-08-03: a machine went silent for 74 minutes).
+pub async fn beat<S: LinkRead>(socket: &mut S, watch: &mut IdleWatch) -> Beat {
+    beat_within(socket, watch, LINK_IDLE_MS).await
+}
+
+/// The body of [`beat`]. The window size is passable **only for tests** — callers use `beat`.
+async fn beat_within<S: LinkRead>(socket: &mut S, watch: &mut IdleWatch, window_ms: u64) -> Beat {
+    match tokio::time::timeout(std::time::Duration::from_millis(window_ms), socket.read_frame()).await {
+        Ok(Frame::Text(t)) => {
+            watch.on_traffic();
+            Beat::Text(t)
+        }
+        Ok(Frame::Other) => {
+            watch.on_traffic();
+            Beat::Alive
+        }
+        Ok(Frame::Closed(why)) => Beat::Gone(why),
+        Err(_) => match watch.on_idle() {
+            Idle::Ping => Beat::Ping,
+            Idle::Dead => Beat::Gone(format!("no reply to ping within {window_ms}ms")),
+        },
+    }
+}
+
+impl<S> LinkRead for tokio_tungstenite::WebSocketStream<S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    async fn read_frame(&mut self) -> Frame {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::protocol::Message as M;
+        match self.next().await {
+            Some(Ok(M::Text(t))) => Frame::Text(t.to_string()),
+            Some(Ok(M::Close(_))) | None => Frame::Closed("closed by the other side".to_string()),
+            Some(Ok(_)) => Frame::Other, // tungstenite handles ping/pong and the like
+            Some(Err(e)) => Frame::Closed(e.to_string()),
+        }
+    }
+}
+
 // ── Section 9: CLI (the fleet section of `status`) ─────────────────────────────────
 
 pub(crate) const DEFAULT_LISTEN: &str = "0.0.0.0:8787";
@@ -2402,54 +2564,6 @@ impl Cli {
         }
     }
 
-    /// The first line of `status`. **The role is decided by `.env` alone** — it doesn't look at processes, so
-    /// it shows even when the Bridge isn't running (which is exactly when you want to read it).
-    /// If `Wiring::resolve` rejects the config, its reason is shown as is — the only place to learn why
-    /// a Bridge can't start without opening the logs.
-    pub fn role_line(env: &HashMap<String, String>) -> String {
-        use crate::bridge::machine::{Mode, Wiring};
-        let wiring = match Wiring::resolve(|k| env.get(k).cloned()) {
-            Ok(w) => w,
-            Err(why) => {
-                let why = why.lines().next().unwrap_or("");
-                return crate::t!("Role: can't tell — {why}", "役割: 判定できません — {why}");
-            }
-        };
-        let name = wiring
-            .self_id
-            .as_deref()
-            .map(|n| crate::t!(" \"{n}\"", "「{n}」"))
-            .unwrap_or_default();
-        match (&wiring.upstream, &wiring.children, &wiring.inlet) {
-            (Mode::Direct { .. }, Some(l), _) => {
-                let addr = l.addr;
-                crate::t!(
-                    "Role: gateway{name} — connected to Slack, accepts machines on {addr}",
-                    "役割: ゲートウェイ{name} — Slack に接続、マシンを {addr} で受け付け"
-                )
-            }
-            (Mode::Direct { .. }, None, _) => crate::t!(
-                "Role: gateway{name} — connected to Slack, no other machines",
-                "役割: ゲートウェイ{name} — Slack に接続、ほかのマシンなし"
-            ),
-            (Mode::Relay { url, .. }, ..) => crate::t!(
-                "Role: machine{name} — connects to the gateway at {url}",
-                "役割: マシン{name} — ゲートウェイ {url} につなぐ"
-            ),
-            (Mode::AwaitParent, _, Some(l)) => {
-                let addr = l.addr;
-                crate::t!(
-                    "Role: machine{name} — waits for the gateway to connect on {addr}",
-                    "役割: マシン{name} — ゲートウェイからの接続を {addr} で待つ"
-                )
-            }
-            (Mode::AwaitParent, _, None) => crate::t!(
-                "Role: machine{name} — waits for the gateway, but has no address to listen on",
-                "役割: マシン{name} — ゲートウェイを待っているが、受け付ける場所が未設定"
-            ),
-        }
-    }
-
     /// The open ports. Agents connect back here, so it's the first number to check when they can't connect.
     ///
     /// **Nothing is allocated here** — it only reads what's recorded (status adding ports would defeat
@@ -2477,12 +2591,11 @@ impl Cli {
         }
     }
 
-    /// The fleet section of `status`. The role line is **always shown** (it's the first place to look when the
-    /// config is wrong, so staying silent on a machine leaves no clue). The table is only shown when this host is
+    /// The fleet section of `status` (after the role line, which `main.rs` prints from
+    /// [`machine::role_line`](crate::bridge::machine::role_line)). The table is only shown when this host is
     /// set up to accept machines — a lone Bridge doesn't get an empty table.
     pub async fn print_fleet(dir: &StateDir) {
         let env = Self::env_of(dir);
-        println!("\n{}", Self::role_line(&env));
         println!("{}", Self::ports_line(dir));
         let (Some(listen), Some(token)) = (
             env.get("AGENTGW_LINK_LISTEN"),
@@ -2588,51 +2701,6 @@ mod tests {
 
     const TOKEN: &str = "the-shared-secret";
 
-    /// The first line of `status`. **Staying silent with the role misread is the worst**, so the four shapes and
-    /// "can't tell" are pinned.
-    #[test]
-    fn role_line_names_the_role() {
-        let env = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
-            pairs
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect()
-        };
-        let line = |pairs: &[(&str, &str)]| Cli::role_line(&env(pairs));
-
-        let solo = line(&[("SLACK_APP_TOKEN", "xapp-1"), ("SLACK_BOT_TOKEN", "xoxb-1")]);
-        assert!(solo.starts_with("Role: gateway — connected to Slack, no other machines"), "{solo}");
-
-        let parent = line(&[
-            ("SLACK_APP_TOKEN", "xapp-1"),
-            ("SLACK_BOT_TOKEN", "xoxb-1"),
-            ("AGENTGW_BRIDGE_ID", "mac"),
-            ("AGENTGW_LINK_LISTEN", "127.0.0.1:8787"),
-            ("AGENTGW_LINK_TOKEN", "k"),
-        ]);
-        assert!(parent.contains("Role: gateway \"mac\""), "{parent}");
-        assert!(parent.contains("127.0.0.1:8787"), "{parent}");
-
-        let dialing = line(&[
-            ("AGENTGW_RELAY_URL", "wss://p.example"),
-            ("AGENTGW_RELAY_TOKEN", "k"),
-            ("AGENTGW_BRIDGE_ID", "laptop"),
-        ]);
-        assert!(dialing.contains("Role: machine \"laptop\""), "{dialing}");
-        assert!(dialing.contains("wss://p.example"), "{dialing}");
-
-        let awaiting = line(&[
-            ("AGENTGW_LINK_LISTEN", "127.0.0.1:8788"),
-            ("AGENTGW_LINK_TOKEN", "k"),
-            ("AGENTGW_BRIDGE_ID", "laptop"),
-        ]);
-        assert!(awaiting.contains("waits for the gateway"), "{awaiting}");
-
-        // A config that can't start is exactly when status needs to give the reason (without opening the logs)
-        let broken = line(&[]);
-        assert!(broken.starts_with("Role: can't tell"), "{broken}");
-    }
-
     fn ok_admit(path: &str) -> Admit {
         Admit::of(
             path,
@@ -2699,12 +2767,12 @@ mod tests {
     /// The reachability probe **passes but gives no name**. It still has to pass authentication like the rest.
     #[test]
     fn the_probe_path_is_admitted_without_a_name() {
-        assert_eq!(ok_admit(wire::PROBE_PATH), Admit::Probe);
-        assert_eq!(ok_admit(wire::PROBE_PATH).status(), None);
+        assert_eq!(ok_admit(link::PROBE_PATH), Admit::Probe);
+        assert_eq!(ok_admit(link::PROBE_PATH).status(), None);
         // Authentication isn't skipped
         assert_eq!(
             Admit::of(
-                wire::PROBE_PATH,
+                link::PROBE_PATH,
                 Some("Bearer wrong"),
                 Some(LINK_SUBPROTOCOL),
                 TOKEN
@@ -2767,8 +2835,8 @@ mod tests {
         (Conn::new(tx), rx)
     }
 
-    fn ready() -> wire::LinkFrame {
-        wire::LinkFrame::Ready {
+    fn ready() -> link::LinkFrame {
+        link::LinkFrame::Ready {
             bot_token: "xoxb-1".into(),
             home: None,
         }
@@ -3473,7 +3541,7 @@ mod tests {
     // ── DM name-claim ─────────────────────────────────────────────────────────
 
     fn conn_string() -> String {
-        wire::encode_connection(&wire::Invite {
+        link::encode_connection(&link::Invite {
             url: "wss://relay.example".into(),
             api_token: TOKEN.into(),
         })
@@ -3569,7 +3637,7 @@ mod tests {
 
     #[test]
     fn a_string_for_another_bot_is_refused() {
-        let other = wire::encode_connection(&wire::Invite {
+        let other = link::encode_connection(&link::Invite {
             url: "wss://relay.example".into(),
             api_token: "a-different-secret".into(),
         });
@@ -3766,5 +3834,83 @@ mod tests {
             "転送に失敗したら黙って生き残らない: {args:?}"
         );
         assert_eq!(args.last().unwrap(), "me@laptop", "ssh 先は最後: {args:?}");
+    }
+
+    // ── the link watch ──
+
+    /// Two silent windows mean dead. **Don't disconnect on the first** — cutting a link
+    /// that is merely quiet every 30 seconds causes a reconnect storm.
+    #[test]
+    fn two_silent_windows_mean_the_link_is_dead() {
+        let mut w = IdleWatch::default();
+        assert_eq!(w.on_idle(), Idle::Ping); // first: poke to check
+        assert_eq!(w.on_idle(), Idle::Dead); // second: no answer = dead
+    }
+
+    /// A Pong or a delivery — **anything arriving means alive**. The watchman restarts its count there.
+    #[test]
+    fn any_traffic_clears_the_watch() {
+        let mut w = IdleWatch::default();
+        assert_eq!(w.on_idle(), Idle::Ping);
+        w.on_traffic(); // a Pong came back
+        assert_eq!(w.on_idle(), Idle::Ping); // back to the first one
+        w.on_traffic();
+        w.on_traffic();
+        assert_eq!(w.on_idle(), Idle::Ping);
+        assert_eq!(w.on_idle(), Idle::Dead);
+    }
+
+    /// A socket that returns nothing = the peer silently vanished (half-open).
+    struct SilentSocket;
+    impl LinkRead for SilentSocket {
+        async fn read_frame(&mut self) -> Frame {
+            std::future::pending().await // never returns — this is what the 74-minute silence was
+        }
+    }
+
+    /// A socket that returns a payload only on the second read and is silent otherwise (silent → arrives → silent).
+    struct SilentThenText(u32);
+    impl LinkRead for SilentThenText {
+        async fn read_frame(&mut self) -> Frame {
+            self.0 += 1;
+            if self.0 == 2 {
+                Frame::Text("hello".to_string())
+            } else {
+                std::future::pending().await
+            }
+        }
+    }
+
+    /// **`beat` never waits forever.** If it stays silent, it asks for a Ping, then says to disconnect in the next window.
+    #[tokio::test]
+    async fn a_silent_socket_gets_pinged_then_declared_gone() {
+        let mut s = SilentSocket;
+        let mut w = IdleWatch::default();
+        assert!(matches!(beat_within(&mut s, &mut w, 10).await, Beat::Ping));
+        let Beat::Gone(why) = beat_within(&mut s, &mut w, 10).await else {
+            panic!("2窓目は Gone のはず");
+        };
+        assert!(why.contains("no reply to ping"), "{why}");
+    }
+
+    /// When something arrives, return the payload and **restart the watchman's count** — the key to not cutting a live link.
+    /// Without the reset, a single silent window right after a Ping would disconnect.
+    #[tokio::test]
+    async fn a_frame_arrives_and_resets_the_watch() {
+        let mut s = SilentThenText(0);
+        let mut w = IdleWatch::default();
+        // First window is silent → ask for a Ping
+        assert!(matches!(beat_within(&mut s, &mut w, 10).await, Beat::Ping));
+        // Then a payload arrives (a Pong works the same) → alive, so restart the count
+        match beat_within(&mut s, &mut w, 10).await {
+            Beat::Text(t) => assert_eq!(t, "hello"),
+            _ => panic!("本文が来るはず"),
+        }
+        // **The count was reset, so it's Ping again.** Gone here would mean the reset didn't happen
+        assert!(matches!(beat_within(&mut s, &mut w, 10).await, Beat::Ping));
+        assert!(matches!(
+            beat_within(&mut s, &mut w, 10).await,
+            Beat::Gone(_)
+        ));
     }
 }

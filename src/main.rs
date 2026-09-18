@@ -58,12 +58,18 @@ async fn main() {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             std::process::exit(agentgw::setup::add_machine::cli(&rest).await);
         }
+        "install" | "uninstall" => {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            std::process::exit(agentgw::setup::run(&cmd, &rest));
+        }
         c if Service::COMMANDS.contains(&c) => {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             let rc = Service::run(c, &rest);
             // Only when this host is set up to accept machines, follow with the fleet status
             if c == "status" {
                 let dir = agentgw::state_dir::StateDir::resolve();
+                let env = dir.load_env().unwrap_or_default().into_iter().collect();
+                println!("\n{}", agentgw::bridge::machine::role_line(&env));
                 agentgw::bridge::gateway::Cli::print_fleet(&dir).await;
             }
             std::process::exit(rc);

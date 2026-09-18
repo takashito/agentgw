@@ -50,3 +50,22 @@ fn unknown_commands_fall_to_the_overall_usage() {
     assert_eq!(code, 2, "invite は畳んだ: {text}");
     assert!(text.contains("add-machine user@host"), "{text}");
 }
+
+#[test]
+fn install_reaches_setup() {
+    // With no terminal and no .env, install stops at the role question **before writing anything**.
+    // HOME and the service label point away from the real service anyway.
+    let dir = std::env::temp_dir().join(format!("agentgw-cli-install-{}", std::process::id()));
+    let out = Command::new(env!("CARGO_BIN_EXE_agentgw"))
+        .arg("install")
+        .env("AGENTGW_STATE_DIR", dir.join("state"))
+        .env("HOME", &dir)
+        .env("AGENTGW_SERVICE_LABEL", "agentgw-cli-test")
+        .env("AGENTGW_SERVICE_UNIT", "agentgw-cli-test.service")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("agentgw failed to start");
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.starts_with("install: "), "{text}");
+}

@@ -40,7 +40,7 @@ impl LogCtx {
 
     fn write(&self, level: &str, component: &str, message: &str) {
         // Logging must never break the hot path — failures are swallowed
-        let path = StateDir::resolve().log_path(self);
+        let path = self.path(&StateDir::resolve());
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -51,6 +51,23 @@ impl LogCtx {
             .open(&path)
         {
             let _ = f.write_all(self.line(level, component, message).as_bytes());
+        }
+    }
+
+    /// Where logs go. thread_key set → by-thread, only session_id → sessions,
+    /// neither → plugin-debug.log
+    fn path(&self, dir: &StateDir) -> std::path::PathBuf {
+        match (&self.thread_key, &self.session_id) {
+            (Some(key), _) => dir
+                .join("logs")
+                .join("by-thread")
+                .join(self.sanitized_key().unwrap_or_else(|| key.to_string()))
+                .join("bridge.log"),
+            (None, Some(sid)) => dir
+                .join("logs")
+                .join("sessions")
+                .join(format!("{sid}.log")),
+            (None, None) => dir.join("plugin-debug.log"),
         }
     }
 

@@ -17,7 +17,8 @@
 //! 401 during a deploy would keep the machine down for good. Even for an unfixable refusal it keeps
 //! reconnecting at intervals, and recovers on its own the moment it is fixed.
 
-use crate::bridge::gateway::wire::{self, LinkFrame};
+use crate::bridge::gateway::link::{self, LinkFrame};
+use crate::bridge::gateway::{Beat, IdleWatch, RECONNECT_MAX_MS, RECONNECT_MIN_MS, beat};
 use crate::log::LogCtx;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,125 +31,6 @@ use axum::http::HeaderMap;
 use axum::routing::get;
 
 use crate::bridge::gateway;
-
-pub const RECONNECT_MIN_MS: u64 = 1_000;
-pub const RECONNECT_MAX_MS: u64 = 30_000;
-
-/// After this much silence, send one Ping. If the next window is silent too, treat it as dead and disconnect.
-pub const LINK_IDLE_MS: u64 = 30_000;
-
-/// What to do when a silent window closes.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Idle {
-    /// Check that it's alive.
-    Ping,
-    /// The previous Ping got no answer. Disconnect and reconnect.
-    Dead,
-}
-
-/// The watchman checking the link isn't dead. **The only way to detect half-open.**
-///
-/// When the peer vanishes without a FIN (network loss, suspend, a dropped NAT entry), the socket stays
-/// `ESTAB` and receiving **never returns**. No Close and no Err arrive, so no receive loop can
-/// exit, and the reconnect beyond it is never reached (2026-08-03: a machine went silent for 74 minutes).
-/// For WebSocket Ping, both tungstenite and axum **only answer received Pings with Pong** and never
-/// send their own. TCP keepalive is off by default too. So the only way is to poke from our side.
-#[derive(Default)]
-pub struct IdleWatch {
-    pinged: bool,
-}
-
-impl IdleWatch {
-    /// Something arrived / was sent. Alive.
-    pub fn on_traffic(&mut self) {
-        self.pinged = false;
-    }
-
-    /// The window closed with no traffic.
-    pub fn on_idle(&mut self) -> Idle {
-        if self.pinged {
-            Idle::Dead
-        } else {
-            self.pinged = true;
-            Idle::Ping
-        }
-    }
-}
-
-/// The result of reading one frame from the link. Returned by the implementor of [`LinkRead`].
-pub enum Frame {
-    /// A payload.
-    Text(String),
-    /// Not a payload (Pong etc.). Its content is irrelevant, but **the fact it arrived** proves liveness.
-    Other,
-    /// The peer closed / broke. The reason is a line for humans.
-    Closed(String),
-}
-
-/// A reader of one frame. **No timeout here** — the watchman ([`beat`]) wraps it from outside.
-///
-/// axum and tungstenite differ only in the name of their read method, so implementations just bridge that.
-/// **The watch clock and state machine exist only once, in [`beat`]** (to prevent a repeat of when they were copied to 4 places).
-pub trait LinkRead {
-    fn read_frame(&mut self) -> impl std::future::Future<Output = Frame> + Send;
-}
-
-/// The result of a watched receive.
-///
-/// **Don't swallow `Ping`.** Ignoring it means never noticing a link whose peer silently vanished
-/// (half-open). Exhaustive matching enforces that.
-pub enum Beat {
-    /// A payload arrived.
-    Text(String),
-    /// Something other than a payload arrived. Alive.
-    Alive,
-    /// Silence continued. **The caller sends one Ping and waits for the next.**
-    Ping,
-    /// Disconnected, with a reason. The caller leaves the loop.
-    Gone(String),
-}
-
-/// **Every link receive goes through this.** Waiting on a bare `next()` / `recv()` directly
-/// never returns when the peer vanishes without a FIN, since neither Close nor Err arrives
-/// (2026-08-03: a machine went silent for 74 minutes).
-pub async fn beat<S: LinkRead>(socket: &mut S, watch: &mut IdleWatch) -> Beat {
-    beat_within(socket, watch, LINK_IDLE_MS).await
-}
-
-/// The body of [`beat`]. The window size is passable **only for tests** — callers use `beat`.
-async fn beat_within<S: LinkRead>(socket: &mut S, watch: &mut IdleWatch, window_ms: u64) -> Beat {
-    match tokio::time::timeout(Duration::from_millis(window_ms), socket.read_frame()).await {
-        Ok(Frame::Text(t)) => {
-            watch.on_traffic();
-            Beat::Text(t)
-        }
-        Ok(Frame::Other) => {
-            watch.on_traffic();
-            Beat::Alive
-        }
-        Ok(Frame::Closed(why)) => Beat::Gone(why),
-        Err(_) => match watch.on_idle() {
-            Idle::Ping => Beat::Ping,
-            Idle::Dead => Beat::Gone(format!("no reply to ping within {window_ms}ms")),
-        },
-    }
-}
-
-impl<S> LinkRead for tokio_tungstenite::WebSocketStream<S>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
-{
-    async fn read_frame(&mut self) -> Frame {
-        use futures_util::StreamExt;
-        use tokio_tungstenite::tungstenite::protocol::Message as M;
-        match self.next().await {
-            Some(Ok(M::Text(t))) => Frame::Text(t.to_string()),
-            Some(Ok(M::Close(_))) | None => Frame::Closed("closed by the other side".to_string()),
-            Some(Ok(_)) => Frame::Other, // tungstenite handles ping/pong and the like
-            Some(Err(e)) => Frame::Closed(e.to_string()),
-        }
-    }
-}
 
 /// Reasons the handshake was refused where **the caller should change its behaviour**.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,9 +98,9 @@ pub enum FromRelay {
 
 /// A frame from the gateway becomes an upstream message as-is. The bridge that lets **both the dialing side and the
 /// accepted side use the same sink** (`Fatal` alone is a local matter, so it isn't in `From`).
-impl From<crate::bridge::gateway::wire::LinkFrame> for FromRelay {
-    fn from(frame: crate::bridge::gateway::wire::LinkFrame) -> Self {
-        use crate::bridge::gateway::wire::LinkFrame as F;
+impl From<crate::bridge::gateway::link::LinkFrame> for FromRelay {
+    fn from(frame: crate::bridge::gateway::link::LinkFrame) -> Self {
+        use crate::bridge::gateway::link::LinkFrame as F;
         match frame {
             F::Ready { bot_token, home } => FromRelay::Ready { bot_token, home },
             F::Event { name, event } => FromRelay::Event { name, event },
@@ -288,7 +170,7 @@ impl RelayLink {
 
     /// One connection. `Ok(true)` = got through the handshake (then dropped), `Ok(false)` = didn't connect.
     async fn connect_once(&self, tx: &tokio::sync::mpsc::Sender<FromRelay>) -> Result<bool, Fatal> {
-        let target = format!("{}{}", self.url, wire::path_for(&self.bridge_id));
+        let target = format!("{}{}", self.url, link::path_for(&self.bridge_id));
         LogCtx::default().info(
             "bridge",
             &format!(
@@ -296,7 +178,7 @@ impl RelayLink {
                 self.bridge_id
             ),
         );
-        let request = match build_request(&target, &self.api_token) {
+        let request = match link::build_request(&target, &self.api_token) {
             Ok(r) => r,
             Err(e) => {
                 LogCtx::default().error("bridge", &format!("remote link: {e}"));
@@ -341,7 +223,7 @@ impl RelayLink {
                     break;
                 }
             };
-            let Some(frame) = wire::decode(&raw) else {
+            let Some(frame) = link::decode(&raw) else {
                 LogCtx::default().info(
                     "bridge",
                     &format!("remote link: dropped an unrecognised frame: {}", {
@@ -392,31 +274,6 @@ impl RelayLink {
         // A dropped link only means the flow from Slack stopped.
         Ok(true)
     }
-}
-
-/// Build the request carrying the three upgrade parts (path / `Authorization` / `Sec-WebSocket-Protocol`).
-pub(crate) fn build_request(
-    target: &str,
-    api_token: &str,
-) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request, String> {
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-    let mut request = target
-        .into_client_request()
-        .map_err(|e| format!("not a usable address ({target}): {e}"))?;
-    let headers = request.headers_mut();
-    headers.insert(
-        "authorization",
-        format!("Bearer {api_token}")
-            .parse()
-            .map_err(|_| "the key can't go in a header".to_string())?,
-    );
-    headers.insert(
-        "sec-websocket-protocol",
-        wire::LINK_SUBPROTOCOL
-            .parse()
-            .map_err(|_| "the subprotocol can't go in a header".to_string())?,
-    );
-    Ok(request)
 }
 
 /// The wait before the next reconnect. Reset to the short wait once a handshake succeeds.
@@ -660,7 +517,7 @@ async fn on_parent_upgrade(
 ) -> axum::response::Response {
     match gateway::admit_upgrade(&headers, &uri, &inlet.token, "a parent", ws) {
         Ok((parent_id, ws)) => ws
-            .protocols([wire::LINK_SUBPROTOCOL])
+            .protocols([link::LINK_SUBPROTOCOL])
             .on_upgrade(move |socket| on_parent_socket(inlet, parent_id, socket)),
         Err(response) => response,
     }
@@ -695,7 +552,7 @@ async fn on_parent_socket(inlet: Arc<GatewayInlet>, parent_id: String, mut socke
                 break;
             }
         };
-        let Some(frame) = wire::decode(&raw) else {
+        let Some(frame) = link::decode(&raw) else {
             gateway::rlog("info", "dropped an unrecognised frame from the parent");
             continue;
         };
@@ -711,7 +568,7 @@ impl GatewayInlet {
     /// Open the listener that accepts the gateway. **Does not return.**
     pub async fn serve(self: Arc<Self>, addr: std::net::SocketAddr) {
         let app = Router::new()
-            .route(wire::PROBE_PATH, get(on_parent_upgrade))
+            .route(link::PROBE_PATH, get(on_parent_upgrade))
             .route("/bridge/{id}", get(on_parent_upgrade))
             .with_state(self);
         let Some(listener) = gateway::bind_link_port(addr, "parent").await else {
@@ -768,6 +625,54 @@ pub fn child_urls(raw: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The role line of `status` — **always shown** (it's the first place to look when the config is wrong,
+/// so staying silent on a machine leaves no clue). **The role is decided by `.env` alone** — it doesn't look at processes, so
+/// it shows even when the Bridge isn't running (which is exactly when you want to read it).
+/// If `Wiring::resolve` rejects the config, its reason is shown as is — the only place to learn why
+/// a Bridge can't start without opening the logs.
+pub fn role_line(env: &std::collections::HashMap<String, String>) -> String {
+    let wiring = match Wiring::resolve(|k| env.get(k).cloned()) {
+        Ok(w) => w,
+        Err(why) => {
+            let why = why.lines().next().unwrap_or("");
+            return crate::t!("Role: can't tell — {why}", "役割: 判定できません — {why}");
+        }
+    };
+    let name = wiring
+        .self_id
+        .as_deref()
+        .map(|n| crate::t!(" \"{n}\"", "「{n}」"))
+        .unwrap_or_default();
+    match (&wiring.upstream, &wiring.children, &wiring.inlet) {
+        (Mode::Direct { .. }, Some(l), _) => {
+            let addr = l.addr;
+            crate::t!(
+                "Role: gateway{name} — connected to Slack, accepts machines on {addr}",
+                "役割: ゲートウェイ{name} — Slack に接続、マシンを {addr} で受け付け"
+            )
+        }
+        (Mode::Direct { .. }, None, _) => crate::t!(
+            "Role: gateway{name} — connected to Slack, no other machines",
+            "役割: ゲートウェイ{name} — Slack に接続、ほかのマシンなし"
+        ),
+        (Mode::Relay { url, .. }, ..) => crate::t!(
+            "Role: machine{name} — connects to the gateway at {url}",
+            "役割: マシン{name} — ゲートウェイ {url} につなぐ"
+        ),
+        (Mode::AwaitParent, _, Some(l)) => {
+            let addr = l.addr;
+            crate::t!(
+                "Role: machine{name} — waits for the gateway to connect on {addr}",
+                "役割: マシン{name} — ゲートウェイからの接続を {addr} で待つ"
+            )
+        }
+        (Mode::AwaitParent, _, None) => crate::t!(
+            "Role: machine{name} — waits for the gateway, but has no address to listen on",
+            "役割: マシン{name} — ゲートウェイを待っているが、受け付ける場所が未設定"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -785,81 +690,6 @@ mod tests {
         }
     }
 
-    /// Two silent windows mean dead. **Don't disconnect on the first** — cutting a link
-    /// that is merely quiet every 30 seconds causes a reconnect storm.
-    #[test]
-    fn two_silent_windows_mean_the_link_is_dead() {
-        let mut w = IdleWatch::default();
-        assert_eq!(w.on_idle(), Idle::Ping); // first: poke to check
-        assert_eq!(w.on_idle(), Idle::Dead); // second: no answer = dead
-    }
-
-    /// A Pong or a delivery — **anything arriving means alive**. The watchman restarts its count there.
-    #[test]
-    fn any_traffic_clears_the_watch() {
-        let mut w = IdleWatch::default();
-        assert_eq!(w.on_idle(), Idle::Ping);
-        w.on_traffic(); // a Pong came back
-        assert_eq!(w.on_idle(), Idle::Ping); // back to the first one
-        w.on_traffic();
-        w.on_traffic();
-        assert_eq!(w.on_idle(), Idle::Ping);
-        assert_eq!(w.on_idle(), Idle::Dead);
-    }
-
-    /// A socket that returns nothing = the peer silently vanished (half-open).
-    struct SilentSocket;
-    impl LinkRead for SilentSocket {
-        async fn read_frame(&mut self) -> Frame {
-            std::future::pending().await // never returns — this is what the 74-minute silence was
-        }
-    }
-
-    /// A socket that returns a payload only on the second read and is silent otherwise (silent → arrives → silent).
-    struct SilentThenText(u32);
-    impl LinkRead for SilentThenText {
-        async fn read_frame(&mut self) -> Frame {
-            self.0 += 1;
-            if self.0 == 2 {
-                Frame::Text("hello".to_string())
-            } else {
-                std::future::pending().await
-            }
-        }
-    }
-
-    /// **`beat` never waits forever.** If it stays silent, it asks for a Ping, then says to disconnect in the next window.
-    #[tokio::test]
-    async fn a_silent_socket_gets_pinged_then_declared_gone() {
-        let mut s = SilentSocket;
-        let mut w = IdleWatch::default();
-        assert!(matches!(beat_within(&mut s, &mut w, 10).await, Beat::Ping));
-        let Beat::Gone(why) = beat_within(&mut s, &mut w, 10).await else {
-            panic!("2窓目は Gone のはず");
-        };
-        assert!(why.contains("no reply to ping"), "{why}");
-    }
-
-    /// When something arrives, return the payload and **restart the watchman's count** — the key to not cutting a live link.
-    /// Without the reset, a single silent window right after a Ping would disconnect.
-    #[tokio::test]
-    async fn a_frame_arrives_and_resets_the_watch() {
-        let mut s = SilentThenText(0);
-        let mut w = IdleWatch::default();
-        // First window is silent → ask for a Ping
-        assert!(matches!(beat_within(&mut s, &mut w, 10).await, Beat::Ping));
-        // Then a payload arrives (a Pong works the same) → alive, so restart the count
-        match beat_within(&mut s, &mut w, 10).await {
-            Beat::Text(t) => assert_eq!(t, "hello"),
-            _ => panic!("本文が来るはず"),
-        }
-        // **The count was reset, so it's Ping again.** Gone here would mean the reset didn't happen
-        assert!(matches!(beat_within(&mut s, &mut w, 10).await, Beat::Ping));
-        assert!(matches!(
-            beat_within(&mut s, &mut w, 10).await,
-            Beat::Gone(_)
-        ));
-    }
 
     /// Only a version mismatch is worded as "update this machine and restart to fix".
     #[test]
@@ -878,23 +708,6 @@ mod tests {
         }
         // Once a handshake has succeeded, the next wait starts short
         assert_eq!(next_backoff(b, true), RECONNECT_MIN_MS);
-    }
-
-    #[test]
-    fn the_request_carries_the_three_things_the_upgrade_needs() {
-        let req = build_request("wss://relay.example/bridge/desktop", "s3cret").unwrap();
-        assert_eq!(req.uri().path(), "/bridge/desktop");
-        assert_eq!(req.headers().get("authorization").unwrap(), "Bearer s3cret");
-        assert_eq!(
-            req.headers().get("sec-websocket-protocol").unwrap(),
-            wire::LINK_SUBPROTOCOL
-        );
-    }
-
-    #[test]
-    fn a_url_that_is_not_a_websocket_target_is_refused_rather_than_dialled() {
-        assert!(build_request("not a url", "s").is_err());
-        assert!(build_request("", "s").is_err());
     }
 
     // ── Mode selection ──────────────────────────────────────────────────────
@@ -1174,8 +987,53 @@ mod tests {
         let l = RelayLink::new("wss://relay.example/", "tok", "desktop");
         assert_eq!(l.url, "wss://relay.example");
         assert_eq!(
-            format!("{}{}", l.url, wire::path_for(&l.bridge_id)),
+            format!("{}{}", l.url, link::path_for(&l.bridge_id)),
             "wss://relay.example/bridge/desktop"
         );
+    }
+
+    /// The first line of `status`. **Staying silent with the role misread is the worst**, so the four shapes and
+    /// "can't tell" are pinned.
+    #[test]
+    fn role_line_names_the_role() {
+        let env = |pairs: &[(&str, &str)]| -> std::collections::HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let line = |pairs: &[(&str, &str)]| role_line(&env(pairs));
+
+        let solo = line(&[("SLACK_APP_TOKEN", "xapp-1"), ("SLACK_BOT_TOKEN", "xoxb-1")]);
+        assert!(solo.starts_with("Role: gateway — connected to Slack, no other machines"), "{solo}");
+
+        let parent = line(&[
+            ("SLACK_APP_TOKEN", "xapp-1"),
+            ("SLACK_BOT_TOKEN", "xoxb-1"),
+            ("AGENTGW_BRIDGE_ID", "mac"),
+            ("AGENTGW_LINK_LISTEN", "127.0.0.1:8787"),
+            ("AGENTGW_LINK_TOKEN", "k"),
+        ]);
+        assert!(parent.contains("Role: gateway \"mac\""), "{parent}");
+        assert!(parent.contains("127.0.0.1:8787"), "{parent}");
+
+        let dialing = line(&[
+            ("AGENTGW_RELAY_URL", "wss://p.example"),
+            ("AGENTGW_RELAY_TOKEN", "k"),
+            ("AGENTGW_BRIDGE_ID", "laptop"),
+        ]);
+        assert!(dialing.contains("Role: machine \"laptop\""), "{dialing}");
+        assert!(dialing.contains("wss://p.example"), "{dialing}");
+
+        let awaiting = line(&[
+            ("AGENTGW_LINK_LISTEN", "127.0.0.1:8788"),
+            ("AGENTGW_LINK_TOKEN", "k"),
+            ("AGENTGW_BRIDGE_ID", "laptop"),
+        ]);
+        assert!(awaiting.contains("waits for the gateway"), "{awaiting}");
+
+        // A config that can't start is exactly when status needs to give the reason (without opening the logs)
+        let broken = line(&[]);
+        assert!(broken.starts_with("Role: can't tell"), "{broken}");
     }
 }

@@ -55,14 +55,8 @@ pub enum RestartStep {
 // This layer only calls the OS. Every decision lives in the pure functions above (which are tested).
 
 /// Subcommands accepted besides `serve`.
-pub const COMMANDS: [&str; 6] = [
-    "install",
-    "start",
-    "restart",
-    "shutdown",
-    "status",
-    "uninstall",
-];
+/// (`install` / `uninstall` are setup's — see `setup::run`.)
+pub const COMMANDS: [&str; 4] = ["start", "restart", "shutdown", "status"];
 
 impl JobSpec {
     /// LaunchAgent job definition. RunAtLoad + KeepAlive = start at login and come back up
@@ -224,7 +218,7 @@ pub struct Service;
 
 impl Service {
     /// Operations the CLI accepts. The dispatch in `main` looks up this table.
-    pub const COMMANDS: [&'static str; 6] = COMMANDS;
+    pub const COMMANDS: [&'static str; 4] = COMMANDS;
 
     /// The launchd label used on this machine.
     pub fn label() -> String {
@@ -275,7 +269,7 @@ impl Service {
     }
 
     /// Where this OS keeps the job definition file.
-    fn job_path() -> PathBuf {
+    pub(crate) fn job_path() -> PathBuf {
         Self::job_path_of()
     }
 
@@ -425,24 +419,31 @@ impl Service {
             .unwrap_or(false)
     }
 
+    /// Whether this platform has a service manager we drive (launchd / systemd). Says why not when it hasn't.
+    pub(crate) fn supported() -> bool {
+        if cfg!(target_os = "macos") || cfg!(target_os = "linux") {
+            return true;
+        }
+        eprintln!(
+            "{}",
+            crate::t!(
+                "There's no service support for this platform (macOS uses launchd, Linux uses \
+                 systemd). Run `agentgw serve` yourself.",
+                "このプラットフォームにはサービスの実装がありません(macOS=launchd / Linux=systemd)。\
+                 `agentgw serve` を手で起こしてください"
+            )
+        );
+        false
+    }
+
     /// Run one subcommand and return the process exit code.
     pub fn run(cmd: &str, rest: &[String]) -> i32 {
-        if !cfg!(target_os = "macos") && !cfg!(target_os = "linux") {
-            eprintln!(
-                "{}",
-                crate::t!(
-                    "There's no service support for this platform (macOS uses launchd, Linux uses \
-                     systemd). Run `agentgw serve` yourself.",
-                    "このプラットフォームにはサービスの実装がありません(macOS=launchd / Linux=systemd)。\
-                     `agentgw serve` を手で起こしてください"
-                )
-            );
+        if !Self::supported() {
             return 2;
         }
         let mac = cfg!(target_os = "macos");
         let job = Self::job_path();
         match cmd {
-            "install" => crate::setup::install(mac, &job, rest),
             "start" => {
                 if mac {
                     Self::run_ctl(
@@ -468,7 +469,6 @@ impl Service {
                 }
             }
             "status" => Self::status(mac, rest, &job),
-            "uninstall" => crate::setup::uninstall(mac, &job),
             "restart" => Self::graceful_restart(mac, &job),
             other => {
                 eprintln!("{}", crate::t!("Unknown command: {other}", "知らないサブコマンドです: {other}"));

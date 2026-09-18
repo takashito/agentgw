@@ -138,7 +138,7 @@ use super::ssh;
 use crate::bridge::gateway::TUNNEL_PORT;
 
 use crate::bridge::gateway::Cli as RelayCli;
-use crate::bridge::gateway::wire;
+use crate::bridge::gateway::link;
 use crate::state_dir::StateDir;
 
 /// The bootstrap sent to the machine. **Baked into the binary** — a gateway installed from a release
@@ -419,7 +419,7 @@ fn link_child(
     state_prefix: &str,
     remote_bin: &str,
 ) -> Result<(), String> {
-    let conn = wire::encode_connection(&wire::Invite {
+    let conn = link::encode_connection(&link::Invite {
         url: dial_url(transport),
         api_token: inlet.token.clone(),
     });

@@ -3,7 +3,6 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::log::LogCtx;
 
 /// An empty JSON object. Needed again and again as the default for `read_json_or`.
 pub(crate) fn json_obj() -> serde_json::Value {
@@ -171,23 +170,6 @@ impl StateDir {
         let token = format!("{:x}{nanos:x}", std::process::id());
         let _ = self.put_endpoint(which, "token", serde_json::json!(token));
         token
-    }
-
-    /// Where logs go. thread_key set → by-thread, only session_id → sessions,
-    /// neither → plugin-debug.log
-    pub fn log_path(&self, ctx: &LogCtx) -> PathBuf {
-        match (&ctx.thread_key, &ctx.session_id) {
-            (Some(key), _) => self
-                .join("logs")
-                .join("by-thread")
-                .join(ctx.sanitized_key().unwrap_or_else(|| key.to_string()))
-                .join("bridge.log"),
-            (None, Some(sid)) => self
-                .join("logs")
-                .join("sessions")
-                .join(format!("{sid}.log")),
-            (None, None) => self.join("plugin-debug.log"),
-        }
     }
 
     /// Lets the OS pick a free port.
