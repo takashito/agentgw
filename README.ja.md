@@ -2,7 +2,7 @@
 
 <h1>agentgw</h1>
 
-<p><b>ホームラボのどのマシンでも、自分の Claude Code エージェントを、1つの Slack ボットから、自分だけが操る。</b></p>
+<p><b>ホームラボのどのマシンでも、自分の Claude Code エージェントを、1つの Slack ボットから操る。</b></p>
 
 [![Release](https://img.shields.io/github/v/release/takashito/agentgw?style=flat-square&labelColor=black)](https://github.com/takashito/agentgw/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square&labelColor=black)](LICENSE)
@@ -20,10 +20,6 @@ agentgw は、1つの Slack ボットと、自分のすべてのマシンの Cla
 </p>
 
 ## なぜ agentgw か
-
-### 🔑 エージェントと話せるのは自分だけ
-
-エージェントと話せるのは Owner(あなた)だけです。エージェントは**あなた自身の Claude のサブスクリプション**(Slack からボットに `login` と DM して、Claude Code をサインインさせる)か、**そのマシンに設定された API キー**で動きます。agentgw はモデルの認証情報を一切扱いません。誰かのアカウントで動く共有のボットでもありません。チャンネルのほかの人はスレッドを追って文脈を足せますが、作業を始めたりコマンドを打ったりはできません。
 
 ### 🖧 どのマシンも、ボット1つで
 
@@ -279,8 +275,8 @@ agentgw の表示は英語です。日本語にするには `~/.local/state/agen
 
 ## セキュリティ
 
-- **作業を始められるのも、コマンドを打てるのも Owner だけ**(`login` で Claude Code をサインインさせた人)。動いているスレッドでのほかの人の発言は、文脈としてだけエージェントに渡ります。
-- **エージェントは自分の認証情報で動きます** — 自分の Claude のサブスクリプションか、そのマシンの Claude Code に設定した API キー。agentgw はモデルの認証情報を一切扱いません。
+- **作業を始められるのも、コマンドを打てるのも Owner だけ**(最初に `login` で Claude Code をサインインさせた人)。動いているスレッドでのほかの人の発言は、文脈としてだけエージェントに渡ります。誰かのアカウントで動く共有のボットではありません。
+- **エージェントは自分の認証情報で動きます** — 自分の Claude のサブスクリプションか、そのマシンの Claude Code に設定した API キー。agentgw はモデルの認証情報を一切扱いません。サインインは Claude Code 自身のサインインの手順で行います。サインインはマシンごとに持ち、切れたときはそのマシンが受け持つチャンネルで `login` と送ります。
 - **エージェントは agentgw を入れたユーザーの権限で動き**、そのユーザーにできることは何でもできます。`root` ではなく専用のユーザーで入れてください(例: `agentgw add-machine agent@host`)。
 - **トークンは手元にだけ置きます。** `.env` に権限 600 で。ほかのマシンは app トークンを受け取らず、bot トークンもメモリにだけ置きます。
 - **ゲートウェイとマシンの接続の鍵はパスワードと同じです。** 持っている人はマシンとして参加し、そのマシン宛のメッセージを受け取れます。`add-machine` は ssh の標準入力で渡し、コマンドラインには載せません。

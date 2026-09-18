@@ -2,7 +2,7 @@
 
 <h1>agentgw</h1>
 
-<p><b>Your own Claude Code agents, on every machine in your homelab — driven from one Slack bot, by you alone.</b></p>
+<p><b>Your own Claude Code agents, on every machine in your homelab — driven from one Slack bot.</b></p>
 
 [![Release](https://img.shields.io/github/v/release/takashito/agentgw?style=flat-square&labelColor=black)](https://github.com/takashito/agentgw/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square&labelColor=black)](LICENSE)
@@ -20,10 +20,6 @@ agentgw is a small service that connects one Slack bot to Claude Code on every m
 </p>
 
 ## Why agentgw?
-
-### 🔑 Your agents, for you alone
-
-Only you — the owner — can talk to the agents. They run on **your own Claude subscription** (you sign Claude Code in from Slack by DMing the bot `login`) or on an **API key set up on that machine**. agentgw never handles model credentials, and it is not a shared bot running on somebody else's account: other people in a channel can follow a thread and add context, but they can't start work or run commands.
 
 ### 🖧 Every machine, one bot
 
@@ -279,8 +275,8 @@ Every machine uses the same layout.
 
 ## Security
 
-- **Only the owner can start work or run commands** — the person who signed Claude Code in with `login`. In a thread that's already running, other people's messages reach the agent as context only.
-- **Agents run on your own credentials** — your Claude subscription, or an API key set up for Claude Code on that machine. agentgw never handles model credentials.
+- **Only the owner can start work or run commands** — the person who first signed Claude Code in with `login`. In a thread that's already running, other people's messages reach the agent as context only. agentgw is not a shared bot running on somebody else's account.
+- **Agents run on your own credentials** — your Claude subscription, or an API key set up for Claude Code on that machine. agentgw never handles model credentials: signing in goes through Claude Code's own sign-in flow. Each machine keeps its own sign-in; if one lapses, send `login` in a channel that machine handles.
 - **Agents run as the user that installed agentgw** and can do anything that user can. Install under a dedicated account (e.g. `agentgw add-machine agent@host`) rather than `root`.
 - **Tokens stay local**, in `.env` with mode 600. Other machines never get the app token; they hold the bot token in memory only.
 - **The link secret is a password.** Whoever has it can join as a machine and receive that machine's messages. `add-machine` sends it over ssh stdin, never on a command line.
