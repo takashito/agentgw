@@ -3,12 +3,12 @@
 
 use crate::bridge::state::ThreadKey;
 
-// ─── 付箋(進捗スティッキー) ─────────────────────────────────────────────
+// ─── Progress message (progress sticky) ────────────────────────────────────
 //
-// StickyBoard は純粋な状態 — Slack I/O は持たない。post/update/delete は main の
-// flush ループが `take_dirty` / `settle` の結果を見て Api で行う。
+// StickyBoard is pure state — it does no Slack I/O. The flush loop in main looks at
+// what `take_dirty` / `settle` return and does the post/update/delete through Api.
 
-/// ツール行の状態。
+/// State of a tool row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolStatus {
     Pending,
@@ -18,8 +18,8 @@ pub enum ToolStatus {
 }
 
 impl ToolStatus {
-    /// hook イベント → ツールの状態。PostToolUse 以外はまだ走っている(Pending)。
-    /// 失敗のうち権限拒否は 💥 でなく 🚫 に振り分ける(結果テキストで判定)。
+    /// hook event → tool state. Anything other than PostToolUse is still running (Pending).
+    /// Among failures, permission denials go to 🚫 instead of 💥 (judged by the result text).
     pub fn of(hook_event_name: &str, is_error: bool, result_text: &str) -> ToolStatus {
         if hook_event_name != "PostToolUse" {
             return ToolStatus::Pending;
@@ -48,29 +48,29 @@ impl ToolStatus {
     }
 }
 
-/// 畳みの対象。**完了済みが連続したときだけ**1行にまとめる。
-/// 走行中(◌)と失敗(💥/🚫)は畳まない — 今なにが起きているかは常に見えていないと困る。
+/// What gets folded. Rows are merged into one line **only when completed ones run consecutively**.
+/// Running (◌) and failed (💥/🚫) rows are never folded — what is happening now must always stay visible.
 const FOLD_READ: [&str; 1] = ["Read"];
 const FOLD_SEARCH: [&str; 2] = ["Grep", "Glob"];
 
-/// 編集系(diff を出す対象。畳みには載せない)。
+/// Editing tools (they get a diff, so they are never folded).
 const EDIT_TOOLS: [&str; 3] = ["Edit", "MultiEdit", "Write"];
 
-/// Edit/MultiEdit/Write は**何が変わったか**を git 風の unified diff で行の下に出す
-/// 新しい配管は要らない: PostToolUse の `tool_input` に
-/// `old_string`/`new_string`(Edit)・`edits[]`(MultiEdit)・`content`(Write)が既に来ている。
-/// Slack のコードブロックは色を持てないので、git と同じ1文字の前置(`-` 削除 / `+` 追加 /
-/// ` ` 文脈)を ``` フェンスに入れる。**done の行にだけ**、**main セッションの行にだけ**出す
-/// (畳んだ subagent の窓は1行のまま)。
+/// Edit/MultiEdit/Write show **what changed** as a git-style unified diff under the row.
+/// No new plumbing is needed: PostToolUse's `tool_input` already carries
+/// `old_string`/`new_string` (Edit), `edits[]` (MultiEdit) and `content` (Write).
+/// Slack code blocks cannot be colored, so we put git's one-character prefix (`-` removed / `+` added /
+/// ` ` context) inside a ``` fence. Shown **only on done rows** and **only on main-session rows**
+/// (a folded subagent window stays one line per row).
 const DIFF_CTX: usize = 3;
 const DIFF_MAX_LINES: usize = 16;
 const DIFF_MAX_BYTES: usize = 900;
 const DIFF_MAX_LINE: usize = 120;
-/// LCS の DP を張る上限。超えたら素朴な「全削除 + 全追加」に落とす(出力はどのみち上で切る)。
+/// Upper bound for building the LCS DP table. Beyond it we fall back to a naive "delete all + add all" (the output is clipped above anyway).
 const DIFF_MAX_INPUT_LINES: usize = 200;
 
-/// ``` の run を zero-width space で分断してからクリップする。裸の ``` 行が1本あるだけで
-/// **こちらのフェンスが先に閉じてしまう**ので、中身側で必ず殺す。
+/// Break runs of ``` with a zero-width space before clipping. A single bare ``` line
+/// **closes our fence early**, so it must always be neutralized on the content side.
 fn clip_diff_line(s: &str) -> String {
     fn flush(out: &mut String, run: usize) {
         for k in 0..run {
@@ -98,8 +98,8 @@ fn clip_diff_line(s: &str) -> String {
     out
 }
 
-/// 行単位の LCS 差分 — git が作る形(一致は文脈、残りが `-`/`+`)。Edit が扱う断片は小さいので
-/// O(n·m) で足りる。
+/// Line-level LCS diff — the shape git produces (matches are context, the rest is `-`/`+`). Edit works on
+/// small fragments, so O(n·m) is enough.
 pub fn diff_lines(old_text: &str, new_text: &str) -> Vec<(char, String)> {
     let split = |t: &str| -> Vec<String> {
         if t.is_empty() {
@@ -117,7 +117,7 @@ pub fn diff_lines(old_text: &str, new_text: &str) -> Vec<(char, String)> {
             .collect();
     }
     let (n, m) = (a.len(), b.len());
-    // dp[i][j] = a[i..] と b[j..] の最長共通部分列の長さ
+    // dp[i][j] = length of the longest common subsequence of a[i..] and b[j..]
     let mut dp = vec![vec![0usize; m + 1]; n + 1];
     for i in (0..n).rev() {
         for j in (0..m).rev() {
@@ -148,8 +148,8 @@ pub fn diff_lines(old_text: &str, new_text: &str) -> Vec<(char, String)> {
     out
 }
 
-/// 差分を git 風の hunk に畳む: 変化の前後 `DIFF_CTX` 行だけ文脈を残し、それ以外の
-/// 変化していない連なりは `…` 1行に置き換える。
+/// Fold the diff into git-style hunks: keep only `DIFF_CTX` lines of context around each change and
+/// replace any other unchanged stretch with a single `…` line.
 fn collapse_hunk(diff: &[(char, String)]) -> Vec<String> {
     let mut keep = vec![false; diff.len()];
     for (idx, (t, _)) in diff.iter().enumerate() {
@@ -174,9 +174,9 @@ fn collapse_hunk(diff: &[(char, String)]) -> Vec<String> {
     out
 }
 
-/// ツール行に足す差分。返すのは `" (+A -R)\n```…```"` の形の**行の続き**で、
-/// 出すものが無ければ `None`(テキストの変化なし / input が無い)。
-/// MultiEdit の hunk と hunk の間は `…` で区切る。
+/// The diff appended to a tool row. It returns **the continuation of the row** in the form `" (+A -R)\n```…```"`,
+/// or `None` when there is nothing to show (no text change / no input).
+/// MultiEdit hunks are separated by `…`.
 pub fn render_edit_diff(name: &str, input: &serde_json::Value) -> Option<String> {
     let text = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_string();
     let hunks: Vec<(String, String)> = match name {
@@ -215,7 +215,7 @@ pub fn render_edit_diff(name: &str, input: &serde_json::Value) -> Option<String>
         bytes += ln.len() + 1;
         capped.push(ln.clone());
     }
-    // 打ち切りの脚注は**2行**(件数を1行、そのあとに `…`)
+    // The truncation footnote is **two lines** (the count on one line, then `…`)
     if dropped > 0 {
         capped.push(format!("(+{dropped} more)"));
         capped.push("…".to_string());
@@ -226,25 +226,25 @@ pub fn render_edit_diff(name: &str, input: &serde_json::Value) -> Option<String>
     ))
 }
 
-/// 付箋の1行と subagent の結び付き。
+/// Links a progress-message row to a subagent.
 ///
-/// この行が **どの subagent のものか**、あるいは **どの subagent を起こしたか**。
-/// hook payload 由来で、main セッションのツール呼び出しでは全部 None。
+/// **Which subagent this row belongs to**, or **which subagent it started**.
+/// Comes from the hook payload; all None for tool calls in the main session.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentRef {
-    /// この行を走らせた subagent の id(payload の top-level `agent_id`)。
+    /// id of the subagent that ran this row (top-level `agent_id` in the payload).
     pub agent_id: Option<String>,
-    /// その subagent の名前(`agent_type`。Explore / general-purpose など)。
+    /// Name of that subagent (`agent_type`: Explore / general-purpose etc.).
     pub agent_type: Option<String>,
-    /// `Agent` 行が起こした subagent の id(`tool_response.agentId` / `.agent_id`)。
+    /// id of the subagent an `Agent` row started (`tool_response.agentId` / `.agent_id`).
     pub spawned_agent_id: Option<String>,
-    /// `Agent` 行が起動した名前(`tool_input.name`)。background/teammate を**名前で**結ぶのに要る。
-    /// **`summary` では代用できない** — `Self::summarize("Agent", …)` が返すのは `description` で、
-    /// 起動名とは別のフィールド(`input.name` を見ている)。
+    /// Name an `Agent` row launched with (`tool_input.name`). Needed to link background/teammate agents **by name**.
+    /// **`summary` cannot stand in for it** — `Self::summarize("Agent", …)` returns `description`,
+    /// a different field from the launch name (which reads `input.name`).
     pub launched_name: Option<String>,
 }
 
-/// 付箋の1行。
+/// One row of a progress message.
 #[derive(Debug, Clone)]
 pub enum RenderItem {
     Narration {
@@ -256,23 +256,23 @@ pub enum RenderItem {
         summary: String,
         status: ToolStatus,
         agent: AgentRef,
-        /// done になった編集系ツールの差分(`" (+A -R)\n```…```"`)。
-        /// **描画時ではなく受け取った時に**組む — 付箋は `tool_input` を持ち続けないので、
-        /// 手元に input があるこの瞬間しか作れない。
+        /// Diff of an editing tool that finished (`" (+A -R)\n```…```"`).
+        /// Built **when the event arrives, not at render time** — the progress message does not keep
+        /// `tool_input`, so this is the only moment the input is at hand.
         diff: Option<String>,
     },
-    /// 中断の締め行。グリフ無しの生の1行(notice をそのまま push)。
+    /// Closing line for an interruption. A raw line with no glyph (the notice is pushed as is).
     Interrupted,
 }
 
-/// ナレーション行の頭。⏺(U+23FA)は Slack が絵文字化するので ● を使う。
+/// Prefix of a narration line. Slack turns ⏺ (U+23FA) into an emoji, so we use ●.
 const NARR_GLYPH: &str = "●";
-/// ツール行のインデント。**普通の空白ではなく NBSP** — Slack は行頭の空白を潰し、
-/// `• ` で始まる行を箇条書きに整形してしまう。
+/// Indent of a tool row. **NBSP, not a plain space** — Slack collapses leading whitespace
+/// and reformats lines starting with `• ` as a bulleted list.
 const TOOL_INDENT: &str = "\u{A0}\u{A0}\u{A0}";
-/// 許可プロンプトが誰にも押されないまま満期になったときに付箋へ足す1行
-/// TOOL_INDENT を付けて、止まったツール行の
-/// **下の注記**として読ませる。
+/// Line appended to the progress message when a permission prompt expires without anyone pressing it.
+/// It carries TOOL_INDENT so it reads as a **note under**
+/// the stalled tool row.
 fn perm_timeout_line() -> String {
     crate::t!(
         "\u{A0}\u{A0}\u{A0}⚠️ No answer to the permission request — timed out",
@@ -280,70 +280,70 @@ fn perm_timeout_line() -> String {
     )
 }
 
-/// 1枚の付箋の予算(バイト)。Slack の本文上限に対して余裕をとった値。
+/// Budget (bytes) for one progress message. Leaves headroom below Slack's message body limit.
 const STICKY_BUDGET: usize = 3800;
-/// stop で切られたラウンドの締め行。ここまでの進捗の
-/// **下**に付く — 「どこまで行ったか」を残したまま中断だと分かる形。
+/// Closing line for a round cut off by stop. It goes **under**
+/// the progress so far — it shows the interruption while keeping "how far it got".
 const INTERRUPTED_NOTICE: &str = "└ `Interrupted by user.`";
 
-/// 畳んだ subagent セクションで見せる直近件数(ローリング窓)。
-/// Slack はメッセージの**中を**スクロールできないので、この「最後の N 件」がスクロールの代わり。
+/// Number of recent rows shown in a folded subagent section (a rolling window).
+/// Slack cannot scroll **inside** a message, so this "last N" stands in for scrolling.
 const SUBAGENT_WINDOW: usize = 2;
-/// セクションの見出し記号。
+/// Heading marker for a section.
 const SUBAGENT_MARK: &str = "▾";
-/// セクション行のインデント(ツール行の TOOL_INDENT にさらに重ねる)。
+/// Indent of section rows (stacked on top of the tool row's TOOL_INDENT).
 const SUBAGENT_INDENT: &str = "\u{A0}\u{A0}";
 
-/// settle の結果 — 付箋を記録として残すか、消すか。
+/// Result of settle — keep the progress message as a record, or delete it.
 #[derive(Debug, PartialEq, Eq)]
 pub enum StickyAction {
     Keep,
     Delete(String),
 }
 
-/// 1ラウンド分の付箋。
+/// The progress message for one round.
 #[derive(Default)]
 struct Sticky {
     items: Vec<RenderItem>,
     posted_ts: Option<String>,
     dirty: bool,
     last_flush_ms: Option<u64>,
-    /// 許可待ちが満期になった。次のラウンドまで注記を出し続ける。
+    /// A permission wait expired. The note stays until the next round.
     perm_timed_out: bool,
-    /// **封じたページに出し終えた行数**。いま育てているページは
-    /// ここから始まる。Slack は約4000バイトを超える編集を拒むので、1枚に収まらなくなったら
-    /// そのメッセージを封じて(以後編集しない)続きを次のメッセージに出す。
+    /// **Number of lines already shown on sealed pages**. The page being grown now
+    /// starts here. Slack rejects edits over about 4000 bytes, so once it no longer fits on one message
+    /// we seal that message (never edit it again) and continue in the next message.
     sealed_lines: usize,
-    /// いまのページが**コードブロックの中から**始まるか(前のページから持ち越した)。
+    /// Whether the current page starts **inside a code block** (carried over from the previous page).
     sealed_open_fence: bool,
-    /// まだ投稿していないページのまま溢れた回数。封じたページは二度と編集しないので、
-    /// その投稿が返してくる ts は**捨てる**(拾うと次のページがそれを編集してしまう)。
+    /// How many times a not-yet-posted page overflowed. Sealed pages are never edited again, so
+    /// the ts that post returns is **discarded** (keeping it would make the next page edit it).
     sealed_awaiting_post: usize,
 }
 
-/// thread_key → 進行中の付箋。1スレッド1枚(ページ繰りは持たない)。
+/// thread_key → the progress message in flight. One per thread (no pagination).
 #[derive(Default)]
 pub struct StickyBoard {
     stickies: std::collections::HashMap<ThreadKey, Sticky>,
-    /// 決着したスレッド → **返事の後の続きを新しい付箋に出してよいか**。
-    /// `true` は reply/edit で答えたラウンド、`false` は no_reply/react や中断で黙ったラウンド。
+    /// Settled thread → **whether follow-up work after the answer may open a new progress message**.
+    /// `true` is a round answered with reply/edit; `false` is a round that went silent via no_reply/react or an interruption.
     settled: std::collections::HashMap<ThreadKey, bool>,
-    /// 決着後に来たナレーションの控え。**描かずにとっておく**(下の
-    /// `push_narration` / `open_after_answer` が入れ手と出し手)。
+    /// Narration that arrived after settling. **Kept, not drawn** (`push_narration` /
+    /// `open_after_answer` below put it in and take it out).
     held: std::collections::HashMap<ThreadKey, Vec<String>>,
 }
 
 impl StickyBoard {
-    /// 行を組んで予算で打ち切る。切ったことは `…(N more)` で必ず見せる(黙って切らない)。
-    /// item 1つを1行に。
-    /// `lead_blank` は `Interrupted` が先行行を持つときに前へ空行を入れるかどうか。
-    /// `with_diff` は編集系の差分ブロックを行の下に付けるかどうか。main セッションの行だけ
-    /// true — 畳んだ subagent の窓は1行のままにする。
+    /// Build the lines and truncate to the budget. Truncation is always shown as `…(N more)` (never cut silently).
+    /// One item per line.
+    /// `lead_blank` says whether to put a blank line before `Interrupted` when it has preceding lines.
+    /// `with_diff` says whether to attach the diff block of editing tools under the row. True only for
+    /// main-session rows — a folded subagent window stays one line per row.
     fn render_item_line(it: &RenderItem, lead_blank: bool, with_diff: bool) -> String {
         match it {
             RenderItem::Narration { text } => format!("{NARR_GLYPH} {text}"),
-            // 先行行があれば空行を挟んで独立した段落にする。
-            // 空行込みで1本の行として組むので、予算の勘定もそのまま合う
+            // With preceding lines, put a blank line in between so it is its own paragraph.
+            // It is built as a single line including the blank, so the budget count still adds up
             RenderItem::Interrupted if lead_blank => format!("\n{INTERRUPTED_NOTICE}"),
             RenderItem::Interrupted => INTERRUPTED_NOTICE.to_string(),
             RenderItem::Tool {
@@ -366,8 +366,8 @@ impl StickyBoard {
         }
     }
 
-    /// 溜めた run を1行(2本以上)か素の行(1本)にして吐く。
-    /// 1本だけの run は畳まない(行数が減らず、パスやコマンドが消えるだけなので)。
+    /// Emit the accumulated run as one line (2 or more) or as a plain row (just 1).
+    /// A run of one is not folded (it saves no lines and only hides the path or command).
     fn flush_fold_run(run: &mut Vec<&RenderItem>, lines: &mut Vec<String>) {
         match run.len() {
             0 => {}
@@ -380,16 +380,16 @@ impl StickyBoard {
                         _ => None,
                     })
                     .collect();
-                // `•` の後の**空白2つ**は、畳まれていない `•` 行と桁を揃えるため
+                // The **two spaces** after `•` line up with unfolded `•` rows
                 lines.push(format!("{TOOL_INDENT}•  {}", Self::tool_breakdown(&pairs)));
             }
         }
         run.clear();
     }
 
-    /// 畳んだ subagent セクション1つ分。`header` が None なら独立した
-    /// `▾ <type> · <内訳>` 見出し、Some なら Agent 行を見出しに使う。
-    /// 行は直近 SUBAGENT_WINDOW 件だけ、1段深いインデントで。
+    /// One folded subagent section. If `header` is None it gets its own
+    /// `▾ <type> · <breakdown>` heading; if Some, the Agent row is used as the heading.
+    /// Only the latest SUBAGENT_WINDOW rows, indented one level deeper.
     fn push_agent_section(
         lines: &mut Vec<String>,
         header: Option<String>,
@@ -417,14 +417,14 @@ impl StickyBoard {
         }
     }
 
-    /// `start` から予算に収まる最後の行(排他)。**予算はバイトで測る**
-    /// Slack の上限がバイト基準なので、日本語だと文字数勘定では上限に先に当たって
-    /// 編集が拒まれ、付箋が固まる。**必ず1行は進む**(1行で超える行はそれ単独のページ)。
+    /// The last line (exclusive) from `start` that fits the budget. **The budget is measured in bytes**
+    /// because Slack's limit is in bytes; counting characters hits the limit early with Japanese text,
+    /// the edit is rejected, and the progress message freezes. **Always advances at least one line** (a line that is over budget on its own gets its own page).
     fn pack_cut(lines: &[String], start: usize, budget: usize) -> usize {
         let mut len = 0usize;
         let mut i = start;
         while i < lines.len() {
-            let add = usize::from(i > start) + lines[i].len(); // 継ぎ目の \n は1バイト
+            let add = usize::from(i > start) + lines[i].len(); // the joining \n is one byte
             if len + add > budget && i > start {
                 break;
             }
@@ -434,15 +434,15 @@ impl StickyBoard {
         i
     }
 
-    /// ``` を開く/閉じる行か。diff の**中身**は当たらない
-    /// (`clip_diff_line` が ``` の連なりを zero-width space で割ってある)。
+    /// Whether the line opens/closes a ```. The diff **content** never matches
+    /// (`clip_diff_line` splits runs of ``` with a zero-width space).
     fn is_fence_toggle(line: &str) -> bool {
         line.trim_start().starts_with("```")
     }
 
-    /// 1ページをコードブロックとして自己完結させる。`open_in` は前のページから
-    /// フェンスが開いたまま来たか(なら頭で開き直す)。ページの途中でフェンスが開いたまま
-    /// 終わるなら末尾で閉じる。返すのは (本文, ページ末でフェンスが開いているか)。
+    /// Make one page a self-contained code block. `open_in` says whether a fence came in open
+    /// from the previous page (if so, reopen it at the top). If the page ends with a fence still open,
+    /// close it at the end. Returns (body, whether a fence is open at the end of the page).
     fn wrap_fences(page: &[String], open_in: bool) -> (String, bool) {
         let mut in_fence = open_in;
         for ln in page {
@@ -461,11 +461,11 @@ impl StickyBoard {
         (parts.join("\n"), in_fence)
     }
 
-    /// `from` 行目から1ページ分を組む。返すのは (本文, 次ページの開始行, ページ末のフェンス状態)。
-    /// 次ページの開始行が `lines.len()` なら、そのページで終わり。
+    /// Build one page starting at line `from`. Returns (body, first line of the next page, fence state at the end of the page).
+    /// If the next page's first line is `lines.len()`, this page is the last.
     fn page(lines: &[String], from: usize, open_fence: bool) -> (String, usize, bool) {
         let cut = Self::pack_cut(lines, from, STICKY_BUDGET);
-        // 1行だけで予算を超えるページは頭出しする(Slack はそのままだと編集ごと拒む)
+        // A page whose single line exceeds the budget is truncated to its head (otherwise Slack rejects the whole edit)
         if cut == from + 1 && lines[from].len() > STICKY_BUDGET {
             let head = Self::clip(&lines[from], STICKY_BUDGET);
             let (text, end) = Self::wrap_fences(&[head], open_fence);
@@ -475,36 +475,36 @@ impl StickyBoard {
         (text, cut, end)
     }
 
-    /// 決着後に遅れて来た hook を落とす。これが無いと「● …返信しました」だけの
-    /// 孤児付箋が生える(no_reply の後だと沈黙のはずが発言に見える — E2E で3回再現)。
-    /// ponytail: 決着後は次ターンまで沈黙。再開が要るなら、そのときに再開の条件を足す
+    /// Drop hooks that arrive late after settling. Without this, an orphan progress message holding only
+    /// "● …replied" appears (after no_reply, what should be silence looks like a message — reproduced 3 times in E2E).
+    /// ponytail: silent after settling until the next turn. If resuming is needed, add the resume condition then
     fn settled(&self, key: &ThreadKey) -> bool {
         self.settled.contains_key(key)
     }
 
-    /// 返事を出した後もワーカーが働き続けることがある(「ついでに説明して」の類)。
-    /// その進捗を捨てると Slack には何も残らないので、**返事の下に新しい付箋を1枚起こす**。
+    /// The agent sometimes keeps working after answering (the "and also explain this" kind).
+    /// Dropping that progress leaves nothing in Slack, so **open a new progress message under the answer**.
     ///
-    /// 起こすのは決着1回につき1枚だけ(2枚目以降の行は同じ付箋に足す)。**黙ると決めた
-    /// ラウンドでは起こさない** — no_reply / react / 中断の後に進捗だけ生えると、沈黙の
-    /// はずが発言に見える(`settled` の但し書きと同じ事故)。
+    /// Only one is opened per settle (later rows go into the same message). **Not opened for
+    /// rounds that chose silence** — progress appearing after no_reply / react / an interruption
+    /// makes what should be silence look like a message (the same accident as the caveat on `settled`).
     ///
-    /// 新しい付箋を起こしてよいのは**本物のツールが動いたとき**だけ
-    /// (= 返事の後も仕事が続いている証拠)。ここに来るのはツールの行だけで、決着後の
-    /// ナレーションは `push_narration` が控えに回すので届かない。
+    /// A new progress message may be opened **only when a real tool runs**
+    /// (= proof that work continues after the answer). Only tool rows reach here; narration after
+    /// settling is diverted to the held buffer by `push_narration` and never arrives.
     ///
-    /// 返り値は「この行を描いてよいか」。
-    /// `by_tool` = この行がツールか。**沈黙で決着したラウンドはツールでだけ再開する** —
-    /// no_reply / react の後に本物の仕事が動いたなら記録は要る。
-    /// ナレーションだけでは起こさない。
+    /// Returns "whether this row may be drawn".
+    /// `by_tool` = whether this row is a tool. **A round settled in silence resumes only on a tool** —
+    /// if real work runs after no_reply / react, it needs a record.
+    /// Narration alone does not open one.
     fn open_after_answer(&mut self, key: &ThreadKey, by_tool: bool) -> bool {
         match self.settled.get(key) {
-            None => true, // まだ決着していない — 普段どおり
+            None => true, // not settled yet — business as usual
             Some(false) if !by_tool => false,
             _ => {
                 self.settled.remove(key);
                 let mut s = Sticky::default();
-                // とっておいたナレーションを、続きの仕事の**上**に出す
+                // Show the held narration **above** the follow-up work
                 s.items.extend(
                     self.held
                         .remove(key)
@@ -518,21 +518,21 @@ impl StickyBoard {
         }
     }
 
-    /// 新ラウンド。前の付箋は Slack 上に記録として残り、こちらは追跡をやめる。
+    /// New round. The previous progress message stays in Slack as a record; we stop tracking it.
     pub fn on_turn_start(&mut self, key: &ThreadKey) {
         self.stickies.insert(key.clone(), Sticky::default());
         self.settled.remove(key);
-        self.held.remove(key); // 次ターンへ持ち越さない(ターン終わりで消し損ねた分の保険)
+        self.held.remove(key); // do not carry over to the next turn (a safety net for anything not dropped at turn end)
     }
 
-    /// ターンが終わった。ここまで誰も出さなかった控えは**締めの一言だった**
-    /// ということなので捨てる。次の発言が
-    /// 来るまで持ち続けると、二度と発言の来ないスレッドのぶんが残りっぱなしになる。
+    /// The turn ended. Held narration nobody showed by now **was a closing remark**,
+    /// so drop it. Keeping it until the next message
+    /// arrives would leave it behind forever for threads where no message ever comes again.
     pub fn on_turn_end(&mut self, key: &ThreadKey) {
         self.held.remove(key);
     }
 
-    /// PreToolUse の ◌ 行を、同じ tool_use_id の PostToolUse が •/💥/🚫 に差し替える。
+    /// A PostToolUse with the same tool_use_id replaces the PreToolUse ◌ row with •/💥/🚫.
     pub fn upsert_tool(
         &mut self,
         key: &ThreadKey,
@@ -544,13 +544,13 @@ impl StickyBoard {
         input: &serde_json::Value,
     ) {
         if Self::is_denied(name) {
-            return; // ノイズと自前ツールは行にしない — 呼び手の規律でなく board の不変条件
+            return; // noise and our own tools never become rows — a board invariant, not a caller discipline
         }
         if !self.open_after_answer(key, true) {
             return;
         }
-        // 差分は**ここでしか作れない**(付箋は input を持ち続けない)。done の
-        // 編集系だけ。走行中(◌)に出すと、まだ適用されていない変更を「変わった」と見せてしまう
+        // The diff **can only be built here** (the progress message does not keep the input). Only
+        // for editing tools that are done. Showing it while running (◌) would present unapplied changes as "changed"
         let diff = (status == ToolStatus::Done && EDIT_TOOLS.contains(&name))
             .then(|| render_edit_diff(name, input))
             .flatten();
@@ -567,12 +567,12 @@ impl StickyBoard {
                 ..
             }) => {
                 *cur = status;
-                // PreToolUse で作った行に、PostToolUse の差分が後から乗る
+                // The PostToolUse diff lands later on the row created at PreToolUse
                 if diff.is_some() {
                     *cur_diff = diff;
                 }
-                // PreToolUse の時点では「どの subagent を起こしたか」は分からない。PostToolUse で
-                // 初めて載るので、**後から来た値だけ**採る(既に知っている値は消さない)
+                // At PreToolUse we do not yet know "which subagent it started". It first appears at
+                // PostToolUse, so **only take values that arrive later** (never erase a value we already know)
                 if agent.spawned_agent_id.is_some() {
                     cur_agent.spawned_agent_id = agent.spawned_agent_id.clone();
                 }
@@ -592,13 +592,13 @@ impl StickyBoard {
         s.dirty = true;
     }
 
-    /// final になったナレーションを1行足す(delta の蓄積は呼び出し側)。
+    /// Add one line of narration that became final (accumulating deltas is the caller's job).
     pub fn push_narration(&mut self, key: &ThreadKey, text: &str) {
-        // 決着後のナレーションは**とっておくだけで描かない**。返事の後に本物の
-        // ツールが動けば「仕事が続いている」証拠なので `open_after_answer` がまとめて出す。
-        // 何も動かないままターンが終われば締めの一言だったということで、次の
-        // `on_turn_start` が捨てる。これが無いと「● Slack に返信しました。」だけの
-        // 付箋が返事の下に生えて誰も消さない
+        // Narration after settling is **kept, not drawn**. If a real tool runs after the answer,
+        // that proves "work continues", and `open_after_answer` shows it all together.
+        // If the turn ends with nothing running, it was a closing remark and the next
+        // `on_turn_start` drops it. Without this, a progress message holding only "● Replied in Slack."
+        // appears under the answer and nobody deletes it
         if self.settled.get(key) == Some(&true) {
             self.held
                 .entry(key.clone())
@@ -616,14 +616,14 @@ impl StickyBoard {
         s.dirty = true;
     }
 
-    /// stop で切られたラウンド。締め行を1本足してそこで沈黙する — settle と違い
-    /// 付箋は残す(切られるまでの進捗が記録)。復帰は次の `on_turn_start`。
-    /// 許可プロンプトが押されないまま満期になった。
+    /// A round cut off by stop. Add one closing line and go silent there — unlike settle,
+    /// the progress message stays (the progress until the cut is the record). It resumes at the next `on_turn_start`.
+    /// A permission prompt expired without being pressed.
     ///
-    /// **止まったツール行は触らない**(◌ のまま)。別 upsert で ⚠️ に落とすと
-    /// **行が二重になる** — perm フレームの tool_use_id は PreToolUse の行の鍵と
-    /// 一致するとは限らないため。
-    /// 足すのはインデント付きの注記1行だけ。
+    /// **The stalled tool row is left alone** (stays ◌). Dropping it to ⚠️ with a separate upsert
+    /// **duplicates the row** — the perm frame's tool_use_id does not always match the key
+    /// of the PreToolUse row.
+    /// Only one indented note line is added.
     pub fn on_perm_timeout(&mut self, key: &ThreadKey) {
         if self.settled(key) {
             return;
@@ -633,8 +633,8 @@ impl StickyBoard {
         s.dirty = true;
     }
 
-    /// Deny が押された。**そのツールの行**を 🚫 にする(満期とは別の道で、
-    /// 注記行は出さない)。行が引けなければ何もしない。
+    /// Deny was pressed. Mark **that tool's row** 🚫 (a separate path from expiry;
+    /// no note line). Does nothing if the row cannot be found.
     pub fn on_perm_denied(&mut self, key: &ThreadKey, tool_use_id: &str) {
         if self.settled(key) || tool_use_id.is_empty() {
             return;
@@ -660,14 +660,14 @@ impl StickyBoard {
         let s = self.stickies.entry(key.clone()).or_default();
         s.items.push(RenderItem::Interrupted);
         s.dirty = true;
-        // 中断で黙ったラウンド — 後から来る進捗で新しい付箋を起こさない
+        // A round silenced by interruption — later progress does not open a new progress message
         self.settled.insert(key.clone(), false);
     }
 
-    /// 投稿できた ts を覚える(以降は update)。
+    /// Remember the ts that was posted (updates from then on).
     pub fn set_posted(&mut self, key: &ThreadKey, ts: &str) {
         let s = self.stickies.entry(key.clone()).or_default();
-        // 封じたページの投稿だった — その ts は覚えない(覚えると次のページがそれを編集する)
+        // This was the post of a sealed page — do not remember its ts (the next page would edit it)
         if s.sealed_awaiting_post > 0 {
             s.sealed_awaiting_post -= 1;
             return;
@@ -675,14 +675,14 @@ impl StickyBoard {
         s.posted_ts = Some(ts.to_string());
     }
 
-    /// このスレッドで**いま出ている進捗付箋**の ts。stop 絵文字が付いたのが
-    /// 付箋かどうかを見分けるのに使う。
+    /// ts of the **progress message currently shown** in this thread. Used to tell whether
+    /// the message a stop emoji was added to is the progress message.
     pub fn sticky_ts(&self, key: &ThreadKey) -> Option<String> {
         self.stickies.get(key).and_then(|s| s.posted_ts.clone())
     }
 
-    /// 描き直しが要る付箋を (key, 投稿済み ts, 本文) で返す。
-    /// **スレッドごとに前回から1秒未満は返さない** — Slack の編集レート保護。
+    /// Return the progress messages that need redrawing as (key, posted ts, body).
+    /// **Nothing is returned for a thread within 1 second of the last one** — protects Slack's edit rate.
     pub fn take_dirty(&mut self, now_ms: u64) -> Vec<(ThreadKey, Option<String>, String)> {
         let mut out = Vec::new();
         for (key, s) in self.stickies.iter_mut() {
@@ -695,14 +695,14 @@ impl StickyBoard {
             let lines = Self::lines_of(&s.items, s.perm_timed_out);
             let (body, next, end_fence) = Self::page(&lines, s.sealed_lines, s.sealed_open_fence);
             if next < lines.len() {
-                // 入りきらなくなった。**このページを封じて**次のメッセージへ移る。
-                // 封じたページの ts はもう要らない(二度と編集しない)ので手放し、次の周回で
-                // 続きが新しいメッセージとして投稿される。`dirty` は立てたまま・スロットルも
-                // 進めない — 残りを次の tick ですぐ出すため
+                // It no longer fits. **Seal this page** and move on to the next message.
+                // The sealed page's ts is no longer needed (never edited again), so let it go; on the next pass
+                // the rest is posted as a new message. `dirty` stays set and the throttle
+                // is not advanced — so the rest goes out on the next tick
                 let sealed_ts = s.posted_ts.take();
                 if sealed_ts.is_none() {
-                    // まだ投稿されていないページのまま溢れた — これから post されるが、
-                    // その ts は封じたページのものなので拾わない
+                    // Overflowed while the page was not posted yet — it will be posted now,
+                    // but that ts belongs to the sealed page, so do not take it
                     s.sealed_awaiting_post += 1;
                 }
                 out.push((key.clone(), sealed_ts, body));
@@ -717,26 +717,26 @@ impl StickyBoard {
         out
     }
 
-    /// 決着時の最終描画。スロットルを無視して1回だけ返す(呼ぶのは settle の直前)。
-    /// これが無いと、最後の PostToolUse が1秒以内に決着した付箋が `◌` のまま残る。
+    /// Final render at settle. Ignores the throttle and returns once (called right before settle).
+    /// Without it, a progress message whose last PostToolUse settled within 1 second stays at `◌`.
     pub fn take_final(&mut self, key: &ThreadKey) -> Option<(Option<String>, String)> {
         let s = self.stickies.get_mut(key)?;
         if !s.dirty {
             return None;
         }
         s.dirty = false;
-        // 最終描画も**いま育てているページ**だけ(封じたページは編集しない)。ここで
-        // 溢れていても次ページは起こさない — 決着でこの付箋の追跡は終わる
+        // The final render is also only for **the page being grown now** (sealed pages are not edited). Even if
+        // it overflows here, no next page is opened — settling ends tracking of this progress message
         let lines = Self::lines_of(&s.items, s.perm_timed_out);
         let (body, _, _) = Self::page(&lines, s.sealed_lines, s.sealed_open_fence);
         Some((s.posted_ts.clone(), body))
     }
 
-    /// ラウンドの決着。返信したなら付箋は記録として残す。沈黙(no_reply)や
-    /// リアクションだけなら進捗は「ボットの独り言」に見えるので消す。
-    /// どちらでも追跡は終える — flush ループが消した付箋を復活させないため。
+    /// Settle the round. If it replied, the progress message stays as a record. If it went silent (no_reply)
+    /// or only reacted, the progress looks like "the bot talking to itself", so delete it.
+    /// Either way tracking ends — so the flush loop does not bring back a deleted message.
     pub fn settle(&mut self, key: &ThreadKey, kind: &str) -> StickyAction {
-        // 答えたラウンドだけ、後続の進捗に新しい付箋を許す
+        // Only answered rounds allow a new progress message for follow-up progress
         let answered_with_text = !matches!(kind, "no_reply" | "react");
         self.settled.insert(key.clone(), answered_with_text);
         match self.stickies.remove(key) {
@@ -748,13 +748,13 @@ impl StickyBoard {
         }
     }
 
-    /// 付箋に出さないツール(ノイズと自前ツール)。
+    /// Tools not shown in the progress message (noise and our own tools).
     pub fn is_denied(name: &str) -> bool {
         matches!(name, "TodoWrite" | "ToolSearch" | "advisor") || name.starts_with("mcp__agentgw__")
     }
 
-    /// ツール入力から一番目立つ引数を1行に。
-    /// Slack のインラインコードに入れるので改行とバッククォートを落とし、70字で `…`。
+    /// The most prominent argument of the tool input, on one line.
+    /// It goes into Slack inline code, so newlines and backquotes are dropped, and it is cut with `…` at 70 chars.
     pub fn summarize(name: &str, input: &serde_json::Value) -> String {
         let get = |k: &str| {
             input
@@ -764,7 +764,7 @@ impl StickyBoard {
         };
         let raw = match name {
             "Bash" => get("command"),
-            // NotebookEdit は file_path を持たない
+            // NotebookEdit has no file_path
             "Edit" | "Write" | "Read" | "NotebookEdit" => {
                 get("file_path").or_else(|| get("notebook_path"))
             }
@@ -791,21 +791,21 @@ impl StickyBoard {
         }
     }
 
-    /// 畳んでよいツールか(Read / Grep / Glob / Bash)。
+    /// Whether the tool may be folded (Read / Grep / Glob / Bash).
     pub fn is_foldable(name: &str) -> bool {
         FOLD_READ.contains(&name) || FOLD_SEARCH.contains(&name) || name == "Bash"
     }
 
-    /// `grep` 系を走らせた Bash 行は「Ran N commands」ではなく
-    /// 「Searched for N patterns」に数える。ワーカーのセッションには Grep/Glob ツールが無く、
-    /// コード検索は実際には Bash 越しの `grep`/`rg` で走るため。
+    /// Bash rows that ran a `grep`-like command count as "Searched for N patterns",
+    /// not "Ran N commands". Agent sessions have no Grep/Glob tools, so
+    /// code search actually runs as `grep`/`rg` through Bash.
     ///
-    /// 判定は**起動したコマンド**(先頭トークン。先頭の `VAR=val` を捨て、絶対パスは基底名に)。
-    /// パイプの**フィルタ**として使う grep(`ps ax | grep x`)は主コマンドが ps なので数えない。
+    /// Judged by **the command launched** (the first token, skipping leading `VAR=val`, absolute paths reduced to the base name).
+    /// grep used as a pipe **filter** (`ps ax | grep x`) is not counted because the main command is ps.
     pub fn bash_is_search(command: &str) -> bool {
         const SEARCH_CMDS: [&str; 7] = ["grep", "egrep", "fgrep", "rg", "ripgrep", "ag", "ack"];
         let mut s = command.trim();
-        // 先頭の `LC_ALL=C ` 等を落とす
+        // Drop a leading `LC_ALL=C ` and the like
         while let Some((head, rest)) = s.split_once(char::is_whitespace) {
             let is_assign = head.split_once('=').is_some_and(|(k, _)| {
                 !k.is_empty() && k.chars().all(|c| c.is_alphanumeric() || c == '_')
@@ -823,15 +823,15 @@ impl StickyBoard {
         SEARCH_CMDS.contains(&base) || (base == "git" && tokens.next() == Some("grep"))
     }
 
-    /// subagent が走らせたツールの内訳。畳んだセクションの
-    /// 見出しに出して「何をした agent か」を一目で分かるようにする。**全ステータスを数える**ので、
-    /// 各節の合計は総数に一致する。分類に載らないものはツール名ごとに束ねる("WebFetch 2")。
+    /// Breakdown of the tools a subagent ran. Shown in the heading of the folded
+    /// section so "what this agent did" is visible at a glance. **Every status is counted**, so
+    /// the parts add up to the total. Anything outside the categories is grouped by tool name ("WebFetch 2").
     ///
-    /// 受けるのは `(ツール名, summary)`。Bash の判定は先頭トークンしか使わないので、
-    /// 70 字にクリップ済みの summary で足りる。
+    /// Takes `(tool name, summary)`. The Bash check uses only the first token, so
+    /// a summary already clipped to 70 chars is enough.
     pub fn tool_breakdown(items: &[(&str, &str)]) -> String {
         let (mut reads, mut searches, mut cmds, mut edits) = (0usize, 0usize, 0usize, 0usize);
-        // 出現順を保つ(HashMap だと "WebFetch 2, Skill 1" の順が不定になる)
+        // Keep order of appearance (with a HashMap the order of "WebFetch 2, Skill 1" is unstable)
         let mut other: Vec<(String, usize)> = Vec::new();
         for (name, summary) in items {
             if *name == "Read" {
@@ -870,7 +870,7 @@ impl StickyBoard {
         parts.join(", ")
     }
 
-    /// `room` バイトに収まる最長の prefix(**char 境界**)+ `…`。1文字も入らなければ空。
+    /// Longest prefix that fits in `room` bytes (**on a char boundary**) + `…`. Empty if not even one char fits.
     pub fn clip(line: &str, room: usize) -> String {
         let budget = room.saturating_sub("…".len());
         match line
@@ -884,11 +884,11 @@ impl StickyBoard {
         }
     }
 
-    /// 出す行を組む(畳み込みまで)。ページ分割はこの後の仕事。
+    /// Build the lines to show (up to folding). Splitting into pages comes after this.
     fn lines_of(items: &[RenderItem], perm_timed_out: bool) -> Vec<String> {
-        // subagent の中で走ったツールは**その場では描かない**。agent ごとに1つの
-        // セクションにまとめ、その agent の最初のツールがあった位置に1回だけ出す。
-        // 何十本もツールを走らせる subagent が付箋を埋め尽くすのを防ぐ。
+        // Tools run inside a subagent are **not drawn in place**. Each agent gets one
+        // section, shown once at the position of that agent's first tool.
+        // This keeps a subagent running dozens of tools from filling the progress message.
         let mut groups: Vec<(String, String, Vec<&RenderItem>)> = Vec::new(); // (agent_id, type, items)
         for it in items {
             let RenderItem::Tool { agent, .. } = it else {
@@ -911,9 +911,9 @@ impl StickyBoard {
         }
         let mut rendered_agents: Vec<String> = Vec::new();
 
-        // ── 1段目: 畳んで「出す行」を決める ─────────────────────────────
-        // 完了した Read/検索/Bash が**連続**したら1行にまとめる。走行中(◌)は
-        // 「いま何をしているか」なので畳まない。失敗(💥/🚫)も見えたまま残す。
+        // ── Stage 1: fold and decide which lines to show ─────────────────────
+        // Completed Read/search/Bash rows that are **consecutive** become one line. Running (◌) rows
+        // are "what is happening now", so they are not folded. Failures (💥/🚫) also stay visible.
         let mut lines: Vec<String> = Vec::new();
         let mut run: Vec<&RenderItem> = Vec::new();
         for it in items {
@@ -926,9 +926,9 @@ impl StickyBoard {
                 continue;
             }
             Self::flush_fold_run(&mut run, &mut lines);
-            // `Agent` 行は、それが起こした subagent のセクションと1ブロックに畳む。
-            // 結び方は2通り: foreground は id が一致する。background/teammate は id 空間が違うので
-            // **起動名**(tool_input.name)と agent_type で結ぶ(由来)。
+            // An `Agent` row is folded into one block with the section of the subagent it started.
+            // Two ways to link: for foreground the ids match. background/teammate live in a different id space, so
+            // they are linked by **launch name** (tool_input.name) and agent_type (origin).
             if let RenderItem::Tool { name, agent, .. } = it
                 && (name == "Agent" || name == "Task")
             {
@@ -952,7 +952,7 @@ impl StickyBoard {
                 if let Some(key) = key {
                     rendered_agents.push(key.clone());
                     if let Some((_, ty, rows)) = groups.iter().find(|(gid, _, _)| *gid == key) {
-                        // 行頭の • を ▾ に差し替え、独立セクションの見出しと同じ形にする
+                        // Replace the leading • with ▾ so it looks like a standalone section heading
                         let head = Self::render_item_line(it, false, false);
                         let head = match head.strip_prefix(TOOL_INDENT) {
                             Some(rest) => {
@@ -965,9 +965,9 @@ impl StickyBoard {
                     }
                     continue;
                 }
-                // 結ぶ相手がまだ居ない(agent が起動中 / ツールが1つも来ていない)→ 普通の行として描く
+                // Nothing to link to yet (agent still starting / no tool has arrived yet) → draw as a normal row
             }
-            // subagent 自身のツール行: その agent のセクションを**1回だけ**、最初のツールの位置で出す
+            // A subagent's own tool row: show that agent's section **only once**, at its first tool
             if let RenderItem::Tool { agent, .. } = it
                 && let Some(id) = agent.agent_id.as_deref()
             {
@@ -983,8 +983,8 @@ impl StickyBoard {
             lines.push(Self::render_item_line(it, !lines.is_empty(), true));
         }
         Self::flush_fold_run(&mut run, &mut lines);
-        // 許可待ちの満期は**ツール行の下の注記**として最後に足す
-        // (行の並びは触らない。中断通知より前)
+        // An expired permission wait is added last as **a note under the tool row**
+        // (the row order is not touched; before the interruption notice)
         if perm_timed_out {
             lines.push(perm_timeout_line());
         }
@@ -999,17 +999,17 @@ mod tests {
     use super::*;
 
     impl StickyBoard {
-        /// テスト用 — 本体のエージェントの行を、既定のスレッド `k` に。
+        /// For tests — a main agent row in the default thread `k`.
         fn tool(&mut self, tool_use_id: &str, name: &str, summary: &str, status: ToolStatus) {
             self.tool_at(&ThreadKey::parse("k"), tool_use_id, name, summary, status);
         }
 
-        /// テスト用 — 本体のエージェントの行を、指定したスレッドに。
+        /// For tests — a main agent row in the given thread.
         fn tool_at(&mut self, key: &ThreadKey, tool_use_id: &str, name: &str, summary: &str, status: ToolStatus) {
             self.upsert_tool_t(key, tool_use_id, name, summary, status, &AgentRef::default());
         }
 
-        /// テスト用 — 差分の要らない行(input を見ない)。
+        /// For tests — a row that needs no diff (input is not read).
         fn upsert_tool_t(
             &mut self,
             key: &ThreadKey,
@@ -1034,28 +1034,28 @@ mod tests {
     #[test]
     fn a_bash_row_that_is_really_a_search_counts_as_one() {
         for (command, is_search) in [
-            // 素の検索コマンド
+            // Plain search commands
             ("grep -rn foo src/", true),
             ("rg --hidden pattern", true),
             ("git grep TODO", true),
-            // 先頭の環境変数代入は読み飛ばす
+            // Leading environment variable assignments are skipped
             ("LC_ALL=C grep x file", true),
             ("A=1 B=2 rg x", true),
-            // 絶対パスでも基底名で判定
+            // Absolute paths are judged by their base name
             ("/usr/bin/grep x file", true),
-            // パイプの**フィルタ**として使う grep は検索ではない(主コマンドは ps)
+            // grep used as a pipe **filter** is not a search (the main command is ps)
             ("ps ax | grep x", false),
             ("cargo test", false),
             ("", false),
-            // git の別サブコマンドは検索ではない
+            // Other git subcommands are not searches
             ("git log --oneline", false),
         ] {
             assert_eq!(StickyBoard::bash_is_search(command), is_search, "{command:?}");
         }
     }
 
-    /// 何が変わったかを git 風の diff で出す。カウント・文脈の畳み・
-    /// フェンスの無害化まで。
+    /// Show what changed as a git-style diff: counts, context folding,
+    /// and fence neutralizing.
     #[test]
     fn edit_diff_renders_git_style_hunks_with_counts() {
         let old = (1..=12)
@@ -1073,7 +1073,7 @@ mod tests {
         assert!(d.contains("\n…"), "離れた文脈は … 1行に畳む: {d}");
         assert!(d.ends_with("\n```"), "{d}");
 
-        // 変化が無ければ何も出さない(空の ``` を貼らない)
+        // No change, nothing shown (never paste an empty ```)
         assert!(
             render_edit_diff(
                 "Edit",
@@ -1081,13 +1081,13 @@ mod tests {
             )
             .is_none()
         );
-        // Write は全行が追加
+        // Write is all additions
         let w = render_edit_diff("Write", &serde_json::json!({"content":"a\nb"})).unwrap();
         assert!(w.starts_with(" (+2 -0)\n"), "{w}");
-        // 中身の ``` は zero-width space で分断する — でないとこちらのフェンスが先に閉じる
+        // ``` in the content is split with a zero-width space — otherwise our fence closes early
         let f = render_edit_diff("Write", &serde_json::json!({"content":"```"})).unwrap();
         assert!(f.contains("`\u{200b}`\u{200b}`"), "{f}");
-        // MultiEdit は hunk を … で継ぐ
+        // MultiEdit joins hunks with …
         let m = render_edit_diff(
             "MultiEdit",
             &serde_json::json!({"edits":[
@@ -1100,8 +1100,8 @@ mod tests {
         assert!(m.contains("-a\n+b\n…\n-c\n+d"), "{m}");
     }
 
-    /// 差分が乗るのは **main セッションの done の行だけ**。走行中の行と、畳んだ subagent の
-    /// 窓には出さない(窓は1行ずつのままにする約束)。
+    /// The diff goes **only on done rows in the main session**. Not on running rows, nor in a folded
+    /// subagent window (the window stays one line per row by design).
     #[test]
     fn edit_diff_rides_the_main_row_only() {
         let k = ThreadKey::parse("k");
@@ -1155,7 +1155,7 @@ mod tests {
     #[test]
     fn an_agent_row_folds_together_with_the_subagent_it_spawned() {
         let mut b = StickyBoard::default();
-        // main セッションの Agent 行(PostToolUse で spawned id が載る)
+        // A main-session Agent row (the spawned id arrives with PostToolUse)
         b.upsert_tool_t(
             &ThreadKey::parse("k"),
             "t0",
@@ -1181,32 +1181,32 @@ mod tests {
             &sub,
         );
         let body = b.take_dirty(10_000).pop().unwrap().2;
-        // 見出しは Agent 行だが、頭の • は ▾ に差し替わる
+        // The heading is the Agent row, but its leading • is replaced by ▾
         assert!(
             body.contains(&format!(
                 "{TOOL_INDENT}▾ Agent `コードを調べる` : Explore · Read 1 file"
             )),
             "{body}"
         );
-        // 独立した ▾ Explore 見出しは**出ない**(二重に出さない)
+        // A standalone ▾ Explore heading does **not** appear (never shown twice)
         assert_eq!(body.matches('▾').count(), 1, "{body}");
     }
 
     #[test]
     fn a_background_agent_joins_by_name_when_the_ids_never_match() {
-        // background/teammate は Agent 結果の id と、そのツール行の id が別空間で、
-        // **id では永久に一致しない**。起動名(tool_input.name)と agent_type で結ぶ。
-        // summary(= description)は起動名とは別物なので使えない
+        // For background/teammate, the id in the Agent result and the id on its tool rows live in different spaces
+        // and **will never match**. Link by launch name (tool_input.name) and agent_type.
+        // summary (= description) is different from the launch name, so it cannot be used
         let mut b = StickyBoard::default();
         b.upsert_tool_t(
             &ThreadKey::parse("k"),
             "t0",
             "Agent",
-            "レビューを頼む", // description(summary に入る)— 名前とは別物
+            "レビューを頼む", // description (goes into summary) — not the name
             ToolStatus::Done,
             &AgentRef {
                 spawned_agent_id: Some("reviewer@session-9".into()),
-                launched_name: Some("reviewer".into()), // ← これで結ぶ
+                launched_name: Some("reviewer".into()), // ← this is what links them
                 ..Default::default()
             },
         );
@@ -1233,7 +1233,7 @@ mod tests {
 
     #[test]
     fn an_agent_row_without_a_linked_group_renders_as_a_plain_row() {
-        // まだ subagent のツールが1つも届いていない間は普通の行のまま
+        // Stays a normal row until the subagent's first tool arrives
         let mut b = StickyBoard::default();
         b.tool("t0", "Agent", "調査", ToolStatus::Pending);
         let body = b.take_dirty(10_000).pop().unwrap().2;
@@ -1259,12 +1259,12 @@ mod tests {
             );
         }
         let body = b.take_dirty(10_000).pop().unwrap().2;
-        // 見出しは ▾ + agent 名 + 内訳
+        // Heading is ▾ + agent name + breakdown
         assert!(
             body.contains(&format!("{TOOL_INDENT}▾ Explore · Read 3 files")),
             "{body}"
         );
-        // 直近2件だけ、さらに1段深いインデントで
+        // Only the latest 2, indented one level deeper
         assert!(
             !body.contains("/a.rs"),
             "古い行はスクロールアウトする: {body}"
@@ -1337,7 +1337,7 @@ mod tests {
 
     #[test]
     fn a_subagents_rows_are_never_folded_by_the_read_run_rule() {
-        // subagent 側は自分のセクションで既に畳まれている。二重に畳まない
+        // The subagent's rows are already folded in its own section. Do not fold them twice
         let mut b = StickyBoard::default();
         let sub = AgentRef {
             agent_id: Some("A1".into()),
@@ -1372,18 +1372,18 @@ mod tests {
         );
     }
 
-    /// ツール名の無い progress(活動 ping)を**行にしてしまう**と、名前が空の行が
-    /// 畳めないので連続した Read/検索の run を分断する。board 側の門番だけでは足りず、
-    /// 空名の行が1つでも混ざると畳み込みが壊れることを固定する(実際に壊れていた退行)。
-    /// 満期と Deny は**別の道**。
-    /// 満期は止まったツール行を触らず注記1行だけ足す(別 upsert で ⚠️ に落とすと、
-    /// perm フレームの tool_use_id が Pre の行の鍵と一致せず**行が二重になる**)。
-    /// Deny はその行だけ 🚫 にして注記は出さない。
+    /// Turning a progress event with no tool name (an activity ping) **into a row** splits a run of
+    /// consecutive Read/search rows, because a row with an empty name cannot be folded. The board-side gate alone is not enough;
+    /// this pins that even one empty-name row breaks folding (a regression that actually happened).
+    /// Expiry and Deny are **separate paths**.
+    /// Expiry leaves the stalled tool row alone and only adds one note line (dropping it to ⚠️ with a separate upsert
+    /// **duplicates the row**, because the perm frame's tool_use_id does not match the Pre row's key).
+    /// Deny marks only that row 🚫 and shows no note.
     #[test]
     fn perm_timeout_annotates_without_touching_the_row_and_deny_marks_only_the_row() {
         let k = ThreadKey::parse("k");
 
-        // 満期: 行は ◌ のまま、下に注記
+        // Expiry: the row stays ◌, with a note below
         let mut timed = StickyBoard::default();
         timed.tool_at(&k, "t1", "Bash", "rm -rf /tmp/x", ToolStatus::Pending);
         timed.on_perm_timeout(&k);
@@ -1392,7 +1392,7 @@ mod tests {
         assert!(out.contains("◌ Bash"), "行は触らず ◌ のまま: {out}");
         assert!(!out.contains("🚫"), "満期で行を落としてはいけない: {out}");
 
-        // 満期は行が引けなくても注記だけ出る(鍵が一致しないケース)
+        // On expiry the note appears even if the row cannot be found (the key-mismatch case)
         let mut lone = StickyBoard::default();
         lone.on_perm_timeout(&ThreadKey::parse("k2"));
         let (_, out) = lone
@@ -1400,7 +1400,7 @@ mod tests {
             .expect("付箋が出ていない");
         assert!(out.contains("⚠️ No answer to the permission request — timed out"), "{out}");
 
-        // Deny: その行だけ 🚫。注記は出さない
+        // Deny: only that row becomes 🚫. No note
         let mut denied = StickyBoard::default();
         denied.tool_at(&k, "t1", "Bash", "rm -rf /tmp/x", ToolStatus::Pending);
         denied.on_perm_denied(&k, "t1");
@@ -1416,7 +1416,7 @@ mod tests {
             b.tool_at(&k, id, "Read", path, ToolStatus::Done);
         };
 
-        // 素直に3連続 → 1行に畳まれる
+        // Three in a row → folded into one line
         let mut good = StickyBoard::default();
         read(&mut good, "t1", "/a.rs");
         read(&mut good, "t2", "/b.rs");
@@ -1424,7 +1424,7 @@ mod tests {
         let (_, out) = good.take_final(&k).expect("付箋が出ていない");
         assert!(out.contains("Read 3 files"), "{out}");
 
-        // 真ん中に空名の行が入ると run が割れて畳めない = 行にしてはいけない証拠
+        // An empty-name row in the middle splits the run so it cannot fold = proof it must not become a row
         let mut split = StickyBoard::default();
         read(&mut split, "t1", "/a.rs");
         split.tool_at(&k, "ping", "", "", ToolStatus::Done);
@@ -1452,7 +1452,7 @@ mod tests {
 
     #[test]
     fn a_lone_finished_row_stays_expanded() {
-        // 1本を畳んでも行は減らず、パスだけ見えなくなる — 畳むのは2本以上から
+        // Folding a single row saves no lines and only hides the path — folding starts at two
         let mut b = StickyBoard::default();
         b.tool("t1", "Read", "/a.rs", ToolStatus::Done);
         let body = b.take_dirty(10_000).pop().unwrap().2;
@@ -1463,10 +1463,10 @@ mod tests {
     fn a_running_or_failed_row_is_never_folded() {
         let mut b = StickyBoard::default();
         b.tool("t1", "Read", "/a.rs", ToolStatus::Done);
-        b.tool("t2", "Read", "/b.rs", ToolStatus::Pending); // 走行中
-        b.tool("t3", "Read", "/c.rs", ToolStatus::Error); // 失敗
+        b.tool("t2", "Read", "/b.rs", ToolStatus::Pending); // running
+        b.tool("t3", "Read", "/c.rs", ToolStatus::Error); // failed
         let body = b.take_dirty(10_000).pop().unwrap().2;
-        // 完了1本だけの run は畳まれず、走行中と失敗はそれぞれ自分の行を保つ
+        // A run with only one completed row is not folded; running and failed rows each keep their own line
         assert!(body.contains("`/a.rs`"), "{body}");
         assert!(body.contains("◌ Read `/b.rs`"), "{body}");
         assert!(body.contains("💥 Read `/c.rs`"), "{body}");
@@ -1502,11 +1502,11 @@ mod tests {
 
     #[test]
     fn the_breakdown_groups_by_category_then_falls_back_to_the_tool_name() {
-        // Read / 検索 / コマンド / 編集 の順、残りはツール名ごと
+        // Read / search / command / edit in that order, the rest by tool name
         let items = [
             ("Read", "/a.rs"),
             ("Grep", "foo"),
-            ("Bash", "rg bar"), // grep 系 Bash は検索に数える
+            ("Bash", "rg bar"), // grep-like Bash counts as a search
             ("Bash", "cargo test"),
             ("Edit", "/b.rs"),
             ("Write", "/c.rs"),
@@ -1526,7 +1526,7 @@ mod tests {
 
     #[test]
     fn the_fold_summary_drops_zero_clauses() {
-        // 0 件の節は落ち、単複を言い分け、順序は Read → Searched → Ran で固定
+        // Zero-count parts are dropped, singular/plural is handled, and the order is fixed as Read → Searched → Ran
         let read = ("Read", "a.rs");
         let search = ("Grep", "fn main");
         let cmd = ("Bash", "cargo test");
@@ -1555,7 +1555,7 @@ mod tests {
         ] {
             assert_eq!(StickyBoard::summarize(name, &input), want);
         }
-        // 70 字 + …
+        // 70 chars + …
         let long = serde_json::json!({"command": "x".repeat(80)});
         assert_eq!(StickyBoard::summarize("Bash", &long).chars().count(), 71);
     }
@@ -1577,7 +1577,7 @@ mod tests {
         assert!(StickyBoard::is_denied("TodoWrite"));
         assert!(StickyBoard::is_denied("mcp__agentgw__reply"));
         assert!(!StickyBoard::is_denied("Bash"));
-        // 呼び手が漏らしても board が行にしない
+        // Even if the caller lets it through, the board does not make it a row
         let mut b = StickyBoard::default();
         b.on_turn_start(&ThreadKey::parse("k"));
         b.tool("t", "TodoWrite", "x", ToolStatus::Done);
@@ -1598,11 +1598,11 @@ mod tests {
         let dirty = b.take_dirty(10_000);
         assert_eq!(dirty.len(), 1);
         assert!(dirty[0].2.contains("• Bash `cargo test`") && dirty[0].2.contains("● ビルド"));
-        // 1秒以内の再 flush はレート保護で出てこない
+        // A re-flush within 1 second is held back by the rate guard
         b.push_narration(&ThreadKey::parse("k"), "続き");
         assert!(b.take_dirty(10_500).is_empty());
         assert_eq!(b.take_dirty(11_100).len(), 1);
-        // reply は残す / no_reply は消す
+        // reply keeps it / no_reply deletes it
         b.set_posted(&ThreadKey::parse("k"), "999.1");
         assert!(matches!(
             b.settle(&ThreadKey::parse("k"), "reply"),
@@ -1616,14 +1616,14 @@ mod tests {
         );
     }
 
-    /// 1枚に収まらなくなったら、そのメッセージを封じて続きを
-    /// **次のメッセージ**に出す(切って捨てない)。Slack は約4000バイトを超える編集を拒む。
+    /// When it no longer fits on one message, seal that message and continue
+    /// in **the next message** (never cut and drop). Slack rejects edits over about 4000 bytes.
     #[test]
     fn an_overflowing_sticky_seals_the_page_and_continues_on_a_new_message() {
         let k = ThreadKey::parse("k");
         let mut b = StickyBoard::default();
         b.on_turn_start(&k);
-        // 畳み対象**外**の Edit を使う。Bash/Read だ で1行に畳まれて溢れない
+        // Use Edit, which is **not** folded. With Bash/Read they would fold into one line and never overflow
         for i in 0..500 {
             b.upsert_tool_t(
                 &k,
@@ -1645,8 +1645,8 @@ mod tests {
             first[0].2.len()
         );
 
-        // 続きは**新しいメッセージ**。封じたページは二度と編集しないので ts を持たない。
-        // スロットル(1秒)を待たずに続けて出る
+        // The rest goes to **a new message**. The sealed page is never edited again, so it keeps no ts.
+        // It goes out right away without waiting for the throttle (1 second)
         let second = b.take_dirty(10_100);
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].1, None, "封じたページの続きは新規投稿");
@@ -1654,7 +1654,7 @@ mod tests {
         assert_ne!(first[0].2, second[0].2, "同じ内容を2度出さない");
     }
 
-    /// ページの境目でコードブロックが割れても、両ページが自己完結する。
+    /// Even when a code block is split at a page boundary, both pages are self-contained.
     #[test]
     fn a_code_fence_split_by_a_page_boundary_is_closed_and_reopened() {
         let lines: Vec<String> = vec![
@@ -1680,7 +1680,7 @@ mod tests {
 
     #[test]
     fn an_over_budget_single_line_is_clipped_so_the_page_still_sends() {
-        // 6000 バイトのナレーション1本。行ごと落とすと後続が何も見えなくなるので頭出しする
+        // One 6000-byte narration. Dropping the whole line would hide everything after it, so it is truncated to its head
         let mut items = vec![RenderItem::Narration {
             text: "あ".repeat(2000),
         }];
@@ -1706,8 +1706,8 @@ mod tests {
         );
     }
 
-    /// 返事の後も働き続けたぶんは**新しい付箋**に出す(返事の下に1枚)。
-    /// 黙ると決めたラウンド(no_reply / react)は決着後も沈黙のまま。
+    /// Work continuing after the answer goes to **a new progress message** (one under the answer).
+    /// Rounds that chose silence (no_reply / react) stay silent after settling.
     #[test]
     fn work_after_a_reply_splits_into_a_new_sticky_but_silence_stays_silent() {
         let k = ThreadKey::parse("k");
@@ -1734,7 +1734,7 @@ mod tests {
             dirty[0].2
         );
 
-        // 次ターンはまた新しい付箋から
+        // The next turn starts from a new progress message again
         b.on_turn_start(&k);
         b.push_narration(&k, "次のターン");
         let dirty = b.take_dirty(100_000);
@@ -1745,8 +1745,8 @@ mod tests {
             "前ターンの遅刻分が混ざった"
         );
 
-        // 締めの一言だけ(後に**ツールが動かない**)なら付箋は生えない。
-        // (「● Slack に返信しました。」だけの付箋が返事の下に残らないこと)
+        // If there is only a closing remark (**no tool runs** after it), no progress message appears.
+        // (No progress message holding only "● Replied in Slack." is left under the answer)
         let mut r = StickyBoard::default();
         r.on_turn_start(&k);
         r.tool_at(&k, "t1", "Bash", "ls", ToolStatus::Done);
@@ -1758,8 +1758,8 @@ mod tests {
             "締めのナレーションだけでは新しい付箋を起こさない"
         );
         assert!(r.take_final(&k).is_none());
-        // 捨てるのは**ターンの終わり**。次の発言が来ないスレッドで残りっぱなしにしない
-        // (`on_turn_start` を待つと、二度と喋られないスレッドのぶんが残る)
+        // Dropping happens **at turn end**. Do not leave it behind in threads where no message comes next
+        // (waiting for `on_turn_start` leaves behind entries for threads that never speak again)
         r.on_turn_end(&k);
         r.tool_at(&k, "t2", "Read", "/x", ToolStatus::Done);
         let dirty = r.take_dirty(100_000);
@@ -1770,7 +1770,7 @@ mod tests {
             dirty[0].2
         );
 
-        // 黙ると決めたラウンド — 決着後の行は付箋を生まない(沈黙が発言に見える事故を防ぐ)
+        // A round that chose silence — rows after settling do not create a progress message (prevents silence looking like a message)
         let mut q = StickyBoard::default();
         q.on_turn_start(&k);
         q.tool_at(&k, "t1", "Bash", "ls", ToolStatus::Done);
@@ -1784,7 +1784,7 @@ mod tests {
             q.take_dirty(99_000).is_empty(),
             "沈黙のあとのナレーションだけでは何も出さない"
         );
-        // ただし**本物の仕事が動いたら**記録は出す(沈黙しても作業は残す)
+        // But **when real work runs**, the record is shown (the work is kept even after going silent)
         q.tool_at(&k, "t2", "Edit", "/x.rs", ToolStatus::Done);
         let after = q.take_dirty(99_000);
         assert_eq!(after.len(), 1);
@@ -1801,12 +1801,12 @@ mod tests {
         b.on_interrupted(&ThreadKey::parse("k"));
         let dirty = b.take_dirty(10_000);
         assert_eq!(dirty.len(), 1);
-        // 進捗行の「下」に、空行を1つ挟んだ独立した段落として付く(置き換えではない)
+        // Goes "under" the progress rows as its own paragraph after one blank line (not a replacement)
         assert_eq!(
             dirty[0].2,
             "\u{A0}\u{A0}\u{A0}◌ Bash `x`\n\n└ `Interrupted by user.`"
         );
-        // settled 後は新しい行が来ても沈黙(次の on_turn_start まで)
+        // After settling, new rows stay silent (until the next on_turn_start)
         b.push_narration(&ThreadKey::parse("k"), "続き");
         assert!(b.take_dirty(20_000).is_empty());
     }
@@ -1818,7 +1818,7 @@ mod tests {
         b.on_interrupted(&ThreadKey::parse("k"));
         let dirty = b.take_dirty(10_000);
         assert_eq!(dirty.len(), 1);
-        // 先行行が無ければ空行は挟まない(頭が空行の付箋にしない)
+        // No blank line without preceding lines (the progress message never starts with a blank line)
         assert_eq!(dirty[0].2, "└ `Interrupted by user.`");
     }
 
@@ -1829,7 +1829,7 @@ mod tests {
         b.tool("t1", "Bash", "cargo test", ToolStatus::Pending);
         assert_eq!(b.take_dirty(10_000).len(), 1);
         b.tool("t1", "Bash", "cargo test", ToolStatus::Done);
-        // スロットル内でも決着直前の最終描画は出る(◌ のまま固まらない)
+        // Even within the throttle, the final render right before settling goes out (it does not freeze at ◌)
         assert!(
             b.take_dirty(10_100).is_empty(),
             "通常 flush はスロットルで出ない"

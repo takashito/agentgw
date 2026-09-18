@@ -1,4 +1,4 @@
-//! Slack との出入り。slack-morphism の型はこのファイルの外に出さない。
+//! Traffic in and out of Slack. slack-morphism types never leave this file.
 
 pub mod sticky;
 pub use sticky::{StickyAction, StickyBoard, ToolStatus};
@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 // ── the Slack Web API ──────────────────────────────────────────────────────
 
-/// Slack Web API。呼び出し側に slack-morphism の型を見せない。
+/// Slack Web API. Callers never see slack-morphism types.
 pub struct Api {
     client: Arc<SlackHyperClient>,
     token: SlackApiToken,
@@ -29,7 +29,7 @@ impl Api {
         })
     }
 
-    /// 投稿した ts を返す。
+    /// Returns the posted ts.
     pub async fn post_message(
         &self,
         channel: &str,
@@ -39,9 +39,9 @@ impl Api {
         self.post(channel, text, thread_ts, true).await
     }
 
-    /// Bridge が自分で答えるコマンドの投稿口。プレビュー展開を止める —
-    /// `status` の本文はスレッド permalink だらけで、展開されると1本ずつ大きなカードになって
-    /// 読めなくなる(現行はコマンド応答を全部この形で出す)。
+    /// Posting path for commands the Bridge answers itself. Suppresses link previews —
+    /// the `status` body is full of thread permalinks, and unfurled each one becomes a big card
+    /// and the post becomes unreadable (all command replies go out this way).
     pub async fn post_message_no_unfurl(
         &self,
         channel: &str,
@@ -51,12 +51,12 @@ impl Api {
         self.post(channel, text, thread_ts, false).await
     }
 
-    /// 標準 Markdown で投稿する(Slack の `markdown` ブロック)。
+    /// Post as standard Markdown (Slack's `markdown` block).
     ///
-    /// mrkdwn(`*bold*`・見出し無し・**表無し**)と違い、`##` 見出し・表・チェックボックス・
-    /// 言語つき code block がそのまま出る。Slack が 2025-02 に足し、2026-03 に表まで広げた口。
-    /// **`text` は残す** — 通知(プッシュ・一覧のプレビュー)が読むのはそちらで、
-    /// blocks だけの投稿は通知が空になる。
+    /// Unlike mrkdwn (`*bold*`, no headings, **no tables**), `##` headings, tables, checkboxes and
+    /// code blocks with a language render as is. Slack added it in 2025-02 and extended it to tables in 2026-03.
+    /// **Keep `text`** — notifications (push, list previews) read that one, and
+    /// a blocks-only post gives an empty notification.
     pub async fn post_markdown(
         &self,
         channel: &str,
@@ -96,7 +96,7 @@ impl Api {
         if let Some(ts) = thread_ts {
             req = req.with_thread_ts(ts.into());
         }
-        // 抑止するときだけ触る — 既定のままの経路(ワーカーの reply)の見え方を変えない
+        // Only touched when suppressing — the default path (the agent's reply) must look the same as before
         if !unfurl {
             req = req.with_unfurl_links(false).with_unfurl_media(false);
         }
@@ -109,9 +109,9 @@ impl Api {
         Ok(res.ts.to_string())
     }
 
-    /// Owner との DM チャンネルを開いて id を返す(`conversations.open`)。
-    /// home チャンネルが無いときの通知先 — 既に開いていれば同じ id が返るので、
-    /// 呼ぶたびに新しい会話ができることはない。
+    /// Open the DM channel with the Owner and return its id (`conversations.open`).
+    /// The notification target when there is no home channel — if it is already open the same id comes back,
+    /// so calling it again never creates a new conversation.
     pub async fn open_dm(&self, user_id: &str) -> Result<String, String> {
         let req = SlackApiConversationsOpenRequest::new().with_users(vec![user_id.into()]);
         let res = self
@@ -123,12 +123,12 @@ impl Api {
         Ok(res.channel.id.to_string())
     }
 
-    /// ツール許可を人に訊く Block Kit プロンプト。返すのは投稿の ts で、
-    /// 期限切れのときにこれを消す(消さないと後から押された Allow が、とうに動き出した
-    /// ワーカーに届いて「押しても何も起きない」になる)。
+    /// Block Kit prompt asking a person for tool permission. Returns the post's ts, which
+    /// is deleted on expiry (otherwise an Allow pressed later reaches an agent that has long since
+    /// moved on, and "pressing it does nothing").
     ///
-    /// `channel_grant_label` は DM だと「Allow for User」— DM は1人なので同じ
-    /// allow-channel が「この人には以後訊かない」になる。
+    /// In a DM `channel_grant_label` is "Allow for User" — a DM has one person, so the same
+    /// allow-channel means "never ask this person again".
     pub async fn post_perm_prompt(
         &self,
         channel: &str,
@@ -224,11 +224,11 @@ impl Api {
             .map_err(|e| e.to_string())
     }
 
-    /// 標準 Markdown で書き換える(`markdown` ブロック)。
+    /// Rewrite as standard Markdown (`markdown` block).
     ///
-    /// **付箋(進捗)や許可プロンプトはこちらを通さない** — あれは手書きの mrkdwn
-    /// (`*太字*`)で、Markdown として読ませると太字が斜体に化ける。使うのはワーカーの
-    /// `edit_message`(= 答えの差し替え)だけ。
+    /// **Progress messages and permission prompts do not go through here** — they are hand-written mrkdwn
+    /// (`*bold*`), and read as Markdown the bold turns into italics. Only the agent's
+    /// `edit_message` (= replacing an answer) uses it.
     pub async fn update_markdown(&self, channel: &str, ts: &str, text: &str) -> Result<(), String> {
         self.update_with(channel, ts, text, true).await
     }
@@ -260,7 +260,7 @@ impl Api {
             .map_err(|e| e.to_string())
     }
 
-    /// チャンネル履歴(oldest-first に整えるのは呼び出し側)。
+    /// Channel history (the caller puts it oldest-first).
     pub async fn history(&self, channel: &str, limit: u16) -> Result<Vec<FetchedMsg>, String> {
         let req = SlackApiConversationsHistoryRequest::new()
             .with_channel(channel.into())
@@ -274,26 +274,26 @@ impl Api {
         Ok(res.messages.iter().map(Self::fetched).collect())
     }
 
-    /// この ts のメッセージが属するスレッドの根。
+    /// Root of the thread the message at this ts belongs to.
     ///
-    /// 編集・削除のイベントは**スレッドを教えてくれない**(使っているライブラリの型が
-    /// 入れ子の `thread_ts` を落とす)ので、Slack に1件だけ問い合わせて引く。
-    /// 返信でなければスレッドの根はそのメッセージ自身 — その場合は `ts` をそのまま返す。
+    /// Edit and delete events **do not tell us the thread** (the library's types
+    /// drop the nested `thread_ts`), so we ask Slack for this one message.
+    /// If it is not a reply, the thread root is the message itself — then `ts` is returned as is.
     pub async fn parent_thread_of(&self, channel: &str, ts: &str) -> Option<String> {
         self.message_at(channel, ts).await.map(|m| m.thread_ts)
     }
 
-    /// この ts のメッセージの**書き手とスレッド**。
+    /// **Author and thread** of the message at this ts.
     ///
-    /// リアクションの通知には**どちらも入っていない**(`item` は種別・チャンネル・ts だけ)。
-    /// 現行 も同じ理由でここを1回引いている。省くと
-    /// 「誰の投稿へのリアクションか」が分からず、スレッドも ts で代用するしかない。
+    /// Reaction notifications carry **neither** (`item` has only the type, channel and ts).
+    /// We look it up once for that reason. Without it we cannot tell
+    /// "whose post the reaction is on", and the thread would have to be approximated by the ts.
     ///
-    /// **`conversations.history` では引けない。** history が返すのはチャンネル直下の投稿だけで、
-    /// **スレッドの中の返信は1件も入っていない** — 返信の ts で引くと「それ以前の別の投稿」が
-    /// 来て、ts の照合で弾かれる(2026-08-02 実測: スレッド内の投稿への ✗ が
-    /// `could not read` で落ちた)。`conversations.replies` は返信の ts をそのまま解釈し、
-    /// **その投稿自身**を書き手と `thread_ts` 付きで返す(実測で確認)。
+    /// **`conversations.history` cannot do this.** history returns only top-level channel posts and
+    /// **contains no thread replies at all** — looking up a reply's ts returns "some earlier post",
+    /// which the ts check then rejects (measured 2026-08-02: an ✗ on a post inside a thread
+    /// failed with `could not read`). `conversations.replies` takes the reply's ts as is and
+    /// returns **that post itself** with its author and `thread_ts` (confirmed by measurement).
     pub async fn message_at(&self, channel: &str, ts: &str) -> Option<MessageAt> {
         let req = SlackApiConversationsRepliesRequest::new(channel.into(), ts.into())
             .with_limit(1)
@@ -311,7 +311,7 @@ impl Api {
             })
             .ok()?;
         let m = res.messages.first()?;
-        // 取れたのが本当にその ts か確かめる(スレッドの根が返ることがある)
+        // Check that what came back really is that ts (the thread root can come back instead)
         if m.origin.ts.to_string() != ts {
             return None;
         }
@@ -332,7 +332,7 @@ impl Api {
         thread_ts: &str,
         limit: u16,
     ) -> Result<Vec<FetchedMsg>, String> {
-        // inclusive: 指定した ts のメッセージ自身を含める(現行)
+        // inclusive: include the message at the given ts itself
         let req = SlackApiConversationsRepliesRequest::new(channel.into(), thread_ts.into())
             .with_limit(limit)
             .with_inclusive(true);
@@ -345,15 +345,14 @@ impl Api {
         Ok(res.messages.iter().map(Self::fetched).collect())
     }
 
-    /// スレッドの根がもう無いか。消えた根に `thread_ts` 付きで投げると、Slack は
-    /// それを**チャンネル直下の発言**として落とすのでチャンネルが荒れる(現行
-    /// の `probeThreadRoot`)。
+    /// Whether the thread root is gone. Posting with `thread_ts` to a deleted root makes Slack
+    /// drop it **as a top-level channel message**, which clutters the channel.
     ///
-    /// **消えたと言い切るのは「無い」と分かったときだけ**。ネットワークやその他の API
-    /// エラーは削除の証拠ではないので `false`(= 投げる)を返す — 本当に通信が壊れていれば
-    /// 投稿自体も失敗するので荒れようがなく、一時的な瞬断で正当な投稿を握り潰す方が悪い。
+    /// **Only claim it is gone when we know it "does not exist"**. Network and other API
+    /// errors are not evidence of deletion, so return `false` (= post) — if the connection is really broken
+    /// the post fails too, so nothing gets cluttered, and swallowing a legitimate post over a brief glitch is worse.
     ///
-    /// **DM では呼ばない**(根がそうやって消えない。呼び手が `D` 始まりを弾く)。
+    /// **Not called for DMs** (roots do not vanish that way there; the caller filters out ids starting with `D`).
     pub async fn thread_root_gone(&self, channel: &str, thread_ts: &str) -> bool {
         match self.replies(channel, thread_ts, 1).await {
             Ok(msgs) => msgs.is_empty(),
@@ -370,13 +369,13 @@ impl Api {
         }
     }
 
-    /// url_private を Bearer 付きで取ってファイルに落とす。
-    /// ponytail: curl 呼び出し。slack-morphism の HTTP ヘルパーは全て JSON デシリアライズ前提で
-    /// 生バイトを返す口が無く、依存追加は禁止のため。添付を本格化するとき見直す。
+    /// Fetch url_private with a Bearer token and write it to a file.
+    /// ponytail: shells out to curl. Every slack-morphism HTTP helper assumes JSON deserialization and
+    /// has no way to return raw bytes, and adding dependencies is not allowed. Revisit when attachments get serious.
     pub async fn download_to(&self, url: &str, dest: &std::path::Path) -> Result<(), String> {
         let auth = format!("Authorization: Bearer {}", self.bot_token);
-        // `--max-time` はプロセス側の実上限。呼び手が future を drop しても curl は生き残り、
-        // 「timed out」と言った後も inbox に書き続けてしまうため、子プロセスにも効かせる
+        // `--max-time` is the real limit on the process side. If the caller drops the future, curl lives on
+        // and keeps writing into the inbox after we said "timed out", so the limit must apply to the child too
         let max_time = DOWNLOAD_TIMEOUT.as_secs().to_string();
         let out = tokio::process::Command::new("/usr/bin/curl")
             .args(["-sSfL", "--max-time", &max_time, "-H", &auth, "-o"])
@@ -394,8 +393,8 @@ impl Api {
         Ok(())
     }
 
-    /// ローカルファイルを1つ Slack に上げる(getUploadURLExternal → 生バイト PUT → completeUploadExternal)。
-    /// content-type は Slack の自動判定に委ねる(現行 Bun 版も filename しか渡さない)。
+    /// Upload one local file to Slack (getUploadURLExternal → raw byte PUT → completeUploadExternal).
+    /// The content type is left to Slack's auto-detection (only the filename is passed).
     pub async fn upload_file(
         &self,
         channel: &str,
@@ -447,7 +446,7 @@ impl Api {
             .map_err(|e| e.to_string())
     }
 
-    /// メッセージへの permalink(`status` の各スレッド行に付ける)。
+    /// Permalink to a message (attached to each thread line of `status`).
     pub async fn get_permalink(&self, channel: &str, ts: &str) -> Result<String, String> {
         let req = SlackApiChatGetPermalinkRequest::new(channel.into(), ts.into());
         let res = self
@@ -459,9 +458,9 @@ impl Api {
         Ok(res.permalink.to_string())
     }
 
-    /// スレッドに Slack ネイティブの assistant ステータス(静かな shimmer)を出す。
-    /// **空文字を送るとクリア**。投稿と違って通知を鳴らさず、後に読むものを残さない
-    /// DM 専用の API なのでチャンネルでは無害な no-op。
+    /// Show Slack's native assistant status (a quiet shimmer) on a thread.
+    /// **Sending an empty string clears it**. Unlike a post, it makes no notification and leaves nothing to read later.
+    /// It is a DM-only API, so in channels it is a harmless no-op.
     pub async fn set_thinking_status(
         &self,
         channel: &str,
@@ -481,9 +480,9 @@ impl Api {
             .map_err(|e| e.to_string())
     }
 
-    /// 生 JSON で読む GET。slack-morphism の型付きモデルが**落としてしまう**フィールド
-    /// (DM の `channel.user`、`user.profile.bot_id` — どちらも 2.24.0 のモデルに無い)を
-    /// 読むための口。`ok:false` は connector が Err にしてからここへ来る。
+    /// GET read as raw JSON. For reading fields that slack-morphism's typed models **drop**
+    /// (a DM's `channel.user`, `user.profile.bot_id` — neither is in the 2.24.0 models).
+    /// `ok:false` is already turned into Err by the connector before it gets here.
     async fn get_json(
         &self,
         method: &str,
@@ -498,10 +497,10 @@ impl Api {
             .map_err(|e| e.to_string())
     }
 
-    /// 人が読めるチャンネル名。DM(`is_im`)は相手の `@name`、チャンネルは `#name`。
-    /// best-effort — 失敗は None。
+    /// Human-readable channel name. For a DM (`is_im`) the other person's `@name`, for a channel `#name`.
+    /// best-effort — None on failure.
     pub async fn channel_display_name(&self, channel: &str) -> Option<String> {
-        // 空文字は「無い」扱いで次の候補に落とす(現行 TS の `||` と同じ)
+        // An empty string counts as "missing" and falls through to the next candidate
         let s = |v: &serde_json::Value, k: &str| {
             v.get(k)
                 .and_then(|x| x.as_str())
@@ -533,8 +532,8 @@ impl Api {
         })
     }
 
-    /// 人が読める `@名前`。生の `U…` は誰のことだか分からないので、`status` の owner 欄と
-    /// DM のチャンネル名がこれを通る。best-effort — 失敗は None。
+    /// Human-readable `@name`. A raw `U…` tells nobody who it is, so the owner field of `status` and
+    /// DM channel names go through this. best-effort — None on failure.
     pub async fn user_display_name(&self, user: &str) -> Option<String> {
         let s = |v: &serde_json::Value, k: &str| {
             v.get(k)
@@ -559,9 +558,9 @@ impl Api {
         })
     }
 
-    /// この bot 自身の user id(`U…`)と表示名。id は本文コマンドから自 mention を剥がすのに要り、
-    /// 名前は home への起動通知に出す(生の `U…` は人が見て誰だか分からない。以前の実装は
-    /// `authResult.user` を出している)。起動時に1回呼ぶだけ。
+    /// This bot's own user id (`U…`) and display name. The id is needed to strip self-mentions from text commands,
+    /// and the name goes into the startup notice in home (a raw `U…` means nothing to a person;
+    /// the earlier implementation showed `authResult.user`). Called once at startup.
     pub async fn auth_test(&self) -> Result<(String, Option<String>), String> {
         self.client
             .open_session(&self.token)
@@ -571,9 +570,8 @@ impl Api {
             .map_err(|e| e.to_string())
     }
 
-    /// メンション(`<@U…>`)が bot なら台帳の鍵になる `bot_id`(B…)を返す。人間は Ok(None)。
-    /// bot なのに `profile.bot_id` が無いのは Err — 保存できない id を黙って捨てないため
-    /// (resolveSenderForException と同じ判断)。
+    /// If a mention (`<@U…>`) is a bot, return its `bot_id` (B…), the key for the ledger. Ok(None) for humans.
+    /// A bot without `profile.bot_id` is Err — so an id that cannot be saved is never dropped silently.
     pub async fn resolve_bot_id(&self, user_id: &str) -> Result<Option<String>, String> {
         let v = self.get_json("users.info", &[("user", user_id)]).await?;
         let u = v
@@ -589,9 +587,9 @@ impl Api {
             .ok_or_else(|| format!("{user_id} is a bot but users.info exposed no profile.bot_id"))
     }
 
-    /// 添付の (url_private, ファイル名, バイト数)。size は上限判定に使う —
-    /// slack-morphism の `SlackFile` は size を持たないので生 JSON で取る
-    /// (`resolve_bot_id` と同じ作法)。
+    /// An attachment's (url_private, file name, byte count). The size is used for the limit check —
+    /// slack-morphism's `SlackFile` has no size, so it is read from raw JSON
+    /// (same approach as `resolve_bot_id`).
     pub async fn file_info(&self, file_id: &str) -> Result<(String, String, u64), String> {
         let v = self.get_json("files.info", &[("file", file_id)]).await?;
         let f = v
@@ -606,13 +604,13 @@ impl Api {
         Ok((url.to_string(), name.to_string(), size))
     }
 
-    // ── Bridge が Slack を1本叩くときの共通の作法 ──
+    // ── Shared conventions for each Slack call the Bridge makes ──
 
-    /// Socket Mode を張り、message イベントを正規化して流す。
-    /// AppMention は捨てる — 同じ発言が Message としても届く(dedup と二段構え)。
-    /// `fleet` が `Some` のとき(= 子を持つ親)は、**畳まずに生のまま**そちらへ渡す。
-    /// 誰の担当かを決めてから、自分の分だけ `tx` / `clicks` に戻ってくる — つまり
-    /// ローカル配達も直結と同じ変換([`inbound_of`])を通る。
+    /// Open Socket Mode, normalize message events and stream them.
+    /// AppMention is dropped — the same message also arrives as a Message (a second line of defense next to dedup).
+    /// When `fleet` is `Some` (= a gateway with machines), events are handed there **raw, without folding**.
+    /// Once it decides who handles them, only our own share comes back to `tx` / `clicks` — so
+    /// local delivery goes through the same conversion as a direct connection ([`inbound_of`]).
     pub async fn listen(
         app_token: &str,
         tx: tokio::sync::mpsc::Sender<InboundMsg>,
@@ -647,24 +645,24 @@ impl Api {
         Ok(())
     }
 
-    /// inbox に置く保存名。`name` は **Slack から来る外部入力**で、`a/b.txt` や `../../etc/passwd`
-    /// のようにパス区切りを含みうる — そのまま join すると inbox の外に書けてしまう
-    /// (現行が `{ts}-{fileId}{ext}` にして生の name をパスに使わないのはこれを避けるため)。
-    /// 最終成分だけを取り、残った区切り文字を落として**必ず1要素**にする。使えるものが
-    /// 残らなければ file_id だけ。
+    /// File name used in the inbox. `name` is **external input from Slack** and may contain path separators,
+    /// like `a/b.txt` or `../../etc/passwd` — joining it as is could write outside the inbox
+    /// (which is why the name is never used raw as a path, as in `{ts}-{fileId}{ext}`).
+    /// Take only the last component, drop any remaining separators, and **always end up with one component**. If nothing
+    /// usable is left, just the file_id.
     pub fn attachment_file_name(file_id: &str, name: &str) -> String {
-        // `Path::file_name()` は "a/b.txt" → "b.txt"、".." や "" → None。
-        // Unix では `\` が区切りでないので、その分は自前で落とす
+        // `Path::file_name()` gives "a/b.txt" → "b.txt", and ".." or "" → None.
+        // On Unix `\` is not a separator, so we drop it ourselves
         let one = |s: &str| -> String {
-            // trim は `Path::new` に渡す**前**(" .. " を ".." として残さないため)
+            // trim **before** passing to `Path::new` (so " .. " is not kept as "..")
             let base = std::path::Path::new(s.trim())
                 .file_name()
                 .map(|b| b.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            // `"` は封筒の属性(`file_paths="…"`)を壊すので落とす
+            // `"` breaks the envelope attribute (`file_paths="…"`), so drop it
             let base = base.replace(['/', '\\', '"', '\0'], "");
             match base.trim() {
-                // 除去の結果 "." / ".." に化けることがある(ダブルクォートで包んだ `".."` など)
+                // Stripping can turn it into "." / ".." (e.g. `".."` wrapped in double quotes)
                 "." | ".." => String::new(),
                 b => b.to_string(),
             }
@@ -681,17 +679,17 @@ impl Api {
         }
     }
 
-    /// 受信 ack の絵文字(未設定は "eyes")。
+    /// Emoji for the receive ack ("eyes" when unset).
     pub fn ack_emoji(access: &bridge_state::Access) -> &str {
         access.ack_reaction.as_deref().unwrap_or("eyes")
     }
 
-    /// TTL を過ぎた inbox のファイルを消す。
-    /// **全部 best-effort** — 読めない・消せない1件で掃除ごと止めない。
-    /// 境界(ちょうど TTL)は残す(現行と同じ厳密な `>`)。
+    /// Delete inbox files past their TTL.
+    /// **Everything is best-effort** — one unreadable or undeletable file does not stop the sweep.
+    /// A file right at the TTL boundary is kept (strict `>`).
     pub fn sweep_inbox(inbox: &std::path::Path, now_ms: u64) {
         let Ok(entries) = std::fs::read_dir(inbox) else {
-            return; // まだ作られていない / 読めない — 掃除するものが無い
+            return; // not created yet / unreadable — nothing to sweep
         };
         let mut swept = 0usize;
         for e in entries.flatten() {
@@ -713,9 +711,9 @@ impl Api {
         }
     }
 
-    /// 再起動の道中の Slack 1本を5秒で見切る。ここで投げるものはどれも「出れば嬉しい」飾りで、
-    /// 1本の hang が marker 書きと exit(0) を止めてはならない(現行が allSettled で束ねているのと
-    /// 同じ趣旨)。失敗も時間切れもログして続ける。
+    /// Give up on a Slack call during restart after 5 seconds. Everything sent here is decoration that is "nice if it lands",
+    /// and one hang must not block writing the marker and exit(0).
+    /// Failures and timeouts are logged and we move on.
     pub async fn brief_call<T>(
         label: &str,
         call: impl std::future::Future<Output = Result<T, String>>,
@@ -755,8 +753,8 @@ impl Api {
 
 /// Helpers every Slack port gets, real or fake.
 impl dyn Chat {
-    /// assistant ステータスを1本投げてログに残す。**best-effort, but never silent** —
-    /// 成功も失敗も残す。呼び手を待たせないのは呼び手側の責任。
+    /// Send one assistant status call and log it. **best-effort, but never silent** —
+    /// both success and failure are logged. Not blocking the caller is the caller's responsibility.
     pub async fn thinking(&self, channel: &str, thread_ts: &str, status: &str) {
         let ctx = LogCtx {
             session_id: None,
@@ -773,8 +771,8 @@ impl dyn Chat {
         }
     }
 
-    /// Bridge 直答の実投稿。既に spawn 済みの文脈から呼ぶ(probe の答えは60秒後に届く)。
-    /// 失敗はログだけ — コマンドの答えは未応答台帳の外の出来事。
+    /// The actual post for a Bridge direct answer. Called from an already spawned context (a probe's answer arrives 60 seconds later).
+    /// Failures are only logged — a command's answer lives outside the unanswered ledger.
     pub async fn post_now(&self, channel: &str, thread_ts: &str, text: String, key: &ThreadKey) {
         if let Err(e) = self
             .post_message_no_unfurl(channel, &text, Some(thread_ts))
@@ -792,8 +790,8 @@ impl dyn Chat {
     }
 }
 
-/// ダウンロードに許す時間。現行の `DOWNLOAD_TIMEOUT_MS` と同じ 60 秒で、
-/// curl の `--max-time` と、受信時の先読み全体の締切の両方に使う。
+/// Time allowed for a download: 60 seconds, used both for curl's `--max-time`
+/// and for the overall deadline of prefetching on receive.
 pub const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[async_trait::async_trait]
@@ -921,8 +919,8 @@ impl crate::chat::Chat for Api {
 
 // ── reading what Slack sends (Socket Mode events, button clicks) ────────────
 
-/// 親が引き取る Slack の生イベント。**子へそのまま転送できる形**で持つ
-/// (どのマシンの担当かを決めるのは `bridge::gateway` の仕事で、ここは運ぶだけ)。
+/// A raw Slack event taken in by the gateway. Kept **in a form that can be forwarded to a machine as is**
+/// (deciding which machine handles it is the job of `bridge::gateway`; this only carries it).
 #[derive(Debug, Clone)]
 pub enum FleetEvent {
     Event {
@@ -935,8 +933,8 @@ pub enum FleetEvent {
     },
 }
 
-/// 親が子へ転送するイベント。**Bridge が扱いを知っているものだけ** — ここに無い種類は
-/// 名前が付かず、そのまま落ちる(この match が購読表そのもの)。
+/// Events the gateway forwards to a machine. **Only those the Bridge knows how to handle** — kinds not listed here
+/// get no name and are dropped (this match is the subscription table itself).
 fn fleet_event_of(ev: &SlackEventCallbackBody) -> Option<FleetEvent> {
     let (name, value) = match ev {
         SlackEventCallbackBody::Message(e) => ("message", serde_json::to_value(e)),
@@ -953,38 +951,38 @@ fn fleet_event_of(ev: &SlackEventCallbackBody) -> Option<FleetEvent> {
     })
 }
 
-/// 押された承認ボタン1つ。`action_id` は `perm:<動作>:<reqId>`。
+/// One pressed approval button. `action_id` is `perm:<action>:<reqId>`.
 #[derive(Debug, Clone)]
 pub struct PermClick {
     pub req_id: String,
     /// `allow` / `deny` / `allow-thread` / `allow-channel`
     pub action: String,
-    /// 押した人(監査とログ用)。
+    /// Who pressed it (for audit and logs).
     pub by: String,
 }
 
-/// Block Kit のボタン。**押した事実だけ**を main ループへ渡し、判断はしない
-/// (Slack のイベント処理は3秒で返さないと Slack が再送する)。
-/// Slack は接続のたびに `hello` を投げ、そこに**その app がいま張っている接続の本数**が入る
-/// (`num_connections`)。Web API には本数を返す口が無いので、これが唯一の手がかり。
+/// Block Kit buttons. Only **the fact that it was pressed** is passed to the main loop; no decision is made here
+/// (Slack resends if event handling does not return within 3 seconds).
+/// Slack sends `hello` on every connection, carrying **the number of connections the app currently holds**
+/// (`num_connections`). The Web API has no way to return that count, so this is the only clue.
 ///
-/// **健全な状態でも 2 本ある。** slack-morphism は既定で2本張る
-/// (`SlackClientSocketModeConfig::DEFAULT_CONNECTIONS_COUNT = 2`。Slack が定期的に投げる
-/// 張り直しの間、もう1本が受け続けるための冗長で、同じプロセスの中なので取りこぼさない)。
-/// 実機の起動ログでも hello が2回来て `1` → `2` と数えた(2026-08-01 実測)。
+/// **Even a healthy state has 2.** slack-morphism opens two by default
+/// (`SlackClientSocketModeConfig::DEFAULT_CONNECTIONS_COUNT = 2`: redundancy so one keeps receiving while Slack
+/// periodically asks the other to reconnect; they are in the same process, so nothing is lost).
+/// The startup log on a real machine also showed hello twice, counting `1` → `2` (measured 2026-08-01).
 ///
-/// **3本目からが事故。** それは別のプロセスが同じ app トークンで繋いでいるということで、
-/// Slack はイベントを複製せず**半分ずつ振り分ける**。この設計は Slack に繋がるのが
-/// 常に1台であることに乗っている。**誰が繋いでいるかは分からない** — 分かるのは本数だけだが、
-/// 黙って半分消えるよりはるかにましだから出す。
+/// **From the third on it is an accident.** It means another process is connected with the same app token,
+/// and Slack does not duplicate events — it **splits them between the two**. This design relies on exactly
+/// one instance ever being connected to Slack. **We cannot tell who is connected** — only the count — but
+/// that is far better than silently losing half the events, so we report it.
 ///
-/// > `SlackSocketModeHelloEvent` は slack-morphism 2.24.0 から**名前で参照できない**
-/// > (`models` が private で、glob 再輸出が同名の module に隠される)。だから型を書かず、
-/// > 引数の型が推論されるクロージャで受ける。
-/// このプロセスが自分で張る本数。これを超えた分は**他人**。
+/// > `SlackSocketModeHelloEvent` **cannot be referenced by name** from slack-morphism 2.24.0
+/// > (`models` is private and the glob re-export is shadowed by a module of the same name). So we do not write the type
+/// > and take it with a closure whose argument type is inferred.
+/// The number of connections this process opens itself. Anything above it belongs to **someone else**.
 const OWN_CONNECTIONS: u32 = 2;
 
-/// **純関数** — 自分の本数を超えていたら言うことを返す。
+/// **Pure function** — returns what to say if the count exceeds our own.
 pub fn connection_warning(num_connections: u32) -> Option<String> {
     (num_connections > OWN_CONNECTIONS).then(|| {
         format!(
@@ -1001,8 +999,8 @@ async fn on_interaction_event(
     _client: Arc<SlackHyperClient>,
     state: SlackClientEventsUserState,
 ) -> UserCallbackResult<()> {
-    // **届いた事実そのもの**を残す。Slack アプリで Interactivity が無効だとここに1行も
-    // 出ない — 「押しても無反応」が設定側かこちら側かを、この1行で切り分ける
+    // Record **the fact that it arrived**. With Interactivity disabled in the Slack app, not a single line
+    // shows up here — this one line tells whether "pressing does nothing" is on the settings side or ours
     let SlackInteractionEvent::BlockActions(ev) = event else {
         LogCtx::default().debug("slack", "interaction (not block_actions) — ignored");
         return Ok(());
@@ -1045,7 +1043,7 @@ async fn on_interaction_event(
     );
     for a in actions {
         let id = a.action_id.to_string();
-        // `perm:<動作>:<reqId>` — reqId 自体に `:` は入らないので3分割で足りる
+        // `perm:<action>:<reqId>` — reqId itself contains no `:`, so splitting into 3 is enough
         let mut parts = id.splitn(3, ':');
         if parts.next() != Some("perm") {
             continue;
@@ -1071,13 +1069,13 @@ async fn on_interaction_event(
     Ok(())
 }
 
-/// slack-morphism が**イベントを読めずに落とした**ときの受け皿。既定のハンドラは
-/// `tracing` にしか書かないので、こちらのログには何も残らない — 「Slack が送っていない」と
-/// 「こちらが読めなかった」が区別できなくなる(2026-07-31 の削除の調査がこれで長引いた)。
+/// Catch-all for when slack-morphism **could not read an event and dropped it**. The default handler
+/// writes only to `tracing`, so nothing reaches our log — "Slack did not send it" and
+/// "we could not read it" become indistinguishable (this dragged out the deletion investigation on 2026-07-31).
 ///
-/// 読めない筋は実在する: メッセージの種類(`subtype`)を slack-morphism が**固定の一覧**で
-/// 持っていて、そこに無い種類が来ると `SlackMessageEvent` ごと落ちる。Slack が新しい種類を
-/// 足した日に静かに取りこぼすので、せめて1行残す。
+/// Unreadable cases really exist: slack-morphism keeps message kinds (`subtype`) as **a fixed list**,
+/// and a kind not on it drops the whole `SlackMessageEvent`. The day Slack adds a new kind we would
+/// silently miss events, so at least leave one line.
 fn on_listener_error(
     err: Box<dyn std::error::Error + Send + Sync>,
     _client: Arc<SlackHyperClient>,
@@ -1093,7 +1091,7 @@ async fn on_push_event(
     state: SlackClientEventsUserState,
 ) -> UserCallbackResult<()> {
     let guard = state.read().await;
-    // 親(子を持つ Bridge)は、誰の担当かを決める前に畳まない
+    // A gateway (a Bridge with machines) does not fold before deciding who handles it
     if let Some(fleet) = guard.get_user_state::<tokio::sync::mpsc::Sender<FleetEvent>>() {
         if let Some(item) = fleet_event_of(&event.event)
             && let Err(e) = fleet.send(item).await
@@ -1115,12 +1113,12 @@ async fn on_push_event(
     Ok(())
 }
 
-/// Slack の message イベント → Bridge の語彙。返信できない形(中身も添付も無い・channel 無し)は None。
-/// Slack の push イベントを Bridge の語彙へ。落とすべきものは None。
+/// Slack message event → the Bridge's vocabulary. None for shapes we cannot reply to (no content and no attachment, no channel).
+/// Slack push events into the Bridge's vocabulary. None for anything to drop.
 fn message_of(ev: &SlackMessageEvent) -> Option<InboundMsg> {
     let content = ev.content.as_ref()?;
-    // 画像だけの投稿は `subtype:"file_share"` で text 無しに届く。テキストが無くても
-    // 添付があれば通す(現行は `msg.text ?? ''` で素通り)
+    // An image-only post arrives as `subtype:"file_share"` with no text. Even without text,
+    // let it through if it has attachments
     let files: Vec<InboundFile> = content
         .files
         .iter()
@@ -1130,10 +1128,10 @@ fn message_of(ev: &SlackMessageEvent) -> Option<InboundMsg> {
             name: f.name.clone().unwrap_or_else(|| f.id.to_string()),
         })
         .collect();
-    // subtype 付きは**システムメッセージ**(「〜が参加しました」「トピックを変えました」)。
-    // 通すのは `bot_message` と `thread_broadcast`、そして添付付き(file_share = 画像だけの
-    // 投稿。)だけ(関門)。これが無いと、チャンネルへの
-    // 入退室までワーカーに配達される
+    // Messages with a subtype are **system messages** ("X joined", "changed the topic").
+    // Only `bot_message`, `thread_broadcast`, and those with attachments (file_share = an image-only
+    // post) get through (the gate). Without this, even people joining and leaving the
+    // channel would be delivered to the agent
     if let Some(sub) = &ev.subtype
         && !matches!(
             sub,
@@ -1159,7 +1157,7 @@ fn message_of(ev: &SlackMessageEvent) -> Option<InboundMsg> {
         ts: ev.origin.ts.to_string(),
         thread_ts: ev.origin.thread_ts.as_ref().map(|t| t.to_string()),
         user: ev.sender.user.as_ref().map(|u| u.to_string()),
-        // 自分の返信を拾って無限ループしないための判定(スパイクA 実証)
+        // Check so we do not pick up our own replies and loop forever (proven in spike A)
         is_bot: ev.sender.bot_id.is_some() || ev.sender.user.is_none(),
         bot_id: ev.sender.bot_id.as_ref().map(|b| b.to_string()),
         text,
@@ -1172,24 +1170,24 @@ fn message_of(ev: &SlackMessageEvent) -> Option<InboundMsg> {
     })
 }
 
-/// `message_deleted` を1件の受信メッセージに仕立てる。ワーカーに渡すのは
-/// 取り消しの指示文で、消された本文はその中に引用する。
+/// Turn a `message_deleted` into one inbound message. What the agent gets is
+/// an instruction to cancel, quoting the deleted text inside it.
 ///
-/// **bot 自身の投稿の削除は無視する**(付箋や返信をユーザーが消しただけ) — 取り消す
-/// 「依頼」が無いので、伝えてもワーカーを惑わせるだけ。
+/// **Deletions of the bot's own posts are ignored** (the user merely deleted a progress message or a reply) — there is no
+/// "request" to cancel, so passing it on would only confuse the agent.
 fn deletion_of(ev: &SlackMessageEvent) -> Option<InboundMsg> {
     let deleted_ts = ev.deleted_ts.as_ref()?.to_string();
     let prev = ev.previous_message.as_ref();
     let sender = prev.map(|p| &p.sender);
-    // bot が書いたものは「依頼」ではない。人が書いたものだけ通す
+    // What the bot wrote is not a "request". Only what people wrote gets through
     if sender.is_some_and(|s| s.bot_id.is_some() || s.user.is_none()) {
         return None;
     }
     let content = prev.and_then(|p| p.content.as_ref());
     let text = content.and_then(|c| c.text.as_deref()).unwrap_or_default();
     let had_files = content.is_some_and(|c| c.files.iter().flatten().next().is_some());
-    // 削除イベントは根を寄越さないことがある(`previous_message` に thread_ts が無い形)。
-    // 暫定で「消された ts 自身」を根に置き、Bridge 側が台帳から本当の根に読み替える
+    // A delete event sometimes gives no root (`previous_message` without thread_ts).
+    // For now use "the deleted ts itself" as the root; the Bridge maps it to the real root from the ledger
     let thread_ts = ev
         .origin
         .thread_ts
@@ -1217,16 +1215,16 @@ fn deletion_of(ev: &SlackMessageEvent) -> Option<InboundMsg> {
     })
 }
 
-/// `message_changed` を1件の受信メッセージに仕立てる。`text` は**新しい本文
-/// そのもの**で、ワーカーに渡す指示文は Bridge が組む(言い方が「いま処理中かどうか」で
-/// 変わり、それを知っているのは台帳を持つ Bridge だけ)。
+/// Turn a `message_changed` into one inbound message. `text` is **the new body
+/// itself**; the instruction to the agent is built by the Bridge (the wording depends on "whether it is being processed now",
+/// and only the Bridge, which holds the ledger, knows that).
 ///
-/// Slack は編集以外でも `message_changed` を撃つ — リンクのプレビューが付いたとき、
-/// bot が自分の付箋を編集したとき。**本文が変わっていないもの**と **bot の投稿**は捨てる
+/// Slack fires `message_changed` for things other than edits too — when a link preview is attached,
+/// when the bot edits its own progress message. **Anything whose text did not change** and **bot posts** are dropped
 fn edit_of(ev: &SlackMessageEvent) -> Option<InboundMsg> {
     let m = ev.message.as_ref()?;
     if m.sender.bot_id.is_some() || m.sender.user.is_none() {
-        return None; // bot 自身の編集(付箋の描き直しがこれ)
+        return None; // the bot's own edit (redrawing the progress message is this)
     }
     let new_text = m.content.as_ref()?.text.clone().unwrap_or_default();
     let old_text = ev
@@ -1236,7 +1234,7 @@ fn edit_of(ev: &SlackMessageEvent) -> Option<InboundMsg> {
         .and_then(|c| c.text.clone())
         .unwrap_or_default();
     if new_text == old_text {
-        return None; // unfurl などのメタ変更 — 編集ではない
+        return None; // meta change such as an unfurl — not an edit
     }
     let edited_ts = m.ts.to_string();
     let files: Vec<InboundFile> = m
@@ -1255,7 +1253,7 @@ fn edit_of(ev: &SlackMessageEvent) -> Option<InboundMsg> {
             _ => ChannelKind::Channel,
         },
         ts: edited_ts.clone(),
-        // 編集イベントも根を寄越さないことがある(削除と同じ。Bridge が台帳で読み替える)
+        // Edit events sometimes give no root either (same as delete; the Bridge maps it from the ledger)
         thread_ts: ev.origin.thread_ts.as_ref().map(|t| t.to_string()),
         user: m.sender.user.as_ref().map(|u| u.to_string()),
         bot_id: None,
@@ -1267,7 +1265,7 @@ fn edit_of(ev: &SlackMessageEvent) -> Option<InboundMsg> {
         reaction: None,
         deleted_ts: None,
         edited: Some(Edited {
-            // 改訂ごとに変わる id。取れなければ本文長で代用する(再配達の目印)
+            // An id that changes with each revision. If missing, use the text length instead (the marker for redelivery)
             revision: m
                 .edited
                 .as_ref()
@@ -1283,12 +1281,12 @@ fn edit_of(ev: &SlackMessageEvent) -> Option<InboundMsg> {
     })
 }
 
-/// リアクションを1件の受信メッセージに仕立てる。**bot が書いたメッセージへの
-/// リアクションだけ**扱う(`authored` と同じ判定)
-/// 人同士のやり取りに付いた絵文字までワーカーに流さない。
+/// Turn a reaction into one inbound message. **Only reactions on messages the bot
+/// wrote** are handled (same check as `authored`)
+/// Emoji on exchanges between people are not passed to the agent.
 ///
-/// スレッドの根は付けられた側の `thread_ts`、無ければそのメッセージ自身。`ts` は
-/// **付けられた側の ts** にする — 👀 を付ける先も、dedup の鍵もそこになる。
+/// The thread root is the reacted-to message's `thread_ts`, or the message itself if absent. `ts` is
+/// **the reacted-to message's ts** — that is where 👀 goes and what the dedup key is.
 fn reaction_of(
     item: &SlackReactionsItem,
     reactor: &str,
@@ -1296,12 +1294,12 @@ fn reaction_of(
     added: bool,
 ) -> Option<InboundMsg> {
     let SlackReactionsItem::Message(m) = item else {
-        return None; // ファイルへのリアクションは扱わない
+        return None; // reactions on files are not handled
     };
-    // **書き手はここでは分からない。** リアクションの `item` に入るのは種別・チャンネル・ts
-    // だけで、送り主の欄は常に空。ここで「自分の投稿か」を判断しようとすると、空欄を
-    // 「自分の投稿」と読んで**全部通す**検査になる(2026-08-02 に実測)。判断は Bridge 側 —
-    // 元の投稿を1回引いた後(`Api::message_at`)。
+    // **The author is unknown here.** A reaction's `item` has only the type, channel and ts,
+    // and the sender field is always empty. Trying to decide "is this our post" here reads the empty field
+    // as "our post" and becomes a check that **lets everything through** (measured 2026-08-02). The decision is on the Bridge side —
+    // after looking up the original post once (`Api::message_at`).
     let channel = m.origin.channel.as_ref()?.to_string();
     let item_ts = m.origin.ts.to_string();
     let reaction = Reaction {
@@ -1318,7 +1316,7 @@ fn reaction_of(
         ts: item_ts,
         thread_ts: m.origin.thread_ts.as_ref().map(|t| t.to_string()),
         user: Some(reactor.to_string()),
-        // リアクションを**付けた**のは人。付けられた側が bot なのは上で確かめた
+        // The one who **added** the reaction is a person. That the reacted-to message is the bot's was checked above
         is_bot: false,
         bot_id: None,
         text: reaction
@@ -1332,16 +1330,16 @@ fn reaction_of(
     })
 }
 
-/// Slack のイベント1つを、Bridge が扱う形に畳む。**直結でも Relay 経由でもここを通る** —
-/// 2本目を書くと、門番の判断が経路によっていつか食い違う。
+/// Fold one Slack event into the shape the Bridge handles. **Direct and relayed events both go through here** —
+/// a second copy would one day make the gate's decisions differ by path.
 fn inbound_of(event: SlackEventCallbackBody) -> Option<InboundMsg> {
     let msg = match event {
-        // 削除は「取り消し」。本文が無いので from_event では拾えない別の道
+        // A delete is a "cancel". It has no text, so from_event cannot pick it up; separate path
         SlackEventCallbackBody::Message(ev) if ev.deleted_ts.is_some() => {
             match deletion_of(&ev) {
                 Some(msg) => msg,
-                // 黙って落とすと「届いていない」と「落とした」が区別できない。削除は
-                // 経路が長い(Slack → 台帳の読み替え → 取り消し配達)ので1行だけ残す
+                // Dropping silently makes "never arrived" and "dropped" indistinguishable. Deletes
+                // travel a long path (Slack → ledger mapping → cancel delivery), so leave one line
                 None => {
                     LogCtx::default().debug(
                         "slack",
@@ -1357,16 +1355,16 @@ fn inbound_of(event: SlackEventCallbackBody) -> Option<InboundMsg> {
                 }
             }
         }
-        // 書き換え。新しい本文は `message` に入っていて、元のイベントの
-        // `content` には無い(from_event では拾えない)
+        // A rewrite. The new text is in `message`, not in the original event's
+        // `content` (from_event cannot pick it up)
         SlackEventCallbackBody::Message(ev)
             if ev.subtype.as_ref() == Some(&SlackMessageEventType::MessageChanged) =>
         {
             match edit_of(&ev) {
                 Some(msg) => msg,
                 None => {
-                    // 削除と同じ理由で1行残す。ただし **bot 自身の編集は書かない** —
-                    // 付箋の描き直しが毎秒これを撃つので、書くとログが埋まって使えなくなる
+                    // Leave one line for the same reason as delete. But **the bot's own edits are not logged** —
+                    // redrawing the progress message fires this every second, and logging it would bury the log
                     if !ev
                         .message
                         .as_ref()
@@ -1395,8 +1393,8 @@ fn inbound_of(event: SlackEventCallbackBody) -> Option<InboundMsg> {
                 return None;
             }
         },
-        // リアクションも受ける。stop 絵文字の判定と、ワーカーへの合成テキストは
-        // Bridge 側(付箋の ts と bot の id を知っているのはあちら)
+        // Reactions are taken too. Judging the stop emoji and composing text for the agent
+        // happens on the Bridge side (it knows the progress message ts and the bot id)
         SlackEventCallbackBody::ReactionAdded(ev) => {
             match reaction_of(&ev.item, &ev.user.to_string(), ev.reaction.0, true) {
                 Some(msg) => msg,
@@ -1409,16 +1407,16 @@ fn inbound_of(event: SlackEventCallbackBody) -> Option<InboundMsg> {
                 None => return None,
             }
         }
-        _ => return None, // AppMention 含め、他のイベントは使わない
+        _ => return None, // other events, including AppMention, are not used
     };
     Some(msg)
 }
 
-/// Relay が転送してきた生の JSON を、直結と**同じ** [`InboundMsg`] にする。
+/// Turn raw JSON forwarded by the Relay into the **same** [`InboundMsg`] as a direct connection.
 ///
-/// Relay 側は slack-morphism の型を `to_value` して載せているので、ここは同じ serde 実装で
-/// 戻すだけ。戻せなかったら1行残して捨てる — 黙って落とすと「Relay が送っていない」と
-/// 「こちらが読めなかった」が区別できなくなる。
+/// The Relay side serializes slack-morphism types with `to_value`, so this just converts back with
+/// the same serde implementation. If that fails, leave one line and drop it — dropping silently makes "the Relay did not send it" and
+/// "we could not read it" indistinguishable.
 pub fn inbound_from_relay(name: &str, event: &serde_json::Value) -> Option<InboundMsg> {
     let body = match name {
         "message" => serde_json::from_value(event.clone()).map(SlackEventCallbackBody::Message),
@@ -1451,13 +1449,13 @@ pub fn inbound_from_relay(name: &str, event: &serde_json::Value) -> Option<Inbou
     }
 }
 
-/// Relay が転送してきたボタン押しを [`PermClick`] にする。判断はしない — 押された事実だけ。
+/// Turn a button press forwarded by the Relay into a [`PermClick`]. No decision here — only the fact it was pressed.
 pub fn perm_click_from_relay(
     action: &serde_json::Value,
     body: &serde_json::Value,
 ) -> Option<PermClick> {
     let id = action.get("action_id")?.as_str()?;
-    // `perm:<動作>:<reqId>` — reqId 自体に `:` は入らないので3分割で足りる
+    // `perm:<action>:<reqId>` — reqId itself contains no `:`, so splitting into 3 is enough
     let mut parts = id.splitn(3, ':');
     if parts.next() != Some("perm") {
         return None;
@@ -1475,44 +1473,44 @@ pub fn perm_click_from_relay(
     })
 }
 
-// ── assistant ステータスの文言。現行 Bun の原文をそのまま持ってくる(`tests` で固定)。
-// 空文字はどれでもクリアなので、ここに「クリア用の定数」は置かない。
+// ── Wording of the assistant status (pinned in `tests`).
+// Any empty string clears it, so there is no "clear" constant here.
 
-/// 配達直後 / スレッド復帰。
+/// Right after delivery / on returning to a thread.
 pub const TYPING_STATUS: &str = "is typing…";
-/// ターンが無音のまま [`SILENCE_MS`] 過ぎたとき(`THINKING_STATUS`)。
+/// When a turn has been silent past [`SILENCE_MS`] (`THINKING_STATUS`).
 pub const THINKING_STATUS: &str = "is thinking…";
-/// 無音と見なすまでの間。現行 Bun の `deps.silenceMs` 既定値は 5s だが、
-/// **Rust 版は 3s**(2026-07-31 ユーザー判断 — ツール実行後に思考中が戻るまでが遅い)。
+/// How long before we treat it as silent. The Bun version defaulted to 5s,
+/// but **the Rust version uses 3s** (user decision 2026-07-31 — thinking took too long to come back after a tool ran).
 pub const SILENCE_MS: u64 = 3_000;
 /// Slack's "…ing" status line. Use as `thinking.set(&Status::Login.text())`.
 ///
-/// `compact` の専用ステータスは**意図的に持たない**(Bun からの逸脱 — ユーザー判断)。
-/// 以前の実装は compact の間 `コンテキストを圧縮中…` を張り、tick ごとに `… {n}s` 付きへ
-/// 張り直していた。Rust 版はこれを持たない — compact は進捗チェックリスト(sticky)を
-/// 投稿して編集し続けるので、shimmer と二重で冗長だという判断(**移植漏れではない**)。
-/// 配達の `is typing…` と無音の `is thinking…` は compact 実行中も従来どおり出る。
+/// There is **deliberately no** dedicated status for `compact` (a user decision).
+/// The earlier implementation showed a "compacting context…" status during compact and re-set it with `… {n}s` on every
+/// tick. The Rust version drops this — compact posts a progress checklist (sticky) and keeps
+/// editing it, so a shimmer on top would be redundant (**not a porting omission**).
+/// Delivery's `is typing…` and silence's `is thinking…` still show during compact as before.
 #[derive(Clone, Copy, Debug)]
 pub enum Status {
-    /// `status`。
+    /// `status`.
     Gathering,
-    /// `context`。
+    /// `context`.
     Context,
-    /// `usage`。
+    /// `usage`.
     Usage,
-    /// `model`。
+    /// `model`.
     Model,
-    /// `effort <level>`。
+    /// `effort <level>`.
     Effort,
-    /// `mode <名前>` の間だけ出す shimmer。
+    /// Shimmer shown only while in `mode <name>`.
     Mode,
-    /// `login` — 現行 Bun に原文が無い。上の語調に合わせて新規に決めたもの。
+    /// `login` — newly worded to match the tone above.
     Login,
-    /// `logout` — 同上(新規)。
+    /// `logout` — same (new).
     Logout,
-    /// `resume` — 同上(新規)。
+    /// `resume` — same (new).
     Resume,
-    /// `restart` — 同上(新規)。
+    /// `restart` — same (new).
     Restart,
 }
 
@@ -1533,24 +1531,24 @@ impl Status {
     }
 }
 
-// ── 処理中ステータス(shimmer)— Bridge が「考え中」を張る口 ─────────────────
+// ── In-progress status (shimmer) — where the Bridge shows "thinking" ────────────
 
-/// 処理中のあいだ張っておく assistant ステータス(`is thinking…` などの shimmer)。
+/// Assistant status kept up while processing (shimmers like `is thinking…`).
 ///
-/// **Drop で必ず空文字を送る** — 現行 Bun が set → finally で `''` と対にしているものの
-/// Rust 版。早期 return でもエラー経路でも panic でも消えるので、消し忘れが構造的に起きない
-/// (消し忘れは DM の入力欄を固まらせる = ターン中の割り込みを塞ぐ)。
+/// **Drop always sends an empty string** — pairing set with a clear in `finally`.
+/// It clears on early return, on error paths and on panic, so forgetting to clear cannot happen structurally
+/// (a forgotten status freezes the DM input box = blocks interrupting mid-turn).
 ///
-/// 送信は専属の直列タスク1本に流す。set と clear が別々の spawn だと Slack への到着順が
-/// 逆転して「消したはずのステータスが残る」ことがあるため(compact は 800ms ごとに張り直す —
-/// ここが一番詰まる)。tx を落とすとタスクは残りを吐いてから終わる。
+/// Sends go through one dedicated serial task. If set and clear were separate spawns, they could reach Slack
+/// out of order and "a status we cleared stays up" (compact re-sets every 800ms —
+/// that is where it gets busiest). Dropping tx lets the task drain the rest and then finish.
 ///
-/// ponytail: 直列なのは **guard 1本の中だけ**。同じスレッドでワーカーが走っている最中に
-/// コマンドを撃つと、`Stall` の口とコマンドの guard が同じ Slack フィールドを別々の順で
-/// 書きうる(現行 Bun も同様に無調整)。どちらも最後は必ずクリアで終わり、決着時の sweep が
-/// 受け皿になるので**張り付きにはならない** — 見えるのは「ワーカーの shimmer が
-/// コマンドの間だけ消える」程度。スレッド鍵ごとの共有レジストリ(Arc/Weak + 後始末)を
-/// 10 箇所の guard 生成に通す価値が出たらそこで直す
+/// ponytail: serial **only within one guard**. Firing a command while an agent is running in the same thread
+/// lets the `Stall` path and the command's guard write the same Slack field in different orders
+/// (not coordinated). Both always end with a clear, and the sweep at settle
+/// catches the rest, so **it never gets stuck** — at worst "the agent's shimmer disappears
+/// during the command". Fix it once a shared per-thread-key registry (Arc/Weak + cleanup)
+/// is worth threading through the 10 places that create a guard
 pub struct Thinking(tokio::sync::mpsc::UnboundedSender<String>);
 
 impl Thinking {
@@ -1563,16 +1561,16 @@ impl Thinking {
             }
         });
         let t = Self(tx);
-        // 空文字で作ると**何も送らない**(`Stall` の送信口のように「口だけ先に用意して、
-        // 何を出すかは呼び手が決める」場合)。まだ何も出していないのだからクリアの無駄打ちも
-        // しない。Drop のクリアは status に関わらず必ず流れる
+        // Created with an empty string, it **sends nothing** (for cases like the `Stall` send path, "set up the channel first,
+        // the caller decides what to show"). Nothing has been shown yet, so no wasted clear
+        // either. The clear on Drop always goes out regardless of status
         if !status.is_empty() {
             t.set(status);
         }
         t
     }
 
-    /// 張り直し(Slack はステータスを短時間で失効させる — compact の tick で使う)。
+    /// Re-set (Slack expires the status after a short time — used by the compact tick).
     pub fn set(&self, status: &str) {
         let _ = self.0.send(status.to_string());
     }
@@ -1580,29 +1578,29 @@ impl Thinking {
 
 impl Drop for Thinking {
     fn drop(&mut self) {
-        self.set(""); // 空文字 = クリア。送るだけ — 直列タスクが順番どおりに投げる
+        self.set(""); // empty string = clear. Just send it — the serial task sends in order
     }
 }
 
-// ─── ワーカーの MCP ツール実行 ───────────────────────────────────────────────
+// ─── Agent MCP tool execution ──────────────────────────────────────────────────
 
-/// 1ファイルあたりの上限(reply ツールスキーマの "max 50MB each" と同じ数値 — `endpoints.rs:130`)。
+/// Per-file limit (the same number as "max 50MB each" in the reply tool schema).
 pub const MAX_ATTACHMENT_BYTES: u64 = 50 * 1024 * 1024;
 
-/// inbox に置いた添付をどれだけ残すか(7日)。
-/// 掃除はダウンロードの後ろに相乗りする — Bridge に専用のタイマーを増やさない。
+/// How long attachments placed in the inbox are kept (7 days).
+/// The sweep piggybacks on downloads — no dedicated timer in the Bridge.
 pub const INBOX_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
-/// 1投稿あたりの本文の上限。これを超える返信は分けて投げる
-/// Slack は長すぎる本文を弾くので、分けないと**返信ごと落ちる**。
+/// Body limit per post. Replies over this are sent in pieces.
+/// Slack rejects bodies that are too long, so without splitting **the whole reply is lost**.
 pub const MAX_CHUNK_LIMIT: usize = 3900;
 
-/// 返信を Slack に収まる長さに割る。
+/// Split a reply into lengths that fit in Slack.
 ///
-/// `newline` は段落 → 行 → 単語の順に切れ目を探す。ただし**上限の半分より手前では切らない** —
-/// 早すぎる切れ目でぶつ切りにするより、上限で断ち切る方がまし。`length` は上限で断ち切る。
+/// `newline` looks for a break at paragraph → line → word. But it **never breaks before half the limit** —
+/// cutting hard at the limit beats chopping at a break that is too early. `length` cuts hard at the limit.
 ///
-/// 数えるのは**文字**(Rust の `len()` はバイトなので、日本語だと途中で割れる)。
+/// It counts **characters** (Rust's `len()` is bytes, which would split Japanese text mid-character).
 pub fn chunk(text: &str, limit: usize, newline_mode: bool) -> Vec<String> {
     let limit = limit.max(1);
     let chars: Vec<char> = text.chars().collect();
@@ -1633,7 +1631,7 @@ pub fn chunk(text: &str, limit: usize, newline_mode: bool) -> Vec<String> {
         }
         out.push(chars[start..start + cut].iter().collect());
         start += cut;
-        // 切れ目の直後の改行は次の断片の頭に持ち越さない
+        // The newline right after the break is not carried into the next piece
         while chars.get(start) == Some(&'\n') {
             start += 1;
         }
@@ -1644,7 +1642,7 @@ pub fn chunk(text: &str, limit: usize, newline_mode: bool) -> Vec<String> {
     out
 }
 
-/// disposition を main の台帳へ流す。満杯なら待つ(落とすと台帳が消えないまま残る)。
+/// Send a disposition to main's ledger. Waits if full (dropping it would leave the ledger entry behind).
 async fn notify(
     dispo: &tokio::sync::mpsc::Sender<bridge_state::Disposition>,
     d: bridge_state::Disposition,
@@ -1655,11 +1653,11 @@ async fn notify(
     }
 }
 
-/// MCP 受け口に差す実体。
+/// The implementation plugged into the MCP endpoint.
 pub struct ToolExec {
     pub slack: crate::chat::ChatRef,
     pub state_dir: std::path::PathBuf,
-    /// disposition の通知先(受けて台帳を消すのは main)。
+    /// Where dispositions are sent (main receives them and clears the ledger).
     pub dispo: tokio::sync::mpsc::Sender<bridge_state::Disposition>,
 }
 
@@ -1679,8 +1677,8 @@ impl crate::mcp::ToolExecutor for ToolExec {
 
 // ── What the worker's MCP tools do, written once against `Chat` ──
 
-/// 添付を**投稿前に**まとめて検証する。1つでも読めない・
-/// 大きすぎるものがあれば、テキストも含めて何も投稿しないための門番。
+/// Validate all attachments **before posting**. The gate that posts nothing, not even the text,
+/// if even one is unreadable or too large.
 fn check_attachment_sizes(paths: &[String], max_bytes: u64) -> Result<(), String> {
     for p in paths {
         let meta = std::fs::metadata(p).map_err(|e| format!("file not found: {p} ({e})"))?;
@@ -1694,8 +1692,8 @@ fn check_attachment_sizes(paths: &[String], max_bytes: u64) -> Result<(), String
     }
     Ok(())
 }
-/// 根が消えたスレッドか(`probeThreadRoot`)。判断できないときは「生きている」に倒す —
-/// 分からないことを理由に返信を握りつぶさない。
+/// Whether the thread's root is gone. When it cannot be decided, lean toward "alive" —
+/// uncertainty is no reason to swallow a reply.
 pub async fn root_gone(slack: &dyn Chat, channel: &str, thread_ts: &str) -> bool {
     match slack.replies(channel, thread_ts, 1).await {
         Ok(msgs) => msgs.is_empty(),
@@ -1703,8 +1701,8 @@ pub async fn root_gone(slack: &dyn Chat, channel: &str, thread_ts: &str) -> bool
     }
 }
 
-/// 長い本文を分けて投げる。返すのは**最初の**投稿の ts(以後の断片は続きとして並ぶ)。
-/// 上限と切り方は access.json で変えられる(`textChunkLimit` / `chunkMode`)。
+/// Send a long body in pieces. Returns the ts of the **first** post (later pieces follow it).
+/// The limit and split mode can be changed in access.json (`textChunkLimit` / `chunkMode`).
 pub async fn post_chunked(
     slack: &dyn Chat,
     state_dir: &std::path::Path,
@@ -1719,8 +1717,8 @@ pub async fn post_chunked(
         .unwrap_or(MAX_CHUNK_LIMIT)
         .clamp(1, MAX_CHUNK_LIMIT);
     let mut first: Option<String> = None;
-    // 分割は Markdown でも同じ。長い表が途中で切れると2通目の頭が表に見えなくなるが、
-    // 分けずに投げると Slack が本文ごと弾く — 弾かれるよりは切れる方がまし
+    // Splitting is the same for Markdown. A long table cut in the middle means the second post no longer starts as a table,
+    // but sending it unsplit makes Slack reject the whole body — being cut beats being rejected
     for part in chunk(text, limit, a.chunk_mode.as_deref() == Some("newline")) {
         let ts = if markdown {
             slack.post_markdown(channel, &part, thread_ts).await?
@@ -1732,8 +1730,8 @@ pub async fn post_chunked(
     first.ok_or_else(|| "nothing to post".to_string())
 }
 
-/// file_id → inbox に落としたローカルパス。MCP の `download_attachment` ツールと、
-/// 受信時の先読みダウンロードが共有する(保存先の作法と上限判定を1箇所に置くため)。
+/// file_id → local path downloaded into the inbox. Shared by the MCP `download_attachment` tool and
+/// the prefetch download on receive (keeping the storage conventions and the limit check in one place).
 pub async fn download_attachment(
     slack: &dyn Chat,
     file_id: &str,
@@ -1741,7 +1739,7 @@ pub async fn download_attachment(
 ) -> Result<String, String> {
     let (url, name, size) = slack.file_info(file_id).await?;
     if size > MAX_ATTACHMENT_BYTES {
-        // 文言は原文コピー
+        // Wording copied from the original
         return Err(format!(
             "file too large: {:.1}MB, max 50MB",
             size as f64 / 1024.0 / 1024.0
@@ -1754,16 +1752,16 @@ pub async fn download_attachment(
         std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
     }
     slack.download_to(&url, &dest).await?;
-    // 掃除は**書けた後**に相乗りさせる。専用のタイマーを増やさないためと、
-    // 掃除で落ちてもこのダウンロードには影響させないため(いま書いた物は mtime が今なので
-    // 対象にならない)
+    // The sweep piggybacks **after the write succeeds**. So there is no dedicated timer,
+    // and so a sweep failure never affects this download (the file just written has mtime = now,
+    // so it is not a target)
     Api::sweep_inbox(&state_dir.join("inbox"), bridge_state::now_ms());
     Ok(dest.to_string_lossy().to_string())
 }
 
-/// 配達済みの見た目に直す: ack と ⟳ を外して 🤖 を付ける。
-/// 全て best-effort — リアクションは台帳でなく観測シグナルなので、
-/// no_reaction / already_reacted で配達を失敗扱いにはしない。
+/// Switch to the delivered look: remove the ack and ⟳, add 🤖.
+/// All best-effort — reactions are an observation signal, not the ledger, so
+/// no_reaction / already_reacted never counts as a failed delivery.
 pub async fn flip_to_received(slack: &dyn Chat, channel: &str, message_ts: &str, ack: &str) {
     let ctx = LogCtx {
         session_id: None,
@@ -1780,11 +1778,11 @@ pub async fn flip_to_received(slack: &dyn Chat, channel: &str, message_ts: &str,
     }
 }
 
-/// ワーカーが呼んだツールを実行する。失敗は文字列で返し、必ずログにも出す。
+/// Run a tool the agent called. Failures are returned as strings and always logged too.
 ///
-/// disposition(reply / react / no_reply / message_ids 付きの edit)は**ログに出して
-/// `dispo` に流すだけ** — 台帳を消すのは Threads を持つ main 側(現行の
-/// 「slack-action は通知、tracker は bridge」 同じ分担)。
+/// Dispositions (reply / react / no_reply / edit with message_ids) are **only logged and
+/// sent to `dispo`** — clearing the ledger is done on the main side, which holds Threads
+/// (the Slack action notifies; the Bridge tracks).
 pub async fn execute_tool(
     slack: &dyn Chat,
     state_dir: &std::path::Path,
@@ -1799,7 +1797,7 @@ pub async fn execute_tool(
     };
     let s = |k: &str| args[k].as_str().unwrap_or_default().to_string();
     let opt = |k: &str| args[k].as_str().map(str::to_string);
-    // 覆う受信 id。空は異常ではない(reply は UNSPECIFIED として通す)
+    // The inbound ids this covers. Empty is not an error (a reply goes through as UNSPECIFIED)
     let ids: Vec<String> = args["message_ids"]
         .as_array()
         .map(|a| {
@@ -1808,7 +1806,7 @@ pub async fn execute_tool(
                 .collect()
         })
         .unwrap_or_default();
-    // disposition ログの宛先。根が引けないものは session ログに落ちる(現行と同じ振り分け)
+    // Destination of the disposition log. Anything without a root falls into the session log
     let dctx = |root: Option<&str>| LogCtx {
         session_id: Some(session_id.to_string()),
         thread_key: root.map(|t| ThreadKey::new(&s("channel_id"), t)),
@@ -1824,8 +1822,8 @@ pub async fn execute_tool(
                 })
                 .unwrap_or_default();
             let thread = opt("thread_ts");
-            // 根が消えたスレッドには投稿しない。**黙って捨てず**
-            // 台帳は覆う — 落ちたのではなく「出さないと決めた」記録を残す
+            // Do not post to a thread whose root is gone. **Do not drop it silently** —
+            // still cover the ledger, recording "decided not to send" rather than "lost"
             if let Some(t) = thread.as_deref()
                 && !s("channel_id").starts_with('D')
                 && root_gone(slack, &s("channel_id"), t).await
@@ -1853,18 +1851,18 @@ pub async fn execute_tool(
                 .await;
                 return Ok("reply suppressed: the thread root was deleted".to_string());
             }
-            // 添付の検証はテキスト投稿より**前**— 1つでも
-            // 弾かれたらテキストも投稿しない
+            // Attachments are validated **before** the text is posted — if even one
+            // is rejected, the text is not posted either
             let posted = match check_attachment_sizes(&files, MAX_ATTACHMENT_BYTES) {
                 Err(e) => Err(e),
-                // 長い本文は分けて投げる。分けないと Slack が本文ごと弾く
+                // Send a long body in pieces. Unsplit, Slack rejects the whole body
                 Ok(()) => {
                     post_chunked(slack, 
                         state_dir,
                         &s("channel_id"),
                         &s("text"),
                         thread.as_deref(),
-                        // **既定が Markdown**。mrkdwn に戻すのは `markdown: false` のときだけ
+                        // **Markdown is the default**. Back to mrkdwn only with `markdown: false`
                         args["markdown"].as_bool().unwrap_or(true),
                     )
                     .await
@@ -1872,8 +1870,8 @@ pub async fn execute_tool(
             };
             async {
                 let ts = posted?;
-                // 1回に1ファイル・順番に(現行 Bun 版もループ)。
-                // ここで落ちたときテキストだけ残るのは既知 — 現行にもフォールバックは無い
+                // One file per call, in order.
+                // If this fails, only the text remains — known, and there is no fallback
                 for f in &files {
                     slack.upload_file(
                         &s("channel_id"),
@@ -1883,7 +1881,7 @@ pub async fn execute_tool(
                     .await
                     .map_err(|e| format!("text posted but attachment upload failed: {e}"))?;
                 }
-                // 投稿できたときだけ覆う — Slack が受けていない返信で台帳を消さない
+                // Cover only when the post succeeded — never clear the ledger with a reply Slack did not accept
                 let c = dctx(thread.as_deref());
                 c.info(
                     "bridge",
@@ -1911,10 +1909,10 @@ pub async fn execute_tool(
             match slack.add_reaction(&channel, &message_ts, &emoji).await {
                 Err(e) => Err(e),
                 Ok(()) => {
-                    // react の args は thread を運ばない。台帳の鍵は**配達時の根**なので
-                    // replies で引く。返信の ts で引くと先頭は
-                    // 親とは限らないので、**その ts でなく thread_ts** が根。
-                    // スレッド外(thread_ts 無し)なら message_ts 自身が根
+                    // react's args carry no thread. The ledger key is **the root at delivery**, so
+                    // look it up with replies. Looked up by a reply's ts, the first entry
+                    // is not necessarily the parent, so the root is **thread_ts, not that ts**.
+                    // Outside a thread (no thread_ts), message_ts itself is the root
                     let root = match opt("thread_ts") {
                         Some(t) => Some(t),
                         None => match slack.replies(&channel, &message_ts, 1).await {
@@ -1923,7 +1921,7 @@ pub async fn execute_tool(
                                     .and_then(|f| f.thread_ts.clone())
                                     .unwrap_or_else(|| message_ts.clone()),
                             ),
-                            // 引けなかったときだけ根が不明 — 撃たない
+                            // Only when the lookup fails is the root unknown — do not fire
                             Err(e) => {
                                 let m = format!("react: thread-root lookup failed: {e}");
                                 ctx.debug("bridge", &m);
@@ -1945,7 +1943,7 @@ pub async fn execute_tool(
                             };
                             notify(dispo, d, &c).await;
                         }
-                        // 根が違えば別スレッドの台帳を誤射する — 撃たずに残す(best-effort)
+                        // A different root would hit another thread's ledger — do not fire, leave it (best-effort)
                         None => c.debug(
                             "bridge",
                             &format!(
@@ -1959,8 +1957,8 @@ pub async fn execute_tool(
             }
         }
         "edit_message" => {
-            // reply と同じ既定にする。答えを「投稿」しても「編集で差し替え」ても
-            // 同じ見え方でなければ、書く側は使い分けを覚えなければならなくなる
+            // Same default as reply. If "posting" an answer and "replacing it by edit" did not
+            // look the same, the writer would have to learn when to use which
             let md = args["markdown"].as_bool().unwrap_or(true);
             let edited = if md {
                 slack.update_markdown(&s("channel_id"), &s("message_ts"), &s("text"))
@@ -1972,8 +1970,8 @@ pub async fn execute_tool(
             match edited {
                 Err(e) => Err(e),
                 Ok(()) => {
-                    // message_ids 付きの編集だけが「答え」。無ければ進捗編集で、
-                    // 台帳には触らない
+                    // Only edits with message_ids are an "answer". Without them it is a progress edit
+                    // and the ledger is not touched
                     if !ids.is_empty() {
                         let thread = opt("thread_ts");
                         let c = dctx(thread.as_deref().or(ids.first().map(String::as_str)));
@@ -2009,7 +2007,7 @@ pub async fn execute_tool(
         }
         "download_attachment" => download_attachment(slack, &s("file_id"), state_dir).await,
         "no_reply" => {
-            // Slack には何も出さない。だが沈黙は disposition — 記録して台帳を消す。
+            // Nothing is shown in Slack. But silence is a disposition — record it and clear the ledger.
             let thread = opt("thread_ts");
             let c = dctx(thread.as_deref().or(ids.first().map(String::as_str)));
             c.info(
@@ -2050,8 +2048,8 @@ pub async fn execute_tool(
 
 #[cfg(test)]
 mod tests {
-    /// **自分の2本までは正常**(slack-morphism の既定。実機の起動ログで確定)。
-    /// 3本目からは別のプロセスが同じ app を消費している = 事故。
+    /// **Up to two of our own is normal** (slack-morphism's default; confirmed in the startup log on a real machine).
+    /// From the third on, another process is consuming the same app = an accident.
     #[test]
     fn a_third_socket_connection_is_someone_else() {
         for ok in [1, 2] {
@@ -2066,7 +2064,7 @@ mod tests {
 
     use super::*;
 
-    /// TTL を過ぎた添付だけ消す。境界(ちょうど TTL)は残す。
+    /// Only attachments past the TTL are deleted. One right at the TTL boundary is kept.
     #[test]
     fn the_inbox_sweep_removes_only_files_past_the_ttl() {
         let dir = std::env::temp_dir().join(format!("scinbox-{}", std::process::id()));
@@ -2077,9 +2075,9 @@ mod tests {
             p
         };
         let (fresh, old, edge) = (write("fresh"), write("old"), write("edge"));
-        // mtime は「今」なので、掃除の now を進めて年齢を作る
+        // mtime is "now", so advance the sweep's now to create age
         let now = bridge_state::now_ms();
-        Api::sweep_inbox(&dir, now); // まだ何も消えない
+        Api::sweep_inbox(&dir, now); // nothing deleted yet
         assert!(fresh.exists() && old.exists());
 
         Api::sweep_inbox(&dir, now + INBOX_TTL_MS + 1_000);
@@ -2087,12 +2085,12 @@ mod tests {
         assert!(!fresh.exists(), "同じ時刻に書いたものは同じ扱い");
         assert!(!edge.exists());
 
-        // 読めないディレクトリでも落ちない
+        // Does not fail even on an unreadable directory
         Api::sweep_inbox(std::path::Path::new("/nonexistent-inbox-3f9"), now);
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// 保存名は必ず inbox 直下の1要素になる — name は Slack から来る外部入力。
+    /// The stored name is always one component directly under the inbox — name is external input from Slack.
     #[test]
     fn attachment_name_never_escapes_the_inbox() {
         assert_eq!(Api::attachment_file_name("F1", "shot.png"), "F1-shot.png");
@@ -2116,10 +2114,10 @@ mod tests {
             Api::attachment_file_name("F1", "スクショ 1.png"),
             "F1-スクショ 1.png"
         );
-        // file_id 側も外部入力(MCP ツールの引数)— 同じ扱い
+        // file_id is external input too (an MCP tool argument) — treated the same
         assert_eq!(Api::attachment_file_name("../../F1", "a.png"), "F1-a.png");
         assert_eq!(Api::attachment_file_name("/", "a.png"), "attachment-a.png");
-        // どの入力でも inbox の直下から出ない — かつ "." / ".." に化けない
+        // No input escapes the inbox directory — and none turns into "." / ".."
         let inbox = std::path::Path::new("/s/inbox");
         for (id, name) in [
             ("F1", "../../etc/passwd"),
@@ -2134,14 +2132,14 @@ mod tests {
             let p = inbox.join(&s);
             assert_eq!(p.parent(), Some(inbox), "{p:?} escaped the inbox");
         }
-        // 封筒の属性を壊す `"` は落とす(file_paths="…")
+        // Drop `"`, which breaks the envelope attribute (file_paths="…")
         assert_eq!(Api::attachment_file_name("F1", "a\"b.png"), "F1-ab.png");
     }
 
     use crate::chat::fake::FakeChat;
 
-    /// 大きすぎる添付はダウンロードに**入る前に**断る(FakeChat の download_to は
-    /// 別の文言で Err を返す — 判定が先に返らなければ文言の比較で落ちる)。
+    /// An attachment that is too large is refused **before** the download starts (FakeChat's download_to
+    /// returns Err with different wording — if the check did not return first, the wording comparison would fail).
     #[tokio::test]
     async fn oversized_attachment_is_refused_before_downloading() {
         let mut api = FakeChat::default();
@@ -2152,7 +2150,7 @@ mod tests {
         assert_eq!(err, "file too large: 50.0MB, max 50MB", "文言は現行の原文");
     }
 
-    /// スレッドの根が**生きている** fake(返信の抑止に掛からない普通の状態)。
+    /// A fake whose thread root is **alive** (the normal state, where replies are not suppressed).
     fn with_live_root() -> FakeChat {
         let mut api = FakeChat::default();
         api.msgs = vec![FetchedMsg {
@@ -2164,14 +2162,14 @@ mod tests {
         api
     }
 
-    /// 全ての呼び出しが Err を返す fake。
+    /// A fake where every call returns Err.
     fn failing() -> FakeChat {
         let mut api = FakeChat::default();
         api.fail = true;
         api
     }
 
-    /// execute_tool を呼ぶのに要るもの一式(disposition の受信口つき)。
+    /// Everything needed to call execute_tool (with a receiver for dispositions).
     fn harness() -> (
         FakeChat,
         std::path::PathBuf,
@@ -2179,7 +2177,7 @@ mod tests {
         tokio::sync::mpsc::Receiver<bridge_state::Disposition>,
     ) {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
-        // 根は生きている前提(消えたスレッドの抑止は専用のテストで見る)
+        // Assumes the root is alive (suppression for deleted threads has its own test)
         (
             with_live_root(),
             std::path::PathBuf::from("/tmp"),
@@ -2216,8 +2214,8 @@ mod tests {
         );
     }
 
-    /// `markdown: true` のときだけ Markdown ブロックで出す。既定は今までどおり mrkdwn —
-    /// 既存のワーカーの見え方を1バイトも変えない。
+    /// Only with `markdown: true` is it sent as a Markdown block. The default stays mrkdwn —
+    /// existing agents look exactly the same, byte for byte.
     #[tokio::test]
     async fn reply_uses_a_markdown_block_only_when_asked() {
         let (api, dir, tx, _rx) = harness();
@@ -2240,7 +2238,7 @@ mod tests {
         );
     }
 
-    /// **既定が標準 Markdown**。LLM が普通に書く `**bold**` や表がそのまま出る。
+    /// **Standard Markdown is the default**. `**bold**` and tables that an LLM writes naturally render as is.
     #[tokio::test]
     async fn reply_defaults_to_standard_markdown() {
         let (api, dir, tx, _rx) = harness();
@@ -2263,7 +2261,7 @@ mod tests {
         );
     }
 
-    /// 旧来の mrkdwn に戻す口は残す(`*太字*` を意図して書いた文面のため)。
+    /// The way back to legacy mrkdwn stays (for text deliberately written with `*bold*`).
     #[tokio::test]
     async fn reply_can_fall_back_to_mrkdwn() {
         let (api, dir, tx, _rx) = harness();
@@ -2285,7 +2283,7 @@ mod tests {
         assert!(!api.calls().iter().any(|c| c.starts_with("post_md")));
     }
 
-    /// `edit_message` も同じ既定 — 投稿と編集で見え方が違うと使い分けを覚える羽目になる。
+    /// `edit_message` has the same default — if posts and edits looked different, the writer would have to learn which to use.
     #[tokio::test]
     async fn edit_message_defaults_to_standard_markdown_too() {
         let (api, dir, tx, _rx) = harness();
@@ -2343,7 +2341,7 @@ mod tests {
         );
     }
 
-    /// 検証はテキスト投稿より前 — 1つでも読めなければ**何も**投稿しない。
+    /// Validation comes before posting the text — if even one is unreadable, **nothing** is posted.
     #[tokio::test]
     async fn reply_with_unreadable_file_posts_nothing() {
         let (api, dir, tx, mut rx) = harness();
@@ -2386,7 +2384,7 @@ mod tests {
     #[tokio::test]
     async fn flip_swallows_slack_errors() {
         let api = failing();
-        flip_to_received(&api, "C1", "171.002", "eyes").await; // panic せず完走すれば良い
+        flip_to_received(&api, "C1", "171.002", "eyes").await; // fine as long as it runs to completion without panicking
         assert_eq!(api.calls().len(), 3, "失敗しても3手とも試みる");
     }
 
@@ -2420,35 +2418,35 @@ mod tests {
         );
     }
 
-    /// 長い返信は分けて投げる。切り方は2通り(既定は上限で断ち切る)。
+    /// Long replies are sent in pieces. Two split modes (the default cuts hard at the limit).
     #[test]
     fn a_long_reply_is_split_into_slack_sized_posts() {
         assert_eq!(chunk("short", 10, false), vec!["short"]);
-        // 上限ちょうどは割らない
+        // Exactly at the limit is not split
         assert_eq!(chunk("0123456789", 10, false), vec!["0123456789"]);
         assert_eq!(chunk("0123456789a", 10, false), vec!["0123456789", "a"]);
-        // 日本語でも**文字**で割る(バイトで割ると途中で壊れる)
+        // Japanese is split by **characters** too (splitting by bytes would break it mid-character)
         let ja = "あ".repeat(25);
         let parts = chunk(&ja, 10, false);
         assert_eq!(parts.len(), 3);
         assert_eq!(parts[0].chars().count(), 10);
         assert_eq!(parts.concat(), ja);
-        // newline: 上限の手前の切れ目を探し、切れ目の改行は持ち越さない
+        // newline: look for a break before the limit, and do not carry the break's newline over
         let text = format!("{}\n\n{}", "a".repeat(60), "b".repeat(60));
         let parts = chunk(&text, 100, true);
         assert_eq!(parts[0], "a".repeat(60));
         assert_eq!(parts[1], "b".repeat(60));
-        // 切れ目が早すぎる(上限の半分より手前)ときは上限で断ち切る
+        // When the break is too early (before half the limit), cut hard at the limit
         let text = format!("{}\n{}", "a".repeat(10), "b".repeat(200));
         let parts = chunk(&text, 100, true);
         assert_eq!(parts[0].chars().count(), 100);
     }
 
-    /// 根が消えたスレッドには投稿しない。**黙って捨てず**台帳は覆う。
+    /// Do not post to a thread whose root is gone. **Do not drop it silently** — still cover the ledger.
     #[tokio::test]
     async fn a_reply_into_a_deleted_thread_is_suppressed_but_still_disposes() {
         let (mut api, dir, tx, mut rx) = harness();
-        api.msgs = Vec::new(); // 根が引けない = 消えている
+        api.msgs = Vec::new(); // the root cannot be looked up = it is gone
         let out = execute_tool(
                 &api,
                 &dir,
@@ -2484,7 +2482,7 @@ mod tests {
             .unwrap();
         assert!(out.contains("9.0"), "{out}");
         assert_eq!(api.calls(), vec!["post_md C1 1.0 hi"]);
-        // ids 空でも**送る** — 「空 = スレッド全消化」の振り分けは台帳を持つ main の仕事
+        // **Send** even with empty ids — deciding "empty = the whole thread is done" is the job of main, which holds the ledger
         assert!(rx.try_recv().unwrap().message_ids.is_empty());
     }
 
@@ -2553,7 +2551,7 @@ mod tests {
         execute_tool(&api, &dir, "sid", "no_reply", &args, &tx)
             .await
             .unwrap();
-        assert!(api.calls().is_empty()); // Slack には何も出ていない
+        assert!(api.calls().is_empty()); // nothing shown in Slack
         assert_eq!(rx.try_recv().unwrap().kind, "no_reply");
     }
 
@@ -2564,7 +2562,7 @@ mod tests {
         execute_tool(&api, &dir, "sid", "edit_message", &args, &tx)
             .await
             .unwrap();
-        assert!(rx.try_recv().is_err()); // 進捗編集は台帳に触らない
+        assert!(rx.try_recv().is_err()); // a progress edit does not touch the ledger
     }
 
     #[tokio::test]
@@ -2582,7 +2580,7 @@ mod tests {
     #[tokio::test]
     async fn react_covers_the_reacted_ts_under_the_thread_root() {
         let (mut api, dir, tx, mut rx) = harness();
-        // スレッド外のメッセージ(thread_ts 無し)— 根は message_ts 自身
+        // A message outside a thread (no thread_ts) — the root is message_ts itself
         api.msgs = vec![FetchedMsg {
             ts: "1.5".into(),
             user: "U1".into(),
@@ -2601,8 +2599,8 @@ mod tests {
     #[tokio::test]
     async fn react_to_a_reply_keys_off_the_thread_root_not_the_replied_ts() {
         let (mut api, dir, tx, mut rx) = harness();
-        // スレッド内の**返信**にリアクション。replies が返す先頭は親とは限らないので、
-        // その ts(1.5)ではなく thread_ts(1.0)が台帳の鍵でなければならない
+        // A reaction on a **reply** inside a thread. The first entry replies returns is not necessarily the parent, so
+        // the ledger key must be thread_ts (1.0), not that ts (1.5)
         api.msgs = vec![FetchedMsg {
             ts: "1.5".into(),
             user: "U1".into(),
@@ -2628,7 +2626,7 @@ mod tests {
 
     #[tokio::test]
     async fn react_without_a_resolvable_root_skips_the_disposition() {
-        // 根引きが**失敗**したときだけ根が不明(現行も catch のときだけ undefined)
+        // Only when the root lookup **fails** is the root unknown
         let (mut api, dir, tx, mut rx) = harness();
         api.replies_fail = true;
         let args = serde_json::json!({"channel_id": "C1", "message_ts": "1.5", "emoji": "eyes"});
@@ -2641,7 +2639,7 @@ mod tests {
         );
     }
 
-    /// status / allow-bot が使う3種を trait 経由で踏む(実 API の形は E2E で確かめる)。
+    /// Exercise the three used by status / allow-bot through the trait (the real API's shape is checked in E2E).
     #[tokio::test]
     async fn lookup_apis_go_through_the_trait() {
         let api = FakeChat::default();
@@ -2664,16 +2662,16 @@ mod tests {
                 "bot_id U9"
             ],
         );
-        // 名前解決は best-effort — Slack が落ちても None で返る(Err にしない)
+        // Name resolution is best-effort — if Slack is down it returns None (not Err)
         assert_eq!(failing().channel_display_name("C1").await, None);
         assert!(failing().get_permalink("C1", "1").await.is_err());
     }
 
-    /// 文言は現行 Bun の原文をコピーしたもの — 切替日の見た目を変えないための固定。
-    /// 出典は各定数の doc コメント(…`)。
+    /// The wording is pinned so what users see does not change.
+    /// The source is each constant's doc comment.
     #[test]
     fn thinking_status_wording_is_pinned() {
-        // 三点リーダは U+2026 の1文字。ASCII の "..." に化けると見た目が変わる
+        // The ellipsis is the single character U+2026. Turning into ASCII "..." would change how it looks
         assert_eq!(TYPING_STATUS, "is typing\u{2026}");
         assert_eq!(THINKING_STATUS, "is thinking\u{2026}");
         assert_eq!(
@@ -2688,7 +2686,7 @@ mod tests {
         assert_eq!(Status::Restart.text(), "Restarting\u{2026}");
     }
 
-    /// 空文字がクリア(Slack の約束)。FakeChat は素通しで記録するだけ。
+    /// An empty string clears (Slack's contract). FakeChat just records it as is.
     #[tokio::test]
     async fn set_thinking_status_records_set_and_clear() {
         let api = FakeChat::default();
@@ -2718,7 +2716,7 @@ mod tests {
         );
     }
 
-    /// 実物の file_share イベント(画像だけ = text 無し)が落ちずに添付ごと通ること。
+    /// A real file_share event (image only = no text) gets through with its attachment instead of being dropped.
     #[test]
     fn normalize_keeps_a_text_less_file_share() {
         let ev: SlackMessageEvent = serde_json::from_str(
@@ -2738,7 +2736,7 @@ mod tests {
             [("F1", "shot.png"), ("F2", "F2")],
             "name が無ければ id を表示名に使う(劣化ノート用)"
         );
-        // 添付も本文も無ければ従来どおり落とす
+        // With neither attachment nor text, it is dropped as before
         let empty: SlackMessageEvent = serde_json::from_str(
             r#"{"type":"message","ts":"171.003","channel":"D1","channel_type":"im","user":"U1"}"#,
         )
@@ -2777,13 +2775,13 @@ mod tests {
 
     #[test]
     fn marks_bot_and_system_senders() {
-        // bot_id 付き
+        // with bot_id
         let m = message_of(&ev(
             r#"{"ts":"3.3","channel":"C1","user":"U1","bot_id":"B1","text":"echo"}"#,
         ))
         .expect("should normalize");
         assert!(m.is_bot, "bot_id present must mark is_bot");
-        // 送信者不明(システム)
+        // unknown sender (system)
         let m = message_of(&ev(r#"{"ts":"3.4","channel":"C1","text":"joined"}"#))
             .expect("normalize");
         assert!(m.is_bot, "missing user must mark is_bot");
