@@ -70,6 +70,16 @@ impl Default for SessionId {
     }
 }
 
+/// ワーカーの生存。Bridge の `Workers`(`bridge/worker.rs`)が facts から導く。
+///
+/// [`SpawnReq::state`] で実体に渡り、座席の確認(`Absent` 以外への spawn を断る)に使われる。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WorkerState {
+    Absent,
+    Starting,
+    Ready,
+}
+
 /// ワーカーを1本起こす要求。
 #[derive(Clone)]
 pub struct SpawnReq {
@@ -83,10 +93,7 @@ pub struct SpawnReq {
     /// 座席の窓名([`SessionId::window_name`] の規則)。改名されるので追跡には使わない。
     pub window: String,
     /// 座席の現状。`Absent` 以外への spawn は実体が拒否する(spawn を kill にしない)。
-    /// `WorkerState` は `bridge` の型 — 依存の向きの**唯一の例外**。座席チェックの
-    /// エラー文言が `{state:?}` を含むので型を伏せると文面が変わる(`bridge/state.rs` の
-    /// `WorkerState` の doc に同じ規約が書いてある)。
-    pub state: crate::bridge::inbound::WorkerState,
+    pub state: WorkerState,
     /// 実体に渡す hook 設定ファイルの絶対パス。
     pub hooks_file: String,
     /// このセッション用に書き出した MCP 設定ファイルの絶対パス。
@@ -157,34 +164,6 @@ impl Envelope {
              user_id=\"{}\" ts=\"{}\"{thread_ts}{files}{file_errors}{loop_guard}>\n{}\n</channel>",
             e.channel_id, e.message_id, e.user, e.user, e.ts, e.text
         )
-    }
-
-    /// 受信メッセージ → 封筒テキスト。`ts` は**配達時点**の now(`now_ms`)、`thread_ts` は解決済みの根
-    /// (現行`threadTs || msg.ts` を渡す)。
-    pub fn of(msg: &crate::bridge::inbound::InboundMsg, root_ts: &str, now_ms: u64) -> String {
-        Self::of_guarded(msg, root_ts, None, now_ms)
-    }
-
-    /// ループ遮断が立った配達だけ `loop_guard` を載せる(空文字 = 呼ぶ相手が居ない)。
-    pub fn of_guarded(
-        msg: &crate::bridge::inbound::InboundMsg,
-        root_ts: &str,
-        loop_guard: Option<String>,
-        now_ms: u64,
-    ) -> String {
-        Envelope {
-            loop_guard,
-            channel_id: msg.channel.clone(),
-            message_id: msg.ts.clone(),
-            user: msg.user.clone().unwrap_or_else(|| "unknown".to_string()),
-            ts: crate::bridge::state::iso8601(now_ms),
-            thread_ts: Some(root_ts.to_string()),
-            text: msg.text.clone(),
-            // 先読みダウンロードの結果はメッセージが持っている(queue 経由でも持ち越す)
-            file_paths: msg.file_paths.clone(),
-            file_errors: msg.file_errors.clone(),
-        }
-        .render()
     }
 }
 

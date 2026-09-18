@@ -10,7 +10,7 @@
 use super::screen::{Pane, SpawnOutcome, SpawnScreen, strip_modal_decoration};
 use super::tmux::{Pid, Tmux, Window, WindowRow};
 use super::{CompactOutcome, CompactProgress, LimitHit, LoginOutcome, ProbeErr, SpawnReq};
-use crate::bridge::inbound::WorkerState;
+use crate::agent::WorkerState;
 use crate::bridge::state::{LogCtx, StateDir, ThreadKey, WallClock};
 use std::time::Duration;
 

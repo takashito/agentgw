@@ -9,13 +9,13 @@
 use crate::agent::screen::SpawnOutcome;
 use crate::agent::tmux::{self as tmux_mod, Pid, Window};
 use crate::agent::{SessionId, SpawnReq};
-use crate::bridge::{inbound, worker};
+use crate::bridge::worker;
 use crate::bridge::state as bridge;
 use crate::bridge::state::LogCtx;
 use crate::bridge::{Bridge, CmdFx, Host};
 use crate::{mcp, slack};
 use crate::ports::AgentPort;
-use crate::bridge::inbound::WorkerState;
+use crate::agent::WorkerState;
 use crate::bridge::state::{PoolKey, ThreadEntry, ThreadKey};
 use std::collections::{HashMap, HashSet};
 
@@ -690,7 +690,7 @@ impl Bridge {
                 resume_from: nominated.clone().map(SessionId::from),
                 window: SessionId::from(sid.clone()).window_name(),
                 // ここに来た時点で在庫は居ない = 窓も無い
-                state: inbound::WorkerState::Absent,
+                state: crate::agent::WorkerState::Absent,
                 hooks_file: self.hooks_file.clone(),
                 mcp_config: mcp,
             }) {
@@ -1137,7 +1137,7 @@ impl Bridge {
         message_id: &str,
         key: &ThreadKey,
         ctx: &LogCtx,
-    ) {
+    ) -> Result<(), String> {
         let sid = claimed.session_id.clone();
         let ctx = LogCtx {
             session_id: Some(sid.clone()),
@@ -1170,7 +1170,7 @@ impl Bridge {
             .workers
             .window_of(&sid)
             .unwrap_or_else(|| SessionId::from(sid.clone()).window_name());
-        match self.deps.agent.deliver(&Window::of(&target), envelope) {
+        let delivered = match self.deps.agent.deliver(&Window::of(&target), envelope) {
             // Dispatch::Deliver と同型の配達記録。
             // このパスは新規スレッドの割当てなので new は常に true
             Ok(()) => {
@@ -1183,15 +1183,21 @@ impl Bridge {
                 );
                 // Dispatch::Deliver と同じ — 渡した瞬間に shimmer を出す
                 self.touch_thread(key, slack::TYPING_STATUS);
+                Ok(())
             }
-            Err(e) => ctx.error("bridge", &format!("delivery failed: {e}")),
-        }
+            // 渡せなかった1通は呼び手が持ち直す(元のメッセージを持っているのは呼び手)
+            Err(e) => {
+                ctx.error("bridge", &format!("delivery failed: {e} — queued for retry"));
+                Err(e)
+            }
+        };
 
         // 補充で起動するのは別セッション — 割当てた session_id を引きずらせない
         self.start_missing_pool_workers(&LogCtx {
             session_id: None,
             thread_key: ctx.thread_key.clone(),
         });
+        delivered
     }
 
     /// 起動直後の窓を見張る背景タスクを起こす。**spawn した直後に必ず呼ぶ** —

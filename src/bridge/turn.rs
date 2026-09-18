@@ -2,7 +2,7 @@
 //! failure of a turn, the usage-limit watch, the silence watch, tool permission prompts,
 //! and writing the progress message.
 
-use super::{Bridge, Host, inbound};
+use super::{Bridge, Host};
 use crate::agent::tmux::Window;
 use crate::agent::{HookEvent, ProbeErr, SessionId};
 use crate::bridge::state as bridge;
@@ -284,7 +284,7 @@ impl Bridge {
             .map(|s| SessionId::from(s.to_string()).window_name())
             .unwrap_or_default();
         let state = self.workers.state_of(entry.as_ref(), &window, self.deps.agent.as_ref());
-        if state != inbound::WorkerState::Ready {
+        if state != crate::agent::WorkerState::Ready {
             ctx.info(
                 "bridge",
                 &format!(

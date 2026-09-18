@@ -1353,4 +1353,51 @@ mod tests {
         let notice = crate::bridge::render::Notice::Limited { until_ms }.render();
         assert_eq!(slack.calls(), vec![format!("post C1 {ROOT} {notice}")]);
     }
+
+    /// A new thread handed to a warm pool agent whose delivery fails is not lost: it waits in
+    /// the queue for the retry, and the person is told (same as a failed delivery to a running
+    /// thread).
+    #[tokio::test]
+    async fn a_failed_delivery_to_a_pool_agent_is_kept_and_reported() {
+        use crate::agent::{SessionId, SpawnReq};
+        use crate::ports::AgentPort;
+        let (d, slack, agent, _clock) = flow_deps("pool-fail");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let sid = "pool-sid".to_string();
+        let home = Host::home();
+        let req = SpawnReq {
+            session_id: SessionId::from(sid.clone()),
+            cwd: home.clone(),
+            prompt: None,
+            resume_from: None,
+            window: SessionId::from(sid.clone()).window_name(),
+            state: crate::agent::WorkerState::Absent,
+            hooks_file: String::new(),
+            mcp_config: String::new(),
+        };
+        let w = agent.spawn(&req).unwrap();
+        b.workers.insert_pool(
+            bridge::PoolKey::of_cwd(&home),
+            worker::PoolWorker { session_id: sid.clone(), spawned_at_ms: 0, cwd: home, resumed: false },
+        );
+        let warm = b.workers.warm_mut(&sid);
+        warm.mcp_ready = true;
+        warm.window_id = Some(w.as_str().to_string());
+        agent.fail_deliver.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        b.on_inbound(&channel_msg("1.0", "U_OWNER", "<@U_BOT> start")).await;
+
+        assert_eq!(
+            b.threads.get("1.0").and_then(|e| e.agent_id.clone()).as_deref(),
+            Some("pool-sid"),
+            "the thread went to the warm pool agent"
+        );
+        assert_eq!(b.pending.get("1.0").map(Vec::len), Some(1), "the message waits for the retry");
+        settle().await;
+        assert!(
+            slack.calls().iter().any(|c| c.contains("Couldn't hand this to the agent")),
+            "{:?}",
+            slack.calls()
+        );
+    }
 }

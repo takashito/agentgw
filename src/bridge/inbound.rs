@@ -7,7 +7,7 @@
 use super::{Bridge, Host};
 use crate::bridge::turn::Stall;
 use crate::agent::tmux::Window;
-use crate::agent::{Envelope, SessionId, SpawnReq};
+use crate::agent::{Envelope, SessionId, SpawnReq, WorkerState};
 use crate::bridge::state as bridge;
 use crate::bridge::state::{Access, LogCtx, ThreadEntry, ThreadKey};
 use crate::bridge::{inbound, worker};
@@ -75,6 +75,29 @@ pub struct InboundMsg {
 }
 
 impl InboundMsg {
+    /// この1通 → エージェントに渡す封筒テキスト。`ts` は**配達時点**の now(`now_ms`)、
+    /// `thread_ts` は解決済みの根(現行`threadTs || msg.ts` を渡す)。
+    pub fn envelope(&self, root_ts: &str, now_ms: u64) -> String {
+        self.envelope_guarded(root_ts, None, now_ms)
+    }
+
+    /// ループ遮断が立った配達だけ `loop_guard` を載せる(空文字 = 呼ぶ相手が居ない)。
+    pub fn envelope_guarded(&self, root_ts: &str, loop_guard: Option<String>, now_ms: u64) -> String {
+        Envelope {
+            loop_guard,
+            channel_id: self.channel.clone(),
+            message_id: self.ts.clone(),
+            user: self.user.clone().unwrap_or_else(|| "unknown".to_string()),
+            ts: crate::bridge::state::iso8601(now_ms),
+            thread_ts: Some(root_ts.to_string()),
+            text: self.text.clone(),
+            // 先読みダウンロードの結果はメッセージが持っている(queue 経由でも持ち越す)
+            file_paths: self.file_paths.clone(),
+            file_errors: self.file_errors.clone(),
+        }
+        .render()
+    }
+
     /// Slack の message イベント → Bridge の語彙。返信できない形(中身も添付も無い・channel 無し)は None。
     /// Slack の push イベントを Bridge の語彙へ。落とすべきものは None。
     pub(crate) fn from_event(ev: &SlackMessageEvent) -> Option<InboundMsg> {
@@ -438,17 +461,6 @@ pub enum GateVerdict {
     /// 渡す(返事は期待しない)。落とすとスレッドの会話が歯抜けになる。
     Context,
     Drop(&'static str),
-}
-
-/// ワーカーの生存。`bridge/worker.rs` の `Workers` が facts から導く。
-///
-/// `agent::SpawnReq` もこの型を借りている — 依存の向きの唯一の例外(座席チェックの
-/// エラー文言が `{state:?}` を含むため)。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum WorkerState {
-    Absent,
-    Starting,
-    Ready,
 }
 
 /// 門を通った1通をどう捌くか — 「起こす / 再開する / 渡す / 溜める」の4通りしかない。
@@ -1008,7 +1020,7 @@ impl Bridge {
             .and_then(|sid| self.workers.warm(sid))
             .and_then(|h| h.window_id.clone())
             .unwrap_or_else(|| window.clone());
-        let envelope = Envelope::of_guarded(msg, &root_ts, loop_guard, self.deps.clock.now_ms());
+        let envelope = msg.envelope_guarded(&root_ts, loop_guard, self.deps.clock.now_ms());
         // ターン失敗の再送に要る。`track` は ack の直後(封筒がまだ無い時点)なので、
         // 封筒ができた**ここ**で台帳に預ける — これより下の配達経路は全部この後ろ
         self.ledger.remember_envelope(&key, &msg.ts, &envelope);
@@ -1021,7 +1033,7 @@ impl Bridge {
             if let Some(claimed) = self.claim_pool_worker(&key_pool) {
                 // SpawnNew と同じ話題の取り方(trim して頭 60 文字 — 文字単位)
                 let topic: String = msg.text.trim().chars().take(60).collect();
-                self.assign_pool_worker(
+                let assigned = self.assign_pool_worker(
                     claimed,
                     &root_ts,
                     &msg.channel,
@@ -1032,6 +1044,18 @@ impl Bridge {
                     &key,
                     &ctx(None),
                 );
+                // Dispatch::Deliver の失敗と同じ扱い: 取っておいて、待っている人に言う
+                if let Err(e) = assigned {
+                    self.pending
+                        .entry(root_ts.clone())
+                        .or_default()
+                        .push(msg.clone());
+                    self.post_error_frame(
+                        msg.channel.clone(),
+                        root_ts.clone(),
+                        crate::t!("Couldn't hand this to the agent: {e}", "エージェントに渡せませんでした: {e}"),
+                    );
+                }
                 return;
             }
         }
@@ -1215,7 +1239,7 @@ impl Bridge {
                 }
             ),
         );
-        let envelope = Envelope::of(&notice, root_ts, self.deps.clock.now_ms());
+        let envelope = notice.envelope(root_ts, self.deps.clock.now_ms());
         if let Err(e) = self.deps.agent.deliver(&Window::of(&target), &envelope) {
             ctx.error("bridge", &format!("message_changed delivery failed: {e}"));
             return;
@@ -1329,7 +1353,7 @@ impl Bridge {
         });
         match target {
             Some(w) => {
-                let envelope = Envelope::of(msg, root_ts, self.deps.clock.now_ms());
+                let envelope = msg.envelope(root_ts, self.deps.clock.now_ms());
                 match self.deps.agent.deliver(&Window::of(&w), &envelope) {
                     Ok(()) => ctx.info(
                         "bridge",
@@ -1578,7 +1602,7 @@ impl Bridge {
             let window = SessionId::from(sid.clone()).window_name();
             // 聞こえる相手にだけ押す。Starting の分は user_prompt が流す道が生きている
             if self.workers.state_of(entry.as_ref(), &window, self.deps.agent.as_ref())
-                != inbound::WorkerState::Ready
+                != crate::agent::WorkerState::Ready
             {
                 continue;
             }
@@ -1609,7 +1633,7 @@ impl Bridge {
         let mut delivered = false;
         let mut i = 0;
         while i < queued.len() {
-            let text = Envelope::of(&queued[i], &root_ts, self.deps.clock.now_ms());
+            let text = queued[i].envelope(&root_ts, self.deps.clock.now_ms());
             match self.deps.agent.deliver(&Window::of(&window), &text) {
                 Ok(()) => {
                     ctx.info("bridge", "flushed queued message");

@@ -390,6 +390,8 @@ pub mod fake {
         pub delivered: Mutex<Vec<(String, String)>>,
         /// Window ids that got an interrupt (Escape).
         pub interrupted: Mutex<Vec<String>>,
+        /// When set, `deliver` fails the way a window with an open dialog does.
+        pub fail_deliver: std::sync::atomic::AtomicBool,
         windows: Mutex<Vec<WindowRow>>,
         next: AtomicU64,
     }
@@ -409,6 +411,9 @@ pub mod fake {
             Ok(Window::of(&id))
         }
         fn deliver(&self, w: &Window, text: &str) -> Result<(), String> {
+            if self.fail_deliver.load(Ordering::SeqCst) {
+                return Err(format!("{w}: a dialog is open"));
+            }
             self.delivered
                 .lock()
                 .unwrap()
