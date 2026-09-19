@@ -226,7 +226,7 @@ impl Bridge {
     /// The person was told why this turn produced no reply — that is the thread's answer.
     /// Settle it: otherwise the unanswered messages keep the silence watchdog armed and
     /// "is thinking…" stays up on a turn that is already over.
-    fn settle_told(&mut self, key: &ThreadKey) {
+    pub(super) fn settle_told(&mut self, key: &ThreadKey) {
         // Dropping the entry clears the status (slack::Thinking's Drop)
         self.stall.remove(key);
         self.ledger.dispose_all(key);

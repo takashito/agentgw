@@ -1689,6 +1689,75 @@ mod tests {
         assert!(b.ledger.pending(&ThreadKey::new("C1", ROOT)).is_empty());
     }
 
+    /// An agent that exits before it reads its first message (a start-up screen it couldn't pass, a
+    /// crash) must not leave the thread silent. The next message starts a fresh agent: the session
+    /// never began, so there is nothing to resume.
+    #[tokio::test]
+    async fn an_agent_that_exits_before_its_first_message_is_reported() {
+        use crate::agent::{Agent, SpawnOutcome, Window};
+        let (d, slack, agent, _clock) = flow_deps("exit-before-prompt");
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.on_inbound(&channel_msg(ROOT, "U_OWNER", "<@U_BOT> fix the tests")).await;
+        let sid = agent.spawned.lock().unwrap()[0].session_id.as_str().to_string();
+        agent.terminate(&Window::of("@0")).unwrap(); // the window is gone
+        let key = ThreadKey::new("C1", ROOT);
+        b.on_cmd_fx(CmdFx::SpawnScreen {
+            outcome: SpawnOutcome::Exited,
+            what: format!("thread={key}"),
+            key: Some(key.clone()),
+            session_id: sid,
+        })
+        .await;
+        settle().await;
+        assert!(
+            slack.calls().iter().any(|c| c.contains("stopped before it could read")),
+            "{:?}",
+            slack.calls()
+        );
+        assert!(b.ledger.pending(&key).is_empty());
+        b.on_inbound(&in_thread("1782000000.000200", "again")).await;
+        let spawned = agent.spawned.lock().unwrap();
+        assert_eq!(spawned.len(), 2, "a new agent for the next message");
+        assert!(spawned[1].resume_from.is_none(), "nothing to resume");
+    }
+
+    /// A window that is still there when the watch loses sight of it (a tmux hiccup) is not an exit.
+    #[tokio::test]
+    async fn a_live_agent_is_not_reported_as_exited() {
+        use crate::agent::SpawnOutcome;
+        let (d, slack, agent, _clock) = flow_deps("exit-but-alive");
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.on_inbound(&channel_msg(ROOT, "U_OWNER", "<@U_BOT> fix the tests")).await;
+        let sid = agent.spawned.lock().unwrap()[0].session_id.as_str().to_string();
+        let key = ThreadKey::new("C1", ROOT);
+        b.on_cmd_fx(CmdFx::SpawnScreen {
+            outcome: SpawnOutcome::Exited,
+            what: format!("thread={key}"),
+            key: Some(key.clone()),
+            session_id: sid,
+        })
+        .await;
+        settle().await;
+        assert!(!slack.calls().iter().any(|c| c.contains("stopped before")), "{:?}", slack.calls());
+        assert!(!b.ledger.pending(&key).is_empty());
+    }
+
+    /// When the agent can't even be started, the person is told the same way.
+    #[tokio::test]
+    async fn a_failed_spawn_is_reported() {
+        let (d, slack, agent, _clock) = flow_deps("spawn-fails");
+        agent.fail_spawn.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.on_inbound(&channel_msg(ROOT, "U_OWNER", "<@U_BOT> fix the tests")).await;
+        settle().await;
+        assert!(
+            slack.calls().iter().any(|c| c.contains("stopped before it could read")),
+            "{:?}",
+            slack.calls()
+        );
+        assert!(b.ledger.pending(&ThreadKey::new("C1", ROOT)).is_empty());
+    }
+
     #[tokio::test]
     async fn login_on_a_signed_out_machine_starts_the_sign_in_here() {
         let (d, slack, agent, _clock) = flow_deps("login-signed-out");

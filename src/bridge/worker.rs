@@ -717,7 +717,7 @@ impl Bridge {
                 mcp_config: mcp,
             }) {
                 Ok(window) => {
-                    self.start_spawn_screen_watch(&window, format!("pool session={sid}"), &ctx);
+                    self.start_spawn_screen_watch(&window, format!("pool session={sid}"), None, &sid, &ctx);
                     Some(window.as_str().to_string())
                 }
                 Err(e) => {
@@ -1224,19 +1224,29 @@ impl Bridge {
 
     /// Starts a background task watching the window right after startup. **Always call right after spawn** —
     /// this is the only responder, and there is no other startup deadline (`Claude::watch_spawn_screens`).
-    fn start_spawn_screen_watch(&self, w: &Window, what: String, ctx: &LogCtx) {
+    fn start_spawn_screen_watch(
+        &self,
+        w: &Window,
+        what: String,
+        key: Option<ThreadKey>,
+        session_id: &str,
+        ctx: &LogCtx,
+    ) {
         let (tx, w, ctx) = (self.cmd_tx.clone(), w.clone(), ctx.clone());
+        let session_id = session_id.to_string();
         let agent = self.deps.agent.clone();
         tokio::spawn(async move {
             let out = agent
                 .watch_spawn_screens(&w, SPAWN_SCREEN_BUDGET_MS, SPAWN_SCREEN_POLL_MS, &ctx)
                 .await;
-            // Windows that start normally come here every time — only a rejection is worth waking main for
+            // Windows that start normally come here every time — only a rejection or an exit is worth waking main for
             if matches!(
                 out,
-                SpawnOutcome::LoginRequired | SpawnOutcome::UsageLimited
+                SpawnOutcome::LoginRequired | SpawnOutcome::UsageLimited | SpawnOutcome::Exited
             ) {
-                let _ = tx.send(CmdFx::SpawnScreen { outcome: out, what }).await;
+                let _ = tx
+                    .send(CmdFx::SpawnScreen { outcome: out, what, key, session_id })
+                    .await;
             }
         });
     }
@@ -1244,7 +1254,7 @@ impl Bridge {
     pub(super) fn spawn_worker(&mut self, req: &SpawnReq, key: &ThreadKey, ctx: &LogCtx, sid: &str) {
         match self.deps.agent.spawn(req) {
             Ok(window) => {
-                self.start_spawn_screen_watch(&window, format!("thread={key}"), ctx);
+                self.start_spawn_screen_watch(&window, format!("thread={key}"), Some(key.clone()), sid, ctx);
                 let id = window.as_str().to_string();
                 // Window names can be renamed, so track by this window_id from now on
                 self.workers.warm_mut(sid).window_id = Some(id.clone());
@@ -1253,8 +1263,47 @@ impl Bridge {
                 ctx.debug("bridge", &format!("spawned window={id}"));
                 self.milestone(Some(key), "spawn", ctx);
             }
-            Err(e) => ctx.error("bridge", &format!("spawn failed: {e}")),
+            Err(e) => {
+                ctx.error("bridge", &format!("spawn failed: {e}"));
+                self.agent_never_started(key, sid, ctx);
+            }
         }
+    }
+
+    /// The agent for `key` stopped before it read its first message, or never started. Say so in the
+    /// thread and settle it — otherwise the message sits under 👀 with nobody to answer it. A session
+    /// that never began is dropped from the thread, so the next message starts a fresh agent instead
+    /// of resuming a conversation that doesn't exist (which would exit at once, just as silently).
+    pub(super) fn agent_never_started(&mut self, key: &ThreadKey, sid: &str, ctx: &LogCtx) {
+        self.workers.clear_starting(sid);
+        let (channel, root) = key.split();
+        let Some(root_ts) = root else { return };
+        if !self.deps.agent.session_history_exists(None, sid)
+            && let Some(mut e) = self.threads.get(&root_ts).cloned()
+            && e.agent_id.as_deref() == Some(sid)
+        {
+            e.agent_id = None;
+            self.threads.upsert(&root_ts, e);
+            if let Err(err) = self.threads.save() {
+                ctx.error("bridge", &format!("threads.json save failed: {err}"));
+            }
+        }
+        // Messages queued behind the start-up would wait for a first turn that never comes
+        self.pending.remove(&root_ts);
+        self.settle_told(key);
+        ctx.error(
+            "bridge",
+            &format!("agent session={sid} stopped before its first message — told {key}"),
+        );
+        let machine = &self.machine_name;
+        self.post_error_frame(
+            channel,
+            root_ts,
+            crate::t!(
+                "Claude Code on *{machine}* stopped before it could read this message, so no reply was written. Send it again.",
+                "*{machine}* の Claude Code が、このメッセージを読む前に止まったため、返信を書けませんでした。もう一度送ってください。"
+            ),
+        );
     }
 }
 

@@ -1174,9 +1174,40 @@ impl Bridge {
                     &key,
                 );
             }
-            CmdFx::SpawnScreen { outcome, what } => {
+            CmdFx::SpawnScreen { outcome, what, key, session_id } => {
                 let ctx = LogCtx::default();
                 match outcome {
+                    // Only news while the agent never took its first message. One that started and later
+                    // exited is someone else's story (exit / logout / the recovery paths), and a window the
+                    // watch merely lost sight of (the process is still there) isn't an exit at all
+                    SpawnOutcome::Exited => {
+                        let window = self
+                            .workers
+                            .warm(&session_id)
+                            .and_then(|h| h.window_id.clone());
+                        let name = crate::agent::SessionId::from(session_id.clone()).window_name();
+                        let gone = self.deps.agent.pid_of(window.as_deref(), &name).is_none();
+                        if !self.workers.is_starting(&session_id) || !gone {
+                            return;
+                        }
+                        match key {
+                            Some(key) => {
+                                let ctx = LogCtx {
+                                    session_id: Some(session_id.clone()),
+                                    thread_key: Some(key.clone()),
+                                };
+                                self.agent_never_started(&key, &session_id, &ctx);
+                            }
+                            // A warm pool agent: nobody is waiting on it. Refilling the pool is its own job
+                            None => {
+                                self.workers.clear_starting(&session_id);
+                                ctx.error(
+                                    "bridge",
+                                    &format!("{what} exited before its first message (nobody waiting)"),
+                                );
+                            }
+                        }
+                    }
                     // The pane is only a **suspicion**. Confirming it is the existing /usage watch's job,
                     // so just move its deadline into the past so the next flush checks. **Never use 0** —
                     // `usage_tick` uses it as the "first run, wait a bit" signal, so writing 0 not only

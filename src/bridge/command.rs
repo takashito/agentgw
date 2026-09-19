@@ -533,6 +533,9 @@ pub(super) enum CmdFx {
         outcome: SpawnOutcome,
         /// Who to name in the log (`thread=…` / `pool session=…`)
         what: String,
+        /// The thread waiting on this agent. None for a warm pool agent (nobody is waiting yet)
+        key: Option<ThreadKey>,
+        session_id: String,
     },
 }
 

@@ -163,6 +163,9 @@ pub enum SpawnOutcome {
     UsageLimited,
     /// Nothing showed up before the deadline. **Not a failure**: a window that started normally looks like this
     NoScreen,
+    /// The window went away while being watched. Whether that matters (did the agent ever take its
+    /// first message?) is the caller's call — this only says the window is gone
+    Exited,
 }
 
 /// The session identifier of one agent.
@@ -554,6 +557,8 @@ pub mod fake {
         pub signed_in: Mutex<Option<Option<bool>>>,
         /// Sign-in codes handed to `login_submit_code`.
         pub submitted_codes: Mutex<Vec<String>>,
+        /// When set, `spawn` fails (the agent can't be started at all).
+        pub fail_spawn: std::sync::atomic::AtomicBool,
         windows: Mutex<Vec<WindowRow>>,
         next: AtomicU64,
     }
@@ -561,6 +566,9 @@ pub mod fake {
     #[async_trait]
     impl Agent for FakeAgent {
         fn spawn(&self, req: &SpawnReq) -> Result<Window, String> {
+            if self.fail_spawn.load(Ordering::SeqCst) {
+                return Err("tmux: no server running".into());
+            }
             let n = self.next.fetch_add(1, Ordering::SeqCst);
             let id = format!("@{n}");
             self.spawned.lock().unwrap().push(req.clone());

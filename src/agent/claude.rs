@@ -503,7 +503,7 @@ impl Claude {
                 Ok(pane) => pane,
                 Err(e) => {
                     ctx.info("spawn", &format!("{w}: window is gone ({e}) — ending the watch"));
-                    break;
+                    return SpawnOutcome::Exited;
                 }
             };
             match Pane::new(&pane).spawn_screen() {
@@ -2345,7 +2345,7 @@ mod tests {
         let out = c
             .watch_spawn_screens(&Window::of("1-1"), 2_000, 1, &LogCtx::default())
             .await;
-        assert_eq!(out, SpawnOutcome::NoScreen);
+        assert_eq!(out, SpawnOutcome::Exited, "the caller is told the window went away");
         assert_eq!(captures.load(std::sync::atomic::Ordering::SeqCst), 1, "one failed read is enough");
     }
 
