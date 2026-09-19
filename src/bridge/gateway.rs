@@ -1101,20 +1101,22 @@ pub enum RouteOutcome {
 /// leaves the reader unsure where messages written there go.
 pub fn route_table(here: &str, routes: &Routes, connected: &[String], self_id: &str) -> String {
     let online = |id: &str| connected.iter().any(|c| c == id);
+    // Channel rows only flag trouble: a row per channel all marked 🟢 is noise (the machines line
+    // at the bottom already shows who is up)
     let mark = |id: &str| {
         if online(id) {
-            "🟢".to_string()
+            String::new()
         } else {
-            crate::t!("🔴 offline", "🔴 オフライン")
+            crate::t!(" 🔴 offline", " 🔴 オフライン")
         }
     };
     // One destination in a few words (the gateway if nobody is assigned)
     let dest = |id: Option<&String>| match id {
-        Some(id) => format!("*{id}* {}", mark(id)),
+        Some(id) => format!("*{id}*{}", mark(id)),
         None => {
             let m = mark(self_id);
             crate::t!(
-                "not assigned — the gateway *{self_id}* handles it {m}",
+                "not assigned — the gateway *{self_id}* handles it{m}",
                 "未設定(ゲートウェイの *{self_id}* が受け持ちます){m}"
             )
         }
@@ -3397,7 +3399,7 @@ mod tests {
         };
         // The channel it was typed in comes first
         assert!(
-            reply.starts_with("*This channel (<#C1>)*: *desktop* 🟢"),
+            reply.starts_with("*This channel (<#C1>)*: *desktop*\n"),
             "{reply}"
         );
         // Other channels. A channel whose machine isn't here says offline
@@ -3428,10 +3430,12 @@ mod tests {
             panic!("{got:?}")
         };
         assert!(
-            reply.starts_with("*This channel (<#C9>)*: not assigned — the gateway *vps* handles it 🟢"),
+            reply.starts_with("*This channel (<#C9>)*: not assigned — the gateway *vps* handles it\n"),
             "{reply}"
         );
-        assert!(reply.contains("• <#C1> → *desktop* 🟢"), "{reply}");
+        assert!(reply.contains("• <#C1> → *desktop*\n"), "{reply}");
+        // Channel rows carry no 🟢 — only the machines line does
+        assert_eq!(reply.matches('🟢').count(), 2, "{reply}");
     }
 
     #[test]
