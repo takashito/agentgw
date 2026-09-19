@@ -95,11 +95,11 @@ pub struct Bridge {
     usage_warned_pct: u32,
     /// The silence watch (`armWatchdog` / `showStall`). `thread_key` → [`Stall`].
     stall: HashMap<ThreadKey, Stall>,
-    /// Whether this has a port for machines to connect to. Only used to decide whether `help` shows the `route` section
+    /// Whether this has a port for machines to connect to. Only used to decide whether `help` shows the machine commands
     /// (running it is `relay::CommandCtx::route`. Listing it on a machine without one leaves
     /// nobody to route to).
     fleet: bool,
-    /// This machine's name as the gateway knows it (`route <name>`); the hostname if unset.
+    /// This machine's name as the gateway knows it (`pwd <name>`); the hostname if unset.
     machine_name: String,
 }
 
@@ -438,6 +438,13 @@ impl Bridge {
         // connecting and auth.test look like "posted before start-up" and are silently dropped
         let started_at_ms = Host::now_ms();
 
+        let machine_name = match wiring.self_id.clone() {
+            Some(id) if !id.is_empty() => id,
+            _ => Host::name().await,
+        };
+        // Answers this machine sends up the link (only `pwd <machine>:<path>` has one)
+        let (up_tx, up_rx) = mpsc::unbounded_channel();
+        let uplink: machine::Uplink = Arc::new(tokio::sync::Mutex::new(up_rx));
         // Via Relay the bot token **comes in the handshake**, so the Api can only be built after it.
         // This is the only ordering difference from a direct connection.
         let (bot_token, link_home, relay_rx) = match &mode {
@@ -448,7 +455,7 @@ impl Bridge {
                 bridge_id,
             } => {
                 let (tx, mut rx) = mpsc::channel(64);
-                let l = Arc::new(machine::RelayLink::new(url, api_token, bridge_id));
+                let l = Arc::new(machine::RelayLink::new(url, api_token, bridge_id, uplink.clone()));
                 tokio::spawn({
                     let l = l.clone();
                     async move { l.run(tx).await }
@@ -486,6 +493,7 @@ impl Bridge {
                 let inlet = Arc::new(machine::GatewayInlet {
                     token: listen.token,
                     tx,
+                    up: uplink.clone(),
                 });
                 tokio::spawn(inlet.serve(listen.addr));
                 let (token, home) = loop {
@@ -628,12 +636,18 @@ impl Bridge {
             // Via the gateway (whether we dial or it comes to fetch us). **Fed into the same two
             // channels**, so not one line downstream changes
             (machine::Mode::Relay { .. } | machine::Mode::AwaitParent, Some(mut rx)) => {
-                let dir2 = dir.clone();
-                let reload = reload_tx.clone();
-                let relink = relink_tx.clone();
+                let sinks = RelaySinks {
+                    msg_tx,
+                    click_tx,
+                    dir: dir.clone(),
+                    reload: reload_tx.clone(),
+                    relink: relink_tx.clone(),
+                    up: up_tx.clone(),
+                    machine: machine_name.clone(),
+                };
                 tokio::spawn(async move {
                     while let Some(item) = rx.recv().await {
-                        pump_relay(item, &msg_tx, &click_tx, &dir2, &reload, &relink).await;
+                        pump_relay(item, &sinks).await;
                     }
                 });
             }
@@ -679,10 +693,7 @@ impl Bridge {
                 bot_user_id,
                 started_at_ms,
                 fleet: fleet.is_some(),
-                machine_name: match wiring.self_id.clone() {
-                    Some(id) if !id.is_empty() => id,
-                    _ => Host::name().await,
-                },
+                machine_name: machine_name.clone(),
                 cmd_tx,
             },
         );
@@ -871,14 +882,27 @@ fn adopt_home(dir: &crate::state_dir::StateDir, home: Option<String>) -> bool {
     true
 }
 
-async fn pump_relay(
-    item: machine::FromRelay,
-    msg_tx: &mpsc::Sender<InboundMsg>,
-    click_tx: &mpsc::Sender<slack::PermClick>,
-    dir: &crate::state_dir::StateDir,
-    reload: &mpsc::Sender<()>,
-    relink: &mpsc::Sender<()>,
-) {
+/// Where [`pump_relay`] hands things on, and who this machine is (for the words it answers with).
+struct RelaySinks {
+    msg_tx: mpsc::Sender<InboundMsg>,
+    click_tx: mpsc::Sender<slack::PermClick>,
+    dir: crate::state_dir::StateDir,
+    reload: mpsc::Sender<()>,
+    relink: mpsc::Sender<()>,
+    up: mpsc::UnboundedSender<crate::bridge::gateway::link::LinkFrame>,
+    machine: String,
+}
+
+async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
+    let RelaySinks {
+        msg_tx,
+        click_tx,
+        dir,
+        reload,
+        relink,
+        up,
+        machine,
+    } = sinks;
     match item {
         machine::FromRelay::Event { name, event } => {
             if let Some(msg) = slack::inbound_from_relay(&name, &event)
@@ -924,6 +948,42 @@ async fn pump_relay(
                     let _ = reload.send(()).await;
                 }
             }
+        }
+        // `pwd <this machine>:<path>`. Only this machine can see its folders, so the gateway waits for this
+        // answer before handing the channel over — a folder that isn't there changes nothing
+        machine::FromRelay::SetProject {
+            channel,
+            thread_ts,
+            path,
+        } => {
+            let abs = bridge::absolute_project_path(&path, &Host::home());
+            let result = if !std::path::Path::new(&abs).is_dir() {
+                Err(bridge::no_such_folder(&abs, machine))
+            } else {
+                let op = bridge::AccessOp::SetRepo {
+                    channel: channel.clone(),
+                    path: abs.clone(),
+                };
+                match bridge::Access::load(dir).apply(op) {
+                    Ok((next, ..)) => match next.save(dir) {
+                        Ok(()) => {
+                            let _ = reload.send(()).await;
+                            Ok(abs)
+                        }
+                        Err(e) => Err(format!("could not save access.json: {e}")),
+                    },
+                    Err(e) => Err(e),
+                }
+            };
+            LogCtx::default().info(
+                "bridge",
+                &format!("remote link: project for {channel} — {result:?}"),
+            );
+            let _ = up.send(crate::bridge::gateway::link::LinkFrame::ProjectSet {
+                channel,
+                thread_ts,
+                result,
+            });
         }
         // Getting here means the link has been given up. **Don't touch the agents** — running ones
         // keep running. New Slack messages just stop coming until a person fixes the config and restarts
@@ -1179,6 +1239,45 @@ mod tests {
     /// A machine told "you're in charge" by the gateway not only writes access.json but **also sends the reread signal**.
     /// Without it the running gate keeps an empty Owner and drops every later delivery as `no-owner`
     /// (2026-08-02 on a real machine. Dropped at the door, so even the fixing command couldn't get in; only a restart got out).
+    /// `pwd <this machine>:<path>`: a folder that's there is stored (absolute) and the answer goes up;
+    /// one that isn't changes nothing and says why.
+    #[tokio::test]
+    async fn a_machine_checks_and_stores_the_project_it_is_given() {
+        let base = std::env::temp_dir().join(format!("sc-setproject-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = crate::state_dir::StateDir::at(base.join("state"));
+        std::fs::create_dir_all(base.join("proj")).unwrap();
+        let (msg_tx, _msg_rx) = mpsc::channel(4);
+        let (click_tx, _click_rx) = mpsc::channel(4);
+        let (reload, mut reload_rx) = mpsc::channel(4);
+        let (relink, _relink_rx) = mpsc::channel(4);
+        let (up, mut up_rx) = mpsc::unbounded_channel();
+        let sinks = RelaySinks { msg_tx, click_tx, dir: dir.clone(), reload, relink, up, machine: "desk".into() };
+        let ask = |path: &str| machine::FromRelay::SetProject {
+            channel: "C1".into(),
+            thread_ts: "1.1".into(),
+            path: path.into(),
+        };
+        let proj = base.join("proj").to_string_lossy().to_string();
+
+        pump_relay(ask(&format!("{proj}/")), &sinks).await;
+        let crate::bridge::gateway::link::LinkFrame::ProjectSet { result, .. } = up_rx.try_recv().unwrap() else {
+            panic!("an answer goes up")
+        };
+        assert_eq!(result, Ok(proj.clone()));
+        assert_eq!(bridge::Access::load(&dir).repo_path("C1", "/h").0, proj, "stored");
+        assert_eq!(reload_rx.try_recv(), Ok(()), "the running Bridge rereads it");
+
+        let missing = base.join("nope").to_string_lossy().to_string();
+        pump_relay(ask(&missing), &sinks).await;
+        let crate::bridge::gateway::link::LinkFrame::ProjectSet { result, .. } = up_rx.try_recv().unwrap() else {
+            panic!("an answer goes up")
+        };
+        assert!(result.as_ref().is_err_and(|e| e.contains(&missing) && e.contains("*desk*")), "{result:?}");
+        assert_eq!(bridge::Access::load(&dir).repo_path("C1", "/h").0, proj, "unchanged");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[tokio::test]
     async fn being_put_in_charge_asks_the_running_bridge_to_reread_access() {
         let dir = crate::state_dir::StateDir::at(
@@ -1190,17 +1289,23 @@ mod tests {
         let (reload_tx, mut reload_rx) = mpsc::channel(4);
         let (relink_tx, _relink_rx) = mpsc::channel(4);
 
+        let (up, _up_rx) = mpsc::unbounded_channel();
+        let sinks = RelaySinks {
+            msg_tx,
+            click_tx,
+            dir: dir.clone(),
+            reload: reload_tx,
+            relink: relink_tx,
+            up,
+            machine: "test-machine".into(),
+        };
         pump_relay(
             machine::FromRelay::Linked {
                 owner_user_id: "U0OWNER".into(),
                 channel: "C1".into(),
                 thread_ts: "1.1".into(),
             },
-            &msg_tx,
-            &click_tx,
-            &dir,
-            &reload_tx,
-            &relink_tx,
+            &sinks,
         )
         .await;
 

@@ -92,16 +92,44 @@ pub enum FromRelay {
         channel: String,
         thread_ts: String,
     },
+    /// `pwd <this machine>:<path>` — check the folder here, store it, answer up the link.
+    SetProject {
+        channel: String,
+        thread_ts: String,
+        path: String,
+    },
     /// A refusal that talking won't fix. **No retry.**
     Fatal(Fatal),
 }
 
+/// Answers a machine sends up the link (see [`LinkFrame::ProjectSet`]). Shared by every connection this
+/// machine has had, so an answer queued while the link was down goes out on the next one.
+pub type Uplink = Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<LinkFrame>>>;
+
+/// What woke a machine's link loop: something from the gateway, or an answer of ours to send up.
+enum Wake {
+    Beat(Beat),
+    Up(LinkFrame),
+}
+
+async fn wake<S: crate::bridge::gateway::LinkRead + Send>(
+    socket: &mut S,
+    watch: &mut IdleWatch,
+    up: &Uplink,
+) -> Wake {
+    tokio::select! {
+        b = beat(socket, watch) => Wake::Beat(b),
+        Some(f) = async { up.lock().await.recv().await } => Wake::Up(f),
+    }
+}
+
 /// A frame from the gateway becomes an upstream message as-is. The bridge that lets **both the dialing side and the
-/// accepted side use the same sink** (`Fatal` alone is a local matter, so it isn't in `From`).
-impl From<crate::bridge::gateway::link::LinkFrame> for FromRelay {
-    fn from(frame: crate::bridge::gateway::link::LinkFrame) -> Self {
-        use crate::bridge::gateway::link::LinkFrame as F;
-        match frame {
+/// accepted side use the same sink** (`Fatal` is a local matter, so it never comes from a frame).
+/// `None` for [`LinkFrame::ProjectSet`] — that one only ever goes the other way.
+impl FromRelay {
+    fn of(frame: LinkFrame) -> Option<Self> {
+        use LinkFrame as F;
+        Some(match frame {
             F::Ready { bot_token, home } => FromRelay::Ready { bot_token, home },
             F::Event { name, event } => FromRelay::Event { name, event },
             F::Action { action, body } => FromRelay::Action { action, body },
@@ -114,7 +142,17 @@ impl From<crate::bridge::gateway::link::LinkFrame> for FromRelay {
                 channel,
                 thread_ts,
             },
-        }
+            F::SetProject {
+                channel,
+                thread_ts,
+                path,
+            } => FromRelay::SetProject {
+                channel,
+                thread_ts,
+                path,
+            },
+            F::ProjectSet { .. } => return None,
+        })
     }
 }
 
@@ -123,15 +161,17 @@ pub struct RelayLink {
     api_token: String,
     bridge_id: String,
     stopped: Arc<AtomicBool>,
+    up: Uplink,
 }
 
 impl RelayLink {
-    pub fn new(url: &str, api_token: &str, bridge_id: &str) -> Self {
+    pub fn new(url: &str, api_token: &str, bridge_id: &str, up: Uplink) -> Self {
         Self {
             url: url.trim_end_matches('/').to_string(),
             api_token: api_token.to_string(),
             bridge_id: bridge_id.to_string(),
             stopped: Arc::new(AtomicBool::new(false)),
+            up,
         }
     }
 
@@ -209,21 +249,28 @@ impl RelayLink {
         let mut watch = IdleWatch::default();
         loop {
             // **Receive only via `beat`.** Waiting on `next()` directly hangs forever on half-open
-            let raw = match beat(&mut socket, &mut watch).await {
-                Beat::Text(t) => t,
-                Beat::Alive => continue,
-                Beat::Ping => {
+            let raw = match wake(&mut socket, &mut watch, &self.up).await {
+                Wake::Up(frame) => {
+                    watch.on_traffic();
+                    if socket.send(M::Text(link::encode(&frame).into())).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                Wake::Beat(Beat::Text(t)) => t,
+                Wake::Beat(Beat::Alive) => continue,
+                Wake::Beat(Beat::Ping) => {
                     if socket.send(M::Ping(Default::default())).await.is_err() {
                         break;
                     }
                     continue;
                 }
-                Beat::Gone(why) => {
+                Wake::Beat(Beat::Gone(why)) => {
                     LogCtx::default().info("bridge", &format!("remote link: link closed ({why})"));
                     break;
                 }
             };
-            let Some(frame) = link::decode(&raw) else {
+            let Some(out) = link::decode(&raw).and_then(FromRelay::of) else {
                 LogCtx::default().info(
                     "bridge",
                     &format!("remote link: dropped an unrecognised frame: {}", {
@@ -233,39 +280,28 @@ impl RelayLink {
                 );
                 continue;
             };
-            let out = match frame {
-                LinkFrame::Ready { bot_token, home } => {
-                    LogCtx::default().info(
-                        "bridge",
-                        &format!(
-                            "remote link: ready (Slack token received; kept in memory only){}",
-                            home.as_deref()
-                                .map(|h| format!(" — home={h}"))
-                                .unwrap_or_default()
-                        ),
-                    );
-                    FromRelay::Ready { bot_token, home }
-                }
-                LinkFrame::Event { name, event } => FromRelay::Event { name, event },
-                LinkFrame::Action { action, body } => FromRelay::Action { action, body },
-                LinkFrame::Linked {
+            match &out {
+                FromRelay::Ready { home, .. } => LogCtx::default().info(
+                    "bridge",
+                    &format!(
+                        "remote link: ready (Slack token received; kept in memory only){}",
+                        home.as_deref()
+                            .map(|h| format!(" — home={h}"))
+                            .unwrap_or_default()
+                    ),
+                ),
+                FromRelay::Linked {
                     owner_user_id,
                     channel,
-                    thread_ts,
-                } => {
-                    LogCtx::default().info(
-                        "bridge",
-                        &format!(
-                            "remote link: Owner put this machine in charge — owner={owner_user_id} channel={channel}"
-                        ),
-                    );
-                    FromRelay::Linked {
-                        owner_user_id,
-                        channel,
-                        thread_ts,
-                    }
-                }
-            };
+                    ..
+                } => LogCtx::default().info(
+                    "bridge",
+                    &format!(
+                        "remote link: Owner put this machine in charge — owner={owner_user_id} channel={channel}"
+                    ),
+                ),
+                _ => {}
+            }
             if tx.send(out).await.is_err() {
                 return Ok(true); // the Bridge itself has ended
             }
@@ -424,7 +460,7 @@ impl Listen {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Wiring {
     pub upstream: Mode,
-    /// Our own name. A machine announces it; a gateway uses it as the target of `route <own id>`.
+    /// Our own name. A machine announces it; a gateway uses it as the target of `pwd <own id>`.
     pub self_id: Option<String>,
     /// Set when accepting machines. **Without it, the usual standalone Bridge**.
     pub children: Option<Listen>,
@@ -479,13 +515,13 @@ impl Wiring {
                  無いとマシンはつながれません。`agentgw add-machine` を実行すると作られます。"
             ));
         };
-        // A gateway with no name can't be the target of `route <own id>`. It is not decided automatically
+        // A gateway with no name can't be the target of `pwd <own id>`. It is not decided automatically
         if self_id.is_none() {
             return Err(crate::t!(
                 "To accept machines, this gateway needs a name: set AGENTGW_BRIDGE_ID in .env. \
-                 `route` uses it, so it isn't chosen automatically.",
+                 `pwd <name>:<path>` uses it, so it isn't chosen automatically.",
                 "マシンを受け入れるには、このゲートウェイに名前が必要です。.env に AGENTGW_BRIDGE_ID を\
-                 書いてください。`route` で使う名前なので、自動では決めません。"
+                 書いてください。`pwd <名前>:<パス>` で使う名前なので、自動では決めません。"
             ));
         }
         Ok(Wiring {
@@ -507,6 +543,8 @@ pub struct GatewayInlet {
     pub token: String,
     /// Where received frames go. **The same sink** as when the machine dials.
     pub tx: tokio::sync::mpsc::Sender<FromRelay>,
+    /// Answers to send back up (the same as when the machine dials).
+    pub up: Uplink,
 }
 
 async fn on_parent_upgrade(
@@ -531,10 +569,17 @@ async fn on_parent_socket(inlet: Arc<GatewayInlet>, parent_id: String, mut socke
     let mut watch = IdleWatch::default();
     loop {
         // **Receive only via `beat`.** Waiting on `recv()` directly hangs forever on half-open
-        let raw = match beat(&mut socket, &mut watch).await {
-            Beat::Text(t) => t,
-            Beat::Alive => continue,
-            Beat::Ping => {
+        let raw = match wake(&mut socket, &mut watch, &inlet.up).await {
+            Wake::Up(frame) => {
+                watch.on_traffic();
+                if socket.send(Message::Text(link::encode(&frame).into())).await.is_err() {
+                    break;
+                }
+                continue;
+            }
+            Wake::Beat(Beat::Text(t)) => t,
+            Wake::Beat(Beat::Alive) => continue,
+            Wake::Beat(Beat::Ping) => {
                 if socket
                     .send(Message::Ping(Default::default()))
                     .await
@@ -544,7 +589,7 @@ async fn on_parent_socket(inlet: Arc<GatewayInlet>, parent_id: String, mut socke
                 }
                 continue;
             }
-            Beat::Gone(why) => {
+            Wake::Beat(Beat::Gone(why)) => {
                 gateway::rlog(
                     "info",
                     &format!("parent \"{parent_id}\": link closed ({why})"),
@@ -552,11 +597,11 @@ async fn on_parent_socket(inlet: Arc<GatewayInlet>, parent_id: String, mut socke
                 break;
             }
         };
-        let Some(frame) = link::decode(&raw) else {
+        let Some(frame) = link::decode(&raw).and_then(FromRelay::of) else {
             gateway::rlog("info", "dropped an unrecognised frame from the parent");
             continue;
         };
-        if inlet.tx.send(frame.into()).await.is_err() {
+        if inlet.tx.send(frame).await.is_err() {
             break;
         }
     }
@@ -871,7 +916,7 @@ mod tests {
         assert!(e.contains("AGENTGW_LINK_TOKEN"), "{e}");
     }
 
-    /// A gateway with no name can't be the target of `route <own id>`. **Not decided automatically.**
+    /// A gateway with no name can't be the target of `pwd <own id>`. **Not decided automatically.**
     #[test]
     fn a_parent_without_a_name_refuses_to_start() {
         let mut pairs = parent(&[
@@ -984,7 +1029,8 @@ mod tests {
     /// The dial target is built including the path — the connection string's URL has no path.
     #[test]
     fn the_path_is_built_from_the_bridge_id() {
-        let l = RelayLink::new("wss://relay.example/", "tok", "desktop");
+        let (_up, up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let l = RelayLink::new("wss://relay.example/", "tok", "desktop", Arc::new(tokio::sync::Mutex::new(up_rx)));
         assert_eq!(l.url, "wss://relay.example");
         assert_eq!(
             format!("{}{}", l.url, link::path_for(&l.bridge_id)),

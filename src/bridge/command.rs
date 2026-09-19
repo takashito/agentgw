@@ -283,7 +283,10 @@ impl Cmd {
     /// as a sentence. A path may contain spaces, so **all** the rest is joined as the path
     /// (`pwd` has no label argument, so nothing can be confused). `~…` is shaped like a path too, so it fires
     /// and gets the "use an absolute path" answer (better than vanishing into the agent's turn).
-    fn pwd(msg: &Message<'_>) -> Option<PwdMode> {
+    /// A path starts with `/`, `~` or `.`. Any other first word names a machine — `pwd dev` means the
+    /// machine *dev*, never a folder called dev (write `./dev` or `~/dev` for that). A machine form is
+    /// one word (`pwd dev`) or a word with a colon (`pwd dev:~/a b`); anything else is a sentence.
+    pub(crate) fn pwd(msg: &Message<'_>) -> Option<PwdMode> {
         let args = msg.verb_args("pwd")?;
         let Some(first) = args.first() else {
             return Some(PwdMode::Current);
@@ -291,7 +294,16 @@ impl Cmd {
         if args.len() == 1 && first.to_lowercase() == "all" {
             return Some(PwdMode::All);
         }
-        (first.starts_with('/') || first.starts_with('~')).then(|| PwdMode::Set(args.join(" ")))
+        if first.starts_with(['/', '~', '.']) {
+            return Some(PwdMode::Set(args.join(" ")));
+        }
+        let joined = args.join(" ");
+        let (machine, path) = match joined.split_once(':') {
+            Some((m, p)) => (m.to_string(), Some(p.trim().to_string()).filter(|p| !p.is_empty())),
+            None if args.len() == 1 => (joined, None),
+            None => return None,
+        };
+        crate::bridge::state::is_machine_name(&machine).then_some(PwdMode::On { machine, path })
     }
 
     /// Whether this is an **attempt** at the verb or just a sentence that starts with that word. Decided only by
@@ -357,6 +369,10 @@ pub enum PwdMode {
     Current,
     Set(String),
     All,
+    /// `pwd <machine>` / `pwd <machine>:` / `pwd <machine>:<path>` — hand this channel to a machine, and
+    /// with a path, set its project folder there. **The gateway answers these** (it's the one that knows
+    /// the machines); a Bridge that sees one has no machine by that name.
+    On { machine: String, path: Option<String> },
 }
 
 // Access management is not an MCP tool: the Owner sends a plain message and the Bridge parses it here and
@@ -784,6 +800,7 @@ impl Bridge {
                     PwdMode::Current => "current",
                     PwdMode::Set(_) => "set",
                     PwdMode::All => "all",
+                    PwdMode::On { .. } => "on",
                 };
                 ctx.info(
                     "bridge",
@@ -1022,6 +1039,16 @@ mod tests {
             Some(PwdMode::All)
         ));
         assert_eq!(Cmd::pwd(&Message::new("pwd の使い方", None)), None);
+        // A path starts with / ~ or . — any other first word is a machine
+        let on = |m: &str, p: Option<&str>| {
+            Some(PwdMode::On { machine: m.into(), path: p.map(str::to_string) })
+        };
+        assert_eq!(Cmd::pwd(&Message::new("pwd tyo-mpv5l", None)), on("tyo-mpv5l", None));
+        assert_eq!(Cmd::pwd(&Message::new("pwd tyo-mpv5l:", None)), on("tyo-mpv5l", None));
+        assert_eq!(Cmd::pwd(&Message::new("pwd dock:~/a b", None)), on("dock", Some("~/a b")));
+        assert_eq!(Cmd::pwd(&Message::new("pwd ./dev", None)), Some(PwdMode::Set("./dev".into())));
+        assert_eq!(Cmd::pwd(&Message::new("pwd /a:b", None)), Some(PwdMode::Set("/a:b".into())));
+        assert_eq!(Cmd::pwd(&Message::new("pwd is handy", None)), None); // two words, no colon = a sentence
         let oc = Cmd::owner(&Message::new("warm on <#C1|general>", None)).unwrap();
         assert_eq!((oc.verb, oc.args.len()), ("warm", 2));
         assert!(Cmd::owner(&Message::new("warm の話をしよう", None)).is_none()); // no on/off = a sentence

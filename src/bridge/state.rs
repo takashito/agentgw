@@ -859,6 +859,41 @@ impl PoolRestore {
     }
 }
 
+// ─── machine names and project paths ────────────────────────────────────────────
+
+/// A machine's name: `[A-Za-z0-9][A-Za-z0-9_.-]*`. Narrow on purpose — names show up in logs, in
+/// the `channels` table and in dial paths, and nothing is gained by accepting `..`.
+pub fn is_machine_name(s: &str) -> bool {
+    let mut cs = s.chars();
+    cs.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && cs.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+}
+
+/// A project path as typed → the absolute path to store. No shell ever sees it (tmux gets it as is),
+/// so `~` and `./` are resolved against `home` — the home directory of the machine running the agents.
+/// A trailing `/` is dropped.
+pub fn absolute_project_path(typed: &str, home: &str) -> String {
+    let home = home.trim_end_matches('/');
+    let abs = match typed.strip_prefix('~') {
+        Some("") => home.to_string(),
+        Some(rest) if rest.starts_with('/') => format!("{home}{rest}"),
+        _ if typed.starts_with('/') => typed.to_string(),
+        _ => format!("{home}/{}", typed.strip_prefix("./").unwrap_or(typed)),
+    };
+    match abs.trim_end_matches('/') {
+        "" => "/".to_string(),
+        p => p.to_string(),
+    }
+}
+
+/// The answer when a project folder isn't there. Said the same way wherever `pwd` is answered.
+pub fn no_such_folder(path: &str, machine: &str) -> String {
+    crate::t!(
+        "There's no folder `{path}` on *{machine}*. Nothing was changed.",
+        "*{machine}* に `{path}` というフォルダがありません。何も変えていません。"
+    )
+}
+
 // ─── decisions: dedup → gate → decide ────────────────────────────────────────────
 
 /// Loop-breaker threshold — once this many bot posts in a row land in one thread,
@@ -2072,5 +2107,29 @@ mod tests {
         assert_eq!(access.ack_emoji(), "eyes");
         access.ack_reaction = Some("spiral_note_pad".into());
         assert_eq!(access.ack_emoji(), "spiral_note_pad");
+    }
+
+    #[test]
+    fn project_paths_become_absolute_under_home() {
+        for (typed, want) in [
+            ("/srv/app", "/srv/app"),
+            ("/srv/app/", "/srv/app"),
+            ("~", "/home/me"),
+            ("~/dev/x", "/home/me/dev/x"),
+            ("./dev/x", "/home/me/dev/x"),
+            ("/", "/"),
+        ] {
+            assert_eq!(absolute_project_path(typed, "/home/me"), want, "{typed}");
+        }
+    }
+
+    #[test]
+    fn machine_names_are_narrow() {
+        for ok in ["dock", "tyo-mpv5l", "a.b_c", "9"] {
+            assert!(is_machine_name(ok), "{ok}");
+        }
+        for bad in ["", "-x", ".x", "a b", "の使い方", "a/b", "<@U1>"] {
+            assert!(!is_machine_name(bad), "{bad}");
+        }
     }
 }

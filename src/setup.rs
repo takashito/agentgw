@@ -193,8 +193,8 @@ fn ask_child(state_dir: &StateDir) -> Result<(), String> {
     let name = prompt_bridge_id()
         .ok_or_else(|| {
             crate::t!(
-                "This machine needs a name (it's what `route <name>` points at)",
-                "このマシンの名前が要ります(`route <名前>` の指名先)"
+                "This machine needs a name (it's what `pwd <name>:<path>` points at)",
+                "このマシンの名前が要ります(`pwd <名前>:<パス>` の指名先)"
             )
         })?;
     let env_file = state_dir.join(".env");

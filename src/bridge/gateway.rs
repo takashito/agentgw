@@ -48,7 +48,7 @@ pub mod link {
     /// Deliberately separate from the binary's semver — Relay and Bridge are separate programs with
     /// their own release cycles, and mismatched versions are normal. Only the frames' **meaning** must match.
     /// A mismatched peer is refused at the upgrade (426). Old and new silently talking past each other is far worse.
-    pub const LINK_SUBPROTOCOL: &str = "sclink.1";
+    pub const LINK_SUBPROTOCOL: &str = "agentgw.1";
 
     /// The path prefix the Bridge dials. The one segment after it is the machine's name.
     const BRIDGE_PATH: &str = "/bridge/";
@@ -60,8 +60,8 @@ pub mod link {
     /// (trying it with a reserved name `__link_probe__` got rejected by the name check — found on a real machine).
     pub const PROBE_PATH: &str = "/probe";
 
-    /// Frames that flow **after** the handshake. Only four kinds, **all Relay → Bridge**
-    /// (once the handshake is done the Bridge sends nothing back — it has nothing to send).
+    /// Frames that flow **after** the handshake. All go gateway → machine except [`LinkFrame::ProjectSet`],
+    /// the one answer a machine sends back (only it can see its own folders).
     #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
     #[serde(tag = "t", rename_all = "snake_case")]
     pub enum LinkFrame {
@@ -110,6 +110,21 @@ pub mod link {
             channel: String,
             thread_ts: String,
         },
+        /// `pwd <machine>:<path>`: use `path` (as typed — `~` and `./` are resolved on the machine) as this
+        /// channel's project folder. The gateway hands the channel over only after the machine answers
+        /// with [`LinkFrame::ProjectSet`], so a folder that isn't there changes nothing.
+        SetProject {
+            channel: String,
+            thread_ts: String,
+            path: String,
+        },
+        /// The machine's answer to `SetProject`: the absolute path it stored, or why it didn't (said to the
+        /// person as is). Carries the channel and thread back, so the gateway keeps no table of what it asked.
+        ProjectSet {
+            channel: String,
+            thread_ts: String,
+            result: Result<String, String>,
+        },
     }
 
     /// WebSocket already delimits messages, so one message = one frame.
@@ -126,14 +141,10 @@ pub mod link {
     /// Read the machine's name from the dial path. `/bridge/desktop` → `desktop`.
     ///
     /// Only one segment passes, with a narrow alphabet (`[A-Za-z0-9][A-Za-z0-9_.-]*`). The name shows up
-    /// in logs and in the `route` table, and nothing is gained by accepting something like `..` as a name.
+    /// in logs and in the `channels` table, and nothing is gained by accepting something like `..` as a name.
     pub fn bridge_id_of_path(path: &str) -> Option<&str> {
         let id = path.strip_prefix(BRIDGE_PATH)?;
-        let mut cs = id.chars();
-        let first = cs.next()?;
-        (first.is_ascii_alphanumeric()
-            && cs.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-'))
-        .then_some(id)
+        crate::bridge::state::is_machine_name(id).then_some(id)
     }
 
     /// Build the path a machine dials (`link` leaves it off when putting the URL in the connection string —
@@ -290,6 +301,21 @@ pub mod link {
                     owner_user_id: "U_OWNER".into(),
                     channel: "D123".into(),
                     thread_ts: "1700000000.000100".into(),
+                },
+                LinkFrame::SetProject {
+                    channel: "C1".into(),
+                    thread_ts: "1700000000.000100".into(),
+                    path: "~/dev/x".into(),
+                },
+                LinkFrame::ProjectSet {
+                    channel: "C1".into(),
+                    thread_ts: "1700000000.000100".into(),
+                    result: Ok("/home/me/dev/x".into()),
+                },
+                LinkFrame::ProjectSet {
+                    channel: "C1".into(),
+                    thread_ts: "1700000000.000100".into(),
+                    result: Err("no folder".into()),
                 },
             ]
         }
@@ -697,7 +723,7 @@ impl LinkServer {
         }
     }
 
-    /// The Bridge IDs connected right now. Only these can be a `route` target, and forwarding looks at them too.
+    /// The Bridge IDs connected right now. Only these can be a `pwd <machine>` target, and forwarding looks at them too.
     pub fn connected(&self) -> Vec<String> {
         let mut ids: Vec<String> = self.bridges.lock().unwrap().keys().cloned().collect();
         ids.sort();
@@ -942,7 +968,7 @@ impl NoticeCooldown {
 }
 
 // ── Section 5: commands the gateway answers itself ───────────────────────────────
-// Only "things no machine can be asked" live here: `route` (the machine you'd ask is the thing being changed),
+// Only "things no machine can be asked" live here: `pwd <machine>` / `channels` (the machine you'd ask is the thing being changed),
 // `set-home` (a broadcast to the whole fleet), and the DM name-claim (the moment the Owner is born).
 // Decisions are pure functions; the caller does the execution (saving, posting, forwarding).
 
@@ -968,7 +994,7 @@ impl CommandCtx<'_> {
 
     /// Whether this command is addressed to the bot. DMs need no mention.
     ///
-    /// An unaddressed `route` **isn't even refused** — cutting into people's conversation over one word
+    /// An unaddressed `pwd` / `channels` **isn't even refused** — cutting into people's conversation over one word
     /// with "that's Owner-only" is barging into a conversation the bot isn't part of.
     fn addressed(&self) -> bool {
         self.is_dm() || self.msg().mentions_bot()
@@ -993,30 +1019,37 @@ impl CommandCtx<'_> {
         }
     }
 
-/// `route` — the Owner picks the machine in charge of this channel.
+/// `pwd <machine>` — the Owner picks the machine in charge of this channel.
 ///
-/// **Owner only**. Without this, anyone else in a shared channel could type `route my-machine` and
+/// **Owner only**. Without this, anyone else in a shared channel could type `pwd my-machine` and
 /// hijack the channel, sending every later message to their machine (with their permissions).
 /// This check is not decoration.
-    /// `route` — the Owner picks the machine in charge of this channel.
     /// `self_id` is the gateway's name — **channels with no machine assigned go to the gateway**, so the list says so.
+    /// `channels` (the table) and `pwd <machine>[:<path>]` (handing this channel to a machine). Both are
+    /// answered here — the gateway is the one that knows the machines. `pwd <path>` is not: it goes to the
+    /// machine running this channel, which is where the folder is.
     pub fn route(&self, routes: &Routes, connected: &[String], self_id: &str) -> RouteOutcome {
         let ctx = self;
-        let Some(args) = ctx.verb_args("route") else {
+        let listing = ["channels", "channel"]
+            .iter()
+            .any(|verb| ctx.verb_args(verb).is_some_and(|args| args.is_empty()));
+        if listing {
+            if let Some(reply) = ctx.refuse_if_not_owner("channels") {
+                return RouteOutcome::Refused(reply);
+            }
+            return RouteOutcome::List(route_table(ctx.channel_id, routes, connected, self_id));
+        }
+        let pwd = ctx
+            .addressed()
+            .then(|| crate::bridge::command::Cmd::pwd(&ctx.msg()))
+            .flatten();
+        let Some(crate::bridge::command::PwdMode::On { machine: bridge_id, path }) = pwd else {
             return RouteOutcome::NotACommand;
         };
-        if args.len() > 1 {
-            // A `route` buried in a sentence is a sentence, not a command
-            return RouteOutcome::NotACommand;
-        }
-        if let Some(reply) = ctx.refuse_if_not_owner("route")
-        {
+        if let Some(reply) = ctx.refuse_if_not_owner("pwd") {
             return RouteOutcome::Refused(reply);
         }
-
-        let Some(bridge_id) = args.first() else {
-            return RouteOutcome::List(route_table(ctx.channel_id, routes, connected, self_id));
-        };
+        let bridge_id = &bridge_id;
 
         // **Only a machine connected right now can be the target.** A typo and a machine not yet started
         // are treated the same — the only test is "is it here now". Never silently create an assignment with nowhere to go.
@@ -1028,32 +1061,26 @@ impl CommandCtx<'_> {
             };
             return RouteOutcome::UnknownBridge(crate::t!(
                 "No machine named *{bridge_id}* is connected. A channel can only be handed to a \
-                 machine that's online — check the name, or start agentgw on that machine.\n\
+                 machine that's online — check the name, or start agentgw on that machine. \
+                 (For a folder, write `./{bridge_id}` or `~/{bridge_id}`.)\n\
                  Online now: {here}",
                 "*{bridge_id}* という名前のマシンはつながっていません。チャンネルを任せられるのは\
-                 オンラインのマシンだけです。名前を確かめるか、そのマシンで agentgw を起動してください。\n\
+                 オンラインのマシンだけです。名前を確かめるか、そのマシンで agentgw を起動してください。\
+                 (フォルダなら `./{bridge_id}` か `~/{bridge_id}` と書いてください。)\n\
                  オンラインのマシン: {here}"
             ));
         }
-
-        let mut lines = vec![crate::t!(
-            "This channel is now handled by *{bridge_id}*.",
-            "このチャンネルは *{bridge_id}* が受け持つようになりました。"
-        )];
-        if let Some(before) = routes.get(ctx.channel_id).filter(|b| *b != bridge_id) {
-            // The honest part: the new machine can reread the Slack thread, but it can't know **what the
-            // previous machine did** (which files it read, what it tried, what it changed). Saying so lets
-            // the handover stay quiet about everything else.
-            lines.push(crate::t!(
-                "(It was *{before}* before. Running threads continue on *{bridge_id}*, which reads \
-                 the thread to catch up — but *it can't see what {before} actually did*.)",
-                "(前は *{before}* でした。進行中のスレッドは *{bridge_id}* で続きます。スレッドは読み直して\
-                 流れを把握しますが、*{before} が実際に行った作業の中身は分かりません*。)"
-            ));
+        // With a folder, the machine checks it first; the channel moves only if it's there
+        if let Some(path) = path {
+            return RouteOutcome::SetProject {
+                bridge_id: bridge_id.clone(),
+                path,
+            };
         }
+
         RouteOutcome::Set {
             bridge_id: bridge_id.clone(),
-            reply: lines.join("\n"),
+            reply: handover_reply(ctx.channel_id, routes, bridge_id),
         }
     }
 
@@ -1081,6 +1108,27 @@ impl CommandCtx<'_> {
     }
 }
 
+/// What `pwd <machine>` says once the channel is handed over — including, when it moves between machines,
+/// what the new machine can't know.
+fn handover_reply(channel: &str, routes: &Routes, bridge_id: &str) -> String {
+    let mut lines = vec![crate::t!(
+        "This channel is now handled by *{bridge_id}*.",
+        "このチャンネルは *{bridge_id}* が受け持つようになりました。"
+    )];
+    if let Some(before) = routes.get(channel).filter(|b| *b != bridge_id) {
+        // The honest part: the new machine can reread the Slack thread, but it can't know **what the
+        // previous machine did** (which files it read, what it tried, what it changed). Saying so lets
+        // the handover stay quiet about everything else.
+        lines.push(crate::t!(
+            "(It was *{before}* before. Running threads continue on *{bridge_id}*, which reads \
+             the thread to catch up — but *it can't see what {before} actually did*.)",
+            "(前は *{before}* でした。進行中のスレッドは *{bridge_id}* で続きます。スレッドは読み直して\
+             流れを把握しますが、*{before} が実際に行った作業の中身は分かりません*。)"
+        ));
+    }
+    lines.join("\n")
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum RouteOutcome {
     NotACommand,
@@ -1091,10 +1139,12 @@ pub enum RouteOutcome {
         bridge_id: String,
         reply: String,
     },
+    /// `pwd <machine>:<path>`: ask the machine to set `path` up; bind only on its yes.
+    SetProject { bridge_id: String, path: String },
     UnknownBridge(String),
 }
 
-/// The answer to `route` with no arguments. Says **what's going on in the channel it was typed in** first,
+/// The answer to `channels`. Says **what's going on in the channel it was typed in** first,
 /// then lists the other channels and machines. Each one is marked online or not.
 ///
 /// Channels with no machine assigned go to the gateway — writing only "unassigned" in the list
@@ -1111,15 +1161,10 @@ pub fn route_table(here: &str, routes: &Routes, connected: &[String], self_id: &
         }
     };
     // One destination in a few words (the gateway if nobody is assigned)
-    let dest = |id: Option<&String>| match id {
-        Some(id) => format!("*{id}*{}", mark(id)),
-        None => {
-            let m = mark(self_id);
-            crate::t!(
-                "not assigned — the gateway *{self_id}* handles it{m}",
-                "未設定(ゲートウェイの *{self_id}* が受け持ちます){m}"
-            )
-        }
+    // Nobody assigned = the gateway, named like any other machine
+    let dest = |id: Option<&String>| {
+        let id = id.map_or(self_id, String::as_str);
+        format!("*{id}*{}", mark(id))
     };
 
     let this = dest(routes.get(here));
@@ -1185,7 +1230,7 @@ pub enum SetHomeOutcome {
 // ── DM name-claim — the moment the Owner is born ───────────────────────────
 // A new Relay has no Owner. The person who set it up proves they did by **DMing the connection string**
 // (only the Relay's operator has that secret). After that: with 0 machines connected there's nothing to bind to,
-// with 1 it's automatic, with several it asks for the name. This isn't `route` — it's the moment the Owner is born,
+// with 1 it's automatic, with several it asks for the name. This isn't `pwd <machine>` — it's the moment the Owner is born,
 // and the `Linked` sent right after tells the Bridge "this person is your Owner".
 
 pub struct DmOnboardingCtx<'a> {
@@ -1489,9 +1534,9 @@ pub fn format_fleet(
     }
     let n = f.routes.len();
     if f.routes.is_empty() {
-        out.push(crate::t!("● Channels assigned (route) — none", "● チャンネルの割り当て(route)— なし"));
+        out.push(crate::t!("● Channels assigned — none", "● チャンネルの割り当て — なし"));
     } else {
-        out.push(crate::t!("● Channels assigned (route) — {n}", "● チャンネルの割り当て(route)— {n}"));
+        out.push(crate::t!("● Channels assigned — {n}", "● チャンネルの割り当て — {n}"));
         for (ch, id) in &f.routes {
             let mark = match connected {
                 None => String::new(),
@@ -1531,7 +1576,7 @@ pub struct Fleet {
     pub links: LinkServer,
     /// The key machines present.
     pub token: String,
-    /// This machine's name. What `route <own id>` points at.
+    /// This machine's name. What `pwd <own id>` points at.
     pub self_id: String,
     /// The Slack bot token handed to machines (given out in the `Ready` frame).
     pub bot_token: String,
@@ -1673,7 +1718,7 @@ impl Fleet {
         let bot_user_id = self.bot_user_id.lock().await.clone();
 
         // What the gateway answers itself (commands and name-claims) comes **before the delivery decision**. Once answered, stop —
-        // forwarding `route` would send the instruction to change the destination to the old destination
+        // forwarding `pwd <machine>` would send the instruction to change the destination to the old destination
         if ev.is_a_command_candidate(self.owner().as_deref())
             && let Some(ch) = channel
             && self
@@ -1801,7 +1846,7 @@ impl Fleet {
         let owner = self.owner();
         let machines = self.machines();
 
-        // ── DM name-claim. Before `route` (route assumes there's already an Owner)
+        // ── DM name-claim. Before `pwd <machine>` / `channels` (they assume there's already an Owner)
         if crate::chat::slack::SlackId::is_dm(channel) {
             let awaiting = self.pending_selection.lock().await.is_some();
             let outcome = DmOnboardingCtx {
@@ -1874,10 +1919,27 @@ impl Fleet {
                 self.post(channel, Some(&thread), &reply).await;
                 return true;
             }
+            // The folder can only be checked where it is. Here: now. Elsewhere: ask, and bind on the answer
+            RouteOutcome::SetProject { bridge_id, path } => {
+                if bridge_id == self.self_id {
+                    self.set_project_here(channel, &thread, &path).await;
+                } else if !self.links.send_to(
+                    &bridge_id,
+                    &link::LinkFrame::SetProject {
+                        channel: channel.to_string(),
+                        thread_ts: thread.clone(),
+                        path,
+                    },
+                ) {
+                    let notice = Delivery::offline_notice(&bridge_id, &self.links.connected());
+                    self.post(channel, Some(&thread), &notice).await;
+                }
+                return true;
+            }
             RouteOutcome::Refused(reply) => {
                 rlog(
                     "info",
-                    &format!("route REFUSED chan={channel} by={user_id:?} — not the Owner"),
+                    &format!("channels/pwd REFUSED chan={channel} by={user_id:?} — not the Owner"),
                 );
                 self.post(channel, Some(&thread), &reply).await;
                 return true;
@@ -1924,6 +1986,64 @@ impl Fleet {
 
     /// Assign a place to a machine and hand that machine "you're in charge".
     /// **Send nothing when assigning ourselves** — we don't phone ourselves.
+    /// `pwd <this gateway>:<path>` — the folder is here, so check and store it without asking anyone.
+    async fn set_project_here(self: &Arc<Self>, channel: &str, thread_ts: &str, path: &str) {
+        let abs = crate::bridge::state::absolute_project_path(path, &StateDir::home());
+        let result = if !std::path::Path::new(&abs).is_dir() {
+            Err(crate::bridge::state::no_such_folder(&abs, &self.self_id))
+        } else {
+            let op = crate::bridge::state::AccessOp::SetRepo {
+                channel: channel.to_string(),
+                path: abs.clone(),
+            };
+            match self.access().apply(op) {
+                Ok((next, ..)) => {
+                    self.edit_access(move |a| *a = next).await;
+                    Ok(abs)
+                }
+                Err(e) => Err(e),
+            }
+        };
+        let me = self.self_id.clone();
+        self.on_project_set(&me, channel, thread_ts, result).await;
+    }
+
+    /// A machine's answer to `pwd <machine>:<path>`. Yes → hand the channel over and say where it works;
+    /// no → pass on why (nothing was changed).
+    async fn on_project_set(
+        self: &Arc<Self>,
+        bridge_id: &str,
+        channel: &str,
+        thread_ts: &str,
+        result: Result<String, String>,
+    ) {
+        match result {
+            Ok(abs) => {
+                let mut reply = handover_reply(channel, &self.access().bridges(), bridge_id);
+                reply.push('\n');
+                reply.push_str(&crate::t!("Project folder: `{abs}`", "作業ディレクトリ: `{abs}`"));
+                self.bind_and_link(bridge_id, channel, thread_ts).await;
+                self.post(channel, Some(thread_ts), &reply).await;
+            }
+            Err(why) => {
+                rlog("info", &format!("pwd on {bridge_id} for {channel} refused: {why}"));
+                self.post(channel, Some(thread_ts), &why).await;
+            }
+        }
+    }
+
+    /// Text a machine sent up its link. The only thing a machine says is its answer to `SetProject`.
+    async fn on_machine_text(self: &Arc<Self>, bridge_id: &str, raw: &str) {
+        match link::decode(raw) {
+            Some(link::LinkFrame::ProjectSet {
+                channel,
+                thread_ts,
+                result,
+            }) => self.on_project_set(bridge_id, &channel, &thread_ts, result).await,
+            _ => rlog("info", &format!("{bridge_id}: dropped an unexpected frame from a machine")),
+        }
+    }
+
     async fn bind_and_link(self: &Arc<Self>, bridge_id: &str, channel: &str, thread_ts: &str) {
         let (ch, id) = (channel.to_string(), bridge_id.to_string());
         self.edit_access(move |a| a.set_bridge(&ch, &id)).await;
@@ -2060,7 +2180,7 @@ impl Fleet {
     }
 
     /// One connection. `Ok(true)` = got through the handshake (and dropped later). `Err` = pointless until the config is fixed.
-    async fn dial_child_once(&self, bridge_id: &str, url: &str) -> Result<bool, &'static str> {
+    async fn dial_child_once(self: &Arc<Self>, bridge_id: &str, url: &str) -> Result<bool, &'static str> {
         use futures_util::SinkExt;
         // **One key.** Whichever side dials, it presents the same `AGENTGW_LINK_TOKEN`
         let target = format!("{url}{}", link::path_for(&self.self_id));
@@ -2106,7 +2226,8 @@ impl Fleet {
                 },
                 // **Receive only through `beat`.** Waiting on `next()` directly hangs forever on a half-open socket
                 incoming = beat(&mut socket, &mut watch) => match incoming {
-                    Beat::Text(_) | Beat::Alive => {} // it shouldn't send anything
+                    Beat::Text(t) => self.on_machine_text(bridge_id, &t).await,
+                    Beat::Alive => {}
                     Beat::Ping => {
                         if socket.send(M::Ping(Default::default())).await.is_err() {
                             break;
@@ -2179,7 +2300,7 @@ async fn on_upgrade(
         Ok(ok) => ok,
         Err(response) => return response,
     };
-    // Don't accept our own name. Accepting it would give `route <own id>` two destinations
+    // Don't accept our own name. Accepting it would give `pwd <own id>` two destinations
     if bridge_id == fleet.self_id {
         rlog(
             "info",
@@ -2230,7 +2351,8 @@ async fn on_socket(fleet: Arc<Fleet>, bridge_id: String, mut socket: WebSocket) 
             },
             // **Receive only through `beat`.** Waiting on `recv()` directly hangs forever on a half-open socket
             incoming = beat(&mut socket, &mut watch) => match incoming {
-                Beat::Text(_) | Beat::Alive => {} // it shouldn't send anything
+                Beat::Text(t) => fleet.on_machine_text(&bridge_id, &t).await,
+                Beat::Alive => {}
                 Beat::Ping => {
                     if socket.send(Message::Ping(Default::default())).await.is_err() {
                         break;
@@ -2738,8 +2860,8 @@ mod tests {
     fn a_different_protocol_is_426() {
         for sub in [
             None,
-            Some("sclink.0"),
-            Some("sclink.2"),
+            Some("sclink.1"), // before `pwd <machine>:<path>` — would drop SetProject and never answer
+            Some("agentgw.0"),
             Some(""),
             Some("chat"),
         ] {
@@ -2760,7 +2882,7 @@ mod tests {
         let got = Admit::of(
             "/bridge/desktop",
             Some(&format!("Bearer {TOKEN}")),
-            Some("something-else, sclink.1"),
+            Some("something-else, agentgw.1"),
             TOKEN,
         );
         assert_eq!(got, Admit::Ok("desktop".into()));
@@ -2974,7 +3096,7 @@ mod tests {
         let d = |ch: Option<&str>| Delivery::decide(ch, &r, "vps", up);
         assert_eq!(d(Some("C1")), Delivery::Forward("desktop".into()));
         assert_eq!(d(Some("C2")), Delivery::Offline("laptop".into()));
-        // A route naming ourselves (`route <own id>`) is handled here
+        // A route naming ourselves (`pwd <own id>`) is handled here
         assert_eq!(d(Some("C3")), Delivery::Local);
         // **No route means local**. This is the default for a lone Bridge
         assert_eq!(d(Some("C_NEW")), Delivery::Local);
@@ -3062,7 +3184,7 @@ mod tests {
         assert!(!status_line(addr, "/bridge/desktop").await.contains("404"));
     }
 
-    /// **What we answer is checked before delivery.** Forwarding `route` would send the instruction to change the
+    /// **What we answer is checked before delivery.** Forwarding `pwd <machine>` would send the instruction to change the
     /// destination to the old destination (returning after answering is the caller's structure).
     #[test]
     fn only_a_persons_channel_message_is_a_command_candidate() {
@@ -3107,7 +3229,7 @@ mod tests {
     }
 
     /// The same rule is needed **at the command entry too** — `Access::gate` lets the Owner's
-    /// Web API posts through as a person, so if we rejected them as a bot here, `route` couldn't be typed.
+    /// Web API posts through as a person, so if we rejected them as a bot here, `pwd <machine>` couldn't be typed.
     #[test]
     fn only_the_owners_web_api_post_counts_as_a_person() {
         let bot_post = |user: &str| serde_json::json!({"user": user, "bot_id": "B1"});
@@ -3315,7 +3437,7 @@ mod tests {
     #[test]
     fn route_sets_this_channel_to_a_connected_machine() {
         let got = CommandCtx::route(
-            &ctx("C1", "<@U_BOT> route desktop", Some(OWNER)),
+            &ctx("C1", "<@U_BOT> pwd desktop", Some(OWNER)),
             &routes(&[]),
             &here(),
             "parent",
@@ -3334,7 +3456,7 @@ mod tests {
     #[test]
     fn changing_the_owner_of_a_channel_says_what_is_lost() {
         let got = CommandCtx::route(
-            &ctx("C1", "<@U_BOT> route vps", Some(OWNER)),
+            &ctx("C1", "<@U_BOT> pwd vps", Some(OWNER)),
             &routes(&[("C1", "desktop")]),
             &here(),
             "parent",
@@ -3353,7 +3475,7 @@ mod tests {
     fn only_the_owner_may_route() {
         for user in [Some("U_STRANGER"), None] {
             let got = CommandCtx::route(
-                &ctx("C1", "<@U_BOT> route desktop", user),
+                &ctx("C1", "<@U_BOT> pwd desktop", user),
                 &routes(&[]),
                 &here(),
                 "parent",
@@ -3369,7 +3491,7 @@ mod tests {
     #[test]
     fn a_route_to_a_machine_that_is_not_here_is_refused() {
         let got = CommandCtx::route(
-            &ctx("C1", "<@U_BOT> route laptop", Some(OWNER)),
+            &ctx("C1", "<@U_BOT> pwd laptop", Some(OWNER)),
             &routes(&[]),
             &here(),
             "parent",
@@ -3389,7 +3511,7 @@ mod tests {
     fn a_bare_route_says_who_handles_this_channel_first() {
         // here() = ["desktop", "vps"] (connected). laptop is named only in routes
         let got = CommandCtx::route(
-            &ctx("C1", "<@U_BOT> route", Some(OWNER)),
+            &ctx("C1", "<@U_BOT> channels", Some(OWNER)),
             &routes(&[("C1", "desktop"), ("C2", "laptop")]),
             &here(),
             "vps",
@@ -3421,7 +3543,7 @@ mod tests {
     #[test]
     fn a_channel_without_a_route_says_the_parent_takes_it() {
         let got = CommandCtx::route(
-            &ctx("C9", "<@U_BOT> route", Some(OWNER)),
+            &ctx("C9", "<@U_BOT> channels", Some(OWNER)),
             &routes(&[("C1", "desktop")]),
             &here(),
             "vps",
@@ -3430,7 +3552,7 @@ mod tests {
             panic!("{got:?}")
         };
         assert!(
-            reply.starts_with("*This channel (<#C9>)*: not assigned — the gateway *vps* handles it\n"),
+            reply.starts_with("*This channel (<#C9>)*: *vps*\n"),
             "{reply}"
         );
         assert!(reply.contains("• <#C1> → *desktop*\n"), "{reply}");
@@ -3441,7 +3563,7 @@ mod tests {
     #[test]
     fn with_no_routes_at_all_everything_goes_to_the_parent() {
         let got = CommandCtx::route(
-            &ctx("C1", "<@U_BOT> route", Some(OWNER)),
+            &ctx("C1", "<@U_BOT> channels", Some(OWNER)),
             &routes(&[]),
             &[],
             "vps",
@@ -3452,11 +3574,11 @@ mod tests {
         assert!(reply.contains("the gateway handles every channel"), "{reply}");
     }
 
-    /// **A `route` without a mention isn't even refused.** That would be barging into a conversation the bot isn't part of.
+    /// **A `pwd <machine>` without a mention isn't even refused.** That would be barging into a conversation the bot isn't part of.
     #[test]
     fn an_unaddressed_route_falls_through_without_a_refusal() {
         let got = CommandCtx::route(
-            &ctx("C1", "route desktop", Some(OWNER)),
+            &ctx("C1", "pwd desktop", Some(OWNER)),
             &routes(&[]),
             &here(),
             "parent",
@@ -3467,8 +3589,8 @@ mod tests {
     #[test]
     fn a_route_inside_a_sentence_is_a_sentence() {
         for text in [
-            "<@U_BOT> please route desktop",
-            "<@U_BOT> route desktop and also vps",
+            "<@U_BOT> please pwd desktop",
+            "<@U_BOT> pwd desktop and also vps",
         ] {
             let got = CommandCtx::route(
                 &ctx("C1", text, Some(OWNER)),
@@ -3484,12 +3606,49 @@ mod tests {
     #[test]
     fn in_a_dm_route_needs_no_mention() {
         let got = CommandCtx::route(
-            &ctx("D1", "route desktop", Some(OWNER)),
+            &ctx("D1", "pwd desktop", Some(OWNER)),
             &routes(&[]),
             &here(),
             "parent",
         );
         assert!(matches!(got, RouteOutcome::Set { .. }), "{got:?}");
+    }
+
+    /// `pwd <machine>:<path>` asks the machine first — only it can see its folders.
+    #[test]
+    fn pwd_with_a_machine_and_a_path_asks_that_machine() {
+        let got = CommandCtx::route(
+            &ctx("C1", "<@U_BOT> pwd desktop:~/dev/x", Some(OWNER)),
+            &routes(&[]),
+            &here(),
+            "vps",
+        );
+        assert_eq!(
+            got,
+            RouteOutcome::SetProject { bridge_id: "desktop".into(), path: "~/dev/x".into() }
+        );
+    }
+
+    /// A path alone goes to the machine running the channel (NotACommand here = forwarded).
+    #[test]
+    fn pwd_with_only_a_path_is_the_machines_business() {
+        for text in ["<@U_BOT> pwd ~/x", "<@U_BOT> pwd /srv/x", "<@U_BOT> pwd ./x", "<@U_BOT> pwd"] {
+            let got = CommandCtx::route(&ctx("C1", text, Some(OWNER)), &routes(&[]), &here(), "vps");
+            assert_eq!(got, RouteOutcome::NotACommand, "{text}");
+        }
+    }
+
+    /// `channels` and `channel` list; `route` is no command any more (a sentence for the agent).
+    #[test]
+    fn channels_lists_and_route_is_gone() {
+        for text in ["<@U_BOT> channels", "<@U_BOT> channel"] {
+            let got = CommandCtx::route(&ctx("C1", text, Some(OWNER)), &routes(&[]), &here(), "vps");
+            assert!(matches!(got, RouteOutcome::List(_)), "{text} → {got:?}");
+        }
+        for text in ["<@U_BOT> route", "<@U_BOT> route desktop"] {
+            let got = CommandCtx::route(&ctx("C1", text, Some(OWNER)), &routes(&[]), &here(), "vps");
+            assert_eq!(got, RouteOutcome::NotACommand, "{text}");
+        }
     }
 
     #[test]
@@ -3532,7 +3691,7 @@ mod tests {
         let c = CommandCtx {
             channel_id: "C1",
             user_id: Some(OWNER),
-            text: "<@U_BOT> route desktop",
+            text: "<@U_BOT> pwd desktop",
             owner_user_id: Some(OWNER),
             bot_user_id: None,
         };
@@ -3750,7 +3909,7 @@ mod tests {
         let out = format_fleet(&a_view(), None, &Tunnels::new(), &HashMap::new());
         assert!(out.contains("(not answering)"), "{out}");
         assert!(!out.contains("Machines connected"), "{out}");
-        assert!(out.contains("● Channels assigned (route) — 2"), "{out}");
+        assert!(out.contains("● Channels assigned — 2"), "{out}");
         assert!(out.contains("C1 → desktop"), "{out}");
         // No marks when alive/dead is unknown
         assert!(!out.contains("● online"), "{out}");
@@ -3807,7 +3966,7 @@ mod tests {
         assert!(out.contains("Owner:               (not set)"), "{out}");
         assert!(out.contains("Notices go to:       (not set)"), "{out}");
         assert!(out.contains("● Machines connected — none"), "{out}");
-        assert!(out.contains("● Channels assigned (route) — none"), "{out}");
+        assert!(out.contains("● Channels assigned — none"), "{out}");
     }
 
     #[test]

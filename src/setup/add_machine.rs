@@ -360,8 +360,8 @@ async fn add_child(target: &str, name: Option<&str>, from: Option<&str>) -> Resu
         Transport::Tunnel { .. } => crate::t!("over an ssh tunnel", "ssh トンネル経由"),
     };
     Ok(crate::t!(
-        "\n{child} is connected {how}.\nTo hand a Slack channel to it, type `route {child}` in that channel.",
-        "\n{child} がつながりました({how})。\nSlack のチャンネルを任せるには、そのチャンネルで `route {child}` と打ってください。"
+        "\n{child} is connected {how}.\nTo hand a Slack channel to it, type `pwd {child}:<path>` in that channel.",
+        "\n{child} がつながりました({how})。\nSlack のチャンネルを任せるには、そのチャンネルで `pwd {child}:<パス>` と打ってください。"
     ))
 }
 

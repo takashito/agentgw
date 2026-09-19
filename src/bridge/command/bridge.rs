@@ -143,6 +143,12 @@ impl Bridge {
             }
         };
         match mode {
+            // Only the gateway knows the machines and answers these. Reaching a Bridge means there is
+            // no gateway, or no such machine behind it
+            PwdMode::On { machine, .. } => crate::t!(
+                "No machine named *{machine}* is connected. For a folder, write `./{machine}` or `~/{machine}`.",
+                "*{machine}* という名前のマシンはつながっていません。フォルダなら `./{machine}` か `~/{machine}` と書いてください。"
+            ),
             PwdMode::Current => {
                 entry(&self.access, &msg.channel).render(&crate::t!("Project directory for this channel", "このチャンネルの作業ディレクトリ"))
             }
@@ -170,17 +176,13 @@ impl Bridge {
             PwdMode::Set(typed) => {
                 // No shell ever sees this path (tmux gets it as is), so `~` and relative paths are
                 // resolved here, on the machine that runs this channel's agents
-                let path = &absolute_project_path(&typed, &Host::home());
+                let path = &bridge::absolute_project_path(&typed, &Host::home());
                 if !self.deps.agent.workdir_exists(path) {
                     ctx.info(
                         "bridge",
                         &format!("slack-events: pwd set refused — no folder {path} msg={}", msg.ts),
                     );
-                    let machine = &self.machine_name;
-                    return crate::t!(
-                        "There's no folder `{path}` on *{machine}*. Nothing was changed.",
-                        "*{machine}* に `{path}` というフォルダがありません。何も変えていません。"
-                    );
+                    return bridge::no_such_folder(path, &self.machine_name);
                 }
                 let op = bridge::AccessOp::SetRepo {
                     channel: msg.channel.clone(),
@@ -647,7 +649,7 @@ fn with_warnings(message: &str, warnings: &[String]) -> String {
 /// help as Slack mrkdwn. Grouped by purpose; each line is a monospace trigger (with aliases) + a one-line description.
 /// Kept in sync **by hand** with `COMMAND_WORDS` and the argument parser — this is their human-facing index.
 ///
-/// `fleet` decides whether `route` is listed. It is executed by **the side that accepts machines**
+/// `fleet` decides whether the machine commands (`pwd <machine>`, `channels`) are listed. It is executed by **the side that accepts machines**
 /// (`CommandCtx::route` in `relay.rs`), so the condition follows that side.
 pub(super) fn help(fleet: bool, agent: &dyn crate::agent::Agent) -> String {
     fn section<C: std::fmt::Display>(lines: &mut Vec<String>, title: String, rows: Vec<(C, String)>) {
@@ -668,8 +670,8 @@ pub(super) fn help(fleet: bool, agent: &dyn crate::agent::Agent) -> String {
             &mut lines,
             crate::t!("Machines", "マシン"),
             vec![
-                ("route <machine>", crate::t!("hand this channel to a machine", "このチャンネルをマシンに任せる")),
-                ("route", crate::t!("show which machine handles this channel and the others", "このチャンネルとほかのチャンネルを受け持つマシンを見る")),
+                ("pwd <machine>[:<path>]", crate::t!("hand this channel to a machine (and use that folder on it)", "このチャンネルをマシンに任せる(パスを付けるとそのマシンのそのフォルダで)")),
+                ("channels", crate::t!("show which machine handles this channel and the others", "このチャンネルとほかのチャンネルを受け持つマシンを見る")),
             ],
         );
     }
@@ -678,7 +680,7 @@ pub(super) fn help(fleet: bool, agent: &dyn crate::agent::Agent) -> String {
         crate::t!("Channels", "チャンネル"),
         vec![
             ("pwd", crate::t!("show this channel's project directory", "このチャンネルの作業ディレクトリを見る")),
-            ("pwd <absolute path>", crate::t!("set this channel's project directory", "このチャンネルの作業ディレクトリを決める")),
+            ("pwd <path>", crate::t!("set this channel's project directory (`/…`, `~/…` or `./…`)", "このチャンネルの作業ディレクトリを決める(`/…`・`~/…`・`./…`)")),
             ("pwd all", crate::t!("show every channel's project directory", "すべてのチャンネルの作業ディレクトリを見る")),
             ("warm on|off [<#channel>]", crate::t!("keep an agent started ahead of time for a channel (this one if none is given)", "チャンネルのエージェントを先に起動しておくか(省くとこのチャンネル)")),
             ("set-home", crate::t!("send notices to this channel", "通知をこのチャンネルに出す")),
@@ -719,22 +721,6 @@ pub(super) fn help(fleet: bool, agent: &dyn crate::agent::Agent) -> String {
 
 /// The answer when `pwd <path>` is typed in a DM. A DM's agent always runs in the default directory —
 /// there is nothing to set, so say so instead of silently doing nothing.
-/// A project path as typed → the absolute path to store. `~` and relative paths are taken from `home`
-/// (the machine running the agents); a trailing `/` is dropped.
-fn absolute_project_path(typed: &str, home: &str) -> String {
-    let home = home.trim_end_matches('/');
-    let abs = match typed.strip_prefix('~') {
-        Some("") => home.to_string(),
-        Some(rest) if rest.starts_with('/') => format!("{home}{rest}"),
-        _ if typed.starts_with('/') => typed.to_string(),
-        _ => format!("{home}/{typed}"),
-    };
-    match abs.trim_end_matches('/') {
-        "" => "/".to_string(),
-        p => p.to_string(),
-    }
-}
-
 fn pwd_dm_set_refusal() -> String {
     crate::t!(
         "Agents in DMs always work in the default directory; only channels can have their own.",
@@ -902,7 +888,7 @@ mod tests {
             "usage / usg",
             "status",
             "restart",
-            "pwd <absolute path>",
+            "pwd <path>",
             "warm on|off [<#channel>]",
             "set-home",
             "allow-bot <@bot>",
@@ -911,31 +897,17 @@ mod tests {
         ] {
             assert!(h.contains(word), "{word}");
         }
-        assert!(!h.contains("route <machine>")); // A gateway with no machines has no routing table
+        assert!(!h.contains("pwd <machine>")); // A gateway with no machines has nobody to hand a channel to
         assert!(h.ends_with("just part of a normal message._"));
     }
 
     #[test]
-    fn a_bridge_that_takes_children_lists_route() {
-        // It was implemented in `CommandCtx::route` in relay.rs but missing from the list
+    fn a_bridge_that_takes_children_lists_the_machine_commands() {
         let h = help(true, &crate::agent::fake::FakeAgent::default());
-        assert!(h.contains("route <machine>"));
+        assert!(h.contains("pwd <machine>[:<path>]") && h.contains("channels"));
         assert!(h.contains("hand this channel to a machine"));
         // Having machines doesn't change the other sections
         assert!(h.contains("status") && h.contains("help / ?"));
     }
 
-    #[test]
-    fn project_paths_become_absolute_under_home() {
-        for (typed, want) in [
-            ("/srv/app", "/srv/app"),
-            ("/srv/app/", "/srv/app"),
-            ("~", "/home/me"),
-            ("~/dev/x", "/home/me/dev/x"),
-            ("dev/x", "/home/me/dev/x"),
-            ("/", "/"),
-        ] {
-            assert_eq!(absolute_project_path(typed, "/home/me"), want, "{typed}");
-        }
-    }
 }
