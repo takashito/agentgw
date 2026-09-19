@@ -654,6 +654,11 @@ impl Bridge {
         }
         for cwd in targets {
             let key = bridge::PoolKey::of_cwd(&cwd);
+            // A warm agent for a folder that isn't there would sit in the home directory instead
+            if !self.deps.agent.workdir_exists(&cwd) {
+                ctx.debug("bridge", &format!("pool: {cwd} is missing — not warming an agent (key={key})"));
+                continue;
+            }
             // Given-up slots have been removed from the pool — looking only at "missing" would respawn them,
             // so also check the one-way marker (`gave_up_pool_keys`)
             let status = Some(bridge::PoolStatus {

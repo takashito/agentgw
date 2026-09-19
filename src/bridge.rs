@@ -1758,6 +1758,65 @@ mod tests {
         assert!(b.ledger.pending(&ThreadKey::new("C1", ROOT)).is_empty());
     }
 
+    /// `pwd ~/…` is stored as the absolute path on this machine (no shell ever expands `~` later).
+    #[tokio::test]
+    async fn pwd_expands_the_home_directory() {
+        let (d, slack, _agent, _clock) = flow_deps("pwd-home");
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "<@U_BOT> pwd ~/dev/proj")).await;
+        settle().await;
+        let want = format!("{}/dev/proj", Host::home());
+        assert_eq!(b.access.repo_path("C1", "/home").0, want, "{:?}", slack.calls());
+    }
+
+    /// A folder that isn't there is refused at `pwd`. Otherwise tmux quietly starts the agent in the
+    /// home directory and it works somewhere nobody asked for.
+    #[tokio::test]
+    async fn pwd_refuses_a_folder_that_does_not_exist() {
+        let (d, slack, agent, _clock) = flow_deps("pwd-missing");
+        agent.missing_dirs.lock().unwrap().push("/nope/proj".into());
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "<@U_BOT> pwd /nope/proj")).await;
+        settle().await;
+        assert!(b.access.repo_path("C1", "/home").1, "nothing registered");
+        assert!(
+            slack.calls().iter().any(|c| c.contains("/nope/proj") && c.contains("*test-machine*")),
+            "{:?}",
+            slack.calls()
+        );
+    }
+
+    /// No warm agent for a folder that isn't there (it would sit in the home directory instead).
+    #[tokio::test]
+    async fn no_warm_agent_for_a_missing_folder() {
+        let (d, _slack, agent, _clock) = flow_deps("pool-missing");
+        agent.missing_dirs.lock().unwrap().push(Host::home());
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.start_missing_pool_workers(&LogCtx::default());
+        assert!(agent.spawned.lock().unwrap().is_empty());
+    }
+
+    /// A registered folder that has since gone away: say so instead of starting in the home directory.
+    #[tokio::test]
+    async fn a_missing_project_folder_stops_the_start() {
+        let (d, slack, agent, _clock) = flow_deps("repo-gone");
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "<@U_BOT> pwd /work/proj")).await;
+        agent.missing_dirs.lock().unwrap().push("/work/proj".into());
+        b.on_inbound(&channel_msg(ROOT, "U_OWNER", "<@U_BOT> fix the tests")).await;
+        settle().await;
+        let spawned = agent.spawned.lock().unwrap();
+        assert!(spawned.iter().all(|r| r.prompt.is_none()), "no agent for the message");
+        assert!(agent.delivered.lock().unwrap().is_empty(), "nor handed to a warm one");
+        drop(spawned);
+        assert!(
+            slack.calls().iter().any(|c| c.contains("/work/proj") && c.contains("pwd")),
+            "{:?}",
+            slack.calls()
+        );
+        assert!(b.ledger.pending(&ThreadKey::new("C1", ROOT)).is_empty());
+    }
+
     #[tokio::test]
     async fn login_on_a_signed_out_machine_starts_the_sign_in_here() {
         let (d, slack, agent, _clock) = flow_deps("login-signed-out");

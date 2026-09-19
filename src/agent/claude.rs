@@ -1107,6 +1107,9 @@ impl crate::agent::Agent for Claude {
         Transcript::locate(remembered, session_id).and_then(|t| t.cwd())
     }
 
+    fn workdir_exists(&self, path: &str) -> bool {
+        std::path::Path::new(path).is_dir()
+    }
     fn session_history_exists(&self, remembered: Option<&str>, session_id: &str) -> bool {
         Transcript::locate(remembered, session_id).is_some()
     }

@@ -487,6 +487,9 @@ pub trait Agent: Send + Sync + 'static {
     // moved into a worktree takes its history with it).
     fn session_cwd(&self, remembered: Option<&str>, session_id: &str) -> Option<String>;
     fn session_history_exists(&self, remembered: Option<&str>, session_id: &str) -> bool;
+    /// Whether `path` is a folder an agent can start in on this machine. tmux doesn't say when it
+    /// isn't — it quietly starts in the home directory instead.
+    fn workdir_exists(&self, path: &str) -> bool;
     fn last_activity_ms(&self, remembered: Option<&str>, session_id: &str) -> Option<u64>;
     fn current_model(
         &self,
@@ -559,6 +562,8 @@ pub mod fake {
         pub submitted_codes: Mutex<Vec<String>>,
         /// When set, `spawn` fails (the agent can't be started at all).
         pub fail_spawn: std::sync::atomic::AtomicBool,
+        /// Folders `workdir_exists` says are missing (every other folder exists).
+        pub missing_dirs: Mutex<Vec<String>>,
         windows: Mutex<Vec<WindowRow>>,
         next: AtomicU64,
     }
@@ -647,6 +652,9 @@ pub mod fake {
         }
         fn session_history_exists(&self, _r: Option<&str>, s: &str) -> bool {
             self.histories.lock().unwrap().iter().any(|h| h == s)
+        }
+        fn workdir_exists(&self, path: &str) -> bool {
+            !self.missing_dirs.lock().unwrap().iter().any(|d| d == path)
         }
         fn last_activity_ms(&self, _r: Option<&str>, _s: &str) -> Option<u64> {
             None

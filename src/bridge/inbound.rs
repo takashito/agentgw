@@ -632,7 +632,26 @@ impl Bridge {
         // envelope exists), so store it in the ledger **here**, once built; every delivery path below comes after this
         self.ledger.remember_envelope(&key, &msg.ts, &envelope);
         // Resolve the same way as pwd (no route → fall back to Home)
-        let (cwd, _) = self.access.repo_path(&msg.channel, &Host::home());
+        let (cwd, home_fallback) = self.access.repo_path(&msg.channel, &Host::home());
+        // About to start an agent in a registered folder that has gone away: tmux would quietly start it
+        // in the home directory instead, working somewhere nobody asked for. Say so and stop
+        if !home_fallback
+            && state == WorkerState::Absent
+            && !self.deps.agent.workdir_exists(&cwd)
+        {
+            ctx(None).error("bridge", &format!("project folder {cwd} is missing — not starting an agent"));
+            self.settle_told(&key);
+            let machine = &self.machine_name;
+            self.post_error_frame(
+                msg.channel.clone(),
+                root_ts.clone(),
+                crate::t!(
+                    "This channel's project folder `{cwd}` doesn't exist on *{machine}*, so no agent was started. Set it again with `pwd <path>`.",
+                    "このチャンネルのプロジェクトのフォルダ `{cwd}` が *{machine}* にありません。エージェントは起動していません。`pwd <パス>` で設定し直してください。"
+                ),
+            );
+            return;
+        }
 
         // A new thread checks the pool before a cold spawn. If it's empty, fall through to decide below
         if bridge::Threads::should_claim_pool(entry.as_ref()) {

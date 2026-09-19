@@ -167,7 +167,21 @@ impl Bridge {
                 );
                 pwd_dm_set_refusal()
             }
-            PwdMode::Set(path) => {
+            PwdMode::Set(typed) => {
+                // No shell ever sees this path (tmux gets it as is), so `~` and relative paths are
+                // resolved here, on the machine that runs this channel's agents
+                let path = &absolute_project_path(&typed, &Host::home());
+                if !self.deps.agent.workdir_exists(path) {
+                    ctx.info(
+                        "bridge",
+                        &format!("slack-events: pwd set refused — no folder {path} msg={}", msg.ts),
+                    );
+                    let machine = &self.machine_name;
+                    return crate::t!(
+                        "There's no folder `{path}` on *{machine}*. Nothing was changed.",
+                        "*{machine}* に `{path}` というフォルダがありません。何も変えていません。"
+                    );
+                }
                 let op = bridge::AccessOp::SetRepo {
                     channel: msg.channel.clone(),
                     path: path.clone(),
@@ -705,6 +719,22 @@ pub(super) fn help(fleet: bool, agent: &dyn crate::agent::Agent) -> String {
 
 /// The answer when `pwd <path>` is typed in a DM. A DM's agent always runs in the default directory —
 /// there is nothing to set, so say so instead of silently doing nothing.
+/// A project path as typed → the absolute path to store. `~` and relative paths are taken from `home`
+/// (the machine running the agents); a trailing `/` is dropped.
+fn absolute_project_path(typed: &str, home: &str) -> String {
+    let home = home.trim_end_matches('/');
+    let abs = match typed.strip_prefix('~') {
+        Some("") => home.to_string(),
+        Some(rest) if rest.starts_with('/') => format!("{home}{rest}"),
+        _ if typed.starts_with('/') => typed.to_string(),
+        _ => format!("{home}/{typed}"),
+    };
+    match abs.trim_end_matches('/') {
+        "" => "/".to_string(),
+        p => p.to_string(),
+    }
+}
+
 fn pwd_dm_set_refusal() -> String {
     crate::t!(
         "Agents in DMs always work in the default directory; only channels can have their own.",
@@ -893,5 +923,19 @@ mod tests {
         assert!(h.contains("hand this channel to a machine"));
         // Having machines doesn't change the other sections
         assert!(h.contains("status") && h.contains("help / ?"));
+    }
+
+    #[test]
+    fn project_paths_become_absolute_under_home() {
+        for (typed, want) in [
+            ("/srv/app", "/srv/app"),
+            ("/srv/app/", "/srv/app"),
+            ("~", "/home/me"),
+            ("~/dev/x", "/home/me/dev/x"),
+            ("dev/x", "/home/me/dev/x"),
+            ("/", "/"),
+        ] {
+            assert_eq!(absolute_project_path(typed, "/home/me"), want, "{typed}");
+        }
     }
 }
