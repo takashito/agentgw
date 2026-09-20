@@ -151,7 +151,8 @@ impl FromRelay {
                 thread_ts,
                 path,
             },
-            F::ProjectSet { .. } => return None,
+            // Answers and asks only ever go the other way
+            F::ProjectSet { .. } | F::Channels { .. } | F::PwdOn { .. } => return None,
         })
     }
 }

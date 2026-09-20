@@ -164,6 +164,9 @@ pub enum Cmd {
     /// `None` = bare `mode` (show the current value) / `Some(name)` = switch
     Mode(Option<String>),
     Pwd(PwdMode),
+    /// `channels` / `channel` — which machine handles this channel and the others. **The gateway answers it**;
+    /// a machine passes it up (the gateway never sees a follow-up in a running thread — it carries no mention).
+    Channels,
     Owner(OwnerCmd),
 }
 
@@ -172,7 +175,7 @@ impl Cmd {
     /// Name, synonyms and variants sit on one row, so neither `parse` nor `label` needs another table.
     /// The five that take arguments (`model` / `effort` / `mode` / `pwd` / access verbs) can't be recognised
     /// without reading the argument, so they are parsed separately below.
-    const WORDS: [(&str, &[&str], Cmd); 11] = [
+    const WORDS: [(&str, &[&str], Cmd); 12] = [
         // stop: word, `:shortcode:`, raw emoji — Slack's `text` may send any of them
         (
             "stop",
@@ -203,6 +206,7 @@ impl Cmd {
         ("restart", &["restart"], Cmd::Restart),
         ("login", &["login"], Cmd::Login),
         ("logout", &["logout"], Cmd::Logout),
+        ("channels", &["channels", "channel"], Cmd::Channels),
     ];
 
     /// If the **whole** body is a command, return it. The five that need their argument read
@@ -250,6 +254,7 @@ impl Cmd {
             Cmd::Effort(_) => "effort",
             Cmd::Mode(_) => "mode",
             Cmd::Pwd(_) => "pwd",
+            Cmd::Channels => "channels",
             Cmd::Owner(oc) => return format!("owner-command '{}'", oc.verb),
         };
         format!("'{name}'")
@@ -562,6 +567,25 @@ pub(super) enum CmdFx {
 }
 
 impl Bridge {
+    /// Hand a command to the gateway, which answers in the thread itself. `false` = there is no gateway
+    /// (a Bridge on its own), so the caller says what it can.
+    fn ask_the_gateway(
+        &self,
+        frame: crate::bridge::gateway::link::LinkFrame,
+        ctx: &LogCtx,
+    ) -> bool {
+        let Some(up) = &self.ask_gateway else {
+            return false;
+        };
+        match up.send(frame) {
+            Ok(()) => true,
+            Err(e) => {
+                ctx.error("bridge", &format!("could not ask the gateway: {e}"));
+                false
+            }
+        }
+    }
+
     /// Body commands the Bridge answers itself. **true = consumed** — the caller stops there.
     ///
     /// Authorization is a single rule: is the sender the Owner. Regardless of channel or DM,
@@ -815,8 +839,42 @@ impl Bridge {
                         msg.ts, msg.channel
                     ),
                 );
+                // Which machines exist is the gateway's knowledge — ask it, and it answers in this thread
+                if let PwdMode::On { machine, path } = &mode
+                    && self.ask_the_gateway(
+                        crate::bridge::gateway::link::LinkFrame::PwdOn {
+                            channel: msg.channel.clone(),
+                            thread_ts: root_ts.to_string(),
+                            machine: machine.clone(),
+                            path: path.clone(),
+                        },
+                        &ctx,
+                    )
+                {
+                    return true;
+                }
                 let out = self.pwd_answer(msg, mode, dm, root_ts, &ctx);
                 self.post(&msg.channel, root_ts, out, key);
+            }
+            // Same: only the gateway knows every channel and machine
+            Cmd::Channels => {
+                ctx.info(
+                    "bridge",
+                    &format!("slack-events: channels command msg={}", msg.ts),
+                );
+                if !self.ask_the_gateway(
+                    crate::bridge::gateway::link::LinkFrame::Channels {
+                        channel: msg.channel.clone(),
+                        thread_ts: root_ts.to_string(),
+                    },
+                    &ctx,
+                ) {
+                    let text = crate::t!(
+                        "This machine works on its own — there are no other machines.",
+                        "このマシンは単独で動いていて、ほかのマシンはありません。"
+                    );
+                    self.post(&msg.channel, root_ts, text, key);
+                }
             }
             Cmd::Owner(oc) => {
                 ctx.info(

@@ -118,6 +118,16 @@ pub mod link {
             thread_ts: String,
             path: String,
         },
+        /// `channels`, asked from a machine. **The gateway only sees messages that mention the bot**, and a
+        /// follow-up in a running thread doesn't; the machine that owns the thread asks on its behalf.
+        Channels { channel: String, thread_ts: String },
+        /// `pwd <machine>[:<path>]`, asked from a machine — same reason as [`LinkFrame::Channels`].
+        PwdOn {
+            channel: String,
+            thread_ts: String,
+            machine: String,
+            path: Option<String>,
+        },
         /// The machine's answer to `SetProject`: the absolute path it stored, or why it didn't (said to the
         /// person as is). Carries the channel and thread back, so the gateway keeps no table of what it asked.
         ProjectSet {
@@ -1054,23 +1064,8 @@ impl CommandCtx<'_> {
         // **Only a machine connected right now can be the target.** A typo and a machine not yet started
         // are treated the same — the only test is "is it here now". Never silently create an assignment with nowhere to go.
         if !connected.iter().any(|c| c == bridge_id) {
-            let here = if connected.is_empty() {
-                crate::t!("none", "なし")
-            } else {
-                connected.join(", ")
-            };
-            return RouteOutcome::UnknownBridge(crate::t!(
-                "No machine named *{bridge_id}* is connected. A channel can only be handed to a \
-                 machine that's online — check the name, or start agentgw on that machine. \
-                 (For a folder, write `./{bridge_id}` or `~/{bridge_id}`.)\n\
-                 Online now: {here}",
-                "*{bridge_id}* という名前のマシンはつながっていません。チャンネルを任せられるのは\
-                 オンラインのマシンだけです。名前を確かめるか、そのマシンで agentgw を起動してください。\
-                 (フォルダなら `./{bridge_id}` か `~/{bridge_id}` と書いてください。)\n\
-                 オンラインのマシン: {here}"
-            ));
-        }
-        // The machine checks the folder first; the channel moves only if it's there. With no folder named,
+            return RouteOutcome::UnknownBridge(unknown_machine(bridge_id, connected));
+        }        // The machine checks the folder first; the channel moves only if it's there. With no folder named,
         // that machine's home — so `pwd <machine>` records `<machine>:~` instead of leaving it unset
         RouteOutcome::SetProject {
             bridge_id: bridge_id.clone(),
@@ -1101,6 +1096,25 @@ impl CommandCtx<'_> {
             "これからは、すべてのマシンの通知を <#{ch}> に出します。"
         ))
     }
+}
+
+/// Why a name isn't a machine we can hand a channel to, and what is online instead.
+fn unknown_machine(bridge_id: &str, connected: &[String]) -> String {
+    let here = if connected.is_empty() {
+        crate::t!("none", "なし")
+    } else {
+        connected.join(", ")
+    };
+    crate::t!(
+        "No machine named *{bridge_id}* is connected. A channel can only be handed to a \
+         machine that's online — check the name, or start agentgw on that machine. \
+         (For a folder, write `./{bridge_id}` or `~/{bridge_id}`.)\n\
+         Online now: {here}",
+        "*{bridge_id}* という名前のマシンはつながっていません。チャンネルを任せられるのは\
+         オンラインのマシンだけです。名前を確かめるか、そのマシンで agentgw を起動してください。\
+         (フォルダなら `./{bridge_id}` か `~/{bridge_id}` と書いてください。)\n\
+         オンラインのマシン: {here}"
+    )
 }
 
 /// What `pwd <machine>` says once the channel is handed over — including, when it moves between machines,
@@ -1913,19 +1927,7 @@ impl Fleet {
             RouteOutcome::NotACommand => {}
             // The folder can only be checked where it is. Here: now. Elsewhere: ask, and bind on the answer
             RouteOutcome::SetProject { bridge_id, path } => {
-                if bridge_id == self.self_id {
-                    self.set_project_here(channel, &thread, &path).await;
-                } else if !self.links.send_to(
-                    &bridge_id,
-                    &link::LinkFrame::SetProject {
-                        channel: channel.to_string(),
-                        thread_ts: thread.clone(),
-                        path,
-                    },
-                ) {
-                    let notice = Delivery::offline_notice(&bridge_id, &self.links.connected());
-                    self.post(channel, Some(&thread), &notice).await;
-                }
+                self.assign_project(channel, &thread, &bridge_id, Some(path)).await;
                 return true;
             }
             RouteOutcome::Refused(reply) => {
@@ -2033,15 +2035,72 @@ impl Fleet {
         }
     }
 
-    /// Text a machine sent up its link. The only thing a machine says is its answer to `SetProject`.
+    /// Text a machine sent up its link: its answer to `SetProject`, or a command it was given in one of
+    /// its threads (the gateway never saw it — a follow-up in a running thread carries no mention).
     async fn on_machine_text(self: &Arc<Self>, bridge_id: &str, raw: &str) {
         match link::decode(raw) {
-            Some(link::LinkFrame::ProjectSet {
+            Some(frame) => self.on_machine_frame(bridge_id, frame).await,
+            None => rlog("info", &format!("{bridge_id}: dropped an unreadable frame from a machine")),
+        }
+    }
+
+    pub(crate) async fn on_machine_frame(self: &Arc<Self>, bridge_id: &str, frame: link::LinkFrame) {
+        match frame {
+            link::LinkFrame::ProjectSet {
                 channel,
                 thread_ts,
                 result,
-            }) => self.on_project_set(bridge_id, &channel, &thread_ts, result).await,
+            } => self.on_project_set(bridge_id, &channel, &thread_ts, result).await,
+            link::LinkFrame::Channels {
+                channel,
+                thread_ts,
+            } => {
+                let table = route_table(
+                    &channel,
+                    &self.access(),
+                    &self.links.connected(),
+                    &self.self_id,
+                );
+                self.post(&channel, Some(&thread_ts), &table).await;
+            }
+            link::LinkFrame::PwdOn {
+                channel,
+                thread_ts,
+                machine,
+                path,
+            } => self.assign_project(&channel, &thread_ts, &machine, path).await,
             _ => rlog("info", &format!("{bridge_id}: dropped an unexpected frame from a machine")),
+        }
+    }
+
+    /// `pwd <machine>[:<path>]` — check the machine is here, then let it check the folder.
+    /// With no folder named, that machine's home.
+    async fn assign_project(
+        self: &Arc<Self>,
+        channel: &str,
+        thread_ts: &str,
+        machine: &str,
+        path: Option<String>,
+    ) {
+        let connected = self.machines();
+        if !connected.iter().any(|m| m == machine) {
+            let notice = unknown_machine(machine, &connected);
+            self.post(channel, Some(thread_ts), &notice).await;
+            return;
+        }
+        let path = path.unwrap_or_else(|| "~".to_string());
+        if machine == self.self_id {
+            self.set_project_here(channel, thread_ts, &path).await;
+        } else if !self.links.send_to(
+            machine,
+            &link::LinkFrame::SetProject {
+                channel: channel.to_string(),
+                thread_ts: thread_ts.to_string(),
+                path,
+            },
+        ) {
+            let notice = Delivery::offline_notice(machine, &self.links.connected());
+            self.post(channel, Some(thread_ts), &notice).await;
         }
     }
 

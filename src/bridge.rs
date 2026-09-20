@@ -81,6 +81,9 @@ pub struct Bridge {
     started_at_ms: u64,
     /// Where spawned sign-in / sign-out tasks send back their state changes.
     cmd_tx: mpsc::Sender<CmdFx>,
+    /// Where to ask the gateway the things only it knows (`channels`, `pwd <machine>`). `None` = this
+    /// Bridge works on its own, with no gateway anywhere.
+    ask_gateway: Option<mpsc::UnboundedSender<crate::bridge::gateway::link::LinkFrame>>,
     /// The sign-in / sign-out in progress ([`command::SignIn`]).
     sign_in: command::SignIn,
     /// Whether a restart has begun. A flag so the few hundred ms until exit(0) don't run twice
@@ -124,6 +127,7 @@ struct Config {
     fleet: bool,
     machine_name: String,
     cmd_tx: mpsc::Sender<CmdFx>,
+    ask_gateway: Option<mpsc::UnboundedSender<crate::bridge::gateway::link::LinkFrame>>,
 }
 
 impl Bridge {
@@ -150,6 +154,7 @@ impl Bridge {
             bot_user_id: config.bot_user_id,
             started_at_ms: config.started_at_ms,
             cmd_tx: config.cmd_tx,
+            ask_gateway: config.ask_gateway,
             sign_in: command::SignIn::default(),
             restarting: false,
             limited_until_ms: 0,
@@ -174,6 +179,7 @@ impl Bridge {
             fleet: false,
             machine_name: "test-machine".into(),
             cmd_tx,
+            ask_gateway: None,
         };
         (Bridge::new(deps, config), cmd_rx)
     }
@@ -442,8 +448,11 @@ impl Bridge {
             Some(id) if !id.is_empty() => id,
             _ => Host::name().await,
         };
-        // Answers this machine sends up the link (only `pwd <machine>:<path>` has one)
+        // What this Bridge sends up to the gateway: answers (`ProjectSet`) and the commands only the
+        // gateway can run (`channels`, `pwd <machine>`). On the gateway itself it loops back into its own
+        // fleet, so both sides go through the same handler
         let (up_tx, up_rx) = mpsc::unbounded_channel();
+        let up_is_linked = !matches!(wiring.upstream, machine::Mode::Direct { .. });
         let uplink: machine::Uplink = Arc::new(tokio::sync::Mutex::new(up_rx));
         // Via Relay the bot token **comes in the handshake**, so the Api can only be built after it.
         // This is the only ordering difference from a direct connection.
@@ -511,6 +520,9 @@ impl Bridge {
         // Apply the home carried in the first handshake here. `Access::load` rereads it after this,
         // so the start-up notice (online) goes to the same channel as the gateway's from the start
         adopt_home(&dir, link_home);
+        if !matches!(mode, machine::Mode::Direct { .. }) {
+            drop_gateway_records(&dir);
+        }
 
         let api: crate::chat::ChatRef = Arc::new(slack::Api::new(&bot_token)?);
         let (hook_tx, mut hook_rx) = mpsc::channel(64);
@@ -571,6 +583,16 @@ impl Bridge {
                 listen.addr,
             ));
             tokio::spawn(fleet.clone().watch_presence());
+            {
+                // The gateway's own channels: its Bridge asks through the same channel a machine uses
+                let (fleet, up) = (fleet.clone(), uplink.clone());
+                let me = wiring.self_id.clone().unwrap_or_default();
+                tokio::spawn(async move {
+                    while let Some(frame) = up.lock().await.recv().await {
+                        fleet.on_machine_frame(&me, frame).await;
+                    }
+                });
+            }
             fleet
         });
         // Only when the gateway is behind NAT do we go out to fetch the machine
@@ -695,6 +717,7 @@ impl Bridge {
                 fleet: fleet.is_some(),
                 machine_name: machine_name.clone(),
                 cmd_tx,
+                ask_gateway: (fleet.is_some() || up_is_linked).then(|| up_tx.clone()),
             },
         );
         // Sweep login sessions the previous Bridge left before going down
@@ -891,6 +914,35 @@ struct RelaySinks {
     relink: mpsc::Sender<()>,
     up: mpsc::UnboundedSender<crate::bridge::gateway::link::LinkFrame>,
     machine: String,
+}
+
+/// **Who handles which channel is the gateway's record.** A machine that was the gateway once keeps its
+/// old assignments in access.json, and then names the wrong machine for a channel it now handles itself.
+/// Dropped at start-up; a route left with nothing in it goes too.
+fn drop_gateway_records(dir: &crate::state_dir::StateDir) {
+    let mut access = bridge::Access::load(dir);
+    let before = access.routes.len();
+    let mut changed = false;
+    for route in access.routes.values_mut() {
+        changed |= route.bridge.take().is_some();
+    }
+    access.routes.retain(|_, r| {
+        r.repo_path.is_some() || r.label.is_some() || r.warm.is_some() || r.allowed_tools.is_some() || !r.extra.is_empty()
+    });
+    changed |= access.routes.len() != before;
+    if !changed {
+        return;
+    }
+    match access.save(dir) {
+        Ok(()) => LogCtx::default().info(
+            "bridge",
+            &format!(
+                "dropped the gateway's own records from access.json ({before} → {} channel(s) kept)",
+                access.routes.len()
+            ),
+        ),
+        Err(e) => LogCtx::default().error("bridge", &format!("could not save access.json: {e}")),
+    }
 }
 
 async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
@@ -1239,6 +1291,31 @@ mod tests {
     /// A machine told "you're in charge" by the gateway not only writes access.json but **also sends the reread signal**.
     /// Without it the running gate keeps an empty Owner and drops every later delivery as `no-owner`
     /// (2026-08-02 on a real machine. Dropped at the door, so even the fixing command couldn't get in; only a restart got out).
+    /// A machine that used to be the gateway keeps its old assignments; they name the wrong machine for
+    /// channels it now handles itself, so they go at start-up.
+    #[test]
+    fn a_machine_drops_the_gateways_records() {
+        let dir = crate::state_dir::StateDir::at(
+            std::env::temp_dir().join(format!("sc-dropgw-{}", std::process::id())),
+        );
+        let _ = std::fs::remove_dir_all(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(
+            dir.join("access.json"),
+            r#"{"owner":"U1","routes":{"C_MINE":{"bridge":"pve","repo_path":"/srv/app"},"C_THEIRS":{"bridge":"pve"}}}"#,
+        )
+        .unwrap();
+
+        drop_gateway_records(&dir);
+
+        let access = bridge::Access::load(&dir);
+        assert_eq!(access.routes.len(), 1, "a route with nothing left goes");
+        let mine = &access.routes["C_MINE"];
+        assert_eq!(mine.repo_path.as_deref(), Some("/srv/app"), "the folder stays");
+        assert_eq!(mine.bridge, None, "who handles it is the gateway's record");
+        let _ = std::fs::remove_dir_all(dir.path());
+    }
+
     /// `pwd <this machine>:<path>`: a folder that's there is stored (absolute) and the answer goes up;
     /// one that isn't changes nothing and says why.
     #[tokio::test]
@@ -1861,6 +1938,37 @@ mod tests {
             slack.calls()
         );
         assert!(b.ledger.pending(&ThreadKey::new("C1", ROOT)).is_empty());
+    }
+
+    /// `channels` and `pwd <machine>` are the gateway's to answer, and a follow-up in a running thread
+    /// never reaches it (no mention). The machine that owns the thread passes them up.
+    #[tokio::test]
+    async fn the_machine_passes_gateway_commands_up() {
+        use crate::bridge::gateway::link::LinkFrame;
+        let (d, slack, _agent, _clock) = flow_deps("ask-gateway");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let (up, mut up_rx) = mpsc::unbounded_channel();
+        b.ask_gateway = Some(up);
+
+        b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "<@U_BOT> channels")).await;
+        b.on_inbound(&channel_msg("1782000001.000200", "U_OWNER", "<@U_BOT> pwd dock:~/x")).await;
+        settle().await;
+
+        assert_eq!(
+            up_rx.try_recv(),
+            Ok(LinkFrame::Channels { channel: "C1".into(), thread_ts: "1782000001.000100".into() })
+        );
+        assert_eq!(
+            up_rx.try_recv(),
+            Ok(LinkFrame::PwdOn {
+                channel: "C1".into(),
+                thread_ts: "1782000001.000200".into(),
+                machine: "dock".into(),
+                path: Some("~/x".into()),
+            })
+        );
+        // The gateway answers in the thread; the machine says nothing of its own
+        assert!(slack.calls().is_empty(), "{:?}", slack.calls());
     }
 
     /// `pwd` names the machine in front of the path — the same path is a different folder elsewhere.
