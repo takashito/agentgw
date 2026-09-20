@@ -212,7 +212,7 @@ impl Bridge {
     /// Posts "online" to home. Used both **at start-up and when the link to the gateway is re-established**
     /// (for a machine this one line is the only way to tell a person "connected" — the gateway's presence only reports 🔴).
     async fn announce_online(&mut self, connected_as: &str) {
-        let pools: Vec<String> = self.access.pool_targets(&Host::home());
+        let pools: Vec<String> = self.access.pool_targets(&Host::home(), &self.machine_name);
         let text = online_notice(
             &Host::name().await,
             // A notice for people to read, so show the **name**

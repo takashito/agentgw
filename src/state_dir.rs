@@ -209,7 +209,11 @@ pub(crate) fn write_atomic_mode(path: &Path, text: &str, mode: Option<u32>) -> s
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    // **Unique per write, not per process.** The gateway and its own Bridge both write access.json, and
+    // sharing one tmp name made the second rename fail with "No such file or directory"
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp{}-{seq}", std::process::id()));
     match mode {
         None => std::fs::write(&tmp, text)?,
         Some(m) => {

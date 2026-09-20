@@ -760,12 +760,18 @@ impl Access {
     /// - Then one per **distinct repo_path** in routes. The flag is per channel
     ///   but pools are per repo, so if even one channel pointing at the repo opts in (`warm != Some(false)`,
     ///   unset counts as opt-in) it gets stocked (OR). Opted-out channels still claim that pool if it exists.
-    pub fn pool_targets(&self, home_dir: &str) -> Vec<String> {
+    /// `me` is this machine's name: **a folder on another machine is not ours to warm**. The gateway keeps
+    /// a copy of every channel's folder (for `channels`), and without this check it started warming
+    /// agents in folders that only exist on the machines it hands those channels to.
+    pub fn pool_targets(&self, home_dir: &str, me: &str) -> Vec<String> {
         if self.owner.is_empty() {
             return Vec::new();
         }
         let mut targets = vec![home_dir.to_string()];
         for cfg in self.routes.values() {
+            if cfg.bridge.as_deref().is_some_and(|b| b != me) {
+                continue;
+            }
             let repo = match cfg.repo_path.as_deref().filter(|p| !p.is_empty()) {
                 // ponytail: linear search — pool count is repo count (a few at most). Switch to a HashSet if it grows.
                 Some(r) if !targets.iter().any(|cwd| cwd == r) => r,
@@ -1650,7 +1656,7 @@ mod tests {
     fn pool_targets_empty_without_owner() {
         let mut a = Access::default();
         a.owner = String::new();
-        assert!(a.pool_targets("/home").is_empty());
+        assert!(a.pool_targets("/home", "me").is_empty());
     }
 
     #[test]
@@ -1681,7 +1687,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let pools = a.pool_targets("/home");
+        let pools = a.pool_targets("/home", "me");
         let cwds: Vec<&str> = pools.iter().map(|p| p.as_str()).collect();
         assert!(cwds.contains(&"/home"));
         assert!(
@@ -1708,8 +1714,32 @@ mod tests {
                 ..Default::default()
             },
         );
-        let pools = a.pool_targets("/home");
+        let pools = a.pool_targets("/home", "me");
         assert!(!pools.iter().any(|p| p == "/repo/c"));
+    }
+
+    /// The gateway keeps a copy of every channel's folder so `channels` can show it. Those folders live
+    /// on the machines that handle them, and warming an agent in one here would start it in the wrong place
+    /// (seen on a real gateway: it tried to warm the Mac's repos).
+    #[test]
+    fn pool_targets_skip_folders_that_belong_to_another_machine() {
+        let mut a = Access::default();
+        a.owner = "U1".to_string();
+        a.routes.insert(
+            "C_MINE".into(),
+            Route { repo_path: Some("/repo/mine".into()), ..Default::default() },
+        );
+        a.routes.insert(
+            "C_THEIRS".into(),
+            Route {
+                repo_path: Some("/repo/theirs".into()),
+                bridge: Some("other".into()),
+                ..Default::default()
+            },
+        );
+        let pools = a.pool_targets("/home", "me");
+        assert!(pools.iter().any(|p| p == "/repo/mine"), "{pools:?}");
+        assert!(!pools.iter().any(|p| p == "/repo/theirs"), "{pools:?}");
     }
 
     #[test]
