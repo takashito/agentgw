@@ -122,6 +122,9 @@ pub mod link {
         Home { channel: String },
         /// `set-home`, asked from a machine — same reason as [`LinkFrame::Channels`].
         SetHome { channel: String, thread_ts: String },
+        /// Where this machine's agents start when a channel has no folder of its own. Sent on connecting,
+        /// so `channels` can show a real path for every channel instead of just the machine's name.
+        MachineHome { path: String },
         /// `channels`, asked from a machine. **The gateway only sees messages that mention the bot**, and a
         /// follow-up in a running thread doesn't; the machine that owns the thread asks on its behalf.
         Channels { channel: String, thread_ts: String },
@@ -1042,7 +1045,13 @@ impl CommandCtx<'_> {
     /// `channels` (the table) and `pwd <machine>[:<path>]` (handing this channel to a machine). Both are
     /// answered here — the gateway is the one that knows the machines. `pwd <path>` is not: it goes to the
     /// machine running this channel, which is where the folder is.
-    pub fn route(&self, access: &Access, connected: &[String], self_id: &str) -> RouteOutcome {
+    pub fn route(
+        &self,
+        access: &Access,
+        connected: &[String],
+        self_id: &str,
+        homes: &HashMap<String, String>,
+    ) -> RouteOutcome {
         let ctx = self;
         let listing = ["channels", "channel"]
             .iter()
@@ -1051,7 +1060,13 @@ impl CommandCtx<'_> {
             if let Some(reply) = ctx.refuse_if_not_owner("channels") {
                 return RouteOutcome::Refused(reply);
             }
-            return RouteOutcome::List(route_table(ctx.channel_id, access, connected, self_id));
+            return RouteOutcome::List(route_table(
+                ctx.channel_id,
+                access,
+                connected,
+                self_id,
+                homes,
+            ));
         }
         let pwd = ctx
             .addressed()
@@ -1161,7 +1176,13 @@ pub enum RouteOutcome {
 ///
 /// Channels with no machine assigned go to the gateway — writing only "unassigned" in the list
 /// leaves the reader unsure where messages written there go.
-pub fn route_table(here: &str, access: &Access, connected: &[String], self_id: &str) -> String {
+pub fn route_table(
+    here: &str,
+    access: &Access,
+    connected: &[String],
+    self_id: &str,
+    homes: &HashMap<String, String>,
+) -> String {
     let online = |id: &str| connected.iter().any(|c| c == id);
     // Channel rows only flag trouble: a row per channel all marked 🟢 is noise (the machines line
     // at the bottom already shows who is up)
@@ -1180,9 +1201,14 @@ pub fn route_table(here: &str, access: &Access, connected: &[String], self_id: &
             .and_then(|r| r.bridge.as_deref())
             .unwrap_or(self_id)
             .to_string();
-        let where_ = match route.and_then(|r| r.repo_path.as_deref()) {
-            Some(path) if !path.is_empty() => format!("`{id}:{path}`"),
-            _ => format!("*{id}*"),
+        // No folder of its own = that machine's home, which it told us when it connected
+        let folder = route
+            .and_then(|r| r.repo_path.as_deref())
+            .filter(|p| !p.is_empty())
+            .or_else(|| homes.get(&id).map(String::as_str));
+        let where_ = match folder {
+            Some(path) => format!("`{id}:{path}`"),
+            None => format!("*{id}*"),
         };
         format!("{where_}{}", mark(&id))
     };
@@ -1598,6 +1624,9 @@ pub struct Fleet {
     pub token: String,
     /// This machine's name. What `pwd <own id>` points at.
     pub self_id: String,
+    /// machine → the folder its agents start in when a channel has no folder of its own. Filled when a
+    /// machine connects; **memory only**, since it is only for showing `channels`.
+    pub homes: tokio::sync::Mutex<HashMap<String, String>>,
     /// The Slack bot token handed to machines (given out in the `Ready` frame).
     pub bot_token: String,
     pub api: crate::chat::ChatRef,
@@ -1631,6 +1660,15 @@ impl Fleet {
             return;
         }
         let _ = self.reload.send(()).await;
+    }
+
+    /// Each machine's home folder, ours included (nobody tells us our own).
+    async fn homes(&self) -> HashMap<String, String> {
+        let mut homes = self.homes.lock().await.clone();
+        homes
+            .entry(self.self_id.clone())
+            .or_insert_with(StateDir::home);
+        homes
     }
 
     fn owner(&self) -> Option<String> {
@@ -1931,7 +1969,7 @@ impl Fleet {
         };
 
         // ── route — answered here and **never delivered** (the destination is the very thing being changed)
-        match ctx.route(&self.access(), &machines, &self.self_id) {
+        match ctx.route(&self.access(), &machines, &self.self_id, &self.homes().await) {
             RouteOutcome::NotACommand => {}
             // The folder can only be checked where it is. Here: now. Elsewhere: ask, and bind on the answer
             RouteOutcome::SetProject { bridge_id, path } => {
@@ -2060,8 +2098,17 @@ impl Fleet {
             } => {
                 // `machines()` and not `links.connected()`: the gateway is a machine too, and leaving
                 // itself out of the list drew it as offline
-                let table = route_table(&channel, &self.access(), &self.machines(), &self.self_id);
+                let table = route_table(
+                    &channel,
+                    &self.access(),
+                    &self.machines(),
+                    &self.self_id,
+                    &self.homes().await,
+                );
                 self.post(&channel, Some(&thread_ts), &table).await;
+            }
+            link::LinkFrame::MachineHome { path } => {
+                self.homes.lock().await.insert(bridge_id.to_string(), path);
             }
             link::LinkFrame::SetHome {
                 channel,
@@ -3227,6 +3274,7 @@ mod tests {
             std::env::temp_dir().join(format!("slack-relay-test-{}", std::process::id())),
         );
         let fleet = Arc::new(Fleet {
+            homes: Default::default(),
             links: LinkServer::new(),
             token: "s3cret".to_string(),
             self_id: "parent".to_string(),
@@ -3543,6 +3591,7 @@ mod tests {
             &access_of(&[]),
             &here(),
             "parent",
+            &Default::default(),
         );
         // With no folder named, that machine's home — so `pwd` shows `desktop:/home/…`, not "not set"
         assert_eq!(
@@ -3571,6 +3620,7 @@ mod tests {
                 &access_of(&[]),
                 &here(),
                 "parent",
+            &Default::default(),
             );
             assert!(
                 matches!(got, RouteOutcome::Refused(_)),
@@ -3587,6 +3637,7 @@ mod tests {
             &access_of(&[]),
             &here(),
             "parent",
+            &Default::default(),
         );
         match got {
             RouteOutcome::UnknownBridge(reply) => {
@@ -3607,6 +3658,7 @@ mod tests {
             &access_of(&[("C1", "desktop"), ("C2", "laptop")]),
             &here(),
             "vps",
+            &Default::default(),
         );
         let RouteOutcome::List(reply) = got else {
             panic!("{got:?}")
@@ -3639,6 +3691,7 @@ mod tests {
             &access_of(&[("C1", "desktop")]),
             &here(),
             "vps",
+            &Default::default(),
         );
         let RouteOutcome::List(reply) = got else {
             panic!("{got:?}")
@@ -3659,6 +3712,7 @@ mod tests {
             &access_of(&[]),
             &[],
             "vps",
+            &Default::default(),
         );
         let RouteOutcome::List(reply) = got else {
             panic!("{got:?}")
@@ -3674,6 +3728,7 @@ mod tests {
             &access_of(&[]),
             &here(),
             "parent",
+            &Default::default(),
         );
         assert_eq!(got, RouteOutcome::NotACommand);
     }
@@ -3689,6 +3744,7 @@ mod tests {
                 &access_of(&[]),
                 &here(),
                 "parent",
+            &Default::default(),
             );
             assert_eq!(got, RouteOutcome::NotACommand, "{text}");
         }
@@ -3702,8 +3758,28 @@ mod tests {
             &access_of(&[]),
             &here(),
             "parent",
+            &Default::default(),
         );
         assert!(matches!(got, RouteOutcome::SetProject { .. }), "{got:?}");
+    }
+
+    /// Every row says where the work happens: the channel's own folder, or the machine's home (which it
+    /// told us when it connected). A machine we've never heard a home from is named alone.
+    #[test]
+    fn the_table_shows_a_folder_for_every_channel() {
+        let homes: HashMap<String, String> = [("desktop".to_string(), "/home/me".to_string())]
+            .into_iter()
+            .collect();
+        let table = route_table(
+            "C1",
+            &access_of(&[("C1", "desktop:/srv/app"), ("C2", "desktop"), ("C3", "laptop")]),
+            &here(),
+            "vps",
+            &homes,
+        );
+        assert!(table.contains("<#C1> → `desktop:/srv/app`"), "{table}");
+        assert!(table.contains("- <#C2> → `desktop:/home/me`"), "{table}");
+        assert!(table.contains("- <#C3> → *laptop* 🔴 offline"), "{table}");
     }
 
     /// `pwd <machine>:<path>` asks the machine first — only it can see its folders.
@@ -3714,6 +3790,7 @@ mod tests {
             &access_of(&[]),
             &here(),
             "vps",
+            &Default::default(),
         );
         assert_eq!(
             got,
@@ -3725,7 +3802,7 @@ mod tests {
     #[test]
     fn pwd_with_only_a_path_is_the_machines_business() {
         for text in ["<@U_BOT> pwd ~/x", "<@U_BOT> pwd /srv/x", "<@U_BOT> pwd ./x", "<@U_BOT> pwd"] {
-            let got = CommandCtx::route(&ctx("C1", text, Some(OWNER)), &access_of(&[]), &here(), "vps");
+            let got = CommandCtx::route(&ctx("C1", text, Some(OWNER)), &access_of(&[]), &here(), "vps", &Default::default());
             assert_eq!(got, RouteOutcome::NotACommand, "{text}");
         }
     }
@@ -3734,11 +3811,11 @@ mod tests {
     #[test]
     fn channels_lists_and_route_is_gone() {
         for text in ["<@U_BOT> channels", "<@U_BOT> channel"] {
-            let got = CommandCtx::route(&ctx("C1", text, Some(OWNER)), &access_of(&[]), &here(), "vps");
+            let got = CommandCtx::route(&ctx("C1", text, Some(OWNER)), &access_of(&[]), &here(), "vps", &Default::default());
             assert!(matches!(got, RouteOutcome::List(_)), "{text} → {got:?}");
         }
         for text in ["<@U_BOT> route", "<@U_BOT> route desktop"] {
-            let got = CommandCtx::route(&ctx("C1", text, Some(OWNER)), &access_of(&[]), &here(), "vps");
+            let got = CommandCtx::route(&ctx("C1", text, Some(OWNER)), &access_of(&[]), &here(), "vps", &Default::default());
             assert_eq!(got, RouteOutcome::NotACommand, "{text}");
         }
     }
@@ -3788,7 +3865,7 @@ mod tests {
             bot_user_id: None,
         };
         assert_eq!(
-            CommandCtx::route(&c, &access_of(&[]), &here(), "parent"),
+            CommandCtx::route(&c, &access_of(&[]), &here(), "parent", &Default::default()),
             RouteOutcome::NotACommand
         );
     }

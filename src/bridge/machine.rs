@@ -155,7 +155,11 @@ impl FromRelay {
             },
             F::Home { channel } => FromRelay::Home { channel },
             // Answers and asks only ever go the other way
-            F::ProjectSet { .. } | F::Channels { .. } | F::PwdOn { .. } | F::SetHome { .. } => {
+            F::ProjectSet { .. }
+            | F::Channels { .. }
+            | F::PwdOn { .. }
+            | F::SetHome { .. }
+            | F::MachineHome { .. } => {
                 return None;
             }
         })

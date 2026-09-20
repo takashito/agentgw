@@ -570,6 +570,7 @@ impl Bridge {
                 api: api.clone(),
                 dir: dir.clone(),
                 cooldown: Default::default(),
+                homes: Default::default(),
                 presence: Default::default(),
                 pending_selection: Default::default(),
                 bot_user_id: Default::default(),
@@ -927,6 +928,9 @@ fn report_folders(
     dir: &crate::state_dir::StateDir,
     up: &mpsc::UnboundedSender<crate::bridge::gateway::link::LinkFrame>,
 ) {
+    let _ = up.send(crate::bridge::gateway::link::LinkFrame::MachineHome {
+        path: Host::home(),
+    });
     for (channel, route) in bridge::Access::load(dir).routes {
         let Some(path) = route.repo_path.filter(|p| !p.is_empty()) else {
             continue;
@@ -2027,6 +2031,11 @@ mod tests {
 
         report_folders(&dir, &up);
 
+        assert_eq!(
+            up_rx.try_recv(),
+            Ok(LinkFrame::MachineHome { path: Host::home() }),
+            "where a channel with no folder of its own works"
+        );
         assert_eq!(
             up_rx.try_recv(),
             Ok(LinkFrame::ProjectSet {
