@@ -133,10 +133,17 @@ impl Bridge {
         ctx: &LogCtx,
     ) -> String {
         let home = Host::home();
+        let me = self.machine_name.clone();
         let entry = |access: &bridge::Access, ch: &str| {
             let (repo_path, is_fallback) = access.repo_path(ch, &home);
             PwdEntry {
                 channel_id: ch.to_string(),
+                // Unset = this machine handles the channel itself
+                machine: access
+                    .routes
+                    .get(ch)
+                    .and_then(|r| r.bridge.clone())
+                    .unwrap_or_else(|| me.clone()),
                 repo_path,
                 label: access.routes.get(ch).and_then(|r| r.label.clone()),
                 is_fallback,
@@ -160,7 +167,7 @@ impl Bridge {
                     .keys()
                     .map(|ch| entry(&self.access, ch))
                     .collect();
-                PwdEntry::render_all(&all, &home)
+                PwdEntry::render_all(&all, &me, &home)
             }
             // A DM has no route (its agent always starts at Home), so say so
             // instead of silently recording it
@@ -584,6 +591,9 @@ impl StatusReport {
 /// route).
 pub struct PwdEntry {
     pub channel_id: String,
+    /// The machine that works in it. Written in front of the path (`dock:/srv/app`), because the same
+    /// path means different folders on different machines.
+    pub machine: String,
     pub repo_path: String,
     pub label: Option<String>,
     pub is_fallback: bool,
@@ -610,29 +620,30 @@ impl PwdEntry {
             String::new()
         };
         format!(
-            "● {heading}\n<#{}>{label}{note}\n  `{}`",
-            entry.channel_id, entry.repo_path
+            "● {heading}\n<#{}>{label}{note}\n  `{}:{}`",
+            entry.channel_id, entry.machine, entry.repo_path
         )
     }
 
     /// Every configured channel → path (the `pwd all` form). `home` is the Home fallback that channels /
-    /// DMs without a route fall to.
-    pub fn render_all(entries: &[PwdEntry], home: &str) -> String {
+    /// DMs without a route fall to, on `me` (the machine answering).
+    pub fn render_all(entries: &[PwdEntry], me: &str, home: &str) -> String {
         let mut lines = vec![crate::t!("● Project directories by channel", "● チャンネルごとの作業ディレクトリ")];
         if entries.is_empty() {
             lines.push(crate::t!("  • None set.", "  • まだ設定していません。"));
         } else {
             for e in entries {
                 lines.push(format!(
-                    "  • <#{}>{} → `{}`",
+                    "  • <#{}>{} → `{}:{}`",
                     e.channel_id,
                     e.label_text(),
+                    e.machine,
                     e.repo_path
                 ));
             }
         }
         lines.push(String::new());
-        lines.push(crate::t!("_Channels without one, and DMs, use `{home}`_", "_設定していないチャンネルと DM は `{home}` を使います_"));
+        lines.push(crate::t!("_Channels without one, and DMs, use `{me}:{home}`_", "_設定していないチャンネルと DM は `{me}:{home}` を使います_"));
         lines.join("\n")
     }
 }
@@ -671,7 +682,7 @@ pub(super) fn help(fleet: bool, agent: &dyn crate::agent::Agent) -> String {
             &mut lines,
             crate::t!("Machines", "マシン"),
             vec![
-                ("pwd <machine>[:<path>]", crate::t!("hand this channel to a machine (and use that folder on it)", "このチャンネルをマシンに任せる(パスを付けるとそのマシンのそのフォルダで)")),
+                ("pwd <machine>[:<path>]", crate::t!("hand this channel to a machine (its home folder, or the one you name)", "このチャンネルをマシンに任せる(パス無しならそのマシンの家、付ければそのフォルダ)")),
                 ("channels", crate::t!("show which machine handles this channel and the others", "このチャンネルとほかのチャンネルを受け持つマシンを見る")),
             ],
         );
@@ -730,13 +741,13 @@ fn pwd_usage() -> String {
          • `pwd` — this channel's project folder\n\
          • `pwd all` — every channel's\n\
          • `pwd /srv/app` · `pwd ~/dev/app` · `pwd ./dev/app` — work in that folder\n\
-         • `pwd <machine>` — hand this channel to that machine\n\
+         • `pwd <machine>` — hand this channel to that machine (its home folder)\n\
          • `pwd <machine>:~/dev/app` — hand it over and work in that folder there",
         "`pwd` の書き方:\n\
          • `pwd` — このチャンネルの作業ディレクトリを見る\n\
          • `pwd all` — すべてのチャンネルの分を見る\n\
          • `pwd /srv/app`・`pwd ~/dev/app`・`pwd ./dev/app` — そのフォルダで作業する\n\
-         • `pwd <マシン>` — このチャンネルをそのマシンに任せる\n\
+         • `pwd <マシン>` — このチャンネルをそのマシンに任せる(そのマシンの家のディレクトリ)\n\
          • `pwd <マシン>:~/dev/app` — そのマシンに任せて、そのフォルダで作業する"
     )
 }
@@ -875,19 +886,20 @@ mod tests {
     fn pwd_renders() {
         let e = PwdEntry {
             channel_id: "C1".into(),
+            machine: "dock".into(),
             repo_path: "/dev/x".into(),
             label: Some("dev".into()),
             is_fallback: true,
         };
         assert_eq!(
             e.render("This channel"),
-            "● This channel\n<#C1>（dev） — not set; using the default directory\n  `/dev/x`"
+            "● This channel\n<#C1>（dev） — not set; using the default directory\n  `dock:/dev/x`"
         );
-        assert!(PwdEntry::render_all(&[e], "/home").contains("  • <#C1>（dev） → `/dev/x`"));
-        assert!(PwdEntry::render_all(&[], "/home").contains("None set."));
+        assert!(PwdEntry::render_all(&[e], "dock", "/home").contains("  • <#C1>（dev） → `dock:/dev/x`"));
+        assert!(PwdEntry::render_all(&[], "dock", "/home").contains("None set."));
         assert!(
-            PwdEntry::render_all(&[], "/home")
-                .ends_with("_Channels without one, and DMs, use `/home`_")
+            PwdEntry::render_all(&[], "dock", "/home")
+                .ends_with("_Channels without one, and DMs, use `dock:/home`_")
         );
     }
 

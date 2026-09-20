@@ -242,7 +242,7 @@ Mention the bot (`@agentgw <command>`), or type in a thread it's working in.
 | `usage` | Your Claude subscription usage |
 | `status` | Version, active threads and warm agents |
 | `channels` | Which machine handles this channel and the others |
-| `pwd [<machine>:][path]` | Show this channel's project directory, or set it (`/…`, `~/…`, `./…`) — with `<machine>:`, hand the channel to that machine first |
+| `pwd [<machine>[:<path>]]` · `pwd [path]` | Show this channel's project directory, or set it (`/…`, `~/…`, `./…`). Naming a machine hands the channel to it — its home folder, or the one you name |
 | `warm on\|off` | Keep an agent started ahead of time for this channel |
 | `set-home` | Send notices (online, offline, errors) to this channel |
 | `allow-bot @bot` · `remove-bot @bot` | Let another bot's messages start work |

@@ -1863,6 +1863,20 @@ mod tests {
         assert!(b.ledger.pending(&ThreadKey::new("C1", ROOT)).is_empty());
     }
 
+    /// `pwd` names the machine in front of the path — the same path is a different folder elsewhere.
+    #[tokio::test]
+    async fn pwd_says_which_machine_the_folder_is_on() {
+        let (d, slack, _agent, _clock) = flow_deps("pwd-machine");
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "<@U_BOT> pwd")).await;
+        settle().await;
+        assert!(
+            slack.calls().iter().any(|c| c.contains(&format!("`test-machine:{}`", Host::home()))),
+            "{:?}",
+            slack.calls()
+        );
+    }
+
     /// A message that starts with `pwd` but isn't one of the forms gets the usage — it used to go to the
     /// agent as a sentence, so a mistyped path just vanished into the conversation.
     #[tokio::test]

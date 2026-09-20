@@ -1070,19 +1070,14 @@ impl CommandCtx<'_> {
                  オンラインのマシン: {here}"
             ));
         }
-        // With a folder, the machine checks it first; the channel moves only if it's there
-        if let Some(path) = path {
-            return RouteOutcome::SetProject {
-                bridge_id: bridge_id.clone(),
-                path,
-            };
-        }
-
-        RouteOutcome::Set {
+        // The machine checks the folder first; the channel moves only if it's there. With no folder named,
+        // that machine's home — so `pwd <machine>` records `<machine>:~` instead of leaving it unset
+        RouteOutcome::SetProject {
             bridge_id: bridge_id.clone(),
-            reply: handover_reply(ctx.channel_id, routes, bridge_id),
+            path: path.unwrap_or_else(|| "~".to_string()),
         }
     }
+
 
     /// `set-home` — the channel it's typed in becomes the fleet-wide home. Takes no arguments.
     pub fn set_home(&self) -> SetHomeOutcome {
@@ -1134,11 +1129,6 @@ pub enum RouteOutcome {
     NotACommand,
     Refused(String),
     List(String),
-    /// A machine was assigned. Return `reply`, and bind `bridge_id` to this channel.
-    Set {
-        bridge_id: String,
-        reply: String,
-    },
     /// `pwd <machine>:<path>`: ask the machine to set `path` up; bind only on its yes.
     SetProject { bridge_id: String, path: String },
     UnknownBridge(String),
@@ -1914,11 +1904,6 @@ impl Fleet {
         let routes = self.access().bridges();
         match ctx.route(&routes, &machines, &self.self_id) {
             RouteOutcome::NotACommand => {}
-            RouteOutcome::Set { bridge_id, reply } => {
-                self.bind_and_link(&bridge_id, channel, &thread).await;
-                self.post(channel, Some(&thread), &reply).await;
-                return true;
-            }
             // The folder can only be checked where it is. Here: now. Elsewhere: ask, and bind on the answer
             RouteOutcome::SetProject { bridge_id, path } => {
                 if bridge_id == self.self_id {
@@ -3442,32 +3427,22 @@ mod tests {
             &here(),
             "parent",
         );
-        match got {
-            RouteOutcome::Set { bridge_id, reply } => {
-                assert_eq!(bridge_id, "desktop");
-                assert!(reply.contains("This channel is now handled by *desktop*."));
-                assert!(!reply.contains("before")); // no note the first time
-            }
-            other => panic!("{other:?}"),
-        }
+        // With no folder named, that machine's home — so `pwd` shows `desktop:/home/…`, not "not set"
+        assert_eq!(
+            got,
+            RouteOutcome::SetProject { bridge_id: "desktop".into(), path: "~".into() }
+        );
+        let reply = handover_reply("C1", &routes(&[]), "desktop");
+        assert!(reply.contains("This channel is now handled by *desktop*."));
+        assert!(!reply.contains("before")); // no note the first time
     }
 
     /// **Changing** the machine is said honestly — the conversation can be reread, but the details of the work are gone.
     #[test]
     fn changing_the_owner_of_a_channel_says_what_is_lost() {
-        let got = CommandCtx::route(
-            &ctx("C1", "<@U_BOT> pwd vps", Some(OWNER)),
-            &routes(&[("C1", "desktop")]),
-            &here(),
-            "parent",
-        );
-        match got {
-            RouteOutcome::Set { reply, .. } => {
-                assert!(reply.contains("It was *desktop* before"));
-                assert!(reply.contains("it can't see what desktop actually did"));
-            }
-            other => panic!("{other:?}"),
-        }
+        let reply = handover_reply("C1", &routes(&[("C1", "desktop")]), "vps");
+        assert!(reply.contains("It was *desktop* before"));
+        assert!(reply.contains("it can't see what desktop actually did"));
     }
 
     /// **Nobody else can use it.** Without this, a shared channel could be hijacked.
@@ -3611,7 +3586,7 @@ mod tests {
             &here(),
             "parent",
         );
-        assert!(matches!(got, RouteOutcome::Set { .. }), "{got:?}");
+        assert!(matches!(got, RouteOutcome::SetProject { .. }), "{got:?}");
     }
 
     /// `pwd <machine>:<path>` asks the machine first — only it can see its folders.
