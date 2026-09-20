@@ -105,6 +105,30 @@ pub fn candidate_url(env_url: Option<&str>, tailscale_json: Option<&str>) -> Opt
     (!name.is_empty()).then(|| format!("wss://{name}"))
 }
 
+/// This machine on the tailnet: (DNS name, first IPv4). Empty strings where tailscale can't say.
+/// Pure so `machines` can be tested without a tailnet.
+pub fn tailnet_identity(tailscale_json: Option<&str>) -> (String, String) {
+    let Some(json) = tailscale_json.and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+    else {
+        return (String::new(), String::new());
+    };
+    let name = json["Self"]["DNSName"]
+        .as_str()
+        .unwrap_or_default()
+        .trim_end_matches('.')
+        .to_string();
+    let ip = json["Self"]["TailscaleIPs"]
+        .as_array()
+        .and_then(|ips| {
+            ips.iter()
+                .filter_map(|ip| ip.as_str())
+                .find(|ip| !ip.contains(':'))
+        })
+        .unwrap_or_default()
+        .to_string();
+    (name, ip)
+}
+
 /// The URL written to the machine's `.env`.
 pub fn dial_url(t: &Transport) -> String {
     match t {
@@ -486,6 +510,19 @@ fn dist_artifact(triple: &str) -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `machines` shows where each machine can be reached. Nothing from tailscale = nothing to show,
+    /// not a guess.
+    #[test]
+    fn tailnet_identity_reads_the_name_and_the_v4_address() {
+        let json = r#"{"Self":{"DNSName":"pve.tail1234.ts.net.","TailscaleIPs":["fd7a::1","100.89.207.102"]}}"#;
+        assert_eq!(
+            tailnet_identity(Some(json)),
+            ("pve.tail1234.ts.net".to_string(), "100.89.207.102".to_string())
+        );
+        assert_eq!(tailnet_identity(None), (String::new(), String::new()));
+        assert_eq!(tailnet_identity(Some("not json")), (String::new(), String::new()));
+    }
 
     #[test]
     fn maps_uname_to_a_rust_triple() {

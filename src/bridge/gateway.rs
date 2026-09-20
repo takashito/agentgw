@@ -128,6 +128,10 @@ pub mod link {
         /// Where this machine's agents start when a channel has no folder of its own. Sent on connecting,
         /// so `channels` can show a real path for every channel instead of just the machine's name.
         MachineHome { path: String },
+        /// Where this machine can be reached: its tailnet name and IP (empty when there is no tailnet).
+        MachineHost { host: String, ip: String },
+        /// `machines`, asked from a machine — same reason as [`LinkFrame::Channels`].
+        Machines { channel: String, thread_ts: String },
         /// `channels`, asked from a machine. **The gateway only sees messages that mention the bot**, and a
         /// follow-up in a running thread doesn't; the machine that owns the thread asks on its behalf.
         Channels { channel: String, thread_ts: String },
@@ -1630,6 +1634,8 @@ pub struct Fleet {
     /// machine → the folder its agents start in when a channel has no folder of its own. Filled when a
     /// machine connects; **memory only**, since it is only for showing `channels`.
     pub homes: tokio::sync::Mutex<HashMap<String, String>>,
+    /// machine → (host, ip), as the machine itself reported on connecting. **Memory only** for the same reason.
+    pub hosts: tokio::sync::Mutex<HashMap<String, (String, String)>>,
     /// The Slack bot token handed to machines (given out in the `Ready` frame).
     pub bot_token: String,
     pub api: crate::chat::ChatRef,
@@ -1663,6 +1669,61 @@ impl Fleet {
             return;
         }
         let _ = self.reload.send(()).await;
+    }
+
+    /// The `machines` list: the gateway first, then every machine it knows, with where it can be reached
+    /// and whether it is connected. Hosts come from the machines themselves — only they can see their tailnet.
+    async fn machines_table(self: &Arc<Self>) -> String {
+        let hosts = self.hosts.lock().await.clone();
+        let (me_host, me_ip) =
+            crate::setup::add_machine::tailnet_identity(crate::setup::ssh::tailscale_json().as_deref());
+        let connected = self.links.connected();
+        let mut names: Vec<String> = connected.clone();
+        for id in self.access().routes.values().filter_map(|r| r.bridge.clone()) {
+            if id != self.self_id && !names.contains(&id) {
+                names.push(id);
+            }
+        }
+        names.sort();
+        names.dedup();
+
+        let where_ = |host: &str, ip: &str| match (host.is_empty(), ip.is_empty()) {
+            (true, true) => crate::t!("(not known here)", "(こちらでは分かりません)"),
+            (false, true) => format!("`{host}`"),
+            (true, false) => format!("`{ip}`"),
+            (false, false) => format!("`{host}` (`{ip}`)"),
+        };
+        let me = &self.self_id;
+        let me_where = where_(&me_host, &me_ip);
+        let mut lines = vec![
+            crate::t!("*Gateway*", "*ゲートウェイ*"),
+            crate::t!("machine id: `{me}`", "マシン: `{me}`"),
+            crate::t!("host: {me_where}", "ホスト: {me_where}"),
+            String::new(),
+            crate::t!("*Machines*", "*マシン*"),
+        ];
+        if names.is_empty() {
+            lines.push(crate::t!(
+                "(none yet — run `agentgw add-machine user@host` here)",
+                "(まだありません。ここで `agentgw add-machine user@host` を実行してください)"
+            ));
+        }
+        for (i, id) in names.iter().enumerate() {
+            if i > 0 {
+                lines.push(String::new());
+            }
+            let (host, ip) = hosts.get(id).cloned().unwrap_or_default();
+            let online = connected.iter().any(|c| c == id);
+            let state = match online {
+                true => crate::t!("🟢 online", "🟢 オンライン"),
+                false => crate::t!("🔴 offline", "🔴 オフライン"),
+            };
+            let reachable = where_(&host, &ip);
+            lines.push(crate::t!("machine id: `{id}`", "マシン: `{id}`"));
+            lines.push(crate::t!("host: {reachable}", "ホスト: {reachable}"));
+            lines.push(crate::t!("status: {state}", "状態: {state}"));
+        }
+        lines.join("\n")
     }
 
     /// The `channels` table. **`machines()` and not `links.connected()`**: the gateway is a machine too,
@@ -2130,6 +2191,16 @@ impl Fleet {
             }
             link::LinkFrame::MachineHome { path } => {
                 self.homes.lock().await.insert(bridge_id.to_string(), path);
+            }
+            link::LinkFrame::MachineHost { host, ip } => {
+                self.hosts.lock().await.insert(bridge_id.to_string(), (host, ip));
+            }
+            link::LinkFrame::Machines {
+                channel,
+                thread_ts,
+            } => {
+                let table = self.machines_table().await;
+                self.post(&channel, Some(&thread_ts), &table).await;
             }
             link::LinkFrame::SetHome {
                 channel,
@@ -3297,6 +3368,7 @@ mod tests {
         );
         let fleet = Arc::new(Fleet {
             homes: Default::default(),
+            hosts: Default::default(),
             links: LinkServer::new(),
             token: "s3cret".to_string(),
             self_id: "parent".to_string(),

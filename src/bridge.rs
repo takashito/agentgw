@@ -596,6 +596,7 @@ impl Bridge {
                 dir: dir.clone(),
                 cooldown: Default::default(),
                 homes: Default::default(),
+                hosts: Default::default(),
                 presence: Default::default(),
                 pending_selection: Default::default(),
                 bot_user_id: Default::default(),
@@ -966,6 +967,11 @@ fn report_folders(
     let _ = up.send(crate::bridge::gateway::link::LinkFrame::MachineHome {
         path: Host::home(),
     });
+    // Where this machine can be reached. Only it can see its own tailnet
+    let (host, ip) = crate::setup::add_machine::tailnet_identity(
+        crate::setup::ssh::tailscale_json().as_deref(),
+    );
+    let _ = up.send(crate::bridge::gateway::link::LinkFrame::MachineHost { host, ip });
     for (channel, route) in bridge::Access::load(dir).routes {
         let Some(path) = route.repo_path.filter(|p| !p.is_empty()) else {
             continue;
@@ -2021,6 +2027,7 @@ mod tests {
         b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "<@U_BOT> channels")).await;
         b.on_inbound(&channel_msg("1782000001.000200", "U_OWNER", "<@U_BOT> pwd dock:~/x")).await;
         b.on_inbound(&channel_msg("1782000001.000300", "U_OWNER", "<@U_BOT> set-home")).await;
+        b.on_inbound(&channel_msg("1782000001.000400", "U_OWNER", "<@U_BOT> machines")).await;
         settle().await;
 
         assert_eq!(
@@ -2040,6 +2047,11 @@ mod tests {
             up_rx.try_recv(),
             Ok(LinkFrame::SetHome { channel: "C1".into(), thread_ts: "1782000001.000300".into() }),
             "one notice channel for the whole fleet, so the gateway decides"
+        );
+        assert_eq!(
+            up_rx.try_recv(),
+            Ok(LinkFrame::Machines { channel: "C1".into(), thread_ts: "1782000001.000400".into() }),
+            "only the gateway knows the machines"
         );
         // The gateway answers in the thread; the machine says nothing of its own
         assert!(slack.calls().is_empty(), "{:?}", slack.calls());
@@ -2069,6 +2081,8 @@ mod tests {
             Ok(LinkFrame::MachineHome { path: Host::home() }),
             "where a channel with no folder of its own works"
         );
+        // …and where this machine can be reached (whatever this host's tailnet says)
+        assert!(matches!(up_rx.try_recv(), Ok(LinkFrame::MachineHost { .. })));
         assert_eq!(
             up_rx.try_recv(),
             Ok(LinkFrame::ProjectSet {

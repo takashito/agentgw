@@ -169,7 +169,9 @@ impl FromRelay {
             | F::Channels { .. }
             | F::PwdOn { .. }
             | F::SetHome { .. }
-            | F::MachineHome { .. } => {
+            | F::MachineHome { .. }
+            | F::MachineHost { .. }
+            | F::Machines { .. } => {
                 return None;
             }
         })
