@@ -701,6 +701,7 @@ impl Bridge {
                     relink: relink_tx.clone(),
                     up: up_tx.clone(),
                     machine: machine_name.clone(),
+                    gateway_url: link_address.clone(),
                 };
                 tokio::spawn(async move {
                     while let Some(item) = rx.recv().await {
@@ -769,7 +770,7 @@ impl Bridge {
         if up_is_linked
             && let Some(up) = &b.ask_gateway
         {
-            report_folders(&b.deps.dir, up, &Host::name().await);
+            report_folders(&b.deps.dir, up, &Host::name().await, Some(&link_address));
         }
         // Sweep login sessions the previous Bridge left before going down
         b.deps.agent.login_kill();
@@ -962,6 +963,8 @@ struct RelaySinks {
     relink: mpsc::Sender<()>,
     up: mpsc::UnboundedSender<crate::bridge::gateway::link::LinkFrame>,
     machine: String,
+    /// Where this machine dials the gateway — which says which of its interfaces the link goes out of.
+    gateway_url: String,
 }
 
 /// Tell the gateway where this machine works for each of its channels. The folders are **this machine's
@@ -972,14 +975,21 @@ fn report_folders(
     dir: &crate::state_dir::StateDir,
     up: &mpsc::UnboundedSender<crate::bridge::gateway::link::LinkFrame>,
     hostname: &str,
+    gateway_url: Option<&str>,
 ) {
     let _ = up.send(crate::bridge::gateway::link::LinkFrame::MachineHome {
         path: Host::home(),
     });
-    // Where this machine can be reached. Only it can see its own tailnet — and its own hostname
+    // Where this machine can be reached, on the interface it dials the gateway from. Only it can see
+    // that — its own tailnet, its own name, and which of its interfaces the route goes out of
+    let local_ip = gateway_url
+        .and_then(crate::setup::add_machine::host_port_of)
+        .and_then(|(host, port)| crate::setup::add_machine::local_ip_toward(&host, port));
     let (host, ip) = crate::setup::add_machine::reachable_at(
         crate::setup::ssh::tailscale_json().as_deref(),
-        &hostname,
+        hostname,
+        crate::setup::ssh::fqdn().as_deref(),
+        local_ip.as_deref(),
     );
     let _ = up.send(crate::bridge::gateway::link::LinkFrame::MachineHost { host, ip });
     for (channel, route) in bridge::Access::load(dir).routes {
@@ -1032,6 +1042,7 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
         relink,
         up,
         machine,
+        gateway_url,
     } = sinks;
     match item {
         machine::FromRelay::Event { name, event } => {
@@ -1055,7 +1066,7 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
                 let _ = reload.send(()).await;
             }
             // The gateway may have restarted without our folders; say where we work
-            report_folders(dir, up, machine);
+            report_folders(dir, up, machine, Some(gateway_url));
             // **The first one at start-up doesn't come through here** (the wait loop before construction eats it). Only
             // reconnects get here, so post online each time
             let _ = relink.send(()).await;
@@ -1409,7 +1420,7 @@ mod tests {
         let (reload, mut reload_rx) = mpsc::channel(4);
         let (relink, _relink_rx) = mpsc::channel(4);
         let (up, mut up_rx) = mpsc::unbounded_channel();
-        let sinks = RelaySinks { msg_tx, click_tx, dir: dir.clone(), reload, relink, up, machine: "desk".into() };
+        let sinks = RelaySinks { msg_tx, click_tx, dir: dir.clone(), reload, relink, up, machine: "desk".into(), gateway_url: String::new() };
         let ask = |path: &str| machine::FromRelay::SetProject {
             channel: "C1".into(),
             thread_ts: "1.1".into(),
@@ -1455,6 +1466,7 @@ mod tests {
             relink: relink_tx,
             up,
             machine: "test-machine".into(),
+            gateway_url: String::new(),
         };
         pump_relay(
             machine::FromRelay::Linked {
@@ -2084,7 +2096,7 @@ mod tests {
         .unwrap();
         let (up, mut up_rx) = mpsc::unbounded_channel();
 
-        report_folders(&dir, &up, "pve");
+        report_folders(&dir, &up, "pve", None);
 
         assert_eq!(
             up_rx.try_recv(),

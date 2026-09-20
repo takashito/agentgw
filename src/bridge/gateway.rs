@@ -1686,9 +1686,12 @@ impl Fleet {
     /// and whether it is connected. Hosts come from the machines themselves — only they can see their tailnet.
     async fn machines_table(self: &Arc<Self>) -> String {
         let hosts = self.hosts.lock().await.clone();
+        // The gateway doesn't dial anyone, so there is no interface of its own to name
         let (me_host, me_ip) = crate::setup::add_machine::reachable_at(
             crate::setup::ssh::tailscale_json().as_deref(),
             &crate::bridge::Host::name().await,
+            crate::setup::ssh::fqdn().as_deref(),
+            None,
         );
         let tunnels = self.tunnels.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let connected = self.links.connected();

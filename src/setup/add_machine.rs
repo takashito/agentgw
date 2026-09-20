@@ -113,16 +113,59 @@ pub enum Transport {
 /// Candidate for a direct connection. The URL remembered in `.env` wins; otherwise the tailscale name.
 ///
 
-/// Where this machine can be reached: (host, IPv4). The tailnet name when there is one — it works from
-/// anywhere — and **the hostname otherwise**, which is always there even with no tailscale at all.
-/// Pure so `machines` can be tested without a tailnet.
-pub fn reachable_at(tailscale_json: Option<&str>, hostname: &str) -> (String, String) {
-    let (name, ip) = tailnet_identity(tailscale_json);
-    let host = match name.is_empty() {
-        true => hostname.trim().to_string(),
-        false => name,
+/// Where this machine can be reached, **on the interface it uses to reach the gateway**: (host, IPv4).
+///
+/// Not "its best address": a machine on a tailnet that links over the LAN is reachable at its LAN
+/// address, and saying its tailnet name there would name an interface the link doesn't use.
+/// `local_ip` is the address the kernel would send from (see [`local_ip_toward`]); the name is the
+/// tailnet's when that is the address it picked, and this machine's own name otherwise.
+///
+/// Pure so it can be tested without a tailnet.
+pub fn reachable_at(
+    tailscale_json: Option<&str>,
+    hostname: &str,
+    fqdn: Option<&str>,
+    local_ip: Option<&str>,
+) -> (String, String) {
+    let own = fqdn
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .unwrap_or(hostname)
+        .trim()
+        .to_string();
+    let (tailnet, tailnet_ip) = tailnet_identity(tailscale_json);
+    match local_ip.map(str::trim).filter(|i| !i.is_empty()) {
+        // Out over the tailnet: the tailnet's name is the one that resolves to this address
+        Some(ip) if ip == tailnet_ip && !tailnet.is_empty() => (tailnet, ip.to_string()),
+        Some(ip) => (own, ip.to_string()),
+        // Nothing dialled yet (the gateway asking about itself). Its name, with no interface to name
+        None => (own, String::new()),
+    }
+}
+
+/// The address this machine would send from to reach `host:port`. **Asks the routing table, sends
+/// nothing** — a connected UDP socket only fixes the peer, and then the local address is decided.
+pub fn local_ip_toward(host: &str, port: u16) -> Option<String> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect((host, port)).ok()?;
+    match sock.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(ip) => Some(ip.to_string()),
+        std::net::IpAddr::V6(_) => None,
+    }
+}
+
+/// `host` and port from a dial URL: `ws://dock.lan:8787` → `("dock.lan", 8787)`, `wss://x` → `("x", 443)`.
+pub fn host_port_of(url: &str) -> Option<(String, u16)> {
+    let (scheme, rest) = url.trim().split_once("://")?;
+    let rest = rest.split('/').next()?;
+    let default = match scheme {
+        "wss" | "https" => 443,
+        _ => 80,
     };
-    (host, ip)
+    match rest.rsplit_once(':') {
+        Some((host, port)) => Some((host.to_string(), port.parse().ok()?)),
+        None => Some((rest.to_string(), default)),
+    }
 }
 
 /// This machine on the tailnet: (DNS name, first IPv4). Empty strings where tailscale can't say.
@@ -984,19 +1027,37 @@ fn dist_artifact(triple: &str) -> Option<std::path::PathBuf> {
 mod tests {
     use super::*;
 
-    /// `machines` shows where each machine can be reached. Nothing from tailscale = nothing to show,
-    /// not a guess.
-    /// No tailscale at all is the normal case on a plain server: fall back to the hostname, which is
-    /// always there, instead of showing nothing.
+    /// `machines` shows where each machine can be reached **on the interface the link uses**. A machine
+    /// with tailscale that links over the LAN is at its LAN address — naming its tailnet there would
+    /// point at an interface the link doesn't use (seen on a real machine).
     #[test]
-    fn reachable_at_falls_back_to_the_hostname() {
+    fn reachable_at_names_the_interface_the_link_uses() {
         let json = r#"{"Self":{"DNSName":"pve.tail1234.ts.net.","TailscaleIPs":["100.89.207.102"]}}"#;
         assert_eq!(
-            reachable_at(Some(json), "pve"),
-            ("pve.tail1234.ts.net".to_string(), "100.89.207.102".to_string())
+            reachable_at(Some(json), "pve", Some("pve.lan"), Some("100.89.207.102")),
+            ("pve.tail1234.ts.net".to_string(), "100.89.207.102".to_string()),
+            "out over the tailnet"
         );
-        assert_eq!(reachable_at(None, "pve"), ("pve".to_string(), String::new()));
-        assert_eq!(reachable_at(Some("{}"), " pve\n"), ("pve".to_string(), String::new()));
+        assert_eq!(
+            reachable_at(Some(json), "pve", Some("pve.lan"), Some("192.168.10.20")),
+            ("pve.lan".to_string(), "192.168.10.20".to_string()),
+            "tailscale is installed, but the link goes over the LAN"
+        );
+        // No tailscale at all is the normal case on a plain server, and `hostname -f` may say nothing
+        assert_eq!(
+            reachable_at(None, "pve", None, Some("192.168.10.20")),
+            ("pve".to_string(), "192.168.10.20".to_string())
+        );
+        // Nothing dialled (the gateway asking about itself): a name, and no interface to name
+        assert_eq!(reachable_at(None, " pve\n", None, None), ("pve".to_string(), String::new()));
+    }
+
+    #[test]
+    fn a_dial_url_gives_the_host_and_port_to_ask_the_routing_table_about() {
+        assert_eq!(host_port_of("ws://dock.lan:8787"), Some(("dock.lan".to_string(), 8787)));
+        assert_eq!(host_port_of("wss://dock.example.ts.net"), Some(("dock.example.ts.net".to_string(), 443)));
+        assert_eq!(host_port_of("wss://dock.example.ts.net/bridge/pve"), Some(("dock.example.ts.net".to_string(), 443)));
+        assert_eq!(host_port_of("dock.lan"), None);
     }
 
     #[test]
