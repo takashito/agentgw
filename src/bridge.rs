@@ -720,6 +720,9 @@ impl Bridge {
                 ask_gateway: (fleet.is_some() || up_is_linked).then(|| up_tx.clone()),
             },
         );
+        if let Some(up) = &b.ask_gateway {
+            report_folders(&b.deps.dir, up);
+        }
         // Sweep login sessions the previous Bridge left before going down
         b.deps.agent.login_kill();
         // The Owner stays in access.json across restarts. restart goes down without tearing down the pool,
@@ -916,6 +919,26 @@ struct RelaySinks {
     machine: String,
 }
 
+/// Tell the gateway where this machine works for each of its channels. The folders are **this machine's
+/// record** (it reads them when it starts an agent); the gateway keeps a copy only so `channels` can show
+/// them. Sent at start-up and on every reconnect, so the copy is right even for folders set before it
+/// started keeping one.
+fn report_folders(
+    dir: &crate::state_dir::StateDir,
+    up: &mpsc::UnboundedSender<crate::bridge::gateway::link::LinkFrame>,
+) {
+    for (channel, route) in bridge::Access::load(dir).routes {
+        let Some(path) = route.repo_path.filter(|p| !p.is_empty()) else {
+            continue;
+        };
+        let _ = up.send(crate::bridge::gateway::link::LinkFrame::ProjectSet {
+            channel,
+            thread_ts: String::new(),
+            result: Ok(path),
+        });
+    }
+}
+
 /// **Who handles which channel is the gateway's record.** A machine that was the gateway once keeps its
 /// old assignments in access.json, and then names the wrong machine for a channel it now handles itself.
 /// Dropped at start-up; a route left with nothing in it goes too.
@@ -976,6 +999,8 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
             if adopt_home(dir, home) {
                 let _ = reload.send(()).await;
             }
+            // The gateway may have restarted without our folders; say where we work
+            report_folders(dir, up);
             // **The first one at start-up doesn't come through here** (the wait loop before construction eats it). Only
             // reconnects get here, so post online each time
             let _ = relink.send(()).await;
@@ -1981,6 +2006,37 @@ mod tests {
         );
         // The gateway answers in the thread; the machine says nothing of its own
         assert!(slack.calls().is_empty(), "{:?}", slack.calls());
+    }
+
+    /// On connecting, a machine says where it works for each of its channels — the gateway may have
+    /// started with no copy at all, and `channels` would then show machines with no folders.
+    #[test]
+    fn a_machine_reports_its_folders_when_it_connects() {
+        use crate::bridge::gateway::link::LinkFrame;
+        let dir = crate::state_dir::StateDir::at(
+            std::env::temp_dir().join(format!("sc-report-{}", std::process::id())),
+        );
+        let _ = std::fs::remove_dir_all(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(
+            dir.join("access.json"),
+            r#"{"owner":"U1","routes":{"C_WORK":{"repo_path":"/srv/app"},"C_NONE":{"warm":true}}}"#,
+        )
+        .unwrap();
+        let (up, mut up_rx) = mpsc::unbounded_channel();
+
+        report_folders(&dir, &up);
+
+        assert_eq!(
+            up_rx.try_recv(),
+            Ok(LinkFrame::ProjectSet {
+                channel: "C_WORK".into(),
+                thread_ts: String::new(),
+                result: Ok("/srv/app".into()),
+            })
+        );
+        assert_eq!(up_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty), "nothing to say for a channel with no folder");
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     /// A folder set on the machine itself is reported up, so the gateway's `channels` doesn't go stale.

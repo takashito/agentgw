@@ -2058,12 +2058,9 @@ impl Fleet {
                 channel,
                 thread_ts,
             } => {
-                let table = route_table(
-                    &channel,
-                    &self.access(),
-                    &self.links.connected(),
-                    &self.self_id,
-                );
+                // `machines()` and not `links.connected()`: the gateway is a machine too, and leaving
+                // itself out of the list drew it as offline
+                let table = route_table(&channel, &self.access(), &self.machines(), &self.self_id);
                 self.post(&channel, Some(&thread_ts), &table).await;
             }
             link::LinkFrame::SetHome {
