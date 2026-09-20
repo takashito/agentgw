@@ -31,8 +31,8 @@ const CODE_POLL_MAX: u32 = 30;
 /// The one line returned to a thread with no session (shared by all commands).
 fn no_session() -> String {
     crate::t!(
-        "This thread has no session running yet. Send a message to start one first.",
-        "このスレッドには、まだ動いているセッションがありません。先にメッセージを送ってセッションを始めてください。"
+        "This thread has no agent running. Send a message to start one.",
+        "このスレッドには、動いているエージェントがありません。メッセージを送ると始まります。"
     )
 }
 
@@ -371,9 +371,18 @@ impl Bridge {
         };
         let name = SessionId::from(sid.clone()).window_name();
         let window_id = self.workers.window_of(&sid);
+        // **The record isn't the agent.** A thread keeps its session id after its agent is gone, and typing
+        // into a window that isn't there answered with a raw tmux error ("can't find window")
+        if self.deps.agent.pid_of(window_id.as_deref(), &name).is_none() {
+            ctx.info(
+                "bridge",
+                &format!("{label}: session {sid} is not running — {no_session_tail}"),
+            );
+            return Err(no_session());
+        }
         // Check unanswered messages first — if empty, don't go poke tmux (the same short-circuit as user_stop)
         let pending = self.ledger.pending(key);
-        if !pending.is_empty() && self.deps.agent.pid_of(window_id.as_deref(), &name).is_some() {
+        if !pending.is_empty() {
             ctx.info(
                 "bridge",
                 &format!(

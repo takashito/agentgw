@@ -2137,6 +2137,24 @@ mod tests {
         assert!(!out.contains("C_THEIRS"), "a channel handed to another machine is not ours: {out}");
     }
 
+    /// A thread keeps its session id after its agent is gone. `effort` (and `model` / `mode` / `context` /
+    /// `compact`, which share the guard) typed into the window anyway and answered with tmux's own error.
+    #[tokio::test]
+    async fn a_tui_command_says_so_when_the_agent_is_gone() {
+        use crate::agent::{Agent, Window};
+        let (d, slack, agent, _clock) = flow_deps("effort-gone");
+        let (mut b, _fx) = Bridge::for_test(d);
+        running_thread(&mut b, &agent).await;
+        agent.terminate(&Window::of("@0")).unwrap(); // the agent's window is gone
+        b.on_inbound(&in_thread("1782000000.000200", "<@U_BOT> effort")).await;
+        settle().await;
+        assert!(
+            slack.calls().iter().any(|c| c.contains("no agent running")),
+            "{:?}",
+            slack.calls()
+        );
+    }
+
     /// `pwd` names the machine in front of the path — the same path is a different folder elsewhere.
     #[tokio::test]
     async fn pwd_says_which_machine_the_folder_is_on() {
