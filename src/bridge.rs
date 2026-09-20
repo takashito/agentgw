@@ -1863,6 +1863,22 @@ mod tests {
         assert!(b.ledger.pending(&ThreadKey::new("C1", ROOT)).is_empty());
     }
 
+    /// A message that starts with `pwd` but isn't one of the forms gets the usage — it used to go to the
+    /// agent as a sentence, so a mistyped path just vanished into the conversation.
+    #[tokio::test]
+    async fn a_pwd_in_no_known_shape_answers_with_the_usage() {
+        let (d, slack, agent, _clock) = flow_deps("pwd-usage");
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "<@U_BOT> pwd 何か変な値")).await;
+        settle().await;
+        assert!(agent.spawned.lock().unwrap().is_empty(), "not handed to an agent");
+        assert!(
+            slack.calls().iter().any(|c| c.contains("`pwd <machine>:~/dev/app`")),
+            "{:?}",
+            slack.calls()
+        );
+    }
+
     /// `pwd ~/…` is stored as the absolute path on this machine (no shell ever expands `~` later).
     #[tokio::test]
     async fn pwd_expands_the_home_directory() {

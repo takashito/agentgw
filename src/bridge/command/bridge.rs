@@ -143,6 +143,7 @@ impl Bridge {
             }
         };
         match mode {
+            PwdMode::Usage => pwd_usage(),
             // Only the gateway knows the machines and answers these. Reaching a Bridge means there is
             // no gateway, or no such machine behind it
             PwdMode::On { machine, .. } => crate::t!(
@@ -721,6 +722,25 @@ pub(super) fn help(fleet: bool, agent: &dyn crate::agent::Agent) -> String {
 
 /// The answer when `pwd <path>` is typed in a DM. A DM's agent always runs in the default directory —
 /// there is nothing to set, so say so instead of silently doing nothing.
+/// What `pwd` accepts. Answered when a message starts with `pwd` but the rest is none of the forms —
+/// a mistyped path is a mistake to point out, not a sentence to hand to the agent.
+fn pwd_usage() -> String {
+    crate::t!(
+        "`pwd` takes one of these:\n\
+         • `pwd` — this channel's project folder\n\
+         • `pwd all` — every channel's\n\
+         • `pwd /srv/app` · `pwd ~/dev/app` · `pwd ./dev/app` — work in that folder\n\
+         • `pwd <machine>` — hand this channel to that machine\n\
+         • `pwd <machine>:~/dev/app` — hand it over and work in that folder there",
+        "`pwd` の書き方:\n\
+         • `pwd` — このチャンネルの作業ディレクトリを見る\n\
+         • `pwd all` — すべてのチャンネルの分を見る\n\
+         • `pwd /srv/app`・`pwd ~/dev/app`・`pwd ./dev/app` — そのフォルダで作業する\n\
+         • `pwd <マシン>` — このチャンネルをそのマシンに任せる\n\
+         • `pwd <マシン>:~/dev/app` — そのマシンに任せて、そのフォルダで作業する"
+    )
+}
+
 fn pwd_dm_set_refusal() -> String {
     crate::t!(
         "Agents in DMs always work in the default directory; only channels can have their own.",

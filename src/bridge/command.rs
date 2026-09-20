@@ -301,9 +301,12 @@ impl Cmd {
         let (machine, path) = match joined.split_once(':') {
             Some((m, p)) => (m.to_string(), Some(p.trim().to_string()).filter(|p| !p.is_empty())),
             None if args.len() == 1 => (joined, None),
-            None => return None,
+            None => return Some(PwdMode::Usage),
         };
-        crate::bridge::state::is_machine_name(&machine).then_some(PwdMode::On { machine, path })
+        Some(match crate::bridge::state::is_machine_name(&machine) {
+            true => PwdMode::On { machine, path },
+            false => PwdMode::Usage,
+        })
     }
 
     /// Whether this is an **attempt** at the verb or just a sentence that starts with that word. Decided only by
@@ -373,6 +376,9 @@ pub enum PwdMode {
     /// with a path, set its project folder there. **The gateway answers these** (it's the one that knows
     /// the machines); a Bridge that sees one has no machine by that name.
     On { machine: String, path: Option<String> },
+    /// The message starts with `pwd` but what follows is none of the forms. **Answer with the usage**
+    /// rather than handing it to the agent: a mistyped path used to vanish into the conversation.
+    Usage,
 }
 
 // Access management is not an MCP tool: the Owner sends a plain message and the Bridge parses it here and
@@ -801,6 +807,7 @@ impl Bridge {
                     PwdMode::Set(_) => "set",
                     PwdMode::All => "all",
                     PwdMode::On { .. } => "on",
+                    PwdMode::Usage => "usage",
                 };
                 ctx.info(
                     "bridge",
@@ -1038,7 +1045,8 @@ mod tests {
             Cmd::pwd(&Message::new("pwd all", None)),
             Some(PwdMode::All)
         ));
-        assert_eq!(Cmd::pwd(&Message::new("pwd の使い方", None)), None);
+        // Starts with pwd but isn't one of the forms → the usage, not a sentence for the agent
+        assert_eq!(Cmd::pwd(&Message::new("pwd の使い方", None)), Some(PwdMode::Usage));
         // A path starts with / ~ or . — any other first word is a machine
         let on = |m: &str, p: Option<&str>| {
             Some(PwdMode::On { machine: m.into(), path: p.map(str::to_string) })
@@ -1048,7 +1056,9 @@ mod tests {
         assert_eq!(Cmd::pwd(&Message::new("pwd dock:~/a b", None)), on("dock", Some("~/a b")));
         assert_eq!(Cmd::pwd(&Message::new("pwd ./dev", None)), Some(PwdMode::Set("./dev".into())));
         assert_eq!(Cmd::pwd(&Message::new("pwd /a:b", None)), Some(PwdMode::Set("/a:b".into())));
-        assert_eq!(Cmd::pwd(&Message::new("pwd is handy", None)), None); // two words, no colon = a sentence
+        assert_eq!(Cmd::pwd(&Message::new("pwd is handy", None)), Some(PwdMode::Usage));
+        assert_eq!(Cmd::pwd(&Message::new("pwd 何か変な値", None)), Some(PwdMode::Usage));
+        assert_eq!(Cmd::pwd(&Message::new("please pwd /x", None)), None); // not the first word = a sentence
         let oc = Cmd::owner(&Message::new("warm on <#C1|general>", None)).unwrap();
         assert_eq!((oc.verb, oc.args.len()), ("warm", 2));
         assert!(Cmd::owner(&Message::new("warm の話をしよう", None)).is_none()); // no on/off = a sentence
