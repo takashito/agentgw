@@ -786,40 +786,26 @@ pub(super) fn help(machines: bool, agent: &dyn crate::agent::Agent) -> String {
     for (title, rows) in super::agent::help_sections(agent) {
         section(&mut lines, title, rows);
     }
+    let mut channels: Vec<(&str, String)> = Vec::new();
     if machines {
-        section(
-            &mut lines,
-            crate::t!("Machines", "マシン"),
-            vec![
-                ("pwd <machine>[:<path>]", crate::t!("hand this channel to a machine (its home folder, or the one you name)", "このチャンネルをマシンに任せる(パス無しならそのマシンの家、付ければそのフォルダ)")),
-                ("channels", crate::t!("show which machine handles this channel and the others", "このチャンネルとほかのチャンネルを受け持つマシンを見る")),
-            ],
-        );
+        channels.push(("channels", crate::t!("show which machine handles this channel and the others", "このチャンネルとほかのチャンネルを受け持つマシンを見る")));
     }
+    channels.push(("pwd", crate::t!("show this channel's project directory", "このチャンネルの作業ディレクトリを見る")));
+    channels.push(("pwd <path>", crate::t!("set this channel's project directory (`/…`, `~/…`)", "このチャンネルの作業ディレクトリを決める(`/…`・`~/…`)")));
+    if machines {
+        channels.push(("pwd <machine>[:<path>]", crate::t!("map this channel to a machine (its home folder or specific path)", "このチャンネルをマシンに割り当てる(そのマシンの家、またはパスを指定)")));
+    }
+    channels.push(("warm on|off [<#channel>]", crate::t!("keep an agent started ahead of time for a channel", "チャンネルのエージェントを先に起動しておくか")));
+    channels.push(("allow-bot <@bot>", crate::t!("let a bot's messages start work", "そのボットの投稿で作業を始められるようにする")));
+    channels.push(("remove-bot <@bot>", crate::t!("stop letting that bot's messages through", "そのボットの投稿を通さないようにする")));
+    channels.push(("set-home", crate::t!("send notices to this channel", "通知をこのチャンネルに出す")));
+    section(&mut lines, crate::t!("Channels", "チャンネル"), channels);
     section(
         &mut lines,
-        crate::t!("Channels", "チャンネル"),
+        crate::t!("Agent Gateway", "Agent Gateway"),
         vec![
-            ("pwd", crate::t!("show this channel's project directory", "このチャンネルの作業ディレクトリを見る")),
-            ("pwd <path>", crate::t!("set this channel's project directory (`/…`, `~/…` or `./…`)", "このチャンネルの作業ディレクトリを決める(`/…`・`~/…`・`./…`)")),
-            ("warm on|off [<#channel>]", crate::t!("keep an agent started ahead of time for a channel", "チャンネルのエージェントを先に起動しておくか")),
-            ("set-home", crate::t!("send notices to this channel", "通知をこのチャンネルに出す")),
-        ],
-    );
-    section(
-        &mut lines,
-        "agentgw".to_string(),
-        vec![
-            ("status", crate::t!("version, active threads and warm agents", "版・動いているスレッド・待機中のエージェント")),
+            ("status", crate::t!("version, connected gateway, assigned channels, active threads", "版・つながっているゲートウェイ・受け持つチャンネル・動いているスレッド")),
             ("restart", crate::t!("restart agentgw (picks up a new version)", "agentgw を再起動する(新しい版を読み込む)")),
-        ],
-    );
-    section(
-        &mut lines,
-        crate::t!("Other bots", "ほかのボット"),
-        vec![
-            ("allow-bot <@bot>", crate::t!("let a bot's messages start work", "そのボットの投稿で作業を始められるようにする")),
-            ("remove-bot <@bot>", crate::t!("stop letting that bot's messages through", "そのボットの投稿を通さないようにする")),
         ],
     );
     section(
