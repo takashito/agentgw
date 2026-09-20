@@ -2076,7 +2076,7 @@ mod tests {
         b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "<@U_BOT> pwd")).await;
         settle().await;
         assert!(
-            slack.calls().iter().any(|c| c.contains(&format!("\"test-machine:{}\"", Host::home()))),
+            slack.calls().iter().any(|c| c.contains(&format!("`test-machine:{}`", Host::home()))),
             "{:?}",
             slack.calls()
         );

@@ -135,7 +135,7 @@ impl Bridge {
         let home = Host::home();
         let me = self.machine_name.clone();
         let entry = |access: &bridge::Access, ch: &str| {
-            let (repo_path, is_fallback) = access.repo_path(ch, &home);
+            let (repo_path, _) = access.repo_path(ch, &home);
             PwdEntry {
                 // Unset = this machine handles the channel itself
                 machine: access
@@ -144,7 +144,6 @@ impl Bridge {
                     .and_then(|r| r.bridge.clone())
                     .unwrap_or_else(|| me.clone()),
                 repo_path,
-                is_fallback,
             }
         };
         match mode {
@@ -603,22 +602,17 @@ pub struct PwdEntry {
     /// path means different folders on different machines.
     pub machine: String,
     pub repo_path: String,
-    pub is_fallback: bool,
 }
 
 /// One channel's project directory (the `pwd` answer) as Slack mrkdwn.
 impl PwdEntry {
-    /// One line: where this channel's agents work, machine first (`pve:/root`).
+    /// One line: where this channel's agents work, machine first (`pve:/root`). A channel with no folder
+    /// of its own shows the machine's home — the folder it actually starts in, so there is nothing to note.
     pub fn render(&self) -> String {
         let (machine, path) = (&self.machine, &self.repo_path);
-        let note = if self.is_fallback {
-            crate::t!(" — not set; using the default directory", " — 未設定のため既定のディレクトリ")
-        } else {
-            String::new()
-        };
         crate::t!(
-            "Project directory for this channel is \"{machine}:{path}\"{note}",
-            "このチャンネルの作業ディレクトリは \"{machine}:{path}\" です{note}"
+            "Current project directory: `{machine}:{path}`",
+            "いまの作業ディレクトリ: `{machine}:{path}`"
         )
     }
 }
@@ -859,12 +853,8 @@ mod tests {
         let e = PwdEntry {
             machine: "dock".into(),
             repo_path: "/dev/x".into(),
-            is_fallback: true,
         };
-        assert_eq!(
-            e.render(),
-            "Project directory for this channel is \"dock:/dev/x\" — not set; using the default directory"
-        );
+        assert_eq!(e.render(), "Current project directory: `dock:/dev/x`");
     }
 
     #[test]
