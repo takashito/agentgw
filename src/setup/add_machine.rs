@@ -769,12 +769,26 @@ pub fn pick_route(options: &[RouteChoice], answer: Option<usize>) -> Option<usiz
     }
 }
 
+/// One address to try: what to show, what the machine would dial, what to ask, and what the gateway
+/// must hold for it.
+struct Candidate {
+    label: String,
+    url: String,
+    /// Where `/status` lives for this route.
+    base: String,
+    /// `None` = the gateway already holds what this needs (TLS terminated in front of it).
+    listen: Option<String>,
+}
+
 /// Every route the machine can actually take, measured from the machine. In preference order:
 /// the tailnet, then the LAN, then the ssh tunnel (which is always there — we got here over ssh).
 ///
-/// **An address the gateway does not hold yet is opened for the length of the question** (`Doorbell`),
-/// because otherwise it would answer "shut" and could never be chosen. What the chosen one needs is
-/// opened for good afterwards.
+/// **All of them are asked at once.** They are independent questions, each one an ssh round trip of up
+/// to five seconds, and the answers don't depend on each other.
+///
+/// An address the gateway does not hold yet is opened for the length of the question (`Doorbell`) —
+/// otherwise it could never answer and could never be chosen. What the chosen one needs is opened for
+/// good afterwards.
 fn routes_that_work(
     target: &str,
     tailnet: Option<(&str, &str)>,
@@ -784,46 +798,69 @@ fn routes_that_work(
 ) -> Vec<RouteChoice> {
     let held = |addr: &str| listen.unwrap_or_default().split(',').any(|a| a.trim() == addr);
     let port = link_port(listen);
-    let mut out: Vec<RouteChoice> = Vec::new();
+    let mut cands: Vec<Candidate> = Vec::new();
     if machine_on_tailnet
         && let Some((name, ip)) = tailnet.filter(|(n, _)| !n.is_empty())
     {
         // Two ways over the tailnet: through whatever terminates TLS on 443 (`tailscale serve`, which
         // forwards to loopback — nothing to open here), or straight to the link port
-        println!("{}", crate::t!("==> Checking the tailnet route to {name}", "==> tailnet 経路({name})を確かめています"));
-        if tcp_opens(target, name, "443") {
-            out.push(RouteChoice {
-                label: crate::t!("tailnet · wss://{name}", "tailnet · wss://{name}"),
-                url: Some(format!("wss://{name}")),
-                listen: None,
-            });
-        }
-        let addr = format!("{ip}:{port}");
-        if !ip.is_empty()
-            && let Some(_bell) = Doorbell::at(&addr, held(&addr))
-            && tcp_opens(target, name, &port)
-        {
-            out.push(RouteChoice {
+        cands.push(Candidate {
+            label: crate::t!("tailnet · wss://{name}", "tailnet · wss://{name}"),
+            url: format!("wss://{name}"),
+            base: format!("https://{name}"),
+            listen: None,
+        });
+        if !ip.is_empty() {
+            cands.push(Candidate {
                 label: crate::t!("tailnet · ws://{name}:{port}", "tailnet · ws://{name}:{port}"),
-                url: Some(format!("ws://{name}:{port}")),
-                listen: Some(addr),
+                url: format!("ws://{name}:{port}"),
+                base: format!("http://{name}:{port}"),
+                listen: Some(format!("{ip}:{port}")),
             });
         }
     }
     if let Some((url, addr)) = lan {
-        println!("{}", crate::t!("==> Checking the LAN route {url}", "==> LAN 経路 {url} を確かめています"));
-        let hostport = url.trim_start_matches("ws://");
-        if let Some(_bell) = Doorbell::at(&addr, held(&addr))
-            && let Some((host, port)) = hostport.rsplit_once(':')
-            && tcp_opens(target, host, port)
-        {
-            out.push(RouteChoice {
-                label: crate::t!("LAN · {url}", "LAN · {url}"),
-                url: Some(url.clone()),
-                listen: Some(addr),
-            });
+        let host = url.trim_start_matches("ws://").to_string();
+        cands.push(Candidate {
+            label: crate::t!("LAN · {url}", "LAN · {url}"),
+            url,
+            base: format!("http://{host}"),
+            listen: Some(addr),
+        });
+    }
+
+    // Open what needs opening first; a door that won't open takes its candidate with it
+    let mut open: Vec<(Candidate, Option<Doorbell>)> = Vec::new();
+    for c in cands {
+        match &c.listen {
+            Some(addr) => match Doorbell::at(addr, held(addr)) {
+                Some(bell) => open.push((c, Some(bell))),
+                None => println!("{}", crate::t!("==> Can't open {addr} here, so that route is out", "==> ここでは {addr} を開けないので、その経路は除きます")),
+            },
+            None => open.push((c, None)),
         }
     }
+    for (c, _) in &open {
+        println!("{}", crate::t!("==> Asking {target} whether it can reach {}", "==> {target} から {} に届くか訊いています", c.base));
+    }
+    let answered: Vec<bool> = std::thread::scope(|scope| {
+        let asks: Vec<_> = open
+            .iter()
+            .map(|(c, _)| scope.spawn(|| gateway_answers(target, &c.base)))
+            .collect();
+        asks.into_iter().map(|a| a.join().unwrap_or(false)).collect()
+    });
+
+    let mut out: Vec<RouteChoice> = open
+        .into_iter()
+        .zip(answered)
+        .filter(|(_, yes)| *yes)
+        .map(|((c, _), _)| RouteChoice {
+            label: c.label,
+            url: Some(c.url),
+            listen: c.listen,
+        })
+        .collect();
     out.push(RouteChoice {
         label: crate::t!(
             "ssh tunnel · the gateway keeps one open to this machine",
@@ -856,8 +893,9 @@ fn ask_which_route(options: &[RouteChoice]) -> Option<usize> {
     answer.trim().parse::<usize>().ok().map(|n| n.saturating_sub(1))
 }
 
-/// Hold a socket open on `addr` for as long as the guard lives, just so a machine can try to reach it.
-/// **The running gateway is not touched** — this is an address it does not hold yet.
+/// Hold an address open for as long as the guard lives, **answering exactly as the gateway would**,
+/// just so a machine can try to reach it. The running gateway is not touched — this is an address it
+/// does not hold yet.
 ///
 /// Dropping it closes the socket *before* returning, so the gateway can bind the same address a moment
 /// later when this turns out to be the route.
@@ -876,12 +914,17 @@ impl Doorbell {
         listener.set_nonblocking(true).ok()?;
         let stop: std::sync::Arc<std::sync::atomic::AtomicBool> = Default::default();
         let flag = stop.clone();
-        // Answer whatever knocks, until the guard goes away
         let thread = std::thread::spawn(move || {
+            use std::io::{Read, Write};
             while !flag.load(std::sync::atomic::Ordering::Relaxed) {
-                if listener.accept().is_err() {
+                let Ok((mut sock, _)) = listener.accept() else {
                     std::thread::sleep(std::time::Duration::from_millis(50));
-                }
+                    continue;
+                };
+                let _ = sock.set_nonblocking(false);
+                let _ = sock.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                let _ = sock.read(&mut [0u8; 1024]);
+                let _ = sock.write_all(UNAUTHORIZED.as_bytes());
             }
         });
         Some(Doorbell { stop, thread: Some(thread) })
@@ -897,14 +940,21 @@ impl Drop for Doorbell {
     }
 }
 
-/// Can the **machine** open this address? Asked on the machine, because that is who will dial.
-fn tcp_opens(target: &str, host: &str, port: &str) -> bool {
-    let probe = format!(
-        "timeout 5 bash -c 'exec 3<>/dev/tcp/{host}/{port}' >/dev/null 2>&1 && echo open || echo shut"
-    );
-    ssh::ssh_capture(target, &probe).unwrap_or_default().trim() == "open"
-}
+/// What `/status` says to someone with no token — the gateway saying its own name, with no secret in it.
+const UNAUTHORIZED: &str =
+    "HTTP/1.1 401 Unauthorized\r\nContent-Length: 12\r\nConnection: close\r\n\r\nunauthorized";
 
+/// Does **our gateway** answer at this address? Asked from the machine, because that is who will dial.
+///
+/// Not "is the port open": something else answering on 443 passed a plain TCP check and the link then
+/// failed, after the address had already been written down (seen on a real machine). `/status` without a
+/// token answers `unauthorized`, which nothing else does — and no secret goes over the wire to ask.
+fn gateway_answers(target: &str, base: &str) -> bool {
+    let probe = format!("curl -s -m 5 {base}/status");
+    ssh::ssh_capture(target, &probe)
+        .unwrap_or_default()
+        .contains("unauthorized")
+}
 
 /// The `cargo dist` artifact. Found **only when the repo is present**.
 fn dist_artifact(triple: &str) -> Option<std::path::PathBuf> {
@@ -1091,7 +1141,13 @@ mod tests {
         };
         let addr = format!("127.0.0.1:{port}");
         let bell = Doorbell::at(&addr, false).expect("can open it");
-        assert!(std::net::TcpStream::connect(&addr).is_ok(), "a machine can reach it while asking");
+        // It answers the way the gateway does, so one probe fits an address it holds and one it doesn't
+        use std::io::{Read, Write};
+        let mut sock = std::net::TcpStream::connect(&addr).expect("a machine can reach it while asking");
+        sock.write_all(b"GET /status HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let mut said = String::new();
+        sock.read_to_string(&mut said).unwrap();
+        assert!(said.contains("unauthorized"), "said: {said}");
         drop(bell);
         assert!(std::net::TcpListener::bind(&addr).is_ok(), "the gateway can take it over right after");
 
