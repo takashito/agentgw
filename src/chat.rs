@@ -279,6 +279,9 @@ pub trait Chat: Send + Sync + 'static {
     async fn thread_root_gone(&self, channel: &str, thread_ts: &str) -> bool;
     async fn get_permalink(&self, channel: &str, ts: &str) -> Result<String, String>;
     async fn channel_display_name(&self, channel: &str) -> Option<String>;
+    /// Every channel the bot is a member of, as (id, name). The gateway needs it for `status`: a channel
+    /// nobody was assigned is **its own**, and until someone types in it there is nothing else to learn it from.
+    async fn bot_channels(&self) -> Result<Vec<(String, String)>, String>;
     async fn user_display_name(&self, user: &str) -> Option<String>;
     async fn auth_test(&self) -> Result<(String, Option<String>), String>;
     async fn resolve_bot_id(&self, user_id: &str) -> Result<Option<String>, String>;
@@ -369,9 +372,23 @@ pub mod fake {
         pub replies_fail: bool,
         /// The size `file_info` reports.
         pub file_size: u64,
+        /// What `bot_channels` answers: (id, name).
+        pub channels: Vec<(String, String)>,
     }
 
     impl FakeChat {
+        /// A fake that answers `bot_channels` with these (id, name) pairs.
+        pub fn in_channels(pairs: &[(&str, &str)]) -> FakeChat {
+            FakeChat {
+                channels: pairs
+                    .iter()
+                    .map(|(id, name)| (id.to_string(), name.to_string()))
+                    .collect(),
+                ..Default::default()
+            }
+        }
+
+
         /// A fake whose thread root is **alive** (the normal state, where replies are not suppressed).
         pub fn with_live_root() -> FakeChat {
             let mut api = FakeChat::default();
@@ -477,6 +494,10 @@ pub mod fake {
         }
         async fn thread_root_gone(&self, _c: &str, _t: &str) -> bool {
             false
+        }
+        async fn bot_channels(&self) -> Result<Vec<(String, String)>, String> {
+            self.record("bot_channels".to_string())?;
+            Ok(self.channels.clone())
         }
         async fn get_permalink(&self, c: &str, ts: &str) -> Result<String, String> {
             self.record(format!("permalink {c} {ts}"))?;

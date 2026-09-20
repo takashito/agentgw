@@ -1538,7 +1538,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
         std::fs::write(path.join("access.json"), r#"{"owner":"U_OWNER"}"#).unwrap();
-        let slack = Arc::new(FakeChat::default());
+        let slack = Arc::new(FakeChat::in_channels(&[
+            ("C_LAN", "dock-lan"),
+            ("C_ADMIN", "claude-admin"),
+            ("C_THEIRS", "pve-lan"),
+        ]));
         let agent = Arc::new(FakeAgent::default());
         let clock = FakeClock::at(1_782_000_000_000);
         let deps = Deps {
@@ -2110,6 +2114,27 @@ mod tests {
                 result: Ok("/work/app".into()),
             })
         );
+    }
+
+    /// The gateway handles every channel nobody was assigned, so its status lists the channels the bot
+    /// is in — until someone types in one, there is nothing else to learn it from.
+    #[tokio::test]
+    async fn the_gateway_lists_the_channels_the_bot_is_in() {
+        let (d, slack, _agent, _clock) = flow_deps("status-bot-channels");
+        // What Slack says the bot is a member of
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.machines_now = Some(Arc::new(Vec::new));
+        b.access.home_channel = Some("C_ADMIN".into());
+        b.access.routes.insert(
+            "C_THEIRS".into(),
+            bridge::Route { bridge: Some("pve".into()), ..Default::default() },
+        );
+        b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "<@U_BOT> status")).await;
+        settle().await;
+        let out = slack.calls().join("\n");
+        assert!(out.contains("<#C_LAN"), "a channel nobody was assigned is the gateway's: {out}");
+        assert!(out.contains("(notices)"), "the notice channel says so: {out}");
+        assert!(!out.contains("C_THEIRS"), "a channel handed to another machine is not ours: {out}");
     }
 
     /// `pwd` names the machine in front of the path — the same path is a different folder elsewhere.

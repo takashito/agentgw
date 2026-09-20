@@ -101,6 +101,7 @@ impl Bridge {
                     .cloned()
                     .collect();
                 StatusChannel {
+                    notices: false,
                     warm_on: self
                         .access
                         .routes
@@ -118,6 +119,21 @@ impl Bridge {
                     channel_id,
                 }
             })
+            .collect();
+        // The gateway handles every channel nobody was assigned, so it asks Slack which ones the bot is in
+        let gateway_fills_in = self.machines_now.is_some();
+        let assigned_elsewhere: Vec<String> = self
+            .access
+            .routes
+            .iter()
+            .filter(|(_, r)| r.bridge.as_deref().is_some_and(|b| b != self.machine_name))
+            .map(|(ch, _)| ch.clone())
+            .collect();
+        let home_channel = self.access.home_channel.clone();
+        let waiting_home: Vec<u64> = waiting
+            .iter()
+            .filter(|(cwd, _)| *cwd == agent_home)
+            .map(|(_, idle)| *idle)
             .collect();
         // Busy channels first, then by id — the same shape every time it is asked
         channels.sort_by(|a, b| {
@@ -168,6 +184,32 @@ impl Bridge {
                 thread_key: Some(key.clone()),
             };
             // Resolve each channel name only once (one conversation can have many threads)
+            if gateway_fills_in {
+                match slack.bot_channels().await {
+                    Ok(in_slack) => {
+                        for (id, name) in in_slack {
+                            if assigned_elsewhere.contains(&id)
+                                || channels.iter().any(|c| c.channel_id == id)
+                            {
+                                continue;
+                            }
+                            channels.push(StatusChannel {
+                                channel_id: id,
+                                name: (!name.is_empty()).then(|| format!("#{name}")),
+                                folder: agent_home.clone(),
+                                warm_on: false,
+                                threads: vec![],
+                                warm: waiting_home.clone(),
+                                notices: false,
+                            });
+                        }
+                    }
+                    Err(e) => ctx.error("bridge", &format!("status: could not list the bot's channels: {e}")),
+                }
+            }
+            for c in &mut channels {
+                c.notices = home_channel.as_deref() == Some(c.channel_id.as_str());
+            }
             let mut names: HashMap<String, Option<String>> = HashMap::new();
             for c in &mut channels {
                 for t in &mut c.threads {
@@ -578,6 +620,8 @@ pub struct StatusChannel {
     pub threads: Vec<StatusThread>,
     /// One per agent waiting in this channel's folder: when it last did anything (0 = unknown).
     pub warm: Vec<u64>,
+    /// Whether notices (online, offline, errors) go here.
+    pub notices: bool,
 }
 
 /// Where a Bridge sits: the gateway, a machine linked to one, or on its own.
@@ -702,12 +746,18 @@ impl StatusReport {
                 (None, false) => format!("<#{}>", c.channel_id),
             };
             let folder = Self::short_path(Some(&c.folder), &r.home);
-            let warm = if c.warm_on {
-                crate::t!(" (warm on)", "(warm on)")
-            } else {
-                String::new()
+            let mut flags: Vec<String> = Vec::new();
+            if c.warm_on {
+                flags.push(crate::t!("warm on", "warm on"));
+            }
+            if c.notices {
+                flags.push(crate::t!("notices", "通知先"));
+            }
+            let flags = match flags.is_empty() {
+                true => String::new(),
+                false => format!(" ({})", flags.join(", ")),
             };
-            lines.push(format!("{head} · `{folder}`{warm}"));
+            lines.push(format!("{head} · `{folder}`{flags}"));
             let mut rows: Vec<(u64, String)> = c
                 .threads
                 .iter()
@@ -916,6 +966,7 @@ mod tests {
                         Some("https://s/p1"),
                     )],
                     warm: vec![700_000],
+                    notices: false,
                 },
                 StatusChannel {
                     channel_id: "C2".into(),
@@ -924,6 +975,7 @@ mod tests {
                     warm_on: false,
                     threads: vec![],
                     warm: vec![],
+                    notices: true,
                 },
             ],
             ..sample_report()
@@ -932,7 +984,8 @@ mod tests {
         assert!(out.contains("*My channels*\n"), "{out}");
         // Folder next to the channel, warm flag only where it is on
         assert!(out.contains("<#C1|general> · `~/dev/x` (warm on)\n"), "{out}");
-        assert!(out.contains("<#C2|agentgw> · `~/dev/agentgw`\n"), "{out}");
+        // The notice channel says so
+        assert!(out.contains("<#C2|agentgw> · `~/dev/agentgw` (notices)\n"), "{out}");
         // Longest idle first: the waiting agent (5m) above the thread (1m)
         assert!(
             out.contains("`5m ago`　waiting\n`1m ago`　<https://s/p1|READMEを要約して>"),
@@ -953,6 +1006,7 @@ mod tests {
                 warm_on: false,
                 threads: vec![thread("D1", "2.0", 0, None, None)],
                 warm: vec![],
+                notices: false,
             }],
             ..sample_report()
         };

@@ -500,6 +500,33 @@ impl Api {
 
     /// Human-readable channel name. For a DM (`is_im`) the other person's `@name`, for a channel `#name`.
     /// best-effort — None on failure.
+    /// Channels the bot is in, as (id, name). One page of 200 is plenty for the fleets this serves;
+    /// a workspace with more would need the cursor.
+    pub async fn bot_channels(&self) -> Result<Vec<(String, String)>, String> {
+        let page = self
+            .get_json(
+                "users.conversations",
+                &[
+                    ("types", "public_channel,private_channel"),
+                    ("exclude_archived", "true"),
+                    ("limit", "200"),
+                ],
+            )
+            .await?;
+        Ok(page["channels"]
+            .as_array()
+            .map(|cs| {
+                cs.iter()
+                    .filter_map(|c| {
+                        let id = c["id"].as_str()?.to_string();
+                        let name = c["name"].as_str().unwrap_or_default().to_string();
+                        Some((id, name))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     pub async fn channel_display_name(&self, channel: &str) -> Option<String> {
         // An empty string counts as "missing" and falls through to the next candidate
         let s = |v: &serde_json::Value, k: &str| {
@@ -872,6 +899,9 @@ impl crate::chat::Chat for Api {
     }
     async fn channel_display_name(&self, channel: &str) -> Option<String> {
         Api::channel_display_name(self, channel).await
+    }
+    async fn bot_channels(&self) -> Result<Vec<(String, String)>, String> {
+        Api::bot_channels(self).await
     }
     async fn user_display_name(&self, user: &str) -> Option<String> {
         Api::user_display_name(self, user).await
