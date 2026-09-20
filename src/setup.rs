@@ -280,7 +280,65 @@ fn ask_parent(state_dir: &StateDir) -> Result<(), String> {
             env_file.display()
         )
     );
+    ask_listen(state_dir);
     Ok(())
+}
+
+/// Where the gateway accepts machines. **Loopback plus this machine's own LAN address**, so whatever
+/// terminates TLS in front (tailscale serve) and a machine on the same network both get in — without
+/// `0.0.0.0`, which would also accept from anywhere else the host can be reached.
+///
+/// An existing value is **never rewritten behind your back**: it is shown, and changing it is a yes.
+fn ask_listen(state_dir: &StateDir) {
+    let current = state_dir
+        .load_env()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|(k, _)| k == "AGENTGW_LINK_LISTEN")
+        .map(|(_, v)| v);
+    let port = current
+        .as_deref()
+        .and_then(|v| v.split(',').next())
+        .and_then(|a| a.rsplit_once(':').map(|(_, p)| p.to_string()))
+        .unwrap_or_else(|| "8787".to_string());
+    let want = match crate::setup::ssh::lan_ip() {
+        Some(ip) => format!("127.0.0.1:{port},{ip}:{port}"),
+        None => format!("127.0.0.1:{port}"),
+    };
+    match current {
+        Some(now) if now == want => {}
+        Some(now) => {
+            println!(
+                "{}",
+                crate::t!(
+                    "Machines connect to: {now}\n  Suggested: {want} (loopback for TLS in front, and this machine on the LAN)",
+                    "マシンからの接続を受ける場所: {now}\n  こちらを勧めます: {want}(前段の TLS 用の loopback と、LAN のこのマシン)"
+                )
+            );
+            let yes = prompt(&crate::t!("  Change it? [y/N]: ", "  変更しますか? [y/N]: "));
+            if !yes.trim().eq_ignore_ascii_case("y") {
+                return;
+            }
+            write_listen(state_dir, &want);
+        }
+        None => write_listen(state_dir, &want),
+    }
+}
+
+fn write_listen(state_dir: &StateDir, value: &str) {
+    let path = state_dir.join(".env");
+    let before = std::fs::read_to_string(&path).unwrap_or_default();
+    let after = crate::state_dir::set_env_keys(&before, &[("AGENTGW_LINK_LISTEN", value.to_string())]);
+    match crate::state_dir::write_atomic_mode(&path, &after, Some(0o600)) {
+        Ok(()) => println!(
+            "{}",
+            crate::t!(
+                "Machines connect to: {value}",
+                "マシンからの接続を受ける場所: {value}"
+            )
+        ),
+        Err(e) => eprintln!("{}: {e}", path.display()),
+    }
 }
 
 pub fn uninstall(mac: bool, job: &Path) -> i32 {

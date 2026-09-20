@@ -112,32 +112,6 @@ pub enum Transport {
 
 /// Candidate for a direct connection. The URL remembered in `.env` wins; otherwise the tailscale name.
 ///
-/// `Self.DNSName` from `tailscale status --json` **has a trailing dot** (measured:
-/// `mac.tail1234.ts.net.`). Strip it before building the URL.
-pub fn candidate_url(
-    env_url: Option<&str>,
-    tailscale_json: Option<&str>,
-    fqdn: Option<&str>,
-    listen: Option<&str>,
-) -> Option<String> {
-    if let Some(u) = env_url.map(str::trim).filter(|u| !u.is_empty()) {
-        return Some(u.trim_end_matches('/').to_string());
-    }
-    if let Some(name) = tailscale_json
-        .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
-        .and_then(|j| Some(j["Self"]["DNSName"].as_str()?.trim_end_matches('.').to_string()))
-        .filter(|n| !n.is_empty())
-    {
-        return Some(format!("wss://{name}"));
-    }
-    // The machine's own name on the network. **Only when the gateway accepts from outside** — with the
-    // listener on loopback nothing reaches it — and plain `ws://`, since nothing terminates TLS here
-    let host = fqdn.map(str::trim).filter(|h| !h.is_empty() && h.contains('.'))?;
-    let port = listen?.rsplit_once(':')?;
-    let addr = port.0.trim_matches(['[', ']']);
-    let loopback = addr.is_empty() || addr == "127.0.0.1" || addr == "localhost" || addr == "::1";
-    (!loopback).then(|| format!("ws://{host}:{}", port.1))
-}
 
 /// Where this machine can be reached: (host, IPv4). The tailnet name when there is one — it works from
 /// anywhere — and **the hostname otherwise**, which is always there even with no tailscale at all.
@@ -172,6 +146,58 @@ pub fn tailnet_identity(tailscale_json: Option<&str>) -> (String, String) {
         .unwrap_or_default()
         .to_string();
     (name, ip)
+}
+
+/// What the machine can actually reach, decided **from both sides**:
+///
+/// 1. A URL set by hand wins.
+/// 2. **Both on the tailnet** → the gateway's tailnet name. It works from anywhere, and TLS is
+///    terminated by whatever sits in front (`tailscale serve`).
+/// 3. Otherwise **the LAN, proved** — the caller reaches the gateway from the machine before this says yes.
+/// 4. Nothing reachable → the caller falls back to an ssh tunnel.
+pub fn route_url(
+    env_url: Option<&str>,
+    gateway_tailnet: Option<&str>,
+    machine_has_tailscale: bool,
+    lan_reachable: Option<&str>,
+) -> Option<String> {
+    if let Some(u) = env_url.map(str::trim).filter(|u| !u.is_empty()) {
+        return Some(u.trim_end_matches('/').to_string());
+    }
+    if machine_has_tailscale
+        && let Some(name) = gateway_tailnet.filter(|n| !n.is_empty())
+    {
+        return Some(format!("wss://{name}"));
+    }
+    lan_reachable.map(str::to_string)
+}
+
+/// The gateway's own name on the tailnet, if it is on one.
+pub fn tailnet_name(tailscale_json: Option<&str>) -> Option<String> {
+    let (name, _) = tailnet_identity(tailscale_json);
+    (!name.is_empty()).then_some(name)
+}
+
+/// Every `ws://host:port` a machine could try on the LAN, from this gateway's listeners. Loopback is not
+/// one of them (on the other side it means "that machine"), and neither is `0.0.0.0` (not an address to dial).
+pub fn lan_urls(host: Option<&str>, listen: Option<&str>) -> Vec<String> {
+    let host = host.map(str::trim).filter(|h| !h.is_empty());
+    listen
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter_map(|a| a.rsplit_once(':'))
+        .filter_map(|(addr, port)| {
+            let addr = addr.trim_matches(['[', ']']);
+            let dialable = !matches!(addr, "127.0.0.1" | "localhost" | "::1" | "0.0.0.0" | "");
+            // A name others can resolve reads better, but the address is what we know is ours
+            match (dialable, host) {
+                (true, Some(h)) if h.contains('.') => Some(format!("ws://{h}:{port}")),
+                (true, _) => Some(format!("ws://{addr}:{port}")),
+                (false, _) => None,
+            }
+        })
+        .collect()
 }
 
 /// The URL written to the machine's `.env`.
@@ -378,15 +404,27 @@ async fn add_child(target: &str, name: Option<&str>, from: Option<&str>) -> Resu
     // 4. Prepare the gateway's listener and key
     let inlet = ensure_inlet(&dir)?;
 
-    // 5. Try a direct connection. With no candidate, start with the tunnel
+    // 5. Decide the route **from both sides**: the tailnet if the machine is on it too, otherwise the LAN
+    //    if the machine can really reach us there, otherwise a tunnel
     let candidate = {
         let env = RelayCli::env_of(&dir);
-        candidate_url(
-            env.get("AGENTGW_LINK_PUBLIC_URL").map(String::as_str),
-            ssh::tailscale_json().as_deref(),
-            ssh::fqdn().as_deref(),
-            env.get("AGENTGW_LINK_LISTEN").map(String::as_str),
-        )
+        let by_hand = env.get("AGENTGW_LINK_PUBLIC_URL").map(String::as_str);
+        let tailnet = tailnet_name(ssh::tailscale_json().as_deref());
+        let machine_on_tailnet = !ssh::ssh_capture(target, "tailscale status --json 2>/dev/null | head -c 1")
+            .unwrap_or_default()
+            .is_empty();
+        let lan = match (by_hand.is_some(), machine_on_tailnet && tailnet.is_some()) {
+            // Only worth asking when the tailnet isn't the answer
+            (false, false) => reachable_lan_url(
+                target,
+                &lan_urls(
+                    ssh::fqdn().as_deref(),
+                    env.get("AGENTGW_LINK_LISTEN").map(String::as_str),
+                ),
+            ),
+            _ => None,
+        };
+        route_url(by_hand, tailnet.as_deref(), machine_on_tailnet, lan.as_deref())
     };
     let state_prefix = remote_state_prefix(
         std::env::var("AGENTGW_STATE_DIR").ok().as_deref(),
@@ -593,12 +631,8 @@ async fn watch_for_link(
     let deadline = std::time::Instant::now() + limit;
     let mut last_word = String::new();
     loop {
-        if let Some(names) = RelayCli::ask_connected(&inlet.listen, &inlet.token).await
-            && names.iter().any(|n| n == child)
-        {
-            return Ok(());
-        }
-        // The machine knows before the gateway's status does — and knows why when it doesn't
+        // **The machine is the one dialling**, so ask it first: it knows before the gateway's status
+        // does, and it knows why when it doesn't
         if let Ok(line) = ssh::ssh_capture(
             target,
             "grep 'remote link:' ~/.local/state/agentgw/plugin-debug.log | tail -1",
@@ -610,6 +644,12 @@ async fn watch_for_link(
                 last_word = line;
             }
         }
+        // A second opinion for the gateway-dials-the-machine setup, where the machine says nothing
+        if let Some(names) = RelayCli::ask_connected(&inlet.listen, &inlet.token).await
+            && names.iter().any(|n| n == child)
+        {
+            return Ok(());
+        }
         if std::time::Instant::now() >= deadline {
             let said = match last_word.split_once("remote link: ") {
                 Some((_, why)) => why.to_string(),
@@ -619,6 +659,23 @@ async fn watch_for_link(
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
+}
+
+/// Ask the **machine** to open each LAN address in turn and keep the first that answers. Measured, not
+/// guessed: a name that resolves here may not resolve there, and a network may not carry the traffic.
+fn reachable_lan_url(target: &str, urls: &[String]) -> Option<String> {
+    for url in urls {
+        let hostport = url.trim_start_matches("ws://");
+        let (host, port) = hostport.rsplit_once(':')?;
+        println!("{}", crate::t!("==> Checking the LAN route {url}", "==> LAN 経路 {url} を確かめています"));
+        let probe = format!(
+            "timeout 5 bash -c 'exec 3<>/dev/tcp/{host}/{port}' >/dev/null 2>&1 && echo open || echo shut"
+        );
+        if ssh::ssh_capture(target, &probe).unwrap_or_default().trim() == "open" {
+            return Some(url.clone());
+        }
+    }
+    None
 }
 
 /// The `cargo dist` artifact. Found **only when the repo is present**.
@@ -759,41 +816,42 @@ mod tests {
         );
     }
 
+    /// The route is decided from **both** sides: the tailnet only when the machine is on it too, then a
+    /// LAN address the machine actually reached, and a hand-set URL over everything.
     #[test]
-    fn uses_the_remembered_public_url_first() {
+    fn the_route_follows_what_both_sides_have() {
         assert_eq!(
-            candidate_url(Some("wss://mac.tailnet.ts.net/"), None, None, None).as_deref(),
-            Some("wss://mac.tailnet.ts.net")
+            route_url(Some("wss://set.by.hand/"), Some("dock.tailnet.ts.net"), true, None).as_deref(),
+            Some("wss://set.by.hand")
         );
-    }
-
-    #[test]
-    fn falls_back_to_the_tailscale_name() {
-        // Self.DNSName has a trailing dot (measured)
-        let json = r#"{"Self":{"DNSName":"mac.tail1234.ts.net."}}"#;
         assert_eq!(
-            candidate_url(None, Some(json), None, None).as_deref(),
-            Some("wss://mac.tail1234.ts.net")
+            route_url(None, Some("dock.tailnet.ts.net"), true, Some("ws://dock.lan:8787")).as_deref(),
+            Some("wss://dock.tailnet.ts.net")
         );
-    }
-
-    #[test]
-    fn has_no_candidate_without_either() {
-        assert_eq!(candidate_url(None, None, None, None), None);
+        // The gateway is on the tailnet, the machine is not → the LAN it proved it can reach
         assert_eq!(
-            candidate_url(Some("  "), None, None, None),
-            None,
-            "空白だけは候補でない"
-        );
-        assert_eq!(candidate_url(None, Some("not json"), None, None), None);
-
-        // No tailnet: this machine's own name, but only when the gateway accepts from outside
-        assert_eq!(
-            candidate_url(None, None, Some("dock.lan"), Some("0.0.0.0:8787")).as_deref(),
+            route_url(None, Some("dock.tailnet.ts.net"), false, Some("ws://dock.lan:8787")).as_deref(),
             Some("ws://dock.lan:8787")
         );
-        assert_eq!(candidate_url(None, None, Some("dock.lan"), Some("127.0.0.1:8787")), None);
-        assert_eq!(candidate_url(None, None, Some("dock"), Some("0.0.0.0:8787")), None); // not a name others can resolve
+        assert_eq!(route_url(None, None, false, None), None); // nothing left but a tunnel
+    }
+
+    /// What a machine could dial from the LAN: the gateway's own listeners, minus the ones that mean
+    /// "this machine" on the other side.
+    #[test]
+    fn lan_urls_skip_what_cannot_be_dialled() {
+        assert_eq!(
+            lan_urls(Some("dock.lan"), Some("127.0.0.1:8787,192.168.10.11:8787")),
+            vec!["ws://dock.lan:8787".to_string()]
+        );
+        // No name others can resolve → the address itself
+        assert_eq!(
+            lan_urls(Some("dock"), Some("192.168.10.11:8787")),
+            vec!["ws://192.168.10.11:8787".to_string()]
+        );
+        assert!(lan_urls(Some("dock.lan"), Some("127.0.0.1:8787")).is_empty());
+        assert!(lan_urls(Some("dock.lan"), Some("0.0.0.0:8787")).is_empty());
+        assert!(lan_urls(None, None).is_empty());
     }
 
     #[test]

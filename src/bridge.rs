@@ -463,7 +463,7 @@ impl Bridge {
 
         let link_address = match (&wiring.upstream, &wiring.inlet) {
             (machine::Mode::Relay { url, .. }, _) => url.clone(),
-            (machine::Mode::AwaitParent, Some(listen)) => listen.addr.to_string(),
+            (machine::Mode::AwaitParent, Some(listen)) => listen.addr().to_string(),
             _ => String::new(),
         };
         let machine_name = match wiring.self_id.clone() {
@@ -523,13 +523,14 @@ impl Bridge {
                     return Err("AGENTGW_LINK_LISTEN is not set, so the gateway has nowhere to connect".into());
                 };
                 let (tx, mut rx) = mpsc::channel(64);
+                let addr = listen.addr();
                 let inlet = Arc::new(machine::GatewayInlet {
                     token: listen.token,
                     live: link_up.clone(),
                     tx,
                     up: uplink.clone(),
                 });
-                tokio::spawn(inlet.serve(listen.addr));
+                tokio::spawn(inlet.serve(addr));
                 let (token, home, gateway) = loop {
                     match rx.recv().await {
                         Some(machine::FromRelay::Ready { bot_token, home, gateway }) => {
@@ -583,7 +584,13 @@ impl Bridge {
                         "children port {} is outside the loopback — \
                          put TLS in front (tailscale serve / reverse proxy) or the bot token \
                          crosses the network in the clear",
-                        listen.addr
+                        listen
+                            .addrs
+                            .iter()
+                            .filter(|a| !a.ip().is_loopback())
+                            .map(|a| a.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     ),
                 );
             }
@@ -605,10 +612,11 @@ impl Bridge {
                 reload: reload_tx.clone(),
                 tunnels: Default::default(),
             });
-            tokio::spawn(crate::bridge::gateway::serve_children(
-                fleet.clone(),
-                listen.addr,
-            ));
+            // One listener per address: loopback for whatever terminates TLS in front, the LAN address
+            // for machines on the same network
+            for addr in listen.addrs.clone() {
+                tokio::spawn(crate::bridge::gateway::serve_children(fleet.clone(), addr));
+            }
             tokio::spawn(fleet.clone().watch_presence());
             {
                 // The gateway's own channels: its Bridge asks through the same channel a machine uses

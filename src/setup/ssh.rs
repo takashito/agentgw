@@ -232,6 +232,41 @@ pub fn authorize_key(target: &str, pubkey: &str) -> Result<(), String> {
     ssh_stdin(target, script, pubkey).map(|_| ())
 }
 
+/// The address this machine uses on its own network: **the one the default route goes out of**, so a
+/// docker bridge (172.x) or the tailnet (100.x) is never mistaken for it. `None` when it can't be read.
+pub fn lan_ip() -> Option<String> {
+    // Linux answers `ip route get`; macOS answers `route -n get`. Neither sends a packet
+    let linux = Command::new("ip")
+        .args(["-4", "route", "get", "1.1.1.1"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string());
+    if let Some(text) = linux
+        && let Some(ip) = text.split_whitespace().skip_while(|w| *w != "src").nth(1)
+    {
+        return Some(ip.to_string());
+    }
+    let mac = Command::new("route")
+        .args(["-n", "get", "1.1.1.1"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())?;
+    let iface = mac
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("interface: "))?
+        .trim()
+        .to_string();
+    let addrs = Command::new("ipconfig")
+        .args(["getifaddr", &iface])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let ip = String::from_utf8_lossy(&addrs.stdout).trim().to_string();
+    (!ip.is_empty()).then_some(ip)
+}
+
 /// This machine's full name on the network (`hostname -f`), when it has one.
 pub fn fqdn() -> Option<String> {
     let out = Command::new("hostname").arg("-f").output().ok()?;
