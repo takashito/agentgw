@@ -278,6 +278,25 @@ async fn add_child(target: &str, name: Option<&str>, from: Option<&str>) -> Resu
         .ok_or_else(|| crate::t!("There is no prebuilt binary for {uname}. Build and install agentgw there by hand.", "{uname} 用のバイナリは配布していません。そのマシンでビルドして入れてください。"))?;
     println!("  {uname} ({triple})");
 
+    // With `-p` the way in is a password, and **a tunnel can't be asked for one** — it is reopened
+    // unattended. Leave the gateway's own key behind while the password session is still open, and use
+    // it from here on
+    if ssh::asks_for_password() {
+        println!(
+            "{}",
+            crate::t!(
+                "==> Leaving this gateway's ssh key on {target} (so the tunnel can reopen without you)",
+                "==> トンネルを人手なしで張り直せるように、このゲートウェイの ssh 鍵を {target} に置きます"
+            )
+        );
+        let pubkey = ssh::ensure_gateway_key()?;
+        ssh::authorize_key(target, &pubkey)?;
+        ssh::use_key_from_now_on();
+        ssh::ssh_capture(target, "true")
+            .map_err(|e| crate::t!("The key didn't work on {target}: {e}", "{target} で鍵が使えませんでした: {e}"))?;
+        println!("{}", crate::t!("  the key works", "  鍵で入れます"));
+    }
+
     // An explicit name wins. Otherwise use the remote's hostname (**the only place a name is guessed**)
     let child = match name {
         Some(n) => n.trim().to_string(),

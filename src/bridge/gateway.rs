@@ -2667,6 +2667,23 @@ pub const TUNNEL_PORT: u16 = 8799;
 /// `ExitOnForwardFailure=yes` is required — without it ssh survives even when forwarding fails,
 /// leaving a "connected but nothing arrives" state.
 pub fn tunnel_ssh_args(target: &str, remote_port: u16, parent_addr: &str) -> Vec<String> {
+    tunnel_ssh_args_with(target, remote_port, parent_addr, crate::setup::ssh::gateway_key().exists())
+}
+
+/// `key` = the gateway has its own ssh key (left on the machine by `add-machine -p`). **Offer it
+/// explicitly**: with only a password on the machine, nothing else gets in, and a tunnel can't ask.
+pub fn tunnel_ssh_args_with(
+    target: &str,
+    remote_port: u16,
+    parent_addr: &str,
+    key: bool,
+) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    if key {
+        args.push("-i".into());
+        args.push(crate::setup::ssh::gateway_key().to_string_lossy().to_string());
+    }
+    args.extend(
     [
         "-N",
         "-o",
@@ -2682,8 +2699,9 @@ pub fn tunnel_ssh_args(target: &str, remote_port: u16, parent_addr: &str) -> Vec
         target,
     ]
     .iter()
-    .map(|s| s.to_string())
-    .collect()
+    .map(|s| s.to_string()),
+    );
+    args
 }
 
 /// Keep one machine's ssh tunnel open from inside the gateway's agentgw.
@@ -3834,6 +3852,20 @@ mod tests {
         assert!(table.contains("<#C1> → `desktop:/srv/app`"), "{table}");
         assert!(table.contains("- <#C2> → `desktop:/home/me`"), "{table}");
         assert!(table.contains("- <#C3> → *laptop* 🔴 offline"), "{table}");
+    }
+
+    /// The tunnel is reopened unattended, so it can only get in with a key. When `add-machine -p` left
+    /// one behind, offer it by name.
+    #[test]
+    fn the_tunnel_offers_the_gateways_key_when_there_is_one() {
+        let without = tunnel_ssh_args_with("root@pve", 8799, "127.0.0.1:8787", false);
+        assert_eq!(without.first().map(String::as_str), Some("-N"));
+        assert!(!without.iter().any(|a| a == "-i"), "{without:?}");
+
+        let with = tunnel_ssh_args_with("root@pve", 8799, "127.0.0.1:8787", true);
+        assert_eq!(with.first().map(String::as_str), Some("-i"));
+        assert!(with[1].ends_with("agentgw_ed25519"), "{with:?}");
+        assert!(with.contains(&"-N".to_string()) && with.last().unwrap() == "root@pve", "{with:?}");
     }
 
     /// A channel the bot is in that nobody was assigned is the gateway's — and the assignments say

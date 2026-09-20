@@ -26,6 +26,19 @@ pub fn use_access(access: Access) {
     let _ = ACCESS.set(access);
 }
 
+/// Whether we were told to let ssh ask for a password.
+pub fn asks_for_password() -> bool {
+    ACCESS.get().is_some_and(|a| a.ask_password)
+}
+
+/// From now on, reach the machine with the gateway's key — the password session did its one job.
+pub fn use_key_from_now_on() {
+    let key = gateway_key().to_string_lossy().to_string();
+    let _ = KEY_NOW.set(key);
+}
+
+static KEY_NOW: OnceLock<String> = OnceLock::new();
+
 /// The options every ssh / scp call starts with.
 fn opts() -> Vec<String> {
     opts_of(&ACCESS.get().cloned().unwrap_or_default())
@@ -33,7 +46,8 @@ fn opts() -> Vec<String> {
 
 fn opts_of(access: &Access) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    if let Some(key) = &access.identity {
+    let installed = KEY_NOW.get().cloned();
+    if let Some(key) = installed.as_ref().or(access.identity.as_ref()) {
         out.push("-i".into());
         out.push(key.clone());
         // An explicit key is the one to use — don't let the agent's keys go first
@@ -57,7 +71,8 @@ fn opts_of(access: &Access) -> Vec<String> {
 
 /// `BatchMode=yes` means "never ask a human". With `-p` the human is right here, so let ssh ask.
 fn batch_mode() -> [String; 2] {
-    batch_mode_of(ACCESS.get().is_some_and(|a| a.ask_password))
+    // Once the key is in place there is nothing left to ask
+    batch_mode_of(KEY_NOW.get().is_none() && asks_for_password())
 }
 
 fn batch_mode_of(ask: bool) -> [String; 2] {
@@ -166,6 +181,55 @@ pub fn gh_ready() -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// The gateway's own key for reaching machines. Kept next to the user's keys, named so it is obvious
+/// where it came from; the tunnel and every later `add-machine` use it.
+pub fn gateway_key() -> std::path::PathBuf {
+    std::path::PathBuf::from(crate::state_dir::StateDir::home()).join(".ssh/agentgw_ed25519")
+}
+
+/// Make the gateway's key if it isn't there yet, and return its **public** half.
+/// No passphrase: the tunnel is reopened unattended, and a passphrase would need a human every time.
+pub fn ensure_gateway_key() -> Result<String, String> {
+    let key = gateway_key();
+    let pubkey = key.with_extension("pub");
+    if !key.exists() {
+        if let Some(dir) = key.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        let st = Command::new("ssh-keygen")
+            .args([
+                "-t",
+                "ed25519",
+                "-N",
+                "",
+                "-C",
+                "agentgw",
+                "-f",
+                &key.to_string_lossy(),
+            ])
+            .stdout(Stdio::null())
+            .status()
+            .map_err(|e| crate::t!("Couldn't run ssh-keygen: {e}", "ssh-keygen が実行できません: {e}"))?;
+        if !st.success() {
+            return Err(crate::t!("Couldn't make an ssh key", "ssh の鍵を作れませんでした"));
+        }
+    }
+    let at = pubkey.display().to_string();
+    std::fs::read_to_string(&pubkey)
+        .map(|s| s.trim().to_string())
+        .map_err(|e| crate::t!("Couldn't read {at}: {e}", "{at} を読めません: {e}"))
+}
+
+/// Put the gateway's public key in the machine's `authorized_keys` (once), over the connection that is
+/// already open. **This is what lets the tunnel live on** — it is reopened unattended, so it can't ask
+/// anyone for a password.
+pub fn authorize_key(target: &str, pubkey: &str) -> Result<(), String> {
+    let script = "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && \
+                  chmod 600 ~/.ssh/authorized_keys && key=$(cat) && \
+                  if ! grep -qF \"$key\" ~/.ssh/authorized_keys; then echo \"$key\" >> ~/.ssh/authorized_keys; fi";
+    ssh_stdin(target, script, pubkey).map(|_| ())
 }
 
 /// Fetch a URL to a local path with curl. **No credentials** — the release is public.
