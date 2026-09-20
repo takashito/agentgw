@@ -76,6 +76,37 @@ impl Bridge {
             .filter(|(_, ready)| *ready)
             .map(|(cwd, _)| cwd)
             .collect();
+        // Where we sit in the fleet. Read here (the spawn below can't hold `self`): the gateway asks its
+        // own link server, a machine reads the link it keeps
+        let machine = self.machine_name.clone();
+        let role = match (&self.machines_now, &self.link) {
+            (Some(connected), _) => {
+                let live = connected();
+                // Machines we know of from the assignments too, so one that is away still shows (in red)
+                let mut names: Vec<String> = live.clone();
+                for id in self.access.routes.values().filter_map(|r| r.bridge.clone()) {
+                    if id != machine && !names.contains(&id) {
+                        names.push(id);
+                    }
+                }
+                names.sort();
+                StatusRole::Gateway {
+                    machines: names
+                        .into_iter()
+                        .map(|name| {
+                            let online = live.contains(&name);
+                            (name, online)
+                        })
+                        .collect(),
+                }
+            }
+            (None, Some(link)) => StatusRole::Machine {
+                gateway: link.gateway.clone(),
+                address: link.address.clone(),
+                online: link.up.load(std::sync::atomic::Ordering::SeqCst),
+            },
+            (None, None) => StatusRole::Alone,
+        };
         // The report hits Slack once per thread to resolve permalinks and channel names — show a shimmer while waiting
         let thinking =
             slack::Thinking::new(self.deps.slack.clone(), &msg.channel, root_ts, &slack::Status::Gathering.text());
@@ -110,10 +141,10 @@ impl Bridge {
             }
             let report = StatusReport {
                 bridge_version: env!("CARGO_PKG_VERSION").to_string(),
+                machine,
+                role,
                 now_ms: clock.now_ms(),
                 home,
-                // There is only one way to be connected (no Remote)
-                mode: "local".to_string(),
                 threads,
                 pools,
             }
@@ -474,16 +505,38 @@ impl StatusThread {
 /// there is no `version` since this implementation has no version skew).
 pub struct StatusReport {
     pub bridge_version: String,
+    /// This machine's name.
+    pub machine: String,
+    /// Where this Bridge sits in the fleet.
+    pub role: StatusRole,
     /// The snapshot carries the clock (so rendering stays pure and testable with a fixed now)
     pub now_ms: u64,
     /// $HOME. Used to fold long absolute paths into `~` for readability
     pub home: String,
-    /// How this Bridge is connected (`local (label)` etc.)
-    pub mode: String,
     /// Only threads whose agents are **actually running**
     pub threads: Vec<StatusThread>,
     /// Working directories that warm-pool agents are waiting in
     pub pools: Vec<String>,
+}
+
+/// Where a Bridge sits: the gateway, a machine linked to one, or on its own.
+pub enum StatusRole {
+    /// The gateway. `machines` is every machine it knows, and whether each is connected right now.
+    Gateway { machines: Vec<(String, bool)> },
+    /// A machine. The gateway's name (as it said in the handshake), where the link runs, and whether it is up.
+    Machine {
+        gateway: Option<String>,
+        address: String,
+        online: bool,
+    },
+    /// No gateway anywhere.
+    Alone,
+}
+
+/// A machine and whether it is connected, as one word: `` `pve` 🟢 ``.
+fn machine_mark(name: &str, online: bool) -> String {
+    let dot = if online { "🟢" } else { "🔴" };
+    format!("`{name}` {dot}")
 }
 
 /// StatusReport as Slack mrkdwn. A pure function (the clock is the report's now_ms).
@@ -512,14 +565,55 @@ impl StatusReport {
         } else {
             r.bridge_version.as_str()
         };
-        // Fold version and connection mode into one line. A lone `mode: local` line looks like
-        // a stray log fragment under the heading (user feedback, 2026-07-31)
-        let mode = if r.mode.is_empty() {
-            String::new()
-        } else {
-            format!(" · {}", r.mode)
-        };
-        lines.push(format!("🟢 *agentgw* `{version}`{mode}"));
+        lines.push(crate::t!("*version*: `{version}`", "*版*: `{version}`"));
+        let me = &r.machine;
+        match &r.role {
+            StatusRole::Gateway { machines } => {
+                lines.push(crate::t!(
+                    "*machine id*: `{me}` (gateway)",
+                    "*マシン*: `{me}`(ゲートウェイ)"
+                ));
+                let list = machines
+                    .iter()
+                    .map(|(name, online)| machine_mark(name, *online))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let list = if list.is_empty() {
+                    crate::t!("none", "なし")
+                } else {
+                    list
+                };
+                lines.push(crate::t!(
+                    "*connected machines*: {list}",
+                    "*つながっているマシン*: {list}"
+                ));
+            }
+            StatusRole::Machine {
+                gateway,
+                address,
+                online,
+            } => {
+                lines.push(crate::t!("*machine id*: `{me}`", "*マシン*: `{me}`"));
+                let name = gateway.as_deref().unwrap_or("?");
+                let dot = if *online { "🟢" } else { "🔴" };
+                // A loopback address is the ssh tunnel `add-machine` sets up when there is no direct route
+                let via = if address.contains("127.0.0.1")
+                    || address.contains("localhost")
+                    || address.contains("[::1]")
+                {
+                    crate::t!(" · via ssh", " · ssh トンネル")
+                } else {
+                    String::new()
+                };
+                lines.push(crate::t!(
+                    "*gateway*: `{name}` (`{address}`{via}) {dot}",
+                    "*ゲートウェイ*: `{name}`(`{address}`{via}) {dot}"
+                ));
+            }
+            StatusRole::Alone => {
+                lines.push(crate::t!("*machine id*: `{me}`", "*マシン*: `{me}`"));
+            }
+        }
         // A bare blank line only gives a paragraph gap in Slack, which loses to the bullet spacing below,
         // so the heading looks glued to the body. A line with one full-width space survives as a tall line
         lines.push("　".to_string());
@@ -630,9 +724,10 @@ fn with_warnings(message: &str, warnings: &[String]) -> String {
 /// help as Slack mrkdwn. Grouped by purpose; each line is a monospace trigger (with aliases) + a one-line description.
 /// Kept in sync **by hand** with `COMMAND_WORDS` and the argument parser — this is their human-facing index.
 ///
-/// `fleet` decides whether the machine commands (`pwd <machine>`, `channels`) are listed. It is executed by **the side that accepts machines**
-/// (`CommandCtx::route` in `relay.rs`), so the condition follows that side.
-pub(super) fn help(fleet: bool, agent: &dyn crate::agent::Agent) -> String {
+/// `machines` decides whether the machine commands (`pwd <machine>`, `channels`) are listed: true on the
+/// gateway and on any machine linked to one (it passes those commands up). A Bridge on its own has
+/// nobody to hand a channel to, so it doesn't offer.
+pub(super) fn help(machines: bool, agent: &dyn crate::agent::Agent) -> String {
     fn section<C: std::fmt::Display>(lines: &mut Vec<String>, title: String, rows: Vec<(C, String)>) {
         lines.push(format!("*{title}*"));
         for (cmd, desc) in rows {
@@ -646,7 +741,7 @@ pub(super) fn help(fleet: bool, agent: &dyn crate::agent::Agent) -> String {
     for (title, rows) in super::agent::help_sections(agent) {
         section(&mut lines, title, rows);
     }
-    if fleet {
+    if machines {
         section(
             &mut lines,
             crate::t!("Machines", "マシン"),
@@ -662,7 +757,7 @@ pub(super) fn help(fleet: bool, agent: &dyn crate::agent::Agent) -> String {
         vec![
             ("pwd", crate::t!("show this channel's project directory", "このチャンネルの作業ディレクトリを見る")),
             ("pwd <path>", crate::t!("set this channel's project directory (`/…`, `~/…` or `./…`)", "このチャンネルの作業ディレクトリを決める(`/…`・`~/…`・`./…`)")),
-            ("warm on|off [<#channel>]", crate::t!("keep an agent started ahead of time for a channel (this one if none is given)", "チャンネルのエージェントを先に起動しておくか(省くとこのチャンネル)")),
+            ("warm on|off [<#channel>]", crate::t!("keep an agent started ahead of time for a channel", "チャンネルのエージェントを先に起動しておくか")),
             ("set-home", crate::t!("send notices to this channel", "通知をこのチャンネルに出す")),
         ],
     );
@@ -754,7 +849,8 @@ mod tests {
             bridge_version: "0.1.0-rs".into(),
             now_ms: 1_000_000,
             home: "/Users/t".into(),
-            mode: "local".into(),
+            machine: "dock".into(),
+            role: StatusRole::Gateway { machines: vec![("pve".into(), true), ("mac".into(), false)] },
             threads: vec![
                 StatusThread {
                     channel_id: "C1".into(),
@@ -780,7 +876,12 @@ mod tests {
         let out = r.render();
         // Version and mode on one line (a lone `mode: local` line looks like a log fragment)
         // The name is the binary name as-is. Under the heading is a line with one full-width space (a bare blank line leaves too little gap)
-        assert!(out.starts_with("🟢 *agentgw* `0.1.0-rs` · local\n　\n"));
+        assert!(
+            out.starts_with(
+                "*version*: `0.1.0-rs`\n*machine id*: `dock` (gateway)\n*connected machines*: `pve` 🟢, `mac` 🔴\n　\n"
+            ),
+            "{out}"
+        );
         assert!(out.contains("*Active threads* — 2"));
         // DMs first; the mention is stripped from the link text
         assert!(out.find("@alice").unwrap() < out.find("general").unwrap());
@@ -806,7 +907,8 @@ mod tests {
             bridge_version: "0.1.0-rs".into(),
             now_ms: 1_000_000,
             home: "/Users/t".into(),
-            mode: "local".into(),
+            machine: "dock".into(),
+            role: StatusRole::Gateway { machines: vec![("pve".into(), true), ("mac".into(), false)] },
             threads: vec![],
             pools: vec![],
         }
@@ -846,6 +948,41 @@ mod tests {
         let long = "あ".repeat(60);
         let cut = StatusThread::link_text(Some(&long));
         assert!(cut.ends_with('…') && cut.chars().count() == 51);
+    }
+
+    /// A machine's header names its gateway and where the link runs. A loopback address is the ssh
+    /// tunnel `add-machine` sets up when there's no direct route, so say so.
+    #[test]
+    fn status_header_of_a_machine_names_its_gateway() {
+        let head = |role| StatusReport {
+            bridge_version: "1.2.3".into(),
+            machine: "pve".into(),
+            role,
+            now_ms: 0,
+            home: "/root".into(),
+            threads: vec![],
+            pools: vec![],
+        }
+        .render();
+
+        let direct = head(StatusRole::Machine {
+            gateway: Some("dock".into()),
+            address: "wss://dock.example".into(),
+            online: true,
+        });
+        assert!(direct.contains("*machine id*: `pve`\n"), "{direct}");
+        assert!(direct.contains("*gateway*: `dock` (`wss://dock.example`) 🟢"), "{direct}");
+
+        let tunnel = head(StatusRole::Machine {
+            gateway: Some("dock".into()),
+            address: "ws://127.0.0.1:8799".into(),
+            online: false,
+        });
+        assert!(tunnel.contains("(`ws://127.0.0.1:8799` · via ssh) 🔴"), "{tunnel}");
+
+        let alone = head(StatusRole::Alone);
+        assert!(alone.contains("*machine id*: `pve`"), "{alone}");
+        assert!(!alone.contains("gateway"), "{alone}");
     }
 
     #[test]

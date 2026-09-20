@@ -78,6 +78,9 @@ pub mod link {
             bot_token: String,
             #[serde(skip_serializing_if = "Option::is_none")]
             home: Option<String>,
+            /// The gateway's own name, so a machine can say in `status` who it is linked to.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            gateway: Option<String>,
         },
         /// Forward one Slack event to the machine in charge of that channel.
         ///
@@ -301,10 +304,12 @@ pub mod link {
                 LinkFrame::Ready {
                     bot_token: "xoxb-1".into(),
                     home: Some("C_HOME".into()),
+                    gateway: Some("dock".into()),
                 },
                 LinkFrame::Ready {
                     bot_token: "xoxb-1".into(),
                     home: None,
+                    gateway: None,
                 },
                 LinkFrame::Event {
                     name: "message".into(),
@@ -350,6 +355,7 @@ pub mod link {
             let f = LinkFrame::Ready {
                 bot_token: "xoxb-1".into(),
                 home: None,
+                gateway: None,
             };
             assert_eq!(encode(&f), r#"{"t":"ready","bot_token":"xoxb-1"}"#);
         }
@@ -1708,6 +1714,7 @@ impl Fleet {
         let _ = conn.send(&link::LinkFrame::Ready {
             bot_token: self.bot_token.clone(),
             home: self.home(),
+            gateway: Some(self.self_id.clone()),
         });
         (conn, rx)
     }
@@ -3095,6 +3102,7 @@ mod tests {
         link::LinkFrame::Ready {
             bot_token: "xoxb-1".into(),
             home: None,
+            gateway: Some("vps".into()),
         }
     }
 

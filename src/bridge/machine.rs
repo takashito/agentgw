@@ -75,6 +75,8 @@ pub enum FromRelay {
     Ready {
         bot_token: String,
         home: Option<String>,
+        /// Who the gateway is (`status` says so).
+        gateway: Option<String>,
     },
     /// One Slack event.
     Event {
@@ -132,7 +134,15 @@ impl FromRelay {
     fn of(frame: LinkFrame) -> Option<Self> {
         use LinkFrame as F;
         Some(match frame {
-            F::Ready { bot_token, home } => FromRelay::Ready { bot_token, home },
+            F::Ready {
+                bot_token,
+                home,
+                gateway,
+            } => FromRelay::Ready {
+                bot_token,
+                home,
+                gateway,
+            },
             F::Event { name, event } => FromRelay::Event { name, event },
             F::Action { action, body } => FromRelay::Action { action, body },
             F::Linked {
@@ -172,16 +182,19 @@ pub struct RelayLink {
     bridge_id: String,
     stopped: Arc<AtomicBool>,
     up: Uplink,
+    /// Whether the link to the gateway is up right now (`status` says so).
+    live: Arc<AtomicBool>,
 }
 
 impl RelayLink {
-    pub fn new(url: &str, api_token: &str, bridge_id: &str, up: Uplink) -> Self {
+    pub fn new(url: &str, api_token: &str, bridge_id: &str, up: Uplink, live: Arc<AtomicBool>) -> Self {
         Self {
             url: url.trim_end_matches('/').to_string(),
             api_token: api_token.to_string(),
             bridge_id: bridge_id.to_string(),
             stopped: Arc::new(AtomicBool::new(false)),
             up,
+            live,
         }
     }
 
@@ -253,6 +266,7 @@ impl RelayLink {
             "bridge",
             &format!("remote link: linked as \"{}\"", self.bridge_id),
         );
+        self.live.store(true, Ordering::SeqCst);
 
         use futures_util::SinkExt;
         use tokio_tungstenite::tungstenite::protocol::Message as M;
@@ -316,6 +330,7 @@ impl RelayLink {
                 return Ok(true); // the Bridge itself has ended
             }
         }
+        self.live.store(false, Ordering::SeqCst);
         // This is where you'd be tempted to clean up agents by reflex. **Don't.**
         // A dropped link only means the flow from Slack stopped.
         Ok(true)
@@ -551,6 +566,8 @@ impl Wiring {
 /// A machine's kit for waiting for the gateway's connection. It is **where upstream comes in**, so it differs from [`gateway::Fleet`](crate::bridge::gateway::Fleet) (which accepts machines).
 pub struct GatewayInlet {
     pub token: String,
+    /// Whether the gateway is connected right now (`status` says so).
+    pub live: Arc<AtomicBool>,
     /// Where received frames go. **The same sink** as when the machine dials.
     pub tx: tokio::sync::mpsc::Sender<FromRelay>,
     /// Answers to send back up (the same as when the machine dials).
@@ -575,6 +592,7 @@ async fn on_parent_upgrade(
 /// only means "no new Slack messages until it comes back".
 async fn on_parent_socket(inlet: Arc<GatewayInlet>, parent_id: String, mut socket: WebSocket) {
     gateway::rlog("info", &format!("parent \"{parent_id}\" connected"));
+    inlet.live.store(true, Ordering::SeqCst);
     // If the gateway silently vanishes, we'd stay stuck in receive forever without noticing. Poke to check
     let mut watch = IdleWatch::default();
     loop {
@@ -615,6 +633,7 @@ async fn on_parent_socket(inlet: Arc<GatewayInlet>, parent_id: String, mut socke
             break;
         }
     }
+    inlet.live.store(false, Ordering::SeqCst);
     gateway::rlog("info", &format!("parent \"{parent_id}\" disconnected"));
 }
 
@@ -1040,7 +1059,13 @@ mod tests {
     #[test]
     fn the_path_is_built_from_the_bridge_id() {
         let (_up, up_rx) = tokio::sync::mpsc::unbounded_channel();
-        let l = RelayLink::new("wss://relay.example/", "tok", "desktop", Arc::new(tokio::sync::Mutex::new(up_rx)));
+        let l = RelayLink::new(
+            "wss://relay.example/",
+            "tok",
+            "desktop",
+            Arc::new(tokio::sync::Mutex::new(up_rx)),
+            Arc::new(AtomicBool::new(false)),
+        );
         assert_eq!(l.url, "wss://relay.example");
         assert_eq!(
             format!("{}{}", l.url, link::path_for(&l.bridge_id)),

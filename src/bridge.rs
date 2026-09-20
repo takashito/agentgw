@@ -84,6 +84,10 @@ pub struct Bridge {
     /// Where to ask the gateway the things only it knows (`channels`, `pwd <machine>`). `None` = this
     /// Bridge works on its own, with no gateway anywhere.
     ask_gateway: Option<mpsc::UnboundedSender<crate::bridge::gateway::link::LinkFrame>>,
+    /// Set on a machine: the gateway it is linked to.
+    link: Option<LinkStatus>,
+    /// Set on the gateway: who is connected right now.
+    machines_now: Option<Arc<dyn Fn() -> Vec<String> + Send + Sync>>,
     /// The sign-in / sign-out in progress ([`command::SignIn`]).
     sign_in: command::SignIn,
     /// Whether a restart has begun. A flag so the few hundred ms until exit(0) don't run twice
@@ -128,6 +132,21 @@ struct Config {
     machine_name: String,
     cmd_tx: mpsc::Sender<CmdFx>,
     ask_gateway: Option<mpsc::UnboundedSender<crate::bridge::gateway::link::LinkFrame>>,
+    /// Set on a machine: the gateway it is linked to (`status` says so).
+    link: Option<LinkStatus>,
+    /// Set on the gateway: the machines connected right now, read when `status` is asked.
+    machines_now: Option<Arc<dyn Fn() -> Vec<String> + Send + Sync>>,
+}
+
+/// How this machine reaches its gateway, for `status`.
+#[derive(Clone)]
+pub struct LinkStatus {
+    /// The gateway's own name. `None` until the first handshake says it.
+    pub gateway: Option<String>,
+    /// Where the link runs: the address we dial, or the one we wait on.
+    pub address: String,
+    /// Whether it is up right now. The link keeps it current.
+    pub up: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Bridge {
@@ -155,6 +174,8 @@ impl Bridge {
             started_at_ms: config.started_at_ms,
             cmd_tx: config.cmd_tx,
             ask_gateway: config.ask_gateway,
+            link: config.link,
+            machines_now: config.machines_now,
             sign_in: command::SignIn::default(),
             restarting: false,
             limited_until_ms: 0,
@@ -180,6 +201,8 @@ impl Bridge {
             machine_name: "test-machine".into(),
             cmd_tx,
             ask_gateway: None,
+            link: None,
+            machines_now: None,
         };
         (Bridge::new(deps, config), cmd_rx)
     }
@@ -444,6 +467,11 @@ impl Bridge {
         // connecting and auth.test look like "posted before start-up" and are silently dropped
         let started_at_ms = Host::now_ms();
 
+        let link_address = match (&wiring.upstream, &wiring.inlet) {
+            (machine::Mode::Relay { url, .. }, _) => url.clone(),
+            (machine::Mode::AwaitParent, Some(listen)) => listen.addr.to_string(),
+            _ => String::new(),
+        };
         let machine_name = match wiring.self_id.clone() {
             Some(id) if !id.is_empty() => id,
             _ => Host::name().await,
@@ -453,27 +481,29 @@ impl Bridge {
         // fleet, so both sides go through the same handler
         let (up_tx, up_rx) = mpsc::unbounded_channel();
         let up_is_linked = !matches!(wiring.upstream, machine::Mode::Direct { .. });
+        // Whether the link to the gateway is up right now; the link itself keeps it current
+        let link_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let uplink: machine::Uplink = Arc::new(tokio::sync::Mutex::new(up_rx));
         // Via Relay the bot token **comes in the handshake**, so the Api can only be built after it.
         // This is the only ordering difference from a direct connection.
-        let (bot_token, link_home, relay_rx) = match &mode {
-            machine::Mode::Direct { bot_token, .. } => (bot_token.clone(), None, None),
+        let (bot_token, link_home, gateway_name, relay_rx) = match &mode {
+            machine::Mode::Direct { bot_token, .. } => (bot_token.clone(), None, None, None),
             machine::Mode::Relay {
                 url,
                 api_token,
                 bridge_id,
             } => {
                 let (tx, mut rx) = mpsc::channel(64);
-                let l = Arc::new(machine::RelayLink::new(url, api_token, bridge_id, uplink.clone()));
+                let l = Arc::new(machine::RelayLink::new(url, api_token, bridge_id, uplink.clone(), link_up.clone()));
                 tokio::spawn({
                     let l = l.clone();
                     async move { l.run(tx).await }
                 });
                 // Nothing can be written to Slack until the first Ready. **Wait**
-                let (token, home) = loop {
+                let (token, home, gateway) = loop {
                     match rx.recv().await {
-                        Some(machine::FromRelay::Ready { bot_token, home }) => {
-                            break (bot_token, home);
+                        Some(machine::FromRelay::Ready { bot_token, home, gateway }) => {
+                            break (bot_token, home, gateway);
                         }
                         // **Don't exit when the handshake is refused.** Exiting makes the supervisor restart at once,
                         // and that hammering trips systemd's start rate limit (default 5 in 10 seconds),
@@ -491,7 +521,7 @@ impl Bridge {
                         None => return Err("relay link ended before the handshake".into()),
                     }
                 };
-                (token, home, Some(rx))
+                (token, home, gateway, Some(rx))
             }
             // The gateway comes to us. **Waiting is the same** — nothing can be written to Slack until the first Ready
             machine::Mode::AwaitParent => {
@@ -501,20 +531,21 @@ impl Bridge {
                 let (tx, mut rx) = mpsc::channel(64);
                 let inlet = Arc::new(machine::GatewayInlet {
                     token: listen.token,
+                    live: link_up.clone(),
                     tx,
                     up: uplink.clone(),
                 });
                 tokio::spawn(inlet.serve(listen.addr));
-                let (token, home) = loop {
+                let (token, home, gateway) = loop {
                     match rx.recv().await {
-                        Some(machine::FromRelay::Ready { bot_token, home }) => {
-                            break (bot_token, home);
+                        Some(machine::FromRelay::Ready { bot_token, home, gateway }) => {
+                            break (bot_token, home, gateway);
                         }
                         Some(_) => continue,
                         None => return Err("the inlet closed before the parent arrived".into()),
                     }
                 };
-                (token, home, Some(rx))
+                (token, home, gateway, Some(rx))
             }
         };
         // Apply the home carried in the first handshake here. `Access::load` rereads it after this,
@@ -719,6 +750,15 @@ impl Bridge {
                 machine_name: machine_name.clone(),
                 cmd_tx,
                 ask_gateway: (fleet.is_some() || up_is_linked).then(|| up_tx.clone()),
+                link: up_is_linked.then(|| LinkStatus {
+                    gateway: gateway_name.clone(),
+                    address: link_address.clone(),
+                    up: link_up.clone(),
+                }),
+                machines_now: fleet.as_ref().map(|fleet| {
+                    let fleet = fleet.clone();
+                    Arc::new(move || fleet.links.connected()) as Arc<dyn Fn() -> Vec<String> + Send + Sync>
+                }),
             },
         );
         if let Some(up) = &b.ask_gateway {

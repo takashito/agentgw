@@ -672,7 +672,11 @@ impl Bridge {
                 self.post(
                     &msg.channel,
                     root_ts,
-                    bridge::help(self.fleet, self.deps.agent.as_ref()),
+                    // Any machine with a gateway can hand its channel over — it passes the command up
+                    bridge::help(
+                        self.fleet || self.ask_gateway.is_some(),
+                        self.deps.agent.as_ref(),
+                    ),
                     key,
                 );
             }
