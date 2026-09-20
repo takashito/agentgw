@@ -397,6 +397,17 @@ pub mod link {
         }
 
         /// **Regression**: the reachability-check path must be separate and not caught by the name check.
+    /// Several addresses is one setting, not one host. Asking `http://a:1,b:1/status` reached nothing,
+        /// and `status` drew a running gateway as "not answering" with its machines missing.
+        #[test]
+        fn the_gateway_is_asked_at_the_first_address_it_accepts_on() {
+            assert_eq!(
+                super::super::first_addr("127.0.0.1:8787,192.168.10.11:8787"),
+                "127.0.0.1:8787"
+            );
+            assert_eq!(super::super::first_addr("127.0.0.1:8787"), "127.0.0.1:8787");
+        }
+
         /// With the reserved name `__link_probe__` under `/bridge/`, it got 400 because it didn't start with
         /// an alphanumeric, and `relay link` reported it couldn't reach itself (found on a real machine).
         #[test]
@@ -2895,6 +2906,12 @@ where
 /// The port machines link on, when nothing says otherwise.
 pub(crate) const DEFAULT_PORT: &str = "8787";
 
+/// The one address to ask on, out of everything the gateway accepts. **The first is its own way in**
+/// (loopback, written first) — and the whole comma-separated list is not a host to put in a URL.
+pub(crate) fn first_addr(listen: &str) -> &str {
+    listen.split(',').next().unwrap_or(listen).trim()
+}
+
 /// **Loopback**, not `0.0.0.0`: a gateway opens a wider address only when `add-machine` measures that a
 /// machine needs it.
 pub(crate) const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
@@ -3021,6 +3038,7 @@ impl Cli {
     }
 
     async fn ask_status_once(listen: &str, token: &str) -> Option<(Vec<String>, Tunnels)> {
+        let listen = first_addr(listen);
         // Ask curl to avoid a dependency (no HTTP client declared for this one-off job)
         let out = tokio::process::Command::new("curl")
             .args([

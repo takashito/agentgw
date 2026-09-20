@@ -746,7 +746,8 @@ pub fn role_line(env: &std::collections::HashMap<String, String>) -> String {
         .unwrap_or_default();
     match (&wiring.upstream, &wiring.children, &wiring.inlet) {
         (Mode::Direct { .. }, Some(l), _) => {
-            let addr = l.addr();
+            // Every address, not just the first: a gateway opens one per way in that a machine needs
+            let addr = l.addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ");
             crate::t!(
                 "Role: gateway{name} — connected to Slack, accepts machines on {addr}",
                 "役割: ゲートウェイ{name} — Slack に接続、マシンを {addr} で受け付け"
