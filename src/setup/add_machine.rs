@@ -382,6 +382,22 @@ pub async fn cli(args: &[String]) -> i32 {
     }
 }
 
+/// A step that finished. **Every line has the same shape**, so the eye follows the sequence instead of
+/// reading prose — this output is read while waiting, not studied.
+fn ok(what: &str) {
+    println!("  ✔ {what}");
+}
+
+/// A step that is under way (it prints before the waiting, and what it produced follows indented).
+fn doing(what: &str) {
+    println!("  · {what}");
+}
+
+/// A detail belonging to the line above.
+fn detail(what: &str) {
+    println!("      {what}");
+}
+
 /// Add one machine. **The order matters** — see each step's comment.
 async fn add_child(
     target: &str,
@@ -392,29 +408,25 @@ async fn add_child(
     let dir = StateDir::resolve();
 
     // 1. Look at the remote
-    println!("{}", crate::t!("==> Checking {target}", "==> {target} を確認しています"));
+    println!("\n{}\n", crate::t!("agentgw add-machine · {target}", "agentgw add-machine · {target}"));
     let uname = ssh::ssh_capture(target, "uname -sm")?;
     let triple = triple_for(&uname)
         .ok_or_else(|| crate::t!("There is no prebuilt binary for {uname}. Build and install agentgw there by hand.", "{uname} 用のバイナリは配布していません。そのマシンでビルドして入れてください。"))?;
-    println!("  {uname} ({triple})");
+    ok(&crate::t!("reached {target} — {uname}", "{target} に入れました — {uname}"));
 
     // With `-p` the way in is a password, and **a tunnel can't be asked for one** — it is reopened
     // unattended. Leave the gateway's own key behind while the password session is still open, and use
     // it from here on
     if ssh::asks_for_password() {
-        println!(
-            "{}",
-            crate::t!(
-                "==> Leaving this gateway's ssh key on {target} (so the tunnel can reopen without you)",
-                "==> トンネルを人手なしで張り直せるように、このゲートウェイの ssh 鍵を {target} に置きます"
-            )
-        );
         let pubkey = ssh::ensure_gateway_key()?;
         ssh::authorize_key(target, &pubkey)?;
         ssh::use_key_from_now_on();
         ssh::ssh_capture(target, "true")
             .map_err(|e| crate::t!("The key didn't work on {target}: {e}", "{target} で鍵が使えませんでした: {e}"))?;
-        println!("{}", crate::t!("  the key works", "  鍵で入れます"));
+        ok(&crate::t!(
+            "left this gateway's ssh key on {target}, so a tunnel can reopen without you",
+            "このゲートウェイの ssh 鍵を {target} に置きました(トンネルを人手なしで張り直せます)"
+        ));
     }
 
     // An explicit name wins. Otherwise use the remote's hostname (**the only place a name is guessed**)
@@ -428,7 +440,7 @@ async fn add_child(
     if child.is_empty() {
         return Err(crate::t!("Couldn't work out this machine's name. Pass --name <name>.", "このマシンの名前が決められません。--name <名前> を付けてください"));
     }
-    println!("{}", crate::t!("  Name: {child}", "  名前: {child}"));
+    ok(&crate::t!("this machine will be called `{child}`", "このマシンの名前は `{child}`"));
 
     // 2. Pick what to ship (release first, then the cargo dist artifact)
     let staging = std::env::temp_dir().join(format!("agentgw-add-{}", std::process::id()));
@@ -439,7 +451,7 @@ async fn add_child(
             match choose_source(ssh::gh_ready(), dist, env!("CARGO_PKG_VERSION"), triple)? {
                 Source::Release { tag } => {
                     std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
-                    println!("{}", crate::t!("==> Downloading release {tag} from GitHub", "==> GitHub から {tag} をダウンロードしています"));
+                    doing(&crate::t!("fetching {tag} from GitHub", "GitHub から {tag} を取得しています"));
                     ssh::gh_download(
                         &gh_download_args(&tag, triple, &staging),
                         &staging,
@@ -448,13 +460,14 @@ async fn add_child(
                 }
                 Source::Url { url } => {
                     std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
-                    println!("{}", crate::t!("==> Downloading {url}", "==> {url} をダウンロードしています"));
+                    let version = env!("CARGO_PKG_VERSION");
+                    doing(&crate::t!("fetching agentgw {version} from GitHub", "GitHub から agentgw {version} を取得しています"));
                     let out = staging.join(format!("agentgw-{triple}"));
                     ssh::download(&url, &out)?;
                     out
                 }
                 Source::Dist(p) => {
-                    println!("{}", crate::t!("==> Using the binary built on this machine", "==> このマシンでビルドしたバイナリを使います"));
+                    doing(&crate::t!("using the binary built on this machine", "このマシンでビルドしたバイナリを使います"));
                     p
                 }
             }
@@ -462,7 +475,7 @@ async fn add_child(
     };
 
     // 3. Deliver (the binary and install.sh)
-    println!("{}", crate::t!("==> Copying agentgw to {target}", "==> {target} に agentgw をコピーしています"));
+    doing(&crate::t!("sending agentgw to {child}", "{child} へ agentgw を送っています"));
     let remote_bin = ".local/bin/agentgw";
     ssh::ssh_run(target, "mkdir -p ~/.local/bin")?;
     // A running binary cannot be overwritten. Move it aside first, then place the new one
@@ -500,14 +513,14 @@ async fn add_child(
         // What worked last time, unless `-n` says to work it out again. Its address is already open,
         // and if it has stopped working the tunnel is behind it
         Some(Transport::Direct { url }) => {
-            println!("{}", crate::t!("==> {child} came in over {url} last time", "==> 前回 {child} は {url} でつながりました"));
+            ok(&crate::t!("{child} came in over {url} last time — trying that first", "前回 {child} は {url} でつながりました — まずそれを試します"));
             vec![
                 RouteChoice { label: url.clone(), url: Some(url.clone()), listen: None },
                 tunnel_route(),
             ]
         }
         Some(Transport::Tunnel { .. }) => {
-            println!("{}", crate::t!("==> {child} came in over the ssh tunnel last time", "==> 前回 {child} は ssh トンネルでつながりました"));
+            ok(&crate::t!("{child} came in over the ssh tunnel last time", "前回 {child} は ssh トンネルでつながりました"));
             vec![tunnel_route()]
         }
         None => {
@@ -549,29 +562,40 @@ async fn add_child(
         let last = i + 1 == plan.len();
         let transport = match &route.url {
             Some(url) => {
-                println!("{}", crate::t!("==> Trying a direct connection to {url}", "==> {url} への直結を試しています"));
+                doing(&crate::t!("linking {child} directly to {url}", "{child} を {url} に直結でつないでいます"));
                 // Open what this route needs — for good this time — and restart so it takes
                 if let Some(addr) = &route.listen
                     && crate::setup::add_listen(&dir, addr)
                 {
-                    println!("{}", crate::t!("==> Opening {addr} for machines. Restarting to apply it.", "==> マシン用に {addr} を開きます。反映のため再起動します。"));
-                    crate::service::Service::run("restart", &[]);
+                    detail(&crate::t!("opening {addr} on this gateway", "このゲートウェイで {addr} を開きます"));
+                    crate::service::Service::run_quiet("restart", &[]);
                 }
                 Transport::Direct { url: url.clone() }
             }
             None => {
-                println!("{}", crate::t!("==> Connecting {child} over an ssh tunnel", "==> {child} を ssh トンネルでつなぎます"));
+                doing(&crate::t!("linking {child} over an ssh tunnel", "{child} を ssh トンネルでつないでいます"));
                 set_tunnel(&dir, &child, Some(target))?;
                 Transport::Tunnel { remote_port: TUNNEL_PORT }
             }
         };
         link_child(target, &child, &transport, &inlet, &state_prefix, remote_bin)?;
         if i == 0 {
-            println!("{}", crate::t!("==> Installing and starting agentgw on {target}", "==> {target} に agentgw をインストールして起動しています"));
-            let installed = ssh::ssh_interactive(
+            doing(&crate::t!("installing and starting agentgw on {child}", "{child} に agentgw を入れて起動しています"));
+            // **Its output is kept back unless it fails.** The installer narrates its own steps, and
+            // two narrations of one job is what made this unreadable
+            let installed = ssh::ssh_capture(
                 target,
-                &format!("{state_prefix}~/.local/bin/agentgw-install.sh --from ~/{remote_bin}"),
-            );
+                &format!("{state_prefix}~/.local/bin/agentgw-install.sh --from ~/{remote_bin} 2>&1"),
+            )
+            .map(|_| ())
+            .map_err(|out| {
+                let lines: Vec<&str> = out.lines().collect();
+                let tail = lines[lines.len().saturating_sub(12)..].join("\n  ");
+                crate::t!(
+                    "installing agentgw on {child} failed:\n  {tail}",
+                    "{child} への agentgw のインストールが失敗しました:\n  {tail}"
+                )
+            });
             // The shipped install.sh is single-use. **Clean it up whether or not it worked** (the next add-machine sends it again)
             let _ = ssh::ssh_run(target, "rm -f ~/.local/bin/agentgw-install.sh");
             installed?;
@@ -586,7 +610,7 @@ async fn add_child(
             }
             Err(why) => {
                 let label = &route.label;
-                println!("{}", crate::t!("==> {label} didn't connect. {why}", "==> {label} ではつながりませんでした。{why}"));
+                detail(&crate::t!("no link over {label} — {why}", "{label} ではつながりませんでした — {why}"));
                 said.push(format!("{label}: {why}"));
             }
         }
@@ -614,12 +638,13 @@ async fn add_child(
     }
 
     let how = match &transport {
-        Transport::Direct { url } => crate::t!("directly ({url})", "直結({url})"),
-        Transport::Tunnel { .. } => crate::t!("over an ssh tunnel", "ssh トンネル経由"),
+        Transport::Direct { url } => crate::t!("directly, at {url}", "直結({url})"),
+        Transport::Tunnel { .. } => crate::t!("over an ssh tunnel ({target})", "ssh トンネル経由({target})"),
     };
+    ok(&crate::t!("{child} is connected {how}", "{child} がつながりました — {how}"));
     Ok(crate::t!(
-        "\n{child} is connected {how}.\nTo hand a Slack channel to it, type `pwd {child}:<path>` in that channel.",
-        "\n{child} がつながりました({how})。\nSlack のチャンネルを任せるには、そのチャンネルで `pwd {child}:<パス>` と打ってください。"
+        "\nHand {child} a Slack channel by typing this in that channel:\n  pwd {child}:<path>",
+        "\n{child} に Slack のチャンネルを任せるには、そのチャンネルでこう打ちます:\n  pwd {child}:<パス>"
     ))
 }
 
@@ -652,14 +677,11 @@ fn ensure_inlet(dir: &StateDir) -> Result<Listener, String> {
             ],
         )
         .map_err(|e| crate::t!("Couldn't write .env: {e}", ".env が書けません: {e}"))?;
-        println!(
-            "{}",
-            crate::t!(
-                "==> This gateway now accepts machines on {listen}, with a new secret key. Restarting to apply it.",
-                "==> このゲートウェイがマシンを受け入れるようにしました({listen}、新しい秘密鍵)。反映のため再起動します。"
-            )
-        );
-        crate::service::Service::run("restart", &[]);
+        ok(&crate::t!(
+            "this gateway now accepts machines on {listen}, with a new secret key",
+            "このゲートウェイがマシンを受け入れるようにしました({listen}、新しい秘密鍵)"
+        ));
+        crate::service::Service::run_quiet("restart", &[]);
     }
     Ok(Listener {
         listen,
@@ -718,18 +740,17 @@ fn set_tunnel(dir: &StateDir, child: &str, target: Option<&str>) -> Result<(), S
         RelayCli::write_env(dir, &[("AGENTGW_TUNNELS", after)])
             .map_err(|e| crate::t!("Couldn't write .env: {e}", ".env が書けません: {e}"))?;
     }
-    let line = match target {
+    detail(&match target {
         Some(t) => crate::t!(
-            "  This gateway will keep an ssh tunnel open to {child} (ssh {t}). Restarting to apply it.",
-            "  このゲートウェイが {child} への ssh トンネルを張り続けます(ssh {t})。反映のため再起動します。"
+            "this gateway will keep an ssh tunnel open to {child} (ssh {t})",
+            "このゲートウェイが {child} への ssh トンネルを張り続けます(ssh {t})"
         ),
         None => crate::t!(
-            "  {child} no longer needs an ssh tunnel. Restarting to apply it.",
-            "  {child} への ssh トンネルは不要になりました。反映のため再起動します。"
+            "{child} no longer needs an ssh tunnel",
+            "{child} への ssh トンネルは不要になりました"
         ),
-    };
-    println!("{line}");
-    crate::service::Service::run("restart", &[]);
+    });
+    crate::service::Service::run_quiet("restart", &[]);
     Ok(())
 }
 
@@ -905,14 +926,13 @@ fn routes_that_work(
         match &c.listen {
             Some(addr) => match Doorbell::at(addr, held(addr)) {
                 Some(bell) => open.push((c, Some(bell))),
-                None => println!("{}", crate::t!("==> Can't open {addr} here, so that route is out", "==> ここでは {addr} を開けないので、その経路は除きます")),
+                None => detail(&crate::t!("{addr} can't be opened here, so that one is out", "{addr} はここでは開けないので、その経路は除きます")),
             },
             None => open.push((c, None)),
         }
     }
-    for (c, _) in &open {
-        println!("{}", crate::t!("==> Asking {target} whether the gateway answers at {}", "==> ゲートウェイが {} で答えるか {target} に訊いています", c.url));
-    }
+    let who = target.rsplit('@').next().unwrap_or(target);
+    doing(&crate::t!("measuring the ways {who} could reach this gateway", "{who} からこのゲートウェイへ届く経路を測っています"));
     let answered: Vec<bool> = std::thread::scope(|scope| {
         let asks: Vec<_> = open
             .iter()
@@ -920,6 +940,18 @@ fn routes_that_work(
             .collect();
         asks.into_iter().map(|a| a.join().unwrap_or(false)).collect()
     });
+
+    // Show what each one said, aligned, so the answers read as a table and not as sentences
+    let width = open.iter().map(|(c, _)| c.url.chars().count()).max().unwrap_or(0);
+    for ((c, _), yes) in open.iter().zip(&answered) {
+        let url = &c.url;
+        let pad = " ".repeat(width - url.chars().count());
+        let said = match yes {
+            true => crate::t!("the gateway answers", "ゲートウェイが応答"),
+            false => crate::t!("no answer", "応答なし"),
+        };
+        detail(&format!("{url}{pad}   {said}"));
+    }
 
     let mut out: Vec<RouteChoice> = open
         .into_iter()
@@ -942,17 +974,19 @@ fn ask_which_route(options: &[RouteChoice]) -> Option<usize> {
     if options.len() < 2 {
         return None;
     }
-    println!("{}", crate::t!("==> Ways this machine can reach the gateway:", "==> このマシンからゲートウェイへ届く経路:"));
+    println!();
+    println!("  {}", crate::t!("How should this machine reach the gateway?", "このマシンはどうやってゲートウェイにつなぎますか?"));
     for (i, o) in options.iter().enumerate() {
         let n = i + 1;
-        println!("  {n}) {}", o.label);
+        println!("    {n}  {}", o.label);
     }
     if !std::io::stdin().is_terminal() {
         let first = &options[0].label;
-        println!("{}", crate::t!("  Taking {first}", "  {first} を選びます"));
+        println!("  {}\n", crate::t!("Taking {first}", "{first} を使います"));
         return None;
     }
-    let answer = crate::setup::prompt(&crate::t!("  Which one? [1]: ", "  どれにしますか? [1]: "));
+    let answer = crate::setup::prompt(&crate::t!("  → [1]: ", "  → [1]: "));
+    println!();
     answer.trim().parse::<usize>().ok().map(|n| n.saturating_sub(1))
 }
 

@@ -196,6 +196,10 @@ impl Action {
     }
 }
 
+/// Set while a caller wants [`Service`]'s running commentary kept back. Process-wide on purpose: the
+/// calls go through several layers, and a restart is never concurrent with another one.
+static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 impl RestartStep {
     /// `pid` = the main pid reported by the service manager (None = not running).
     /// `alive` = whether that pid still exists. `waited_ms` = time since SIGUSR1 was sent.
@@ -357,9 +361,33 @@ impl Service {
         c
     }
 
+    /// A line of running commentary, unless the caller asked for quiet.
+    fn say(line: &str) {
+        if !QUIET.load(std::sync::atomic::Ordering::Relaxed) {
+            println!("{line}");
+        }
+    }
+
     pub(crate) fn run_ctl(cmd: &str, args: &[String]) -> i32 {
-        match Self::ctl_command(cmd).args(args).status() {
-            Ok(s) => s.code().unwrap_or(-1),
+        match Self::ctl_command(cmd).args(args).output() {
+            Ok(out) => {
+                let err = String::from_utf8_lossy(&out.stderr);
+                let said = err.trim();
+                if !said.is_empty() {
+                    // systemd's own words for this are "Failed to connect to bus", which says nothing
+                    // about what to do. It means there is no user session to talk to from this shell
+                    let unit = Self::unit();
+                    eprintln!("{}", match said.contains("connect to bus") {
+                        true => crate::t!(
+                            "  This shell can't reach your systemd user session, so the service wasn't touched.\n                             \x20 Log in on that machine and run: systemctl --user restart {unit}\n                             \x20 (or enable it for good: loginctl enable-linger $USER)",
+                            "  このシェルからは systemd のユーザーセッションに届かないので、サービスは触れていません。\n                             \x20 そのマシンにログインして実行してください: systemctl --user restart {unit}\n                             \x20 (恒久化するなら: loginctl enable-linger $USER)"
+                        ),
+                        false => format!("  {said}"),
+                    });
+                }
+                print!("{}", String::from_utf8_lossy(&out.stdout));
+                out.status.code().unwrap_or(-1)
+            }
             Err(e) => {
                 eprintln!("{}", crate::t!("Couldn't run {cmd}: {e}", "{cmd} が実行できません: {e}"));
                 -1
@@ -437,6 +465,16 @@ impl Service {
     }
 
     /// Run one subcommand and return the process exit code.
+    /// Same as [`Service::run`], with the running commentary kept back: the caller is already printing
+    /// a step of its own, and two voices describing one restart is what made `add-machine` unreadable.
+    /// **Failures still speak.**
+    pub fn run_quiet(cmd: &str, rest: &[String]) -> i32 {
+        QUIET.store(true, std::sync::atomic::Ordering::Relaxed);
+        let code = Self::run(cmd, rest);
+        QUIET.store(false, std::sync::atomic::Ordering::Relaxed);
+        code
+    }
+
     pub fn run(cmd: &str, rest: &[String]) -> i32 {
         if !Self::supported() {
             return 2;
@@ -481,13 +519,10 @@ impl Service {
     fn graceful_restart(mac: bool, job: &Path) -> i32 {
         let force = |why: &str| -> i32 {
             let manager = if mac { "launchd" } else { "systemd" };
-            println!(
-                "{}",
-                crate::t!(
-                    "  agentgw didn't stop on its own ({why}), so {manager} will restart it",
-                    "  agentgw が自分で止まれなかったので({why})、{manager} に再起動させます"
-                )
-            );
+            Self::say(&crate::t!(
+                "  agentgw didn't stop on its own ({why}), so {manager} will restart it",
+                "  agentgw が自分で止まれなかったので({why})、{manager} に再起動させます"
+            ));
             if mac {
                 Self::run_ctl(
                     "launchctl",
@@ -511,7 +546,7 @@ impl Service {
         // keeps the pool as is (the successor picks it back up by name from pools.json). This
         // message used to say "cleaning up before exiting", which made people hold off deploying
         // for fear of cutting conversations
-        println!("{}", crate::t!("  Restarting agentgw. Running agents keep going.", "  agentgw を再起動します。動いているエージェントはそのまま続きます。"));
+        Self::say(&crate::t!("  Restarting agentgw. Running agents keep going.", "  agentgw を再起動します。動いているエージェントはそのまま続きます。"));
         if !std::process::Command::new("kill")
             .args(["-USR1", &pid.to_string()])
             .status()
@@ -529,7 +564,7 @@ impl Service {
                 GRACEFUL_RESTART_TIMEOUT_MS,
             ) {
                 RestartStep::Gone => {
-                    println!("{}", crate::t!("  Restarted.", "  再起動しました。"));
+                    Self::say(&crate::t!("  Restarted.", "  再起動しました。"));
                     return 0;
                 }
                 RestartStep::Force(why) => return force(&why),

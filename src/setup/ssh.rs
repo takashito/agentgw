@@ -45,7 +45,9 @@ fn opts() -> Vec<String> {
 }
 
 fn opts_of(access: &Access) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+    // ssh's own chatter ("Shared connection to host closed.") is not part of what we are reporting.
+    // Errors and the password prompt still come through
+    let mut out: Vec<String> = vec!["-o".into(), "LogLevel=ERROR".into()];
     let installed = KEY_NOW.get().cloned();
     if let Some(key) = installed.as_ref().or(access.identity.as_ref()) {
         out.push("-i".into());
@@ -280,7 +282,7 @@ pub fn fqdn() -> Option<String> {
 pub fn download(url: &str, out: &Path) -> Result<(), String> {
     let st = Command::new("curl")
         .args([
-            "-fL",
+            "-fsSL",
             "--retry",
             "2",
             "-o",
@@ -346,7 +348,8 @@ mod tests {
             let joined = opts_of(&a).join(" ");
             joined
         };
-        assert_eq!(args(Access::default()), "");
+        // Nothing asked for, so nothing but the quiet: ssh's own chatter is not part of our output
+        assert_eq!(args(Access::default()), "-o LogLevel=ERROR");
         let with_key = args(Access { identity: Some("/k/id".into()), ask_password: false });
         assert!(with_key.contains("-i /k/id") && with_key.contains("IdentitiesOnly=yes"), "{with_key}");
         let with_pw = args(Access { identity: None, ask_password: true });
