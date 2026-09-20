@@ -708,11 +708,16 @@ fn set_tunnel(dir: &StateDir, child: &str, target: Option<&str>) -> Result<(), S
     let env = RelayCli::env_of(dir);
     let before = env.get("AGENTGW_TUNNELS").cloned().unwrap_or_default();
     let after = tunnels_with(&before, child, target);
-    if after == before {
+    // **Setting one up always restarts**, even when the line is already there: the file saying so is not
+    // the same as the running gateway holding it, and a gateway that missed the restart keeps no tunnel
+    // while `machines` reads the empty list and draws the machine as direct (seen on a real machine)
+    if after == before && target.is_none() {
         return Ok(());
     }
-    RelayCli::write_env(dir, &[("AGENTGW_TUNNELS", after)])
-        .map_err(|e| crate::t!("Couldn't write .env: {e}", ".env が書けません: {e}"))?;
+    if after != before {
+        RelayCli::write_env(dir, &[("AGENTGW_TUNNELS", after)])
+            .map_err(|e| crate::t!("Couldn't write .env: {e}", ".env が書けません: {e}"))?;
+    }
     let line = match target {
         Some(t) => crate::t!(
             "  This gateway will keep an ssh tunnel open to {child} (ssh {t}). Restarting to apply it.",

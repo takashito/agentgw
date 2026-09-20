@@ -1525,6 +1525,11 @@ pub struct Tunnel {
 pub type Tunnels = HashMap<String, Tunnel>;
 
 /// One machine's route in a few words.
+/// The host part of an ssh target: `root@pve.lan` → `pve.lan`.
+pub fn ssh_host_of(target: &str) -> &str {
+    target.rsplit_once('@').map(|(_, host)| host).unwrap_or(target)
+}
+
 pub fn route_of(id: &str, tunnels: &Tunnels) -> String {
     match tunnels.get(id) {
         None => crate::t!("direct", "直結"),
@@ -1735,7 +1740,12 @@ impl Fleet {
                 true => crate::t!("🟢 online", "🟢 オンライン"),
                 false => crate::t!("🔴 offline", "🔴 オフライン"),
             };
-            let reachable = where_(&host, &ip);
+            // A machine behind an ssh tunnel dials its own loopback, so loopback is the interface it
+            // names. What reaches *it* is the gateway's ssh target, which only the gateway knows
+            let reachable = match (ip.starts_with("127."), tunnels.get(id)) {
+                (true, Some(t)) => where_(ssh_host_of(&t.target), ""),
+                _ => where_(&host, &ip),
+            };
             // How the gateway gets to it: a tunnel it opened itself (and knows), or straight there
             let route = route_of(id, &tunnels);
             lines.push(crate::t!("machine id: `{id}`", "マシン: `{id}`"));
@@ -4230,6 +4240,14 @@ mod tests {
         );
         assert!(out.contains("  ● laptop — direct"), "{out}");
         assert!(out.contains("  ● desktop — ssh tunnel (me@desktop)"), "{out}");
+    }
+
+    /// A tunnelled machine dials its own loopback, so that is the interface it names — and `127.0.0.1`
+    /// tells nobody where it is. The gateway's ssh target does.
+    #[test]
+    fn an_ssh_target_names_the_host() {
+        assert_eq!(ssh_host_of("root@pve.lan"), "pve.lan");
+        assert_eq!(ssh_host_of("build-box"), "build-box");
     }
 
     #[test]
