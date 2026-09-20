@@ -439,9 +439,9 @@ async fn add_child(
     // 4. Prepare the gateway's listener and key
     let inlet = ensure_inlet(&dir)?;
 
-    // 5. Decide the route by **measuring it from the machine**, which is the side that dials. One way
-    //    that works is no question; several is a choice worth offering (and with nobody to ask, the
-    //    first — they are in preference order)
+    // 5. Work out **the order to try**, by measuring from the machine — which is the side that dials.
+    //    Measuring says who answers; only a real link says it works, so what is measured is an order,
+    //    not a decision. The ssh tunnel is last and is always there (we got here over ssh).
     let env = RelayCli::env_of(&dir);
     let by_hand = env.get("AGENTGW_LINK_PUBLIC_URL").cloned();
     let known = (!fresh)
@@ -453,15 +453,19 @@ async fn add_child(
             )
         })
         .flatten();
-    let chosen = match &known {
-        // What worked last time, unless `-n` says to work it out again
+    let plan: Vec<RouteChoice> = match &known {
+        // What worked last time, unless `-n` says to work it out again. Its address is already open,
+        // and if it has stopped working the tunnel is behind it
         Some(Transport::Direct { url }) => {
             println!("{}", crate::t!("==> {child} came in over {url} last time", "==> 前回 {child} は {url} でつながりました"));
-            Some(url.clone())
+            vec![
+                RouteChoice { label: url.clone(), url: Some(url.clone()), listen: None },
+                tunnel_route(),
+            ]
         }
         Some(Transport::Tunnel { .. }) => {
             println!("{}", crate::t!("==> {child} came in over the ssh tunnel last time", "==> 前回 {child} は ssh トンネルでつながりました"));
-            None
+            vec![tunnel_route()]
         }
         None => {
             let listen = env.get("AGENTGW_LINK_LISTEN").map(String::as_str);
@@ -475,7 +479,7 @@ async fn add_child(
                 ssh::lan_ip().as_deref(),
                 &link_port(listen),
             );
-            let options = routes_that_work(
+            let mut options = routes_that_work(
                 target,
                 by_hand.as_deref(),
                 Some((tailnet.as_str(), tailnet_ip.as_str())),
@@ -483,103 +487,87 @@ async fn add_child(
                 lan,
                 listen,
             );
-            let answer = ask_which_route(&options);
-            match pick_route(&options, answer).map(|i| &options[i]) {
-                // Open what the chosen route needs — for good this time — and restart so it takes
-                Some(RouteChoice { url, listen: Some(addr), .. }) => {
-                    if crate::setup::add_listen(&dir, addr) {
-                        println!("{}", crate::t!("==> Opening {addr} for machines. Restarting to apply it.", "==> マシン用に {addr} を開きます。反映のため再起動します。"));
-                        crate::service::Service::run("restart", &[]);
-                    }
-                    url.clone()
-                }
-                Some(o) => o.url.clone(),
-                None => None,
+            if let Some(i) = pick_route(&options, ask_which_route(&options)) {
+                chosen_first(&mut options, i);
             }
+            options
         }
     };
-    remember_route(&dir, &child, chosen.as_deref());
 
     let state_prefix = remote_state_prefix(
         std::env::var("AGENTGW_STATE_DIR").ok().as_deref(),
         &std::env::var("HOME").unwrap_or_default(),
     );
 
-    let mut transport = match chosen {
-        Some(url) => {
-            println!("{}", crate::t!("==> Trying a direct connection to {url}", "==> {url} への直結を試しています"));
-            Transport::Direct { url }
+    // 6. Try them in order. **The machine is installed on the first pass** and only restarted after that
+    let mut worked: Option<Transport> = None;
+    let mut said: Vec<String> = Vec::new();
+    for (i, route) in plan.iter().enumerate() {
+        let last = i + 1 == plan.len();
+        let transport = match &route.url {
+            Some(url) => {
+                println!("{}", crate::t!("==> Trying a direct connection to {url}", "==> {url} への直結を試しています"));
+                // Open what this route needs — for good this time — and restart so it takes
+                if let Some(addr) = &route.listen
+                    && crate::setup::add_listen(&dir, addr)
+                {
+                    println!("{}", crate::t!("==> Opening {addr} for machines. Restarting to apply it.", "==> マシン用に {addr} を開きます。反映のため再起動します。"));
+                    crate::service::Service::run("restart", &[]);
+                }
+                Transport::Direct { url: url.clone() }
+            }
+            None => {
+                println!("{}", crate::t!("==> Connecting {child} over an ssh tunnel", "==> {child} を ssh トンネルでつなぎます"));
+                set_tunnel(&dir, &child, Some(target))?;
+                Transport::Tunnel { remote_port: TUNNEL_PORT }
+            }
+        };
+        link_child(target, &child, &transport, &inlet, &state_prefix, remote_bin)?;
+        if i == 0 {
+            println!("{}", crate::t!("==> Installing and starting agentgw on {target}", "==> {target} に agentgw をインストールして起動しています"));
+            let installed = ssh::ssh_interactive(
+                target,
+                &format!("{state_prefix}~/.local/bin/agentgw-install.sh --from ~/{remote_bin}"),
+            );
+            // The shipped install.sh is single-use. **Clean it up whether or not it worked** (the next add-machine sends it again)
+            let _ = ssh::ssh_run(target, "rm -f ~/.local/bin/agentgw-install.sh");
+            installed?;
+        } else {
+            ssh::ssh_run(target, &format!("{state_prefix}~/{remote_bin} restart"))?;
         }
-        None => {
-            println!("{}", crate::t!("==> This gateway has no public address, so {child} will connect over an ssh tunnel", "==> このゲートウェイには公開アドレスが無いので、{child} を ssh トンネルでつなぎます"));
-            set_tunnel(&dir, &child, Some(target))?;
-            Transport::Tunnel {
-                remote_port: TUNNEL_PORT,
+        // The last one is given longer: there is nothing behind it to move on to
+        match watch_for_link(&inlet, &child, target, if last { LAST_TRY } else { FIRST_TRY }).await {
+            Ok(()) => {
+                worked = Some(transport);
+                break;
+            }
+            Err(why) => {
+                let label = &route.label;
+                println!("{}", crate::t!("==> {label} didn't connect. {why}", "==> {label} ではつながりませんでした。{why}"));
+                said.push(format!("{label}: {why}"));
             }
         }
+    }
+
+    let Some(transport) = worked else {
+        let tried = said.join("\n  ");
+        return Err(crate::t!(
+            "{child} can't reach the gateway. Every way was tried:\n  {tried}\n\
+             Its log: ssh {target} 'tail ~/.local/state/agentgw/plugin-debug.log'",
+            "{child} がゲートウェイにつながりません。どの経路もだめでした:\n  {tried}\n\
+             {child} のログ: ssh {target} 'tail ~/.local/state/agentgw/plugin-debug.log'"
+        ));
     };
 
-    link_child(
-        target,
-        &child,
-        &transport,
-        &inlet,
-        &state_prefix,
-        remote_bin,
-    )?;
-
-    // 6. Start the machine and check the gateway can see it
-    println!("{}", crate::t!("==> Installing and starting agentgw on {target}", "==> {target} に agentgw をインストールして起動しています"));
-    let installed = ssh::ssh_interactive(
-        target,
-        &format!("{state_prefix}~/.local/bin/agentgw-install.sh --from ~/{remote_bin}"),
-    );
-    // The shipped install.sh is single-use. **Clean it up whether or not it worked** (the next add-child sends it again)
-    let _ = ssh::ssh_run(target, "rm -f ~/.local/bin/agentgw-install.sh");
-    installed?;
-
-    if watch_for_link(&inlet, &child, target, FIRST_TRY).await.is_err() {
-        // The direct connection failed, so fall back to the tunnel and try again
-        if matches!(transport, Transport::Direct { .. }) {
-            println!("{}", crate::t!("==> The direct connection didn't work. Switching to an ssh tunnel.", "==> 直結ではつながりませんでした。ssh トンネルに切り替えます。"));
-            remember_route(&dir, &child, None);
-            set_tunnel(&dir, &child, Some(target))?;
-            transport = Transport::Tunnel {
-                remote_port: TUNNEL_PORT,
-            };
-            link_child(
-                target,
-                &child,
-                &transport,
-                &inlet,
-                &state_prefix,
-                remote_bin,
-            )?;
-            ssh::ssh_run(target, &format!("{state_prefix}~/{remote_bin} restart"))?;
-            if let Err(said) = watch_for_link(&inlet, &child, target, LAST_TRY).await {
-                return Err(crate::t!(
-                    "{child} can't reach the gateway, either directly or over an ssh tunnel.\n\
-                     {said}\n\
-                     Its log: ssh {target} 'tail ~/.local/state/agentgw/plugin-debug.log'",
-                    "{child} がゲートウェイにつながりません。直結でも ssh トンネルでもだめでした。\n\
-                     {said}\n\
-                     {child} のログ: ssh {target} 'tail ~/.local/state/agentgw/plugin-debug.log'"
-                ));
-            }
-        } else {
-            return Err(crate::t!(
-                "{child} can't reach the gateway over the ssh tunnel.\n\
-                 This machine's log: grep tunnel ~/.local/state/agentgw/plugin-debug.log\n\
-                 {child}'s log: ssh {target} 'tail ~/.local/state/agentgw/plugin-debug.log'",
-                "{child} が ssh トンネル経由でゲートウェイにつながりません。\n\
-                 このマシンのログ: grep tunnel ~/.local/state/agentgw/plugin-debug.log\n\
-                 {child} のログ: ssh {target} 'tail ~/.local/state/agentgw/plugin-debug.log'"
-            ));
+    // 7. Write down what actually worked, so the next add-machine starts there
+    match &transport {
+        Transport::Direct { url } => {
+            remember_route(&dir, &child, Some(url));
+            // **If a tunnel was set up before, remove it** — otherwise the gateway keeps holding an ssh
+            // that nobody uses
+            set_tunnel(&dir, &child, None)?;
         }
-    } else if matches!(transport, Transport::Direct { .. }) {
-        // Connected directly. **If a tunnel was set up before, remove it** — otherwise the gateway
-        // keeps holding an ssh that nobody uses
-        set_tunnel(&dir, &child, None)?;
+        Transport::Tunnel { .. } => remember_route(&dir, &child, None),
     }
 
     let how = match &transport {
@@ -697,12 +685,12 @@ fn set_tunnel(dir: &StateDir, child: &str, target: Option<&str>) -> Result<(), S
     Ok(())
 }
 
-/// How long to watch the **first** route (direct). Short: when it doesn't work there is a tunnel to try,
-/// and the machine says so itself within a couple of tries.
+/// How long to watch a route that has another one behind it. Short: when it doesn't work there is
+/// something else to try, and the machine says so itself within a couple of tries.
 const FIRST_TRY: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// How long to watch the **last** route before giving up. Long enough for the machine and the gateway to
-/// restart and for the machine's own backoff (up to 30s) to come round.
+/// How long to watch the **last** route before giving up — nothing is behind it. Long enough for the
+/// machine and the gateway to restart and for the machine's own backoff (up to 30s) to come round.
 const LAST_TRY: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// Watch for the link coming up. **Two ways to tell, both real**: the gateway lists the machine, or the
@@ -757,6 +745,24 @@ pub struct RouteChoice {
     pub url: Option<String>,
     /// The address the gateway must hold for this route. `None` = it already holds what it needs.
     pub listen: Option<String>,
+}
+
+/// Put the chosen route first, leaving the rest in preference order behind it. **They are an order to
+/// try, not a shortlist** — measuring says who answers, and only a real link says it works.
+fn chosen_first<T>(routes: &mut [T], chosen: usize) {
+    routes[..=chosen].rotate_right(1);
+}
+
+/// The ssh tunnel, which is always available: we are already on ssh.
+fn tunnel_route() -> RouteChoice {
+    RouteChoice {
+        label: crate::t!(
+            "ssh tunnel · the gateway keeps one open to this machine",
+            "ssh トンネル · ゲートウェイがこのマシンへ張り続けます"
+        ),
+        url: None,
+        listen: None,
+    }
 }
 
 /// Pick from what actually worked. **One option is no question**; several is a question worth asking,
@@ -877,14 +883,7 @@ fn routes_that_work(
             listen: c.listen,
         })
         .collect();
-    out.push(RouteChoice {
-        label: crate::t!(
-            "ssh tunnel · the gateway keeps one open to this machine",
-            "ssh トンネル · ゲートウェイがこのマシンへ張り続けます"
-        ),
-        url: None,
-        listen: None,
-    });
+    out.push(tunnel_route());
     out
 }
 
@@ -1177,6 +1176,15 @@ mod tests {
         // An address it already holds is not opened a second time
         let held = Doorbell::at(&addr, true).expect("nothing to do");
         assert!(held.thread.is_none());
+    }
+
+    #[test]
+    fn the_chosen_route_goes_first_and_the_rest_keep_their_order() {
+        let mut order = ["tailnet", "lan", "tunnel"];
+        chosen_first(&mut order, 1);
+        assert_eq!(order, ["lan", "tailnet", "tunnel"]);
+        chosen_first(&mut order, 0);
+        assert_eq!(order, ["lan", "tailnet", "tunnel"], "the first one chosen changes nothing");
     }
 
     /// One way that works needs no question. Several is a choice, and with nobody to ask (a pipe) the
