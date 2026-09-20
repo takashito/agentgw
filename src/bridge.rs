@@ -211,16 +211,10 @@ impl Bridge {
     /// they stop neither start-up nor restart. No DM fallback yet (but no silence either).
     /// Posts "online" to home. Used both **at start-up and when the link to the gateway is re-established**
     /// (for a machine this one line is the only way to tell a person "connected" — the gateway's presence only reports 🔴).
-    async fn announce_online(&mut self, connected_as: &str) {
+    async fn announce_online(&mut self) {
         let pools: Vec<String> = self.access.pool_targets(&Host::home(), &self.machine_name, self.link.is_none());
-        let text = online_notice(
-            &Host::name().await,
-            // A notice for people to read, so show the **name**
-            connected_as,
-            env!("CARGO_PKG_VERSION"),
-            &pools,
-            0,
-        );
+        // The machine's own name — the one `channels`, `status` and `pwd <machine>` all use
+        let text = online_notice(&self.machine_name, env!("CARGO_PKG_VERSION"), &pools, 0);
         self.post_notice(&text, &LogCtx::default()).await;
     }
 
@@ -714,7 +708,7 @@ impl Bridge {
             LogCtx::default().info("bridge", "no owner in access.json — serving nobody");
         }
         // Asked once at start-up. A failure doesn't stop start-up — command checks just only match the form without a mention
-        let (bot_user_id, bot_name) = match api.auth_test().await {
+        let (bot_user_id, _bot_name) = match api.auth_test().await {
             Ok((id, name)) => {
                 LogCtx::default().info(
                     "bridge",
@@ -782,10 +776,7 @@ impl Bridge {
         // Re-deliver requests that never got handed over (start an agent to hand them to if there is none)
         b.resume_pending_from_disk().await;
         // Tell home once about the start. pending is always 0 — the Rust version has no auto-resume of unfinished threads
-        let online_as = bot_name
-            .or_else(|| b.bot_user_id.clone())
-            .unwrap_or_else(|| "?".to_string());
-        b.announce_online(&online_as).await;
+        b.announce_online().await;
         // tokio's signal is in features = ["full"] (no new dependency).
         // slack-morphism grabs TERM_SIGNALS first via signal-hook, but the registry
         // allows several receivers per signal, so both get it
@@ -824,7 +815,7 @@ impl Bridge {
                 // The link to the gateway was re-established. **Post online again** — for a machine
                 // this one line is the only way to tell a person "connected" (the gateway's presence
                 // only reports 🔴. Don't say the same thing in two places)
-                Some(()) = relink_rx.recv() => b.announce_online(&online_as).await,
+                Some(()) = relink_rx.recv() => b.announce_online().await,
                 // A restart request from the operator. Joins the same path as Slack's `restart`,
                 // skipping the checklist, status and marker since there's no requester thread
                 _ = sigusr1.recv() => b.maintenance_restart("SIGUSR1", None, &LogCtx::default()).await,
@@ -1238,17 +1229,11 @@ fn startup_notice(pools: &[String], pending_count: u32) -> String {
 }
 
 /// The start-up notice in home.
-fn online_notice(
-    label: &str,
-    connected_as: &str,
-    version: &str,
-    pools: &[String],
-    pending_count: u32,
-) -> String {
+fn online_notice(label: &str, version: &str, pools: &[String], pending_count: u32) -> String {
     let summary = startup_notice(pools, pending_count);
     crate::t!(
-        "🟢 *{label}* is online — as {connected_as}, agentgw v{version}\n{summary}",
-        "🟢 *{label}* がオンラインになりました — {connected_as} として、agentgw v{version}\n{summary}"
+        "🟢 *agentgw on {label}* is online - v{version}\n{summary}",
+        "🟢 *{label} の agentgw* が動き始めました - v{version}\n{summary}"
     )
 }
 
@@ -1819,8 +1804,8 @@ mod tests {
 
     #[test]
     fn online_notice_matches_bun_shape() {
-        let out = online_notice("myhost", "botname", "1.2.3", &["/repo/one".into()], 0);
-        assert!(out.starts_with("🟢 *myhost* is online — as botname, agentgw v1.2.3\n"), "{out}");
+        let out = online_notice("myhost", "1.2.3", &["/repo/one".into()], 0);
+        assert!(out.starts_with("🟢 *agentgw on myhost* is online - v1.2.3\n"), "{out}");
         assert!(out.contains("Started 1 warm agent(s)"));
     }
 
