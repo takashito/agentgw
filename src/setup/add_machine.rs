@@ -303,7 +303,7 @@ pub async fn cli(args: &[String]) -> i32 {
         eprintln!(
             "{}",
             crate::t!(
-                "usage: agentgw add-machine <ssh destination> [-i <key>] [-p] [--name <name>] [--from <binary>]\n\
+                "usage: agentgw add-machine <ssh destination> [-i <key>] [-p] [-n] [--name <name>] [--from <binary>]\n\
                  \n\
                  Example: agentgw add-machine user@host\n\
                  The destination can be a ~/.ssh/config alias; keys and jump hosts come from your ssh config.\n\
@@ -311,7 +311,7 @@ pub async fn cli(args: &[String]) -> i32 {
                    -i <key>  the private key to offer\n\
                    -p        let ssh ask for a password (asked once; every later step shares that connection)\n\
                    -n        work out the route again instead of the one that worked last time",
-                "usage: agentgw add-machine <ssh先> [-i <鍵>] [-p] [--name <名前>] [--from <バイナリ>]\n\
+                "usage: agentgw add-machine <ssh先> [-i <鍵>] [-p] [-n] [--name <名前>] [--from <バイナリ>]\n\
                  \n\
                  例: agentgw add-machine user@host\n\
                  ssh 先は ~/.ssh/config の別名でも構いません(鍵も踏み台もそちらに任せます)。\n\
