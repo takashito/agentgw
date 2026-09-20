@@ -280,57 +280,42 @@ fn ask_parent(state_dir: &StateDir) -> Result<(), String> {
             env_file.display()
         )
     );
-    ask_listen(state_dir);
+    default_listen(state_dir);
     Ok(())
 }
 
-/// Where the gateway accepts machines. **Loopback plus this machine's own LAN address**, so whatever
-/// terminates TLS in front (tailscale serve) and a machine on the same network both get in — without
-/// `0.0.0.0`, which would also accept from anywhere else the host can be reached.
+/// Where the gateway accepts machines. **Loopback only to begin with**: `add-machine` opens the one
+/// address a machine turns out to need, so nothing wider than this is open until something uses it.
+fn default_listen(state_dir: &StateDir) {
+    let set = state_dir
+        .load_env()
+        .unwrap_or_default()
+        .iter()
+        .any(|(k, v)| k == "AGENTGW_LINK_LISTEN" && !v.trim().is_empty());
+    if !set {
+        write_listen(state_dir, &format!("127.0.0.1:{}", crate::bridge::gateway::DEFAULT_PORT));
+    }
+}
+
+/// Add one address to what the gateway listens on, keeping what is there. `false` = it already had it.
 ///
-/// An existing value is **never rewritten behind your back**: it is shown, and changing it is a yes.
-fn ask_listen(state_dir: &StateDir) {
+/// **Called when a route is chosen**, not at install time: the address a machine needs is only known
+/// once it has been measured from that machine.
+pub(crate) fn add_listen(state_dir: &StateDir, addr: &str) -> bool {
     let current = state_dir
         .load_env()
         .unwrap_or_default()
         .into_iter()
         .find(|(k, _)| k == "AGENTGW_LINK_LISTEN")
-        .map(|(_, v)| v);
-    let port = current
-        .as_deref()
-        .and_then(|v| v.split(',').next())
-        .and_then(|a| a.rsplit_once(':').map(|(_, p)| p.to_string()))
-        .unwrap_or_else(|| "8787".to_string());
-    // Loopback for whatever terminates TLS in front, the LAN address for machines on the same network,
-    // and the tailnet address for machines that reach us over tailscale without `tailscale serve`
-    let mut addrs = vec![format!("127.0.0.1:{port}")];
-    if let Some(ip) = crate::setup::ssh::lan_ip() {
-        addrs.push(format!("{ip}:{port}"));
+        .map(|(_, v)| v)
+        .unwrap_or_default();
+    if current.split(',').any(|a| a.trim() == addr) {
+        return false;
     }
-    let (_, tailnet_ip) =
-        crate::setup::add_machine::tailnet_identity(crate::setup::ssh::tailscale_json().as_deref());
-    if !tailnet_ip.is_empty() {
-        addrs.push(format!("{tailnet_ip}:{port}"));
-    }
-    let want = addrs.join(",");
-    match current {
-        Some(now) if now == want => {}
-        Some(now) => {
-            println!(
-                "{}",
-                crate::t!(
-                    "Machines connect to: {now}\n  Suggested: {want} (loopback for TLS in front, and this machine on the LAN)",
-                    "マシンからの接続を受ける場所: {now}\n  こちらを勧めます: {want}(前段の TLS 用の loopback と、LAN のこのマシン)"
-                )
-            );
-            let yes = prompt(&crate::t!("  Change it? [y/N]: ", "  変更しますか? [y/N]: "));
-            if !yes.trim().eq_ignore_ascii_case("y") {
-                return;
-            }
-            write_listen(state_dir, &want);
-        }
-        None => write_listen(state_dir, &want),
-    }
+    let mut addrs: Vec<&str> = current.split(',').map(str::trim).filter(|a| !a.is_empty()).collect();
+    addrs.push(addr);
+    write_listen(state_dir, &addrs.join(","));
+    true
 }
 
 fn write_listen(state_dir: &StateDir, value: &str) {

@@ -2892,7 +2892,12 @@ where
 
 // ── Section 9: CLI (the fleet section of `status`) ─────────────────────────────────
 
-pub(crate) const DEFAULT_LISTEN: &str = "0.0.0.0:8787";
+/// The port machines link on, when nothing says otherwise.
+pub(crate) const DEFAULT_PORT: &str = "8787";
+
+/// **Loopback**, not `0.0.0.0`: a gateway opens a wider address only when `add-machine` measures that a
+/// machine needs it.
+pub(crate) const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
 
 /// The fleet section of `status`. **The only strings shown to people are here.**
 pub struct Cli;

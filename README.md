@@ -296,7 +296,7 @@ Every machine uses the same layout.
 - **Tokens stay local**, in `.env` with mode 600. Other machines never get the app token; they hold the bot token in memory only.
 - **The link secret is a password.** Whoever has it can join as a machine and receive that machine's messages. `add-machine` sends it over ssh stdin, never on a command line.
 - **Tool calls can ask first.** In `manual` mode each call waits for you in Slack; approve it once, for the rest of the thread, or for the channel, or deny it.
-- **Machines open no ports.** The gateway's listener binds `0.0.0.0:8787` by default without TLS — keep it behind Tailscale or an ssh tunnel, or set `AGENTGW_LINK_LISTEN=127.0.0.1:8787`.
+- **Machines open no ports.** The gateway listens on `127.0.0.1:8787` only; `add-machine` opens the one address a machine turns out to need (its LAN or tailnet address, never `0.0.0.0`). There is no TLS on those, so keep them behind your network, Tailscale, or an ssh tunnel.
 - **macOS signing.** Run from a terminal, the installer creates a self-signed code-signing identity once, so macOS permission grants survive upgrades.
 
 ## Limitations

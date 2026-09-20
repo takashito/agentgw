@@ -178,41 +178,28 @@ pub fn tailnet_name(tailscale_json: Option<&str>) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
-/// The ports this gateway accepts links on, without repeats. **A name reaches whichever address the
-/// caller resolves it to**, so the port is all that matters once the name is known.
-pub fn link_ports(listen: Option<&str>) -> Vec<String> {
-    let mut ports: Vec<String> = Vec::new();
-    for a in listen.unwrap_or_default().split(',') {
-        if let Some((_, port)) = a.trim().rsplit_once(':')
-            && !port.is_empty()
-            && !ports.iter().any(|p| p == port)
-        {
-            ports.push(port.to_string());
-        }
-    }
-    ports
-}
-
-/// Every `ws://host:port` a machine could try on the LAN, from this gateway's listeners. Loopback is not
-/// one of them (on the other side it means "that machine"), and neither is `0.0.0.0` (not an address to dial).
-pub fn lan_urls(host: Option<&str>, listen: Option<&str>) -> Vec<String> {
-    let host = host.map(str::trim).filter(|h| !h.is_empty());
+/// The port this gateway accepts links on. Taken from what it already listens on, and `8787` when it
+/// has not been told — **the address is decided per machine**, the port is the same for all of them.
+pub fn link_port(listen: Option<&str>) -> String {
     listen
         .unwrap_or_default()
         .split(',')
+        .filter_map(|a| a.trim().rsplit_once(':'))
+        .map(|(_, port)| port.to_string())
+        .find(|p| !p.is_empty())
+        .unwrap_or_else(|| crate::bridge::gateway::DEFAULT_PORT.to_string())
+}
+
+/// What a machine on the same network would dial, and the address the gateway must hold for it:
+/// `(ws://dock.lan:8787, 192.168.10.11:8787)`. A name others can resolve reads better in `.env`, but
+/// the address is the one we know is ours to open.
+pub fn lan_route(host: Option<&str>, ip: Option<&str>, port: &str) -> Option<(String, String)> {
+    let ip = ip.map(str::trim).filter(|i| !i.is_empty())?;
+    let name = host
         .map(str::trim)
-        .filter_map(|a| a.rsplit_once(':'))
-        .filter_map(|(addr, port)| {
-            let addr = addr.trim_matches(['[', ']']);
-            let dialable = !matches!(addr, "127.0.0.1" | "localhost" | "::1" | "0.0.0.0" | "");
-            // A name others can resolve reads better, but the address is what we know is ours
-            match (dialable, host) {
-                (true, Some(h)) if h.contains('.') => Some(format!("ws://{h}:{port}")),
-                (true, _) => Some(format!("ws://{addr}:{port}")),
-                (false, _) => None,
-            }
-        })
-        .collect()
+        .filter(|h| h.contains('.'))
+        .unwrap_or(ip);
+    Some((format!("ws://{name}:{port}"), format!("{ip}:{port}")))
 }
 
 /// The URL written to the machine's `.env`.
@@ -478,24 +465,37 @@ async fn add_child(
         }
         (Some(url), None) => Some(url.trim_end_matches('/').to_string()),
         (None, None) => {
-            let tailnet = tailnet_name(ssh::tailscale_json().as_deref());
+            let listen = env.get("AGENTGW_LINK_LISTEN").map(String::as_str);
+            let (tailnet, tailnet_ip) = tailnet_identity(ssh::tailscale_json().as_deref());
             let machine_on_tailnet =
                 !ssh::ssh_capture(target, "tailscale status --json 2>/dev/null | head -c 1")
                     .unwrap_or_default()
                     .is_empty();
-            let lan = lan_urls(
+            let lan = lan_route(
                 ssh::fqdn().as_deref(),
-                env.get("AGENTGW_LINK_LISTEN").map(String::as_str),
+                ssh::lan_ip().as_deref(),
+                &link_port(listen),
             );
             let options = routes_that_work(
                 target,
-                tailnet.as_deref(),
+                Some((tailnet.as_str(), tailnet_ip.as_str())),
                 machine_on_tailnet,
-                &lan,
-                env.get("AGENTGW_LINK_LISTEN").map(String::as_str),
+                lan,
+                listen,
             );
             let answer = ask_which_route(&options);
-            pick_route(&options, answer).and_then(|i| options[i].url.clone())
+            match pick_route(&options, answer).map(|i| &options[i]) {
+                // Open what the chosen route needs — for good this time — and restart so it takes
+                Some(RouteChoice { url, listen: Some(addr), .. }) => {
+                    if crate::setup::add_listen(&dir, addr) {
+                        println!("{}", crate::t!("==> Opening {addr} for machines. Restarting to apply it.", "==> マシン用に {addr} を開きます。反映のため再起動します。"));
+                        crate::service::Service::run("restart", &[]);
+                    }
+                    url.clone()
+                }
+                Some(o) => o.url.clone(),
+                None => None,
+            }
         }
     };
     remember_route(&dir, &child, chosen.as_deref());
@@ -755,6 +755,8 @@ pub struct RouteChoice {
     pub label: String,
     /// `None` = the ssh tunnel (always available: we are already on ssh).
     pub url: Option<String>,
+    /// The address the gateway must hold for this route. `None` = it already holds what it needs.
+    pub listen: Option<String>,
 }
 
 /// Pick from what actually worked. **One option is no question**; several is a question worth asking,
@@ -769,44 +771,56 @@ pub fn pick_route(options: &[RouteChoice], answer: Option<usize>) -> Option<usiz
 
 /// Every route the machine can actually take, measured from the machine. In preference order:
 /// the tailnet, then the LAN, then the ssh tunnel (which is always there — we got here over ssh).
+///
+/// **An address the gateway does not hold yet is opened for the length of the question** (`Doorbell`),
+/// because otherwise it would answer "shut" and could never be chosen. What the chosen one needs is
+/// opened for good afterwards.
 fn routes_that_work(
     target: &str,
-    tailnet: Option<&str>,
+    tailnet: Option<(&str, &str)>,
     machine_on_tailnet: bool,
-    lan: &[String],
+    lan: Option<(String, String)>,
     listen: Option<&str>,
 ) -> Vec<RouteChoice> {
+    let held = |addr: &str| listen.unwrap_or_default().split(',').any(|a| a.trim() == addr);
+    let port = link_port(listen);
     let mut out: Vec<RouteChoice> = Vec::new();
     if machine_on_tailnet
-        && let Some(name) = tailnet
+        && let Some((name, ip)) = tailnet.filter(|(n, _)| !n.is_empty())
     {
-        // Two ways over the tailnet: through whatever terminates TLS on 443 (`tailscale serve`), or
-        // straight to the link port — the tailnet carries it encrypted either way
+        // Two ways over the tailnet: through whatever terminates TLS on 443 (`tailscale serve`, which
+        // forwards to loopback — nothing to open here), or straight to the link port
         println!("{}", crate::t!("==> Checking the tailnet route to {name}", "==> tailnet 経路({name})を確かめています"));
         if tcp_opens(target, name, "443") {
             out.push(RouteChoice {
                 label: crate::t!("tailnet · wss://{name}", "tailnet · wss://{name}"),
                 url: Some(format!("wss://{name}")),
+                listen: None,
             });
         }
-        for port in link_ports(listen) {
-            if tcp_opens(target, name, &port) {
-                out.push(RouteChoice {
-                    label: crate::t!("tailnet · ws://{name}:{port}", "tailnet · ws://{name}:{port}"),
-                    url: Some(format!("ws://{name}:{port}")),
-                });
-            }
+        let addr = format!("{ip}:{port}");
+        if !ip.is_empty()
+            && let Some(_bell) = Doorbell::at(&addr, held(&addr))
+            && tcp_opens(target, name, &port)
+        {
+            out.push(RouteChoice {
+                label: crate::t!("tailnet · ws://{name}:{port}", "tailnet · ws://{name}:{port}"),
+                url: Some(format!("ws://{name}:{port}")),
+                listen: Some(addr),
+            });
         }
     }
-    for url in lan {
+    if let Some((url, addr)) = lan {
         println!("{}", crate::t!("==> Checking the LAN route {url}", "==> LAN 経路 {url} を確かめています"));
         let hostport = url.trim_start_matches("ws://");
-        if let Some((host, port)) = hostport.rsplit_once(':')
+        if let Some(_bell) = Doorbell::at(&addr, held(&addr))
+            && let Some((host, port)) = hostport.rsplit_once(':')
             && tcp_opens(target, host, port)
         {
             out.push(RouteChoice {
                 label: crate::t!("LAN · {url}", "LAN · {url}"),
                 url: Some(url.clone()),
+                listen: Some(addr),
             });
         }
     }
@@ -816,6 +830,7 @@ fn routes_that_work(
             "ssh トンネル · ゲートウェイがこのマシンへ張り続けます"
         ),
         url: None,
+        listen: None,
     });
     out
 }
@@ -839,6 +854,47 @@ fn ask_which_route(options: &[RouteChoice]) -> Option<usize> {
     }
     let answer = crate::setup::prompt(&crate::t!("  Which one? [1]: ", "  どれにしますか? [1]: "));
     answer.trim().parse::<usize>().ok().map(|n| n.saturating_sub(1))
+}
+
+/// Hold a socket open on `addr` for as long as the guard lives, just so a machine can try to reach it.
+/// **The running gateway is not touched** — this is an address it does not hold yet.
+///
+/// Dropping it closes the socket *before* returning, so the gateway can bind the same address a moment
+/// later when this turns out to be the route.
+struct Doorbell {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Doorbell {
+    /// `None` = can't open it here, so there is no point asking the machine.
+    fn at(addr: &str, already_open: bool) -> Option<Doorbell> {
+        if already_open {
+            return Some(Doorbell { stop: Default::default(), thread: None });
+        }
+        let listener = std::net::TcpListener::bind(addr).ok()?;
+        listener.set_nonblocking(true).ok()?;
+        let stop: std::sync::Arc<std::sync::atomic::AtomicBool> = Default::default();
+        let flag = stop.clone();
+        // Answer whatever knocks, until the guard goes away
+        let thread = std::thread::spawn(move || {
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                if listener.accept().is_err() {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        });
+        Some(Doorbell { stop, thread: Some(thread) })
+    }
+}
+
+impl Drop for Doorbell {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 /// Can the **machine** open this address? Asked on the machine, because that is who will dial.
@@ -990,12 +1046,11 @@ mod tests {
 
     /// The ports the gateway accepts on, once each — a name reaches whatever address it resolves to.
     #[test]
-    fn link_ports_are_listed_once() {
-        assert_eq!(
-            link_ports(Some("127.0.0.1:8787,192.168.10.11:8787,100.64.0.1:8788")),
-            vec!["8787".to_string(), "8788".to_string()]
-        );
-        assert!(link_ports(None).is_empty());
+    fn link_port_comes_from_what_is_open() {
+        assert_eq!(link_port(Some("127.0.0.1:8788,192.168.10.11:8788")), "8788");
+        // Nothing set yet → the default, which is what `install` writes
+        assert_eq!(link_port(None), "8787");
+        assert_eq!(link_port(Some("")), "8787");
     }
 
     /// Once a machine has come in, the way it came is written down: `add-machine` starts there next time
@@ -1023,7 +1078,26 @@ mod tests {
     }
 
     fn choice(label: &str, url: Option<&str>) -> RouteChoice {
-        RouteChoice { label: label.into(), url: url.map(str::to_string) }
+        RouteChoice { label: label.into(), url: url.map(str::to_string), listen: None }
+    }
+
+    /// The door is open while it is asked about, and **shut again before the gateway is told to bind
+    /// it** — a socket left behind for a few seconds would meet the restart with "Address already in use".
+    #[test]
+    fn a_doorbell_opens_an_address_and_closes_it_on_drop() {
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let addr = format!("127.0.0.1:{port}");
+        let bell = Doorbell::at(&addr, false).expect("can open it");
+        assert!(std::net::TcpStream::connect(&addr).is_ok(), "a machine can reach it while asking");
+        drop(bell);
+        assert!(std::net::TcpListener::bind(&addr).is_ok(), "the gateway can take it over right after");
+
+        // An address it already holds is not opened a second time
+        let held = Doorbell::at(&addr, true).expect("nothing to do");
+        assert!(held.thread.is_none());
     }
 
     /// One way that works needs no question. Several is a choice, and with nobody to ask (a pipe) the
@@ -1063,19 +1137,18 @@ mod tests {
     /// What a machine could dial from the LAN: the gateway's own listeners, minus the ones that mean
     /// "this machine" on the other side.
     #[test]
-    fn lan_urls_skip_what_cannot_be_dialled() {
+    fn lan_route_pairs_a_name_with_the_address_to_open() {
         assert_eq!(
-            lan_urls(Some("dock.lan"), Some("127.0.0.1:8787,192.168.10.11:8787")),
-            vec!["ws://dock.lan:8787".to_string()]
+            lan_route(Some("dock.lan"), Some("192.168.10.11"), "8787"),
+            Some(("ws://dock.lan:8787".to_string(), "192.168.10.11:8787".to_string()))
         );
-        // No name others can resolve → the address itself
+        // No name others can resolve → dial the address itself
         assert_eq!(
-            lan_urls(Some("dock"), Some("192.168.10.11:8787")),
-            vec!["ws://192.168.10.11:8787".to_string()]
+            lan_route(Some("dock"), Some("192.168.10.11"), "8787"),
+            Some(("ws://192.168.10.11:8787".to_string(), "192.168.10.11:8787".to_string()))
         );
-        assert!(lan_urls(Some("dock.lan"), Some("127.0.0.1:8787")).is_empty());
-        assert!(lan_urls(Some("dock.lan"), Some("0.0.0.0:8787")).is_empty());
-        assert!(lan_urls(None, None).is_empty());
+        // No LAN address of our own → no LAN route to offer
+        assert_eq!(lan_route(Some("dock.lan"), None, "8787"), None);
     }
 
     #[test]
