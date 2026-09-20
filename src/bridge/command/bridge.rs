@@ -137,7 +137,6 @@ impl Bridge {
         let entry = |access: &bridge::Access, ch: &str| {
             let (repo_path, is_fallback) = access.repo_path(ch, &home);
             PwdEntry {
-                channel_id: ch.to_string(),
                 // Unset = this machine handles the channel itself
                 machine: access
                     .routes
@@ -145,7 +144,6 @@ impl Bridge {
                     .and_then(|r| r.bridge.clone())
                     .unwrap_or_else(|| me.clone()),
                 repo_path,
-                label: access.routes.get(ch).and_then(|r| r.label.clone()),
                 is_fallback,
             }
         };
@@ -158,16 +156,7 @@ impl Bridge {
                 "*{machine}* という名前のマシンはつながっていません。フォルダなら `./{machine}` か `~/{machine}` と書いてください。"
             ),
             PwdMode::Current => {
-                entry(&self.access, &msg.channel).render(&crate::t!("Project directory for this channel", "このチャンネルの作業ディレクトリ"))
-            }
-            PwdMode::All => {
-                let all: Vec<_> = self
-                    .access
-                    .routes
-                    .keys()
-                    .map(|ch| entry(&self.access, ch))
-                    .collect();
-                PwdEntry::render_all(&all, &me, &home)
+                entry(&self.access, &msg.channel).render()
             }
             // A DM has no route (its agent always starts at Home), so say so
             // instead of silently recording it
@@ -590,61 +579,27 @@ impl StatusReport {
 /// `is_fallback` means it comes from the Home fallback (the channel has no explicit `repo_path`
 /// route).
 pub struct PwdEntry {
-    pub channel_id: String,
     /// The machine that works in it. Written in front of the path (`dock:/srv/app`), because the same
     /// path means different folders on different machines.
     pub machine: String,
     pub repo_path: String,
-    pub label: Option<String>,
     pub is_fallback: bool,
 }
 
-/// One channel's path (the `pwd` form) as Slack mrkdwn. `heading` distinguishes "this channel"
-/// from a named channel.
+/// One channel's project directory (the `pwd` answer) as Slack mrkdwn.
 impl PwdEntry {
-    /// The label in parentheses, or nothing if there is none.
-    fn label_text(&self) -> String {
-        self.label
-            .as_deref()
-            .filter(|l| !l.is_empty())
-            .map(|l| format!("（{l}）"))
-            .unwrap_or_default()
-    }
-
-    pub fn render(&self, heading: &str) -> String {
-        let entry = self;
-        let label = entry.label_text();
-        let note = if entry.is_fallback {
+    /// One line: where this channel's agents work, machine first (`pve:/root`).
+    pub fn render(&self) -> String {
+        let (machine, path) = (&self.machine, &self.repo_path);
+        let note = if self.is_fallback {
             crate::t!(" — not set; using the default directory", " — 未設定のため既定のディレクトリ")
         } else {
             String::new()
         };
-        format!(
-            "● {heading}\n<#{}>{label}{note}\n  `{}:{}`",
-            entry.channel_id, entry.machine, entry.repo_path
+        crate::t!(
+            "Project directory for this channel is \"{machine}:{path}\"{note}",
+            "このチャンネルの作業ディレクトリは \"{machine}:{path}\" です{note}"
         )
-    }
-
-    /// Every configured channel → path (the `pwd all` form). `home` is the Home fallback that channels /
-    /// DMs without a route fall to, on `me` (the machine answering).
-    pub fn render_all(entries: &[PwdEntry], me: &str, home: &str) -> String {
-        let mut lines = vec![crate::t!("● Project directories by channel", "● チャンネルごとの作業ディレクトリ")];
-        if entries.is_empty() {
-            lines.push(crate::t!("  • None set.", "  • まだ設定していません。"));
-        } else {
-            for e in entries {
-                lines.push(format!(
-                    "  • <#{}>{} → `{}:{}`",
-                    e.channel_id,
-                    e.label_text(),
-                    e.machine,
-                    e.repo_path
-                ));
-            }
-        }
-        lines.push(String::new());
-        lines.push(crate::t!("_Channels without one, and DMs, use `{me}:{home}`_", "_設定していないチャンネルと DM は `{me}:{home}` を使います_"));
-        lines.join("\n")
     }
 }
 
@@ -693,7 +648,6 @@ pub(super) fn help(fleet: bool, agent: &dyn crate::agent::Agent) -> String {
         vec![
             ("pwd", crate::t!("show this channel's project directory", "このチャンネルの作業ディレクトリを見る")),
             ("pwd <path>", crate::t!("set this channel's project directory (`/…`, `~/…` or `./…`)", "このチャンネルの作業ディレクトリを決める(`/…`・`~/…`・`./…`)")),
-            ("pwd all", crate::t!("show every channel's project directory", "すべてのチャンネルの作業ディレクトリを見る")),
             ("warm on|off [<#channel>]", crate::t!("keep an agent started ahead of time for a channel (this one if none is given)", "チャンネルのエージェントを先に起動しておくか(省くとこのチャンネル)")),
             ("set-home", crate::t!("send notices to this channel", "通知をこのチャンネルに出す")),
         ],
@@ -731,27 +685,25 @@ pub(super) fn help(fleet: bool, agent: &dyn crate::agent::Agent) -> String {
     lines.join("\n")
 }
 
-/// The answer when `pwd <path>` is typed in a DM. A DM's agent always runs in the default directory —
-/// there is nothing to set, so say so instead of silently doing nothing.
 /// What `pwd` accepts. Answered when a message starts with `pwd` but the rest is none of the forms —
 /// a mistyped path is a mistake to point out, not a sentence to hand to the agent.
 fn pwd_usage() -> String {
     crate::t!(
         "`pwd` takes one of these:\n\
          • `pwd` — this channel's project folder\n\
-         • `pwd all` — every channel's\n\
          • `pwd /srv/app` · `pwd ~/dev/app` · `pwd ./dev/app` — work in that folder\n\
          • `pwd <machine>` — hand this channel to that machine (its home folder)\n\
          • `pwd <machine>:~/dev/app` — hand it over and work in that folder there",
         "`pwd` の書き方:\n\
          • `pwd` — このチャンネルの作業ディレクトリを見る\n\
-         • `pwd all` — すべてのチャンネルの分を見る\n\
          • `pwd /srv/app`・`pwd ~/dev/app`・`pwd ./dev/app` — そのフォルダで作業する\n\
          • `pwd <マシン>` — このチャンネルをそのマシンに任せる(そのマシンの家のディレクトリ)\n\
          • `pwd <マシン>:~/dev/app` — そのマシンに任せて、そのフォルダで作業する"
     )
 }
 
+/// The answer when `pwd <path>` is typed in a DM. A DM's agent always runs in the default directory —
+/// there is nothing to set, so say so instead of silently doing nothing.
 fn pwd_dm_set_refusal() -> String {
     crate::t!(
         "Agents in DMs always work in the default directory; only channels can have their own.",
@@ -885,21 +837,13 @@ mod tests {
     #[test]
     fn pwd_renders() {
         let e = PwdEntry {
-            channel_id: "C1".into(),
             machine: "dock".into(),
             repo_path: "/dev/x".into(),
-            label: Some("dev".into()),
             is_fallback: true,
         };
         assert_eq!(
-            e.render("This channel"),
-            "● This channel\n<#C1>（dev） — not set; using the default directory\n  `dock:/dev/x`"
-        );
-        assert!(PwdEntry::render_all(&[e], "dock", "/home").contains("  • <#C1>（dev） → `dock:/dev/x`"));
-        assert!(PwdEntry::render_all(&[], "dock", "/home").contains("None set."));
-        assert!(
-            PwdEntry::render_all(&[], "dock", "/home")
-                .ends_with("_Channels without one, and DMs, use `dock:/home`_")
+            e.render(),
+            "Project directory for this channel is \"dock:/dev/x\" — not set; using the default directory"
         );
     }
 

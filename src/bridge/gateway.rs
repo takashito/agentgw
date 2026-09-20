@@ -1028,7 +1028,7 @@ impl CommandCtx<'_> {
     /// `channels` (the table) and `pwd <machine>[:<path>]` (handing this channel to a machine). Both are
     /// answered here — the gateway is the one that knows the machines. `pwd <path>` is not: it goes to the
     /// machine running this channel, which is where the folder is.
-    pub fn route(&self, routes: &Routes, connected: &[String], self_id: &str) -> RouteOutcome {
+    pub fn route(&self, access: &Access, connected: &[String], self_id: &str) -> RouteOutcome {
         let ctx = self;
         let listing = ["channels", "channel"]
             .iter()
@@ -1037,7 +1037,7 @@ impl CommandCtx<'_> {
             if let Some(reply) = ctx.refuse_if_not_owner("channels") {
                 return RouteOutcome::Refused(reply);
             }
-            return RouteOutcome::List(route_table(ctx.channel_id, routes, connected, self_id));
+            return RouteOutcome::List(route_table(ctx.channel_id, access, connected, self_id));
         }
         let pwd = ctx
             .addressed()
@@ -1139,7 +1139,7 @@ pub enum RouteOutcome {
 ///
 /// Channels with no machine assigned go to the gateway — writing only "unassigned" in the list
 /// leaves the reader unsure where messages written there go.
-pub fn route_table(here: &str, routes: &Routes, connected: &[String], self_id: &str) -> String {
+pub fn route_table(here: &str, access: &Access, connected: &[String], self_id: &str) -> String {
     let online = |id: &str| connected.iter().any(|c| c == id);
     // Channel rows only flag trouble: a row per channel all marked 🟢 is noise (the machines line
     // at the bottom already shows who is up)
@@ -1150,23 +1150,31 @@ pub fn route_table(here: &str, routes: &Routes, connected: &[String], self_id: &
             crate::t!(" 🔴 offline", " 🔴 オフライン")
         }
     };
-    // One destination in a few words (the gateway if nobody is assigned)
-    // Nobody assigned = the gateway, named like any other machine
-    let dest = |id: Option<&String>| {
-        let id = id.map_or(self_id, String::as_str);
-        format!("*{id}*{}", mark(id))
+    // Where a channel's work happens: the machine, and the folder on it when one is set.
+    // **No machine written down = the gateway** (the default for a lone Bridge)
+    let dest = |ch: &str| {
+        let route = access.routes.get(ch);
+        let id = route
+            .and_then(|r| r.bridge.as_deref())
+            .unwrap_or(self_id)
+            .to_string();
+        let where_ = match route.and_then(|r| r.repo_path.as_deref()) {
+            Some(path) if !path.is_empty() => format!("`{id}:{path}`"),
+            _ => format!("*{id}*"),
+        };
+        format!("{where_}{}", mark(&id))
     };
 
-    let this = dest(routes.get(here));
-    let mut out = vec![crate::t!(
-        "*This channel (<#{here}>)*: {this}",
-        "*このチャンネル(<#{here}>)*: {this}"
-    )];
+    let mut out = vec![
+        crate::t!("*This channel is mapped to*", "*このチャンネルの割り当て*"),
+        format!("<#{here}> → {}", dest(here)),
+    ];
 
-    let others: Vec<String> = routes
-        .iter()
-        .filter(|(ch, _)| ch.as_str() != here)
-        .map(|(ch, id)| format!("• <#{ch}> → {}", dest(Some(id))))
+    let others: Vec<String> = access
+        .routes
+        .keys()
+        .filter(|ch| ch.as_str() != here)
+        .map(|ch| format!("- <#{ch}> → {}", dest(ch)))
         .collect();
     out.push(String::new());
     out.push(crate::t!("*Other channels*", "*ほかのチャンネル*"));
@@ -1181,9 +1189,9 @@ pub fn route_table(here: &str, routes: &Routes, connected: &[String], self_id: &
 
     // Machines: those connected + those named only in routes (= not here now)
     let mut machines: Vec<String> = connected.to_vec();
-    for id in routes.values() {
-        if !machines.contains(id) {
-            machines.push(id.clone());
+    for id in access.routes.values().filter_map(|r| r.bridge.clone()) {
+        if !machines.contains(&id) {
+            machines.push(id);
         }
     }
     if !machines.iter().any(|m| m == self_id) {
@@ -1901,8 +1909,7 @@ impl Fleet {
         };
 
         // ── route — answered here and **never delivered** (the destination is the very thing being changed)
-        let routes = self.access().bridges();
-        match ctx.route(&routes, &machines, &self.self_id) {
+        match ctx.route(&self.access(), &machines, &self.self_id) {
             RouteOutcome::NotACommand => {}
             // The folder can only be checked where it is. Here: now. Elsewhere: ask, and bind on the answer
             RouteOutcome::SetProject { bridge_id, path } => {
@@ -2005,6 +2012,15 @@ impl Fleet {
         match result {
             Ok(abs) => {
                 let mut reply = handover_reply(channel, &self.access().bridges(), bridge_id);
+                let (ch, id, folder) = (channel.to_string(), bridge_id.to_string(), abs.clone());
+                // Keep the folder here too: `channels` says where each channel's work happens, and only
+                // the machine knows the absolute path
+                self.edit_access(move |a| {
+                    let r = a.routes.entry(ch).or_default();
+                    r.bridge = Some(id);
+                    r.repo_path = Some(folder);
+                })
+                .await;
                 reply.push('\n');
                 reply.push_str(&crate::t!("Project folder: `{abs}`", "作業ディレクトリ: `{abs}`"));
                 self.bind_and_link(bridge_id, channel, thread_ts).await;
@@ -3030,6 +3046,22 @@ mod tests {
             .collect()
     }
 
+    /// The same pairs as an `Access` (what the channels table reads). `channel:machine` or
+    /// `channel:machine:/folder`.
+    fn access_of(pairs: &[(&str, &str)]) -> Access {
+        let mut a = Access::default();
+        for (ch, spec) in pairs {
+            let (machine, path) = match spec.split_once(':') {
+                Some((m, p)) => (m, Some(p.to_string())),
+                None => (*spec, None),
+            };
+            let r = a.routes.entry(ch.to_string()).or_default();
+            r.bridge = Some(machine.to_string());
+            r.repo_path = path;
+        }
+        a
+    }
+
     #[test]
     fn the_channel_is_read_from_each_kind_of_event() {
         assert_eq!(
@@ -3423,7 +3455,7 @@ mod tests {
     fn route_sets_this_channel_to_a_connected_machine() {
         let got = CommandCtx::route(
             &ctx("C1", "<@U_BOT> pwd desktop", Some(OWNER)),
-            &routes(&[]),
+            &access_of(&[]),
             &here(),
             "parent",
         );
@@ -3451,7 +3483,7 @@ mod tests {
         for user in [Some("U_STRANGER"), None] {
             let got = CommandCtx::route(
                 &ctx("C1", "<@U_BOT> pwd desktop", user),
-                &routes(&[]),
+                &access_of(&[]),
                 &here(),
                 "parent",
             );
@@ -3467,7 +3499,7 @@ mod tests {
     fn a_route_to_a_machine_that_is_not_here_is_refused() {
         let got = CommandCtx::route(
             &ctx("C1", "<@U_BOT> pwd laptop", Some(OWNER)),
-            &routes(&[]),
+            &access_of(&[]),
             &here(),
             "parent",
         );
@@ -3487,7 +3519,7 @@ mod tests {
         // here() = ["desktop", "vps"] (connected). laptop is named only in routes
         let got = CommandCtx::route(
             &ctx("C1", "<@U_BOT> channels", Some(OWNER)),
-            &routes(&[("C1", "desktop"), ("C2", "laptop")]),
+            &access_of(&[("C1", "desktop"), ("C2", "laptop")]),
             &here(),
             "vps",
         );
@@ -3496,12 +3528,12 @@ mod tests {
         };
         // The channel it was typed in comes first
         assert!(
-            reply.starts_with("*This channel (<#C1>)*: *desktop*\n"),
+            reply.starts_with("*This channel is mapped to*\n<#C1> → *desktop*\n"),
             "{reply}"
         );
         // Other channels. A channel whose machine isn't here says offline
         assert!(
-            reply.contains("• <#C2> → *laptop* 🔴 offline"),
+            reply.contains("- <#C2> → *laptop* 🔴 offline"),
             "{reply}"
         );
         assert!(
@@ -3519,7 +3551,7 @@ mod tests {
     fn a_channel_without_a_route_says_the_parent_takes_it() {
         let got = CommandCtx::route(
             &ctx("C9", "<@U_BOT> channels", Some(OWNER)),
-            &routes(&[("C1", "desktop")]),
+            &access_of(&[("C1", "desktop")]),
             &here(),
             "vps",
         );
@@ -3527,10 +3559,10 @@ mod tests {
             panic!("{got:?}")
         };
         assert!(
-            reply.starts_with("*This channel (<#C9>)*: *vps*\n"),
+            reply.starts_with("*This channel is mapped to*\n<#C9> → *vps*\n"),
             "{reply}"
         );
-        assert!(reply.contains("• <#C1> → *desktop*\n"), "{reply}");
+        assert!(reply.contains("- <#C1> → *desktop*\n"), "{reply}");
         // Channel rows carry no 🟢 — only the machines line does
         assert_eq!(reply.matches('🟢').count(), 2, "{reply}");
     }
@@ -3539,7 +3571,7 @@ mod tests {
     fn with_no_routes_at_all_everything_goes_to_the_parent() {
         let got = CommandCtx::route(
             &ctx("C1", "<@U_BOT> channels", Some(OWNER)),
-            &routes(&[]),
+            &access_of(&[]),
             &[],
             "vps",
         );
@@ -3554,7 +3586,7 @@ mod tests {
     fn an_unaddressed_route_falls_through_without_a_refusal() {
         let got = CommandCtx::route(
             &ctx("C1", "pwd desktop", Some(OWNER)),
-            &routes(&[]),
+            &access_of(&[]),
             &here(),
             "parent",
         );
@@ -3569,7 +3601,7 @@ mod tests {
         ] {
             let got = CommandCtx::route(
                 &ctx("C1", text, Some(OWNER)),
-                &routes(&[]),
+                &access_of(&[]),
                 &here(),
                 "parent",
             );
@@ -3582,7 +3614,7 @@ mod tests {
     fn in_a_dm_route_needs_no_mention() {
         let got = CommandCtx::route(
             &ctx("D1", "pwd desktop", Some(OWNER)),
-            &routes(&[]),
+            &access_of(&[]),
             &here(),
             "parent",
         );
@@ -3594,7 +3626,7 @@ mod tests {
     fn pwd_with_a_machine_and_a_path_asks_that_machine() {
         let got = CommandCtx::route(
             &ctx("C1", "<@U_BOT> pwd desktop:~/dev/x", Some(OWNER)),
-            &routes(&[]),
+            &access_of(&[]),
             &here(),
             "vps",
         );
@@ -3608,7 +3640,7 @@ mod tests {
     #[test]
     fn pwd_with_only_a_path_is_the_machines_business() {
         for text in ["<@U_BOT> pwd ~/x", "<@U_BOT> pwd /srv/x", "<@U_BOT> pwd ./x", "<@U_BOT> pwd"] {
-            let got = CommandCtx::route(&ctx("C1", text, Some(OWNER)), &routes(&[]), &here(), "vps");
+            let got = CommandCtx::route(&ctx("C1", text, Some(OWNER)), &access_of(&[]), &here(), "vps");
             assert_eq!(got, RouteOutcome::NotACommand, "{text}");
         }
     }
@@ -3617,11 +3649,11 @@ mod tests {
     #[test]
     fn channels_lists_and_route_is_gone() {
         for text in ["<@U_BOT> channels", "<@U_BOT> channel"] {
-            let got = CommandCtx::route(&ctx("C1", text, Some(OWNER)), &routes(&[]), &here(), "vps");
+            let got = CommandCtx::route(&ctx("C1", text, Some(OWNER)), &access_of(&[]), &here(), "vps");
             assert!(matches!(got, RouteOutcome::List(_)), "{text} → {got:?}");
         }
         for text in ["<@U_BOT> route", "<@U_BOT> route desktop"] {
-            let got = CommandCtx::route(&ctx("C1", text, Some(OWNER)), &routes(&[]), &here(), "vps");
+            let got = CommandCtx::route(&ctx("C1", text, Some(OWNER)), &access_of(&[]), &here(), "vps");
             assert_eq!(got, RouteOutcome::NotACommand, "{text}");
         }
     }
@@ -3671,7 +3703,7 @@ mod tests {
             bot_user_id: None,
         };
         assert_eq!(
-            CommandCtx::route(&c, &routes(&[]), &here(), "parent"),
+            CommandCtx::route(&c, &access_of(&[]), &here(), "parent"),
             RouteOutcome::NotACommand
         );
     }

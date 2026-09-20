@@ -291,8 +291,9 @@ impl Cmd {
         let Some(first) = args.first() else {
             return Some(PwdMode::Current);
         };
+        // `pwd all` is gone — `channels` shows every channel with its machine and folder
         if args.len() == 1 && first.to_lowercase() == "all" {
-            return Some(PwdMode::All);
+            return Some(PwdMode::Usage);
         }
         if first.starts_with(['/', '~', '.']) {
             return Some(PwdMode::Set(args.join(" ")));
@@ -371,7 +372,6 @@ impl Cmd {
 pub enum PwdMode {
     Current,
     Set(String),
-    All,
     /// `pwd <machine>` / `pwd <machine>:` / `pwd <machine>:<path>` — hand this channel to a machine, and
     /// with a path, set its project folder there. **The gateway answers these** (it's the one that knows
     /// the machines); a Bridge that sees one has no machine by that name.
@@ -805,7 +805,6 @@ impl Bridge {
                 let kind = match mode {
                     PwdMode::Current => "current",
                     PwdMode::Set(_) => "set",
-                    PwdMode::All => "all",
                     PwdMode::On { .. } => "on",
                     PwdMode::Usage => "usage",
                 };
@@ -1041,10 +1040,7 @@ mod tests {
         assert!(
             matches!(Cmd::pwd(&Message::new("pwd /a b/c", None)), Some(PwdMode::Set(p)) if p == "/a b/c")
         );
-        assert!(matches!(
-            Cmd::pwd(&Message::new("pwd all", None)),
-            Some(PwdMode::All)
-        ));
+        assert_eq!(Cmd::pwd(&Message::new("pwd all", None)), Some(PwdMode::Usage));
         // Starts with pwd but isn't one of the forms → the usage, not a sentence for the agent
         assert_eq!(Cmd::pwd(&Message::new("pwd の使い方", None)), Some(PwdMode::Usage));
         // A path starts with / ~ or . — any other first word is a machine
