@@ -1675,8 +1675,11 @@ impl Fleet {
     /// and whether it is connected. Hosts come from the machines themselves — only they can see their tailnet.
     async fn machines_table(self: &Arc<Self>) -> String {
         let hosts = self.hosts.lock().await.clone();
-        let (me_host, me_ip) =
-            crate::setup::add_machine::tailnet_identity(crate::setup::ssh::tailscale_json().as_deref());
+        let (me_host, me_ip) = crate::setup::add_machine::reachable_at(
+            crate::setup::ssh::tailscale_json().as_deref(),
+            &crate::bridge::Host::name().await,
+        );
+        let tunnels = self.tunnels.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let connected = self.links.connected();
         let mut names: Vec<String> = connected.clone();
         for id in self.access().routes.values().filter_map(|r| r.bridge.clone()) {
@@ -1719,8 +1722,11 @@ impl Fleet {
                 false => crate::t!("🔴 offline", "🔴 オフライン"),
             };
             let reachable = where_(&host, &ip);
+            // How the gateway gets to it: a tunnel it opened itself (and knows), or straight there
+            let route = route_of(id, &tunnels);
             lines.push(crate::t!("machine id: `{id}`", "マシン: `{id}`"));
             lines.push(crate::t!("host: {reachable}", "ホスト: {reachable}"));
+            lines.push(crate::t!("link: {route}", "つなぎ方: {route}"));
             lines.push(crate::t!("status: {state}", "状態: {state}"));
         }
         lines.join("\n")

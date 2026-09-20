@@ -105,8 +105,19 @@ pub fn candidate_url(env_url: Option<&str>, tailscale_json: Option<&str>) -> Opt
     (!name.is_empty()).then(|| format!("wss://{name}"))
 }
 
-/// This machine on the tailnet: (DNS name, first IPv4). Empty strings where tailscale can't say.
+/// Where this machine can be reached: (host, IPv4). The tailnet name when there is one — it works from
+/// anywhere — and **the hostname otherwise**, which is always there even with no tailscale at all.
 /// Pure so `machines` can be tested without a tailnet.
+pub fn reachable_at(tailscale_json: Option<&str>, hostname: &str) -> (String, String) {
+    let (name, ip) = tailnet_identity(tailscale_json);
+    let host = match name.is_empty() {
+        true => hostname.trim().to_string(),
+        false => name,
+    };
+    (host, ip)
+}
+
+/// This machine on the tailnet: (DNS name, first IPv4). Empty strings where tailscale can't say.
 pub fn tailnet_identity(tailscale_json: Option<&str>) -> (String, String) {
     let Some(json) = tailscale_json.and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
     else {
@@ -513,6 +524,19 @@ mod tests {
 
     /// `machines` shows where each machine can be reached. Nothing from tailscale = nothing to show,
     /// not a guess.
+    /// No tailscale at all is the normal case on a plain server: fall back to the hostname, which is
+    /// always there, instead of showing nothing.
+    #[test]
+    fn reachable_at_falls_back_to_the_hostname() {
+        let json = r#"{"Self":{"DNSName":"pve.tail1234.ts.net.","TailscaleIPs":["100.89.207.102"]}}"#;
+        assert_eq!(
+            reachable_at(Some(json), "pve"),
+            ("pve.tail1234.ts.net".to_string(), "100.89.207.102".to_string())
+        );
+        assert_eq!(reachable_at(None, "pve"), ("pve".to_string(), String::new()));
+        assert_eq!(reachable_at(Some("{}"), " pve\n"), ("pve".to_string(), String::new()));
+    }
+
     #[test]
     fn tailnet_identity_reads_the_name_and_the_v4_address() {
         let json = r#"{"Self":{"DNSName":"pve.tail1234.ts.net.","TailscaleIPs":["fd7a::1","100.89.207.102"]}}"#;

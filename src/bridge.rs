@@ -761,7 +761,7 @@ impl Bridge {
         if up_is_linked
             && let Some(up) = &b.ask_gateway
         {
-            report_folders(&b.deps.dir, up);
+            report_folders(&b.deps.dir, up, &Host::name().await);
         }
         // Sweep login sessions the previous Bridge left before going down
         b.deps.agent.login_kill();
@@ -963,13 +963,15 @@ struct RelaySinks {
 fn report_folders(
     dir: &crate::state_dir::StateDir,
     up: &mpsc::UnboundedSender<crate::bridge::gateway::link::LinkFrame>,
+    hostname: &str,
 ) {
     let _ = up.send(crate::bridge::gateway::link::LinkFrame::MachineHome {
         path: Host::home(),
     });
-    // Where this machine can be reached. Only it can see its own tailnet
-    let (host, ip) = crate::setup::add_machine::tailnet_identity(
+    // Where this machine can be reached. Only it can see its own tailnet — and its own hostname
+    let (host, ip) = crate::setup::add_machine::reachable_at(
         crate::setup::ssh::tailscale_json().as_deref(),
+        &hostname,
     );
     let _ = up.send(crate::bridge::gateway::link::LinkFrame::MachineHost { host, ip });
     for (channel, route) in bridge::Access::load(dir).routes {
@@ -1045,7 +1047,7 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
                 let _ = reload.send(()).await;
             }
             // The gateway may have restarted without our folders; say where we work
-            report_folders(dir, up);
+            report_folders(dir, up, machine);
             // **The first one at start-up doesn't come through here** (the wait loop before construction eats it). Only
             // reconnects get here, so post online each time
             let _ = relink.send(()).await;
@@ -2074,15 +2076,19 @@ mod tests {
         .unwrap();
         let (up, mut up_rx) = mpsc::unbounded_channel();
 
-        report_folders(&dir, &up);
+        report_folders(&dir, &up, "pve");
 
         assert_eq!(
             up_rx.try_recv(),
             Ok(LinkFrame::MachineHome { path: Host::home() }),
             "where a channel with no folder of its own works"
         );
-        // …and where this machine can be reached (whatever this host's tailnet says)
-        assert!(matches!(up_rx.try_recv(), Ok(LinkFrame::MachineHost { .. })));
+        // …and where it can be reached. With no tailnet at hand, the hostname is still something
+        let host = match up_rx.try_recv() {
+            Ok(LinkFrame::MachineHost { host, .. }) => host,
+            other => panic!("{other:?}"),
+        };
+        assert!(!host.is_empty(), "a machine always knows its own name");
         assert_eq!(
             up_rx.try_recv(),
             Ok(LinkFrame::ProjectSet {
