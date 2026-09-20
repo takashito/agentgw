@@ -763,11 +763,24 @@ impl Access {
     /// `me` is this machine's name: **a folder on another machine is not ours to warm**. The gateway keeps
     /// a copy of every channel's folder (for `channels`), and without this check it started warming
     /// agents in folders that only exist on the machines it hands those channels to.
-    pub fn pool_targets(&self, home_dir: &str, me: &str) -> Vec<String> {
+    /// `serves_home` = this Bridge answers places that have no folder of their own — DMs and unassigned
+    /// channels. True on the gateway and on a lone Bridge; false on a machine behind a gateway, which only
+    /// ever sees the channels it was handed. **Such a machine keeps no home agent unless one of its own
+    /// channels has no folder**: it was starting one nobody could use, invisible in `status` because no
+    /// channel pointed at it.
+    pub fn pool_targets(&self, home_dir: &str, me: &str, serves_home: bool) -> Vec<String> {
         if self.owner.is_empty() {
             return Vec::new();
         }
-        let mut targets = vec![home_dir.to_string()];
+        let mine_without_folder = self
+            .routes
+            .values()
+            .filter(|r| r.bridge.as_deref().is_none_or(|b| b == me))
+            .any(|r| r.repo_path.as_deref().is_none_or(str::is_empty));
+        let mut targets = match serves_home || mine_without_folder {
+            true => vec![home_dir.to_string()],
+            false => Vec::new(),
+        };
         for cfg in self.routes.values() {
             if cfg.bridge.as_deref().is_some_and(|b| b != me) {
                 continue;
@@ -1656,7 +1669,7 @@ mod tests {
     fn pool_targets_empty_without_owner() {
         let mut a = Access::default();
         a.owner = String::new();
-        assert!(a.pool_targets("/home", "me").is_empty());
+        assert!(a.pool_targets("/home", "me", true).is_empty());
     }
 
     #[test]
@@ -1687,7 +1700,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let pools = a.pool_targets("/home", "me");
+        let pools = a.pool_targets("/home", "me", true);
         let cwds: Vec<&str> = pools.iter().map(|p| p.as_str()).collect();
         assert!(cwds.contains(&"/home"));
         assert!(
@@ -1714,7 +1727,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let pools = a.pool_targets("/home", "me");
+        let pools = a.pool_targets("/home", "me", true);
         assert!(!pools.iter().any(|p| p == "/repo/c"));
     }
 
@@ -1737,9 +1750,28 @@ mod tests {
                 ..Default::default()
             },
         );
-        let pools = a.pool_targets("/home", "me");
+        let pools = a.pool_targets("/home", "me", true);
         assert!(pools.iter().any(|p| p == "/repo/mine"), "{pools:?}");
         assert!(!pools.iter().any(|p| p == "/repo/theirs"), "{pools:?}");
+    }
+
+    /// A machine behind a gateway only sees the channels it was handed. If they all have folders, the
+    /// home agent it used to keep was one nobody could ever use — and `status` showed nothing about it.
+    #[test]
+    fn a_machine_keeps_a_home_agent_only_when_a_channel_needs_one() {
+        let mut a = Access::default();
+        a.owner = "U1".to_string();
+        a.routes.insert(
+            "C_MINE".into(),
+            Route { repo_path: Some("/repo/mine".into()), ..Default::default() },
+        );
+        // On the gateway (and on a lone Bridge) home serves DMs and unassigned channels
+        assert!(a.pool_targets("/home", "me", true).iter().any(|p| p == "/home"));
+        // Behind a gateway, with every channel pointing somewhere else
+        assert!(!a.pool_targets("/home", "me", false).iter().any(|p| p == "/home"));
+        // …until one of its channels has no folder of its own
+        a.routes.insert("C_BARE".into(), Route::default());
+        assert!(a.pool_targets("/home", "me", false).iter().any(|p| p == "/home"));
     }
 
     #[test]

@@ -565,7 +565,7 @@ impl Bridge {
     /// Dead reservations are left alone — [`Self::start_missing_pool_workers`], called right after,
     /// starts the same session_id with `--resume`.
     pub(super) async fn restore_pools(&mut self, ctx: &LogCtx) {
-        let targets: Vec<String> = self.access.pool_targets(&Host::home(), &self.machine_name);
+        let targets: Vec<String> = self.access.pool_targets(&Host::home(), &self.machine_name, self.link.is_none());
         let mut dirty = false;
         for (cwd, sid) in self.pools.rows() {
             let name = SessionId::from(sid.clone()).window_name();
@@ -626,7 +626,7 @@ impl Bridge {
     /// Starts pools that are missing entries. While there is no owner, `pool_targets` is empty so this does nothing.
     /// **Does not call `milestone()`** — a pool agent does not belong to any thread yet.
     pub(super) fn start_missing_pool_workers(&mut self, ctx: &LogCtx) {
-        let targets = self.access.pool_targets(&Host::home(), &self.machine_name);
+        let targets = self.access.pool_targets(&Host::home(), &self.machine_name, self.link.is_none());
         // Converge **downward too**. Pool entries for slots no longer targeted sit idle in seats
         // nobody wants. Without this, `warm off` frees nothing until those entries die.
         // Claimed agents have already left the pool roster, so this never stops someone's work
