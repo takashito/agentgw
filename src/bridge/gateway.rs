@@ -1051,13 +1051,7 @@ impl CommandCtx<'_> {
     /// `channels` (the table) and `pwd <machine>[:<path>]` (handing this channel to a machine). Both are
     /// answered here — the gateway is the one that knows the machines. `pwd <path>` is not: it goes to the
     /// machine running this channel, which is where the folder is.
-    pub fn route(
-        &self,
-        access: &Access,
-        connected: &[String],
-        self_id: &str,
-        homes: &HashMap<String, String>,
-    ) -> RouteOutcome {
+    pub fn route(&self, connected: &[String]) -> RouteOutcome {
         let ctx = self;
         let listing = ["channels", "channel"]
             .iter()
@@ -1066,13 +1060,7 @@ impl CommandCtx<'_> {
             if let Some(reply) = ctx.refuse_if_not_owner("channels") {
                 return RouteOutcome::Refused(reply);
             }
-            return RouteOutcome::List(route_table(
-                ctx.channel_id,
-                access,
-                connected,
-                self_id,
-                homes,
-            ));
+            return RouteOutcome::List;
         }
         let pwd = ctx
             .addressed()
@@ -1170,7 +1158,8 @@ fn handover_reply(channel: &str, routes: &Routes, bridge_id: &str) -> String {
 pub enum RouteOutcome {
     NotACommand,
     Refused(String),
-    List(String),
+    /// `channels` — the caller builds the table (it needs Slack, and this decision runs on every message).
+    List,
     /// `pwd <machine>:<path>`: ask the machine to set `path` up; bind only on its yes.
     SetProject { bridge_id: String, path: String },
     UnknownBridge(String),
@@ -1187,6 +1176,9 @@ pub fn route_table(
     connected: &[String],
     self_id: &str,
     homes: &HashMap<String, String>,
+    // `in_slack`: channels the bot is in. One nobody was assigned is the gateway's, and there is
+    // nothing in the assignments to learn it from
+    in_slack: &[String],
 ) -> String {
     let online = |id: &str| connected.iter().any(|c| c == id);
     // Channel rows only flag trouble: a row per channel all marked 🟢 is noise (the machines line
@@ -1223,10 +1215,16 @@ pub fn route_table(
         format!("<#{here}> → {}", dest(here)),
     ];
 
-    let others: Vec<String> = access
-        .routes
-        .keys()
-        .filter(|ch| ch.as_str() != here)
+    let mut ids: Vec<&str> = access.routes.keys().map(String::as_str).collect();
+    for ch in in_slack {
+        if !ids.contains(&ch.as_str()) {
+            ids.push(ch);
+        }
+    }
+    ids.sort();
+    let others: Vec<String> = ids
+        .into_iter()
+        .filter(|ch| *ch != here)
         .map(|ch| format!("- <#{ch}> → {}", dest(ch)))
         .collect();
     out.push(String::new());
@@ -1667,6 +1665,26 @@ impl Fleet {
         let _ = self.reload.send(()).await;
     }
 
+    /// The `channels` table. **`machines()` and not `links.connected()`**: the gateway is a machine too,
+    /// and leaving itself out drew it as offline.
+    async fn channels_table(self: &Arc<Self>, here: &str) -> String {
+        let in_slack = match self.api.bot_channels().await {
+            Ok(cs) => cs.into_iter().map(|(id, _)| id).collect(),
+            Err(e) => {
+                rlog("error", &format!("could not list the bot's channels: {e}"));
+                Vec::new()
+            }
+        };
+        route_table(
+            here,
+            &self.access(),
+            &self.machines(),
+            &self.self_id,
+            &self.homes().await,
+            &in_slack,
+        )
+    }
+
     /// Each machine's home folder, ours included (nobody tells us our own).
     async fn homes(&self) -> HashMap<String, String> {
         let mut homes = self.homes.lock().await.clone();
@@ -1975,7 +1993,7 @@ impl Fleet {
         };
 
         // ── route — answered here and **never delivered** (the destination is the very thing being changed)
-        match ctx.route(&self.access(), &machines, &self.self_id, &self.homes().await) {
+        match ctx.route(&machines) {
             RouteOutcome::NotACommand => {}
             // The folder can only be checked where it is. Here: now. Elsewhere: ask, and bind on the answer
             RouteOutcome::SetProject { bridge_id, path } => {
@@ -1990,7 +2008,12 @@ impl Fleet {
                 self.post(channel, Some(&thread), &reply).await;
                 return true;
             }
-            RouteOutcome::List(reply) | RouteOutcome::UnknownBridge(reply) => {
+            RouteOutcome::List => {
+                let table = self.channels_table(channel).await;
+                self.post(channel, Some(&thread), &table).await;
+                return true;
+            }
+            RouteOutcome::UnknownBridge(reply) => {
                 self.post(channel, Some(&thread), &reply).await;
                 return true;
             }
@@ -2102,15 +2125,7 @@ impl Fleet {
                 channel,
                 thread_ts,
             } => {
-                // `machines()` and not `links.connected()`: the gateway is a machine too, and leaving
-                // itself out of the list drew it as offline
-                let table = route_table(
-                    &channel,
-                    &self.access(),
-                    &self.machines(),
-                    &self.self_id,
-                    &self.homes().await,
-                );
+                let table = self.channels_table(&channel).await;
                 self.post(&channel, Some(&thread_ts), &table).await;
             }
             link::LinkFrame::MachineHome { path } => {
@@ -3593,13 +3608,7 @@ mod tests {
 
     #[test]
     fn route_sets_this_channel_to_a_connected_machine() {
-        let got = CommandCtx::route(
-            &ctx("C1", "<@U_BOT> pwd desktop", Some(OWNER)),
-            &access_of(&[]),
-            &here(),
-            "parent",
-            &Default::default(),
-        );
+        let got = CommandCtx::route(&ctx("C1", "<@U_BOT> pwd desktop", Some(OWNER)), &here());
         // With no folder named, that machine's home — so `pwd` shows `desktop:/home/…`, not "not set"
         assert_eq!(
             got,
@@ -3622,13 +3631,7 @@ mod tests {
     #[test]
     fn only_the_owner_may_route() {
         for user in [Some("U_STRANGER"), None] {
-            let got = CommandCtx::route(
-                &ctx("C1", "<@U_BOT> pwd desktop", user),
-                &access_of(&[]),
-                &here(),
-                "parent",
-            &Default::default(),
-            );
+            let got = CommandCtx::route(&ctx("C1", "<@U_BOT> pwd desktop", user), &here());
             assert!(
                 matches!(got, RouteOutcome::Refused(_)),
                 "{user:?} → {got:?}"
@@ -3639,13 +3642,7 @@ mod tests {
     /// Can't point at a machine that isn't connected — a typo and one not started are treated the same.
     #[test]
     fn a_route_to_a_machine_that_is_not_here_is_refused() {
-        let got = CommandCtx::route(
-            &ctx("C1", "<@U_BOT> pwd laptop", Some(OWNER)),
-            &access_of(&[]),
-            &here(),
-            "parent",
-            &Default::default(),
-        );
+        let got = CommandCtx::route(&ctx("C1", "<@U_BOT> pwd laptop", Some(OWNER)), &here());
         match got {
             RouteOutcome::UnknownBridge(reply) => {
                 assert!(reply.contains("No machine named `laptop` is connected."), "{reply}");
@@ -3658,16 +3655,18 @@ mod tests {
     #[test]
     fn a_bare_route_says_who_handles_this_channel_first() {
         // here() = ["desktop", "vps"] (connected). laptop is named only in routes
-        let got = CommandCtx::route(
-            &ctx("C1", "<@U_BOT> channels", Some(OWNER)),
+        assert_eq!(
+            CommandCtx::route(&ctx("C1", "<@U_BOT> channels", Some(OWNER)), &here()),
+            RouteOutcome::List
+        );
+        let reply = route_table(
+            "C1",
             &access_of(&[("C1", "desktop"), ("C2", "laptop")]),
             &here(),
             "vps",
             &Default::default(),
+            &[],
         );
-        let RouteOutcome::List(reply) = got else {
-            panic!("{got:?}")
-        };
         // The channel it was typed in comes first
         assert!(
             reply.starts_with("*This channel is mapped to*\n<#C1> → *desktop*\n"),
@@ -3691,16 +3690,14 @@ mod tests {
 
     #[test]
     fn a_channel_without_a_route_says_the_parent_takes_it() {
-        let got = CommandCtx::route(
-            &ctx("C9", "<@U_BOT> channels", Some(OWNER)),
+        let reply = route_table(
+            "C9",
             &access_of(&[("C1", "desktop")]),
             &here(),
             "vps",
             &Default::default(),
+            &[],
         );
-        let RouteOutcome::List(reply) = got else {
-            panic!("{got:?}")
-        };
         assert!(
             reply.starts_with("*This channel is mapped to*\n<#C9> → *vps*\n"),
             "{reply}"
@@ -3712,29 +3709,14 @@ mod tests {
 
     #[test]
     fn with_no_routes_at_all_everything_goes_to_the_parent() {
-        let got = CommandCtx::route(
-            &ctx("C1", "<@U_BOT> channels", Some(OWNER)),
-            &access_of(&[]),
-            &[],
-            "vps",
-            &Default::default(),
-        );
-        let RouteOutcome::List(reply) = got else {
-            panic!("{got:?}")
-        };
+        let reply = route_table("C1", &access_of(&[]), &[], "vps", &Default::default(), &[]);
         assert!(reply.contains("the gateway handles every channel"), "{reply}");
     }
 
     /// **A `pwd <machine>` without a mention isn't even refused.** That would be barging into a conversation the bot isn't part of.
     #[test]
     fn an_unaddressed_route_falls_through_without_a_refusal() {
-        let got = CommandCtx::route(
-            &ctx("C1", "pwd desktop", Some(OWNER)),
-            &access_of(&[]),
-            &here(),
-            "parent",
-            &Default::default(),
-        );
+        let got = CommandCtx::route(&ctx("C1", "pwd desktop", Some(OWNER)), &here());
         assert_eq!(got, RouteOutcome::NotACommand);
     }
 
@@ -3744,13 +3726,7 @@ mod tests {
             "<@U_BOT> please pwd desktop",
             "<@U_BOT> pwd desktop and also vps",
         ] {
-            let got = CommandCtx::route(
-                &ctx("C1", text, Some(OWNER)),
-                &access_of(&[]),
-                &here(),
-                "parent",
-            &Default::default(),
-            );
+            let got = CommandCtx::route(&ctx("C1", text, Some(OWNER)), &here());
             assert_eq!(got, RouteOutcome::NotACommand, "{text}");
         }
     }
@@ -3758,13 +3734,7 @@ mod tests {
     /// In a DM no mention is needed.
     #[test]
     fn in_a_dm_route_needs_no_mention() {
-        let got = CommandCtx::route(
-            &ctx("D1", "pwd desktop", Some(OWNER)),
-            &access_of(&[]),
-            &here(),
-            "parent",
-            &Default::default(),
-        );
+        let got = CommandCtx::route(&ctx("D1", "pwd desktop", Some(OWNER)), &here());
         assert!(matches!(got, RouteOutcome::SetProject { .. }), "{got:?}");
     }
 
@@ -3781,22 +3751,36 @@ mod tests {
             &here(),
             "vps",
             &homes,
+            &[],
         );
         assert!(table.contains("<#C1> → `desktop:/srv/app`"), "{table}");
         assert!(table.contains("- <#C2> → `desktop:/home/me`"), "{table}");
         assert!(table.contains("- <#C3> → *laptop* 🔴 offline"), "{table}");
     }
 
-    /// `pwd <machine>:<path>` asks the machine first — only it can see its folders.
+    /// A channel the bot is in that nobody was assigned is the gateway's — and the assignments say
+    /// nothing about it, so the table takes it from Slack.
     #[test]
-    fn pwd_with_a_machine_and_a_path_asks_that_machine() {
-        let got = CommandCtx::route(
-            &ctx("C1", "<@U_BOT> pwd desktop:~/dev/x", Some(OWNER)),
-            &access_of(&[]),
+    fn the_table_includes_channels_the_bot_is_in() {
+        let table = route_table(
+            "C1",
+            &access_of(&[("C2", "laptop")]),
             &here(),
             "vps",
             &Default::default(),
+            &["C1".to_string(), "C_ADMIN".to_string(), "C2".to_string()],
         );
+        assert!(table.contains("<#C1> → *vps*"), "{table}");
+        assert!(table.contains("- <#C_ADMIN> → *vps*"), "{table}");
+        // Not twice, and a channel handed to a machine keeps its machine
+        assert_eq!(table.matches("<#C2>").count(), 1, "{table}");
+        assert!(table.contains("- <#C2> → *laptop* 🔴 offline"), "{table}");
+    }
+
+    /// `pwd <machine>:<path>` asks the machine first — only it can see its folders.
+    #[test]
+    fn pwd_with_a_machine_and_a_path_asks_that_machine() {
+        let got = CommandCtx::route(&ctx("C1", "<@U_BOT> pwd desktop:~/dev/x", Some(OWNER)), &here());
         assert_eq!(
             got,
             RouteOutcome::SetProject { bridge_id: "desktop".into(), path: "~/dev/x".into() }
@@ -3807,7 +3791,7 @@ mod tests {
     #[test]
     fn pwd_with_only_a_path_is_the_machines_business() {
         for text in ["<@U_BOT> pwd ~/x", "<@U_BOT> pwd /srv/x", "<@U_BOT> pwd ./x", "<@U_BOT> pwd"] {
-            let got = CommandCtx::route(&ctx("C1", text, Some(OWNER)), &access_of(&[]), &here(), "vps", &Default::default());
+            let got = CommandCtx::route(&ctx("C1", text, Some(OWNER)), &here());
             assert_eq!(got, RouteOutcome::NotACommand, "{text}");
         }
     }
@@ -3816,11 +3800,11 @@ mod tests {
     #[test]
     fn channels_lists_and_route_is_gone() {
         for text in ["<@U_BOT> channels", "<@U_BOT> channel"] {
-            let got = CommandCtx::route(&ctx("C1", text, Some(OWNER)), &access_of(&[]), &here(), "vps", &Default::default());
-            assert!(matches!(got, RouteOutcome::List(_)), "{text} → {got:?}");
+            let got = CommandCtx::route(&ctx("C1", text, Some(OWNER)), &here());
+            assert_eq!(got, RouteOutcome::List, "{text}");
         }
         for text in ["<@U_BOT> route", "<@U_BOT> route desktop"] {
-            let got = CommandCtx::route(&ctx("C1", text, Some(OWNER)), &access_of(&[]), &here(), "vps", &Default::default());
+            let got = CommandCtx::route(&ctx("C1", text, Some(OWNER)), &here());
             assert_eq!(got, RouteOutcome::NotACommand, "{text}");
         }
     }
@@ -3870,7 +3854,7 @@ mod tests {
             bot_user_id: None,
         };
         assert_eq!(
-            CommandCtx::route(&c, &access_of(&[]), &here(), "parent", &Default::default()),
+            CommandCtx::route(&c, &here()),
             RouteOutcome::NotACommand
         );
     }
