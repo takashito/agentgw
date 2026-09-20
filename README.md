@@ -218,12 +218,18 @@ Then hand it a channel — in that channel: `@agentgw pwd build-box:~/dev/app`.
 
 `add-machine` checks the remote OS, sends the matching binary and the installer, links the machine, starts the service and **waits until the gateway sees it**. Run it again later to bring that machine to the gateway's version.
 
-The link is chosen by trying, not guessing:
+The link is chosen by measuring, not guessing. Every candidate is asked at once, **from the machine**,
+and the question is whether the gateway itself answers there — `/status` says `unauthorized` without a
+token, which nothing else does. An address the gateway doesn't listen on yet is opened for the length of
+the question, and for good once that route is chosen.
 
 | Link | How | Used when |
 |---|---|---|
-| **Direct** | The machine dials the gateway's public name (`AGENTGW_LINK_PUBLIC_URL`, or its Tailscale name) | The gateway is reachable — e.g. `tailscale serve --bg 8787` on the gateway |
-| **SSH tunnel** | The gateway keeps `ssh -N -R` open to the machine, which dials its own loopback | Direct didn't connect within 20 seconds |
+| **Direct** | The machine dials the gateway — its Tailscale name, its LAN address, or `AGENTGW_LINK_PUBLIC_URL` if you set one | The gateway answered there when the machine asked |
+| **SSH tunnel** | The gateway keeps `ssh -N -R` open to the machine, which dials its own loopback | Nothing direct answered |
+
+When more than one works you are asked which; one is taken without asking. The answer is remembered on
+the gateway, so the next `add-machine` starts there — `-n` measures again.
 
 `agentgw status` on the gateway lists each machine and how it is connected.
 
