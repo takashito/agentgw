@@ -114,13 +114,29 @@ pub enum Transport {
 ///
 /// `Self.DNSName` from `tailscale status --json` **has a trailing dot** (measured:
 /// `mac.tail1234.ts.net.`). Strip it before building the URL.
-pub fn candidate_url(env_url: Option<&str>, tailscale_json: Option<&str>) -> Option<String> {
+pub fn candidate_url(
+    env_url: Option<&str>,
+    tailscale_json: Option<&str>,
+    fqdn: Option<&str>,
+    listen: Option<&str>,
+) -> Option<String> {
     if let Some(u) = env_url.map(str::trim).filter(|u| !u.is_empty()) {
         return Some(u.trim_end_matches('/').to_string());
     }
-    let json: serde_json::Value = serde_json::from_str(tailscale_json?).ok()?;
-    let name = json["Self"]["DNSName"].as_str()?.trim_end_matches('.');
-    (!name.is_empty()).then(|| format!("wss://{name}"))
+    if let Some(name) = tailscale_json
+        .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+        .and_then(|j| Some(j["Self"]["DNSName"].as_str()?.trim_end_matches('.').to_string()))
+        .filter(|n| !n.is_empty())
+    {
+        return Some(format!("wss://{name}"));
+    }
+    // The machine's own name on the network. **Only when the gateway accepts from outside** — with the
+    // listener on loopback nothing reaches it — and plain `ws://`, since nothing terminates TLS here
+    let host = fqdn.map(str::trim).filter(|h| !h.is_empty() && h.contains('.'))?;
+    let port = listen?.rsplit_once(':')?;
+    let addr = port.0.trim_matches(['[', ']']);
+    let loopback = addr.is_empty() || addr == "127.0.0.1" || addr == "localhost" || addr == "::1";
+    (!loopback).then(|| format!("ws://{host}:{}", port.1))
 }
 
 /// Where this machine can be reached: (host, IPv4). The tailnet name when there is one — it works from
@@ -368,6 +384,8 @@ async fn add_child(target: &str, name: Option<&str>, from: Option<&str>) -> Resu
         candidate_url(
             env.get("AGENTGW_LINK_PUBLIC_URL").map(String::as_str),
             ssh::tailscale_json().as_deref(),
+            ssh::fqdn().as_deref(),
+            env.get("AGENTGW_LINK_LISTEN").map(String::as_str),
         )
     };
     let state_prefix = remote_state_prefix(
@@ -744,7 +762,7 @@ mod tests {
     #[test]
     fn uses_the_remembered_public_url_first() {
         assert_eq!(
-            candidate_url(Some("wss://mac.tailnet.ts.net/"), None).as_deref(),
+            candidate_url(Some("wss://mac.tailnet.ts.net/"), None, None, None).as_deref(),
             Some("wss://mac.tailnet.ts.net")
         );
     }
@@ -754,20 +772,28 @@ mod tests {
         // Self.DNSName has a trailing dot (measured)
         let json = r#"{"Self":{"DNSName":"mac.tail1234.ts.net."}}"#;
         assert_eq!(
-            candidate_url(None, Some(json)).as_deref(),
+            candidate_url(None, Some(json), None, None).as_deref(),
             Some("wss://mac.tail1234.ts.net")
         );
     }
 
     #[test]
     fn has_no_candidate_without_either() {
-        assert_eq!(candidate_url(None, None), None);
+        assert_eq!(candidate_url(None, None, None, None), None);
         assert_eq!(
-            candidate_url(Some("  "), None),
+            candidate_url(Some("  "), None, None, None),
             None,
             "空白だけは候補でない"
         );
-        assert_eq!(candidate_url(None, Some("not json")), None);
+        assert_eq!(candidate_url(None, Some("not json"), None, None), None);
+
+        // No tailnet: this machine's own name, but only when the gateway accepts from outside
+        assert_eq!(
+            candidate_url(None, None, Some("dock.lan"), Some("0.0.0.0:8787")).as_deref(),
+            Some("ws://dock.lan:8787")
+        );
+        assert_eq!(candidate_url(None, None, Some("dock.lan"), Some("127.0.0.1:8787")), None);
+        assert_eq!(candidate_url(None, None, Some("dock"), Some("0.0.0.0:8787")), None); // not a name others can resolve
     }
 
     #[test]

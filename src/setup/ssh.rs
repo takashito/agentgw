@@ -232,6 +232,15 @@ pub fn authorize_key(target: &str, pubkey: &str) -> Result<(), String> {
     ssh_stdin(target, script, pubkey).map(|_| ())
 }
 
+/// This machine's full name on the network (`hostname -f`), when it has one.
+pub fn fqdn() -> Option<String> {
+    let out = Command::new("hostname").arg("-f").output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Fetch a URL to a local path with curl. **No credentials** — the release is public.
 pub fn download(url: &str, out: &Path) -> Result<(), String> {
     let st = Command::new("curl")
