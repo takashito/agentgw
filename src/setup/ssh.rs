@@ -168,6 +168,29 @@ pub fn gh_ready() -> bool {
         .unwrap_or(false)
 }
 
+/// Fetch a URL to a local path with curl. **No credentials** — the release is public.
+pub fn download(url: &str, out: &Path) -> Result<(), String> {
+    let st = Command::new("curl")
+        .args([
+            "-fL",
+            "--retry",
+            "2",
+            "-o",
+            &out.to_string_lossy(),
+            url,
+        ])
+        .status()
+        .map_err(|e| crate::t!("Couldn't run curl: {e}", "curl が実行できません: {e}"))?;
+    if !st.success() {
+        let _ = std::fs::remove_file(out);
+        return Err(crate::t!(
+            "Couldn't download {url}. Check the release exists, or pass --from <binary>.",
+            "{url} を取得できませんでした。release があるか確かめるか、--from <バイナリ> を指定してください。"
+        ));
+    }
+    Ok(())
+}
+
 /// Download one asset from a GitHub release. Returns the path it landed at.
 pub fn gh_download(
     args: &[String],

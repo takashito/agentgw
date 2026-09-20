@@ -35,12 +35,19 @@ pub fn remote_state_prefix(state_dir: Option<&str>, home: &str) -> String {
 pub enum Source {
     /// Download from a GitHub release (the gateway and machine versions match automatically)
     Release { tag: String },
+    /// The same release over plain HTTPS. **The repository is public**, so no gh and no credentials
+    Url { url: String },
     /// A local artifact built by `cargo dist`
     Dist(PathBuf),
 }
 
-/// A private repository. **Only the gateway downloads** — the machine needs neither gh nor credentials.
+/// The public repository. **Only the gateway downloads** — the machine needs nothing.
 pub const REPO: &str = "takashito/agentgw";
+
+/// Where a release asset sits without gh. Public, so a plain fetch is enough.
+pub fn release_url(tag: &str, triple: &str) -> String {
+    format!("https://github.com/{REPO}/releases/download/{tag}/agentgw-{triple}")
+}
 
 /// Arguments for `gh release download`. **Only builds them** (nothing is run here).
 pub fn gh_download_args(tag: &str, triple: &str, out_dir: &Path) -> Vec<String> {
@@ -64,10 +71,21 @@ pub fn gh_download_args(tag: &str, triple: &str, out_dir: &Path) -> Vec<String> 
 /// **Release first, local artifact second.** Downloading from a release guarantees the gateway and machine run the same version.
 ///
 /// `dist` is "the path of the artifact for that triple, if it exists". The caller checks and passes it.
-pub fn choose_source(has_gh: bool, dist: Option<PathBuf>, version: &str) -> Result<Source, String> {
+pub fn choose_source(
+    has_gh: bool,
+    dist: Option<PathBuf>,
+    version: &str,
+    triple: &str,
+) -> Result<Source, String> {
+    let tag = format!("v{version}");
     if has_gh {
-        return Ok(Source::Release {
-            tag: format!("v{version}"),
+        return Ok(Source::Release { tag });
+    }
+    // No gh is the normal case on a server. The repository is public, so fetch the same asset directly;
+    // a local build is the fallback for a version that was never released
+    if dist.is_none() {
+        return Ok(Source::Url {
+            url: release_url(&tag, triple),
         });
     }
     dist.map(Source::Dist).ok_or_else(|| {
@@ -279,7 +297,7 @@ async fn add_child(target: &str, name: Option<&str>, from: Option<&str>) -> Resu
         Some(p) => std::path::PathBuf::from(p),
         None => {
             let dist = dist_artifact(triple);
-            match choose_source(ssh::gh_ready(), dist, env!("CARGO_PKG_VERSION"))? {
+            match choose_source(ssh::gh_ready(), dist, env!("CARGO_PKG_VERSION"), triple)? {
                 Source::Release { tag } => {
                     std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
                     println!("{}", crate::t!("==> Downloading release {tag} from GitHub", "==> GitHub から {tag} をダウンロードしています"));
@@ -288,6 +306,13 @@ async fn add_child(target: &str, name: Option<&str>, from: Option<&str>) -> Resu
                         &staging,
                         triple,
                     )?
+                }
+                Source::Url { url } => {
+                    std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
+                    println!("{}", crate::t!("==> Downloading {url}", "==> {url} をダウンロードしています"));
+                    let out = staging.join(format!("agentgw-{triple}"));
+                    ssh::download(&url, &out)?;
+                    out
                 }
                 Source::Dist(p) => {
                     println!("{}", crate::t!("==> Using the binary built on this machine", "==> このマシンでビルドしたバイナリを使います"));
@@ -634,7 +659,7 @@ mod tests {
 
     #[test]
     fn prefers_the_release_over_the_local_build() {
-        let s = choose_source(true, Some(PathBuf::from("/t/agentgw")), "0.18.5").unwrap();
+        let s = choose_source(true, Some(PathBuf::from("/t/agentgw")), "0.18.5", "x86_64-linux").unwrap();
         assert_eq!(
             s,
             Source::Release {
@@ -645,14 +670,21 @@ mod tests {
 
     #[test]
     fn falls_back_to_the_local_build_without_gh() {
-        let s = choose_source(false, Some(PathBuf::from("/t/agentgw")), "0.18.5").unwrap();
+        let s = choose_source(false, Some(PathBuf::from("/t/agentgw")), "0.18.5", "x86_64-linux").unwrap();
         assert_eq!(s, Source::Dist(PathBuf::from("/t/agentgw")));
     }
 
+    /// No gh is the normal case on a server. The repository is public, so the same release asset comes
+    /// down over plain HTTPS instead of stopping with "run gh auth login".
     #[test]
-    fn says_what_to_do_when_there_is_nothing_to_send() {
-        let why = choose_source(false, None, "0.18.5").unwrap_err();
-        assert!(why.contains("cargo dist"), "打つべきコマンドを出す: {why}");
+    fn without_gh_or_a_local_build_it_fetches_the_public_release() {
+        let s = choose_source(false, None, "0.18.5", "x86_64-unknown-linux-musl").unwrap();
+        assert_eq!(
+            s,
+            Source::Url {
+                url: "https://github.com/takashito/agentgw/releases/download/v0.18.5/agentgw-x86_64-unknown-linux-musl".to_string()
+            }
+        );
     }
 
     #[test]
