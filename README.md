@@ -212,11 +212,12 @@ agentgw add-machine user@host                   # any ssh destination, ~/.ssh/co
 agentgw add-machine user@host --name build-box  # name the machine (default: its hostname)
 agentgw add-machine user@host -i ~/.ssh/id_ed25519  # the key to offer
 agentgw add-machine user@host -p                # let ssh ask for a password (once)
+agentgw add-machine user@host -n                # measure the route again instead of reusing the last one
 ```
 
 Then hand it a channel — in that channel: `@agentgw pwd build-box:~/dev/app`.
 
-`add-machine` checks the remote OS, sends the matching binary and the installer, links the machine, starts the service and **waits until the gateway sees it**. Run it again later to bring that machine to the gateway's version.
+`add-machine` checks the remote OS, sends the matching binary and the installer, links the machine, starts the service and **watches until the link comes up** (the machine's own log and the gateway's view, either one). Run it again later to bring that machine to the gateway's version.
 
 The link is chosen by measuring, not guessing. Every candidate is asked at once, **from the machine**,
 and the question is whether the gateway itself answers there — `/status` says `unauthorized` without a
@@ -228,10 +229,16 @@ the question, and for good once that route is chosen.
 | **Direct** | The machine dials the gateway — its Tailscale name, its LAN address, or `AGENTGW_LINK_PUBLIC_URL` if you set one | The gateway answered there when the machine asked |
 | **SSH tunnel** | The gateway keeps `ssh -N -R` open to the machine, which dials its own loopback | Nothing direct answered |
 
-When more than one works you are asked which; one is taken without asking. The answer is remembered on
-the gateway, so the next `add-machine` starts there — `-n` measures again.
+When more than one works you are asked which; one is taken without asking. **Measuring says who answers,
+and only a real link says a route works**, so what is measured is an order: each is set up and watched in
+turn until one carries the link, with the ssh tunnel last. The one that worked is remembered on the
+gateway, so the next `add-machine` starts there — `-n` measures again.
 
-`agentgw status` on the gateway lists each machine and how it is connected.
+`install` never asks where to listen: a gateway starts on loopback alone, and `add-machine` opens the one
+address a machine turns out to need.
+
+`agentgw status` on the gateway lists each machine and how it is connected, and `machines` in Slack shows
+where each one is reachable.
 
 ## Slack commands
 
@@ -250,7 +257,7 @@ Mention the bot (`@agentgw <command>`), or type in a thread it's working in.
 | `usage` | Your Claude subscription usage |
 | `status` | Version, active threads and warm agents |
 | `channels` | Which machine handles this channel and the others |
-| `machines` | The gateway and every machine, with where each can be reached |
+| `machines` | The gateway and every machine: how each one links, and the address it links from |
 | `pwd [<machine>[:<path>]]` · `pwd [path]` | Show this channel's project directory, or set it (`/…`, `~/…`, `./…`). Naming a machine hands the channel to it — its home folder, or the one you name |
 | `warm on\|off` | Keep an agent started ahead of time for this channel |
 | `set-home` | Send notices (online, offline, errors) to this channel |
@@ -323,6 +330,7 @@ Every machine uses the same layout.
 | Only some messages get answered | Another process is using the same app token |
 | A machine shows as offline | `agentgw status` on the gateway; `service.err.log` on that machine |
 | An agent can't use new tool options after an upgrade | Run `/mcp` in that agent — it keeps the tool list it started with |
+| "This shell can't reach your systemd user session" | Your Linux user has no running systemd instance to talk to: `loginctl enable-linger $USER`, then log in again |
 
 ## Development
 
