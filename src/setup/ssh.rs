@@ -6,18 +6,70 @@
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+
+/// How to reach the machine: the key to offer, and whether ssh may ask for a password.
+///
+/// **A password is never ours to hold.** `-p` only takes `BatchMode` off so ssh asks on the terminal
+/// itself; with the connection multiplexed, it asks once and every later ssh / scp rides that one.
+/// Passing a password in argv would leave it in this machine's `ps` and shell history.
+#[derive(Default, Clone)]
+pub struct Access {
+    pub identity: Option<String>,
+    pub ask_password: bool,
+}
+
+static ACCESS: OnceLock<Access> = OnceLock::new();
+
+/// Set once, before anything connects (`add-machine` does it from its arguments).
+pub fn use_access(access: Access) {
+    let _ = ACCESS.set(access);
+}
+
+/// The options every ssh / scp call starts with.
+fn opts() -> Vec<String> {
+    opts_of(&ACCESS.get().cloned().unwrap_or_default())
+}
+
+fn opts_of(access: &Access) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(key) = &access.identity {
+        out.push("-i".into());
+        out.push(key.clone());
+        // An explicit key is the one to use — don't let the agent's keys go first
+        out.push("-o".into());
+        out.push("IdentitiesOnly=yes".into());
+    }
+    if access.ask_password {
+        // Ask once: the first connection prompts, the rest share it
+        out.push("-o".into());
+        out.push("ControlMaster=auto".into());
+        out.push("-o".into());
+        out.push(format!(
+            "ControlPath={}/agentgw-%r@%h-%p",
+            std::env::temp_dir().display()
+        ));
+        out.push("-o".into());
+        out.push("ControlPersist=120".into());
+    }
+    out
+}
+
+/// `BatchMode=yes` means "never ask a human". With `-p` the human is right here, so let ssh ask.
+fn batch_mode() -> [String; 2] {
+    batch_mode_of(ACCESS.get().is_some_and(|a| a.ask_password))
+}
+
+fn batch_mode_of(ask: bool) -> [String; 2] {
+    ["-o".to_string(), format!("BatchMode={}", if ask { "no" } else { "yes" })]
+}
 
 /// Run one command on the remote and return its stdout. On failure, Err(its stderr).
 pub fn ssh_capture(target: &str, command: &str) -> Result<String, String> {
     let out = Command::new("ssh")
-        .args([
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=10",
-            target,
-            command,
-        ])
+        .args(opts())
+        .args(batch_mode())
+        .args(["-o", "ConnectTimeout=10", target, command])
         .output()
         .map_err(|e| crate::t!("Couldn't run ssh: {e}", "ssh が実行できません: {e}"))?;
     if !out.status.success() {
@@ -29,7 +81,9 @@ pub fn ssh_capture(target: &str, command: &str) -> Result<String, String> {
 /// Run on the remote and check only success (output goes straight to the remote's terminal).
 pub fn ssh_run(target: &str, command: &str) -> Result<(), String> {
     let st = Command::new("ssh")
-        .args(["-o", "BatchMode=yes", target, command])
+        .args(opts())
+        .args(batch_mode())
+        .args([target, command])
         .status()
         .map_err(|e| crate::t!("Couldn't run ssh: {e}", "ssh が実行できません: {e}"))?;
     st.success()
@@ -44,6 +98,7 @@ pub fn ssh_run(target: &str, command: &str) -> Result<(), String> {
 /// output** — taking over the allocated terminal makes input impossible.
 pub fn ssh_interactive(target: &str, command: &str) -> Result<(), String> {
     let st = Command::new("ssh")
+        .args(opts())
         .args(["-t", target, command])
         .status()
         .map_err(|e| crate::t!("Couldn't run ssh: {e}", "ssh が実行できません: {e}"))?;
@@ -57,7 +112,9 @@ pub fn ssh_interactive(target: &str, command: &str) -> Result<(), String> {
 /// **Never put the connection string in argv** — it would stay in the remote's `ps` and shell history.
 pub fn ssh_stdin(target: &str, command: &str, stdin: &str) -> Result<String, String> {
     let mut child = Command::new("ssh")
-        .args(["-o", "BatchMode=yes", target, command])
+        .args(opts())
+        .args(batch_mode())
+        .args([target, command])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -81,6 +138,7 @@ pub fn ssh_stdin(target: &str, command: &str, stdin: &str) -> Result<String, Str
 /// Put a local file on the remote.
 pub fn scp(local: &Path, target: &str, remote_path: &str) -> Result<(), String> {
     let st = Command::new("scp")
+        .args(opts())
         .args([
             "-q",
             &local.to_string_lossy(),
@@ -143,4 +201,27 @@ pub fn tailscale_json() -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `-i` picks the key and says "this one" (the agent's keys would otherwise go first); `-p` lets ssh
+    /// ask, and multiplexes so it asks once. **No password ever reaches argv.**
+    #[test]
+    fn access_shapes_the_ssh_options() {
+        let args = |a: Access| {
+            let joined = opts_of(&a).join(" ");
+            joined
+        };
+        assert_eq!(args(Access::default()), "");
+        let with_key = args(Access { identity: Some("/k/id".into()), ask_password: false });
+        assert!(with_key.contains("-i /k/id") && with_key.contains("IdentitiesOnly=yes"), "{with_key}");
+        let with_pw = args(Access { identity: None, ask_password: true });
+        assert!(with_pw.contains("ControlMaster=auto") && with_pw.contains("ControlPersist=120"), "{with_pw}");
+        assert!(!with_pw.contains("password"), "{with_pw}");
+        assert_eq!(batch_mode_of(false)[1], "BatchMode=yes");
+        assert_eq!(batch_mode_of(true)[1], "BatchMode=no");
+    }
 }

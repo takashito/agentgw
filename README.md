@@ -210,9 +210,11 @@ From the gateway:
 ```bash
 agentgw add-machine user@host                   # any ssh destination, ~/.ssh/config aliases included
 agentgw add-machine user@host --name build-box  # name the machine (default: its hostname)
+agentgw add-machine user@host -i ~/.ssh/id_ed25519  # the key to offer
+agentgw add-machine user@host -p                # let ssh ask for a password (once)
 ```
 
-Then assign channels to it — in the channel: `@agentgw route build-box`.
+Then hand it a channel — in that channel: `@agentgw pwd build-box:~/dev/app`.
 
 `add-machine` checks the remote OS, sends the matching binary and the installer, links the machine, starts the service and **waits until the gateway sees it**. Run it again later to bring that machine to the gateway's version.
 

@@ -210,9 +210,11 @@ cargo build --release
 ```bash
 agentgw add-machine user@host                   # ssh で入れる相手なら何でも(~/.ssh/config の別名も可)
 agentgw add-machine user@host --name build-box  # マシンの名前を決める(既定はホスト名)
+agentgw add-machine user@host -i ~/.ssh/id_ed25519  # 使う秘密鍵
+agentgw add-machine user@host -p                # ssh にパスワードを訊かせる(1回だけ)
 ```
 
-そのあと、任せたいチャンネルで `@agentgw route build-box`。
+そのあと、任せたいチャンネルで `@agentgw pwd build-box:~/dev/app`。
 
 `add-machine` は相手の OS を見て、合うバイナリとインストーラを届け、ゲートウェイにつなぎ、サービスを起動し、**ゲートウェイから見えるまで待ちます**。あとでもう一度打てば、そのマシンをゲートウェイと同じ版に揃えます。
 

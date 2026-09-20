@@ -192,11 +192,18 @@ pub async fn cli(args: &[String]) -> i32 {
     let mut target = None;
     let mut name = None;
     let mut from = None;
+    let mut access = ssh::Access::default();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--name" => name = it.next().cloned(),
             "--from" => from = it.next().cloned(),
+            "-i" | "--identity" => access.identity = it.next().cloned(),
+            // A flag, not a value: **the password stays between you and ssh** (in argv it would sit in
+            // this machine's `ps` and shell history)
+            "-p" | "--password" => access.ask_password = true,
+            s if s.starts_with("-i=") => access.identity = Some(s["-i=".len()..].to_string()),
+            s if s.starts_with("--identity=") => access.identity = Some(s["--identity=".len()..].to_string()),
             s if s.starts_with("--name=") => name = Some(s["--name=".len()..].to_string()),
             s if s.starts_with("--from=") => from = Some(s["--from=".len()..].to_string()),
             s if s.starts_with('-') => {
@@ -210,18 +217,26 @@ pub async fn cli(args: &[String]) -> i32 {
         eprintln!(
             "{}",
             crate::t!(
-                "usage: agentgw add-machine <ssh destination> [--name <name>] [--from <binary>]\n\
+                "usage: agentgw add-machine <ssh destination> [-i <key>] [-p] [--name <name>] [--from <binary>]\n\
                  \n\
                  Example: agentgw add-machine user@host\n\
-                 The destination can be a ~/.ssh/config alias; keys and jump hosts come from your ssh config.",
-                "usage: agentgw add-machine <ssh先> [--name <名前>] [--from <バイナリ>]\n\
+                 The destination can be a ~/.ssh/config alias; keys and jump hosts come from your ssh config.\n\
+                 \n\
+                   -i <key>  the private key to offer\n\
+                   -p        let ssh ask for a password (asked once; every later step shares that connection)",
+                "usage: agentgw add-machine <ssh先> [-i <鍵>] [-p] [--name <名前>] [--from <バイナリ>]\n\
                  \n\
                  例: agentgw add-machine user@host\n\
-                 ssh 先は ~/.ssh/config の別名でも構いません(鍵も踏み台もそちらに任せます)。"
+                 ssh 先は ~/.ssh/config の別名でも構いません(鍵も踏み台もそちらに任せます)。\n\
+                 \n\
+                   -i <鍵>   使う秘密鍵\n\
+                   -p        ssh にパスワードを訊かせる(訊かれるのは最初の1回。以降の処理は同じ接続を使います)"
             )
         );
         return 2;
     };
+    // Every ssh / scp from here on uses these (set once, before anything connects)
+    ssh::use_access(access);
     match add_child(&target, name.as_deref(), from.as_deref()).await {
         Ok(msg) => {
             println!("{msg}");
