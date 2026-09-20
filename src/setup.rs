@@ -301,10 +301,18 @@ fn ask_listen(state_dir: &StateDir) {
         .and_then(|v| v.split(',').next())
         .and_then(|a| a.rsplit_once(':').map(|(_, p)| p.to_string()))
         .unwrap_or_else(|| "8787".to_string());
-    let want = match crate::setup::ssh::lan_ip() {
-        Some(ip) => format!("127.0.0.1:{port},{ip}:{port}"),
-        None => format!("127.0.0.1:{port}"),
-    };
+    // Loopback for whatever terminates TLS in front, the LAN address for machines on the same network,
+    // and the tailnet address for machines that reach us over tailscale without `tailscale serve`
+    let mut addrs = vec![format!("127.0.0.1:{port}")];
+    if let Some(ip) = crate::setup::ssh::lan_ip() {
+        addrs.push(format!("{ip}:{port}"));
+    }
+    let (_, tailnet_ip) =
+        crate::setup::add_machine::tailnet_identity(crate::setup::ssh::tailscale_json().as_deref());
+    if !tailnet_ip.is_empty() {
+        addrs.push(format!("{tailnet_ip}:{port}"));
+    }
+    let want = addrs.join(",");
     match current {
         Some(now) if now == want => {}
         Some(now) => {

@@ -178,6 +178,21 @@ pub fn tailnet_name(tailscale_json: Option<&str>) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
+/// The ports this gateway accepts links on, without repeats. **A name reaches whichever address the
+/// caller resolves it to**, so the port is all that matters once the name is known.
+pub fn link_ports(listen: Option<&str>) -> Vec<String> {
+    let mut ports: Vec<String> = Vec::new();
+    for a in listen.unwrap_or_default().split(',') {
+        if let Some((_, port)) = a.trim().rsplit_once(':')
+            && !port.is_empty()
+            && !ports.iter().any(|p| p == port)
+        {
+            ports.push(port.to_string());
+        }
+    }
+    ports
+}
+
 /// Every `ws://host:port` a machine could try on the LAN, from this gateway's listeners. Loopback is not
 /// one of them (on the other side it means "that machine"), and neither is `0.0.0.0` (not an address to dial).
 pub fn lan_urls(host: Option<&str>, listen: Option<&str>) -> Vec<String> {
@@ -472,7 +487,13 @@ async fn add_child(
                 ssh::fqdn().as_deref(),
                 env.get("AGENTGW_LINK_LISTEN").map(String::as_str),
             );
-            let options = routes_that_work(target, tailnet.as_deref(), machine_on_tailnet, &lan);
+            let options = routes_that_work(
+                target,
+                tailnet.as_deref(),
+                machine_on_tailnet,
+                &lan,
+                env.get("AGENTGW_LINK_LISTEN").map(String::as_str),
+            );
             let answer = ask_which_route(&options);
             pick_route(&options, answer).and_then(|i| options[i].url.clone())
         }
@@ -753,17 +774,28 @@ fn routes_that_work(
     tailnet: Option<&str>,
     machine_on_tailnet: bool,
     lan: &[String],
+    listen: Option<&str>,
 ) -> Vec<RouteChoice> {
     let mut out: Vec<RouteChoice> = Vec::new();
     if machine_on_tailnet
         && let Some(name) = tailnet
     {
+        // Two ways over the tailnet: through whatever terminates TLS on 443 (`tailscale serve`), or
+        // straight to the link port — the tailnet carries it encrypted either way
         println!("{}", crate::t!("==> Checking the tailnet route to {name}", "==> tailnet 経路({name})を確かめています"));
         if tcp_opens(target, name, "443") {
             out.push(RouteChoice {
                 label: crate::t!("tailnet · wss://{name}", "tailnet · wss://{name}"),
                 url: Some(format!("wss://{name}")),
             });
+        }
+        for port in link_ports(listen) {
+            if tcp_opens(target, name, &port) {
+                out.push(RouteChoice {
+                    label: crate::t!("tailnet · ws://{name}:{port}", "tailnet · ws://{name}:{port}"),
+                    url: Some(format!("ws://{name}:{port}")),
+                });
+            }
         }
     }
     for url in lan {
@@ -954,6 +986,16 @@ mod tests {
                 url: "https://github.com/takashito/agentgw/releases/download/v0.18.5/agentgw-x86_64-unknown-linux-musl".to_string()
             }
         );
+    }
+
+    /// The ports the gateway accepts on, once each — a name reaches whatever address it resolves to.
+    #[test]
+    fn link_ports_are_listed_once() {
+        assert_eq!(
+            link_ports(Some("127.0.0.1:8787,192.168.10.11:8787,100.64.0.1:8788")),
+            vec!["8787".to_string(), "8788".to_string()]
+        );
+        assert!(link_ports(None).is_empty());
     }
 
     /// Once a machine has come in, the way it came is written down: `add-machine` starts there next time
