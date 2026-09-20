@@ -761,7 +761,11 @@ impl Bridge {
                 }),
             },
         );
-        if let Some(up) = &b.ask_gateway {
+        // **Only a machine reports.** The gateway's own access already holds its folders, and among them
+        // the copies it keeps of other machines' — reporting those would claim them as its own
+        if up_is_linked
+            && let Some(up) = &b.ask_gateway
+        {
             report_folders(&b.deps.dir, up);
         }
         // Sweep login sessions the previous Bridge left before going down
