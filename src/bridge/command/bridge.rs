@@ -1061,7 +1061,7 @@ mod tests {
     fn a_bridge_that_takes_children_lists_the_machine_commands() {
         let h = help(true, &crate::agent::fake::FakeAgent::default());
         assert!(h.contains("pwd <machine>[:<path>]") && h.contains("channels"));
-        assert!(h.contains("hand this channel to a machine"));
+        assert!(h.contains("map this channel to a machine"));
         // Having machines doesn't change the other sections
         assert!(h.contains("status") && h.contains("help / ?"));
     }
