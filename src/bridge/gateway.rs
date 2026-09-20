@@ -1525,6 +1525,56 @@ pub struct Tunnel {
 pub type Tunnels = HashMap<String, Tunnel>;
 
 /// One machine's route in a few words.
+/// The name **this** resolver gives an address, asked of the OS. `None` when nothing answers.
+///
+/// Looked up here and not on the machine: the name is read by someone sitting here, and a machine can
+/// call itself something nobody else can resolve — a Proxmox host naming itself `pve.local` out of its
+/// own `/etc/hosts` while the network's DNS calls it `pve.lan` (seen on a real machine).
+async fn name_here(ip: &str) -> Option<String> {
+    if ip.is_empty() {
+        return None;
+    }
+    // No resolver crate for one lookup: `getent` where there is one, `host` elsewhere (macOS has it)
+    let ask = async |program: &str, args: Vec<&str>| -> Option<String> {
+        let out = tokio::process::Command::new(program)
+            .args(args)
+            .output()
+            .await
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).to_string())
+    };
+    let said = match tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        match ask("getent", vec!["hosts", ip]).await {
+            Some(out) => Some(name_from_getent(&out)),
+            None => ask("host", vec!["-W", "2", ip]).await.map(|o| name_from_host(&o)),
+        }
+    })
+    .await
+    {
+        Ok(said) => said?,
+        Err(_) => None,
+    };
+    said.filter(|n| !n.is_empty() && n != ip)
+}
+
+/// `192.168.10.20   pve.lan pve` → `pve.lan`. The first name is the canonical one.
+fn name_from_getent(out: &str) -> Option<String> {
+    out.lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)
+        .map(str::to_string)
+}
+
+/// `20.10.168.192.in-addr.arpa domain name pointer pve.lan.` → `pve.lan`.
+fn name_from_host(out: &str) -> Option<String> {
+    out.lines()
+        .find_map(|l| l.rsplit_once("pointer "))
+        .map(|(_, name)| name.trim().trim_end_matches('.').to_string())
+}
+
 /// The host part of an ssh target: `root@pve.lan` → `pve.lan`.
 pub fn ssh_host_of(target: &str) -> &str {
     target.rsplit_once('@').map(|(_, host)| host).unwrap_or(target)
@@ -1744,7 +1794,8 @@ impl Fleet {
             // names. What reaches *it* is the gateway's ssh target, which only the gateway knows
             let reachable = match (ip.starts_with("127."), tunnels.get(id)) {
                 (true, Some(t)) => where_(ssh_host_of(&t.target), ""),
-                _ => where_(&host, &ip),
+                // What this resolver calls the address wins over what the machine calls itself
+                _ => where_(&name_here(&ip).await.unwrap_or(host), &ip),
             };
             // How the gateway gets to it: a tunnel it opened itself (and knows), or straight there
             let route = route_of(id, &tunnels);
@@ -4240,6 +4291,22 @@ mod tests {
         );
         assert!(out.contains("  ● laptop — direct"), "{out}");
         assert!(out.contains("  ● desktop — ssh tunnel (me@desktop)"), "{out}");
+    }
+
+    /// Both come from a real machine: `getent` on the gateway, `host` where there is no getent.
+    #[test]
+    fn a_reverse_lookup_gives_the_name_this_resolver_uses() {
+        assert_eq!(
+            name_from_getent("192.168.10.20   pve.lan pve\n"),
+            Some("pve.lan".to_string())
+        );
+        assert_eq!(name_from_getent(""), None);
+        assert_eq!(
+            name_from_host("20.10.168.192.in-addr.arpa domain name pointer pve.lan.\n"),
+            Some("pve.lan".to_string())
+        );
+        // Nothing answered: no name to show, so the machine's own stands
+        assert_eq!(name_from_host("Host 192.168.10.20 not found: 3(NXDOMAIN)\n"), None);
     }
 
     /// A tunnelled machine dials its own loopback, so that is the interface it names — and `127.0.0.1`
