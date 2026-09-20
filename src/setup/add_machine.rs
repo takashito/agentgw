@@ -408,7 +408,7 @@ async fn add_child(target: &str, name: Option<&str>, from: Option<&str>) -> Resu
     let _ = ssh::ssh_run(target, "rm -f ~/.local/bin/agentgw-install.sh");
     installed?;
 
-    if !wait_connected(&inlet, &child).await {
+    if watch_for_link(&inlet, &child, target, FIRST_TRY).await.is_err() {
         // The direct connection failed, so fall back to the tunnel and try again
         if matches!(transport, Transport::Direct { .. }) {
             println!("{}", crate::t!("==> The direct connection didn't work. Switching to an ssh tunnel.", "==> 直結ではつながりませんでした。ssh トンネルに切り替えます。"));
@@ -425,11 +425,13 @@ async fn add_child(target: &str, name: Option<&str>, from: Option<&str>) -> Resu
                 remote_bin,
             )?;
             ssh::ssh_run(target, &format!("{state_prefix}~/{remote_bin} restart"))?;
-            if !wait_connected(&inlet, &child).await {
+            if let Err(said) = watch_for_link(&inlet, &child, target, LAST_TRY).await {
                 return Err(crate::t!(
                     "{child} can't reach the gateway, either directly or over an ssh tunnel.\n\
+                     {said}\n\
                      Its log: ssh {target} 'tail ~/.local/state/agentgw/plugin-debug.log'",
                     "{child} がゲートウェイにつながりません。直結でも ssh トンネルでもだめでした。\n\
+                     {said}\n\
                      {child} のログ: ssh {target} 'tail ~/.local/state/agentgw/plugin-debug.log'"
                 ));
             }
@@ -551,21 +553,54 @@ fn set_tunnel(dir: &StateDir, child: &str, target: Option<&str>) -> Result<(), S
     Ok(())
 }
 
-/// Ask the gateway's `status` endpoint for the currently connected machines and wait until the name appears.
+/// How long to watch the **first** route (direct). Short: when it doesn't work there is a tunnel to try,
+/// and the machine says so itself within a couple of tries.
+const FIRST_TRY: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long to watch the **last** route before giving up. Long enough for the machine and the gateway to
+/// restart and for the machine's own backoff (up to 30s) to come round.
+const LAST_TRY: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Watch for the link coming up. **Two ways to tell, both real**: the gateway lists the machine, or the
+/// machine itself says it is ready. Checked every second and it stops the moment either says yes —
+/// waiting a fixed time called it a failure while the link was coming up one second later.
 ///
-/// **This is what decides the route** (whether a real link came up, not a probe).
-async fn wait_connected(inlet: &Listener, child: &str) -> bool {
-    for i in 0..10 {
-        if i > 0 {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        }
+/// When it doesn't come up, the machine's own last word about the link is the reason to show.
+async fn watch_for_link(
+    inlet: &Listener,
+    child: &str,
+    target: &str,
+    limit: std::time::Duration,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + limit;
+    let mut last_word = String::new();
+    loop {
         if let Some(names) = RelayCli::ask_connected(&inlet.listen, &inlet.token).await
             && names.iter().any(|n| n == child)
         {
-            return true;
+            return Ok(());
         }
+        // The machine knows before the gateway's status does — and knows why when it doesn't
+        if let Ok(line) = ssh::ssh_capture(
+            target,
+            "grep 'remote link:' ~/.local/state/agentgw/plugin-debug.log | tail -1",
+        ) {
+            if line.contains("remote link: ready") {
+                return Ok(());
+            }
+            if !line.is_empty() {
+                last_word = line;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            let said = match last_word.split_once("remote link: ") {
+                Some((_, why)) => why.to_string(),
+                None => crate::t!("nothing yet", "まだ何も言っていません"),
+            };
+            return Err(crate::t!("{child} says: {said}", "{child} はこう言っています: {said}"));
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
-    false
 }
 
 /// The `cargo dist` artifact. Found **only when the repo is present**.
