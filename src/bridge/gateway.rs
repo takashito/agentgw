@@ -1123,20 +1123,19 @@ fn set_home_reply(ch: &str) -> String {
 
 /// Why a name isn't a machine we can hand a channel to, and what is online instead.
 fn unknown_machine(bridge_id: &str, connected: &[String]) -> String {
-    let here = if connected.is_empty() {
+    let here = connected
+        .iter()
+        .map(|m| format!("`{m}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let here = if here.is_empty() {
         crate::t!("none", "なし")
     } else {
-        connected.join(", ")
+        here
     };
     crate::t!(
-        "No machine named *{bridge_id}* is connected. A channel can only be handed to a \
-         machine that's online — check the name, or start agentgw on that machine. \
-         (For a folder, write `./{bridge_id}` or `~/{bridge_id}`.)\n\
-         Online now: {here}",
-        "*{bridge_id}* という名前のマシンはつながっていません。チャンネルを任せられるのは\
-         オンラインのマシンだけです。名前を確かめるか、そのマシンで agentgw を起動してください。\
-         (フォルダなら `./{bridge_id}` か `~/{bridge_id}` と書いてください。)\n\
-         オンラインのマシン: {here}"
+        "No machine named `{bridge_id}` is connected.\nOnline machines: {here}",
+        "`{bridge_id}` という名前のマシンはつながっていません。\nオンラインのマシン: {here}"
     )
 }
 
@@ -3641,10 +3640,8 @@ mod tests {
         );
         match got {
             RouteOutcome::UnknownBridge(reply) => {
-                assert!(
-                    reply.contains("No machine named *laptop* is connected.")
-                );
-                assert!(reply.contains("desktop, vps"));
+                assert!(reply.contains("No machine named `laptop` is connected."), "{reply}");
+                assert!(reply.contains("Online machines: `desktop`, `vps`"), "{reply}");
             }
             other => panic!("{other:?}"),
         }

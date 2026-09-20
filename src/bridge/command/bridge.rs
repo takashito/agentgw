@@ -151,8 +151,8 @@ impl Bridge {
             // Only the gateway knows the machines and answers these. Reaching a Bridge means there is
             // no gateway, or no such machine behind it
             PwdMode::On { machine, .. } => crate::t!(
-                "No machine named *{machine}* is connected. For a folder, write `./{machine}` or `~/{machine}`.",
-                "*{machine}* という名前のマシンはつながっていません。フォルダなら `./{machine}` か `~/{machine}` と書いてください。"
+                "No machine named `{machine}` is connected. This machine works on its own.",
+                "`{machine}` という名前のマシンはつながっていません。このマシンは単独で動いています。"
             ),
             PwdMode::Current => {
                 entry(&self.access, &msg.channel).render()
