@@ -453,18 +453,17 @@ async fn add_child(
             )
         })
         .flatten();
-    let chosen = match (&by_hand, &known) {
+    let chosen = match &known {
         // What worked last time, unless `-n` says to work it out again
-        (_, Some(Transport::Direct { url })) => {
+        Some(Transport::Direct { url }) => {
             println!("{}", crate::t!("==> {child} came in over {url} last time", "==> 前回 {child} は {url} でつながりました"));
             Some(url.clone())
         }
-        (_, Some(Transport::Tunnel { .. })) => {
+        Some(Transport::Tunnel { .. }) => {
             println!("{}", crate::t!("==> {child} came in over the ssh tunnel last time", "==> 前回 {child} は ssh トンネルでつながりました"));
             None
         }
-        (Some(url), None) => Some(url.trim_end_matches('/').to_string()),
-        (None, None) => {
+        None => {
             let listen = env.get("AGENTGW_LINK_LISTEN").map(String::as_str);
             let (tailnet, tailnet_ip) = tailnet_identity(ssh::tailscale_json().as_deref());
             let machine_on_tailnet =
@@ -478,6 +477,7 @@ async fn add_child(
             );
             let options = routes_that_work(
                 target,
+                by_hand.as_deref(),
                 Some((tailnet.as_str(), tailnet_ip.as_str())),
                 machine_on_tailnet,
                 lan,
@@ -774,10 +774,18 @@ pub fn pick_route(options: &[RouteChoice], answer: Option<usize>) -> Option<usiz
 struct Candidate {
     label: String,
     url: String,
-    /// Where `/status` lives for this route.
-    base: String,
     /// `None` = the gateway already holds what this needs (TLS terminated in front of it).
     listen: Option<String>,
+}
+
+/// Where `/status` lives for a machine that would dial this URL.
+pub fn probe_base(url: &str) -> String {
+    let url = url.trim_end_matches('/');
+    match url.split_once("://") {
+        Some(("wss", rest)) => format!("https://{rest}"),
+        Some(("ws", rest)) => format!("http://{rest}"),
+        _ => url.to_string(),
+    }
 }
 
 /// Every route the machine can actually take, measured from the machine. In preference order:
@@ -791,6 +799,7 @@ struct Candidate {
 /// good afterwards.
 fn routes_that_work(
     target: &str,
+    by_hand: Option<&str>,
     tailnet: Option<(&str, &str)>,
     machine_on_tailnet: bool,
     lan: Option<(String, String)>,
@@ -799,6 +808,15 @@ fn routes_that_work(
     let held = |addr: &str| listen.unwrap_or_default().split(',').any(|a| a.trim() == addr);
     let port = link_port(listen);
     let mut cands: Vec<Candidate> = Vec::new();
+    // A URL written by hand is asked first and asked the same way. It is someone's intent, not a fact:
+    // one left over from an older setup sent every machine to an address nothing answered at
+    if let Some(url) = by_hand.map(str::trim).filter(|u| !u.is_empty()) {
+        cands.push(Candidate {
+            label: crate::t!("as written · {url}", "手書きの指定 · {url}"),
+            url: url.trim_end_matches('/').to_string(),
+            listen: None,
+        });
+    }
     if machine_on_tailnet
         && let Some((name, ip)) = tailnet.filter(|(n, _)| !n.is_empty())
     {
@@ -807,27 +825,25 @@ fn routes_that_work(
         cands.push(Candidate {
             label: crate::t!("tailnet · wss://{name}", "tailnet · wss://{name}"),
             url: format!("wss://{name}"),
-            base: format!("https://{name}"),
             listen: None,
         });
         if !ip.is_empty() {
             cands.push(Candidate {
                 label: crate::t!("tailnet · ws://{name}:{port}", "tailnet · ws://{name}:{port}"),
                 url: format!("ws://{name}:{port}"),
-                base: format!("http://{name}:{port}"),
                 listen: Some(format!("{ip}:{port}")),
             });
         }
     }
     if let Some((url, addr)) = lan {
-        let host = url.trim_start_matches("ws://").to_string();
         cands.push(Candidate {
             label: crate::t!("LAN · {url}", "LAN · {url}"),
             url,
-            base: format!("http://{host}"),
             listen: Some(addr),
         });
     }
+    // The same address twice (a hand-written URL that is also one of the measured ones) is one question
+    cands.dedup_by(|a, b| a.url == b.url);
 
     // Open what needs opening first; a door that won't open takes its candidate with it
     let mut open: Vec<(Candidate, Option<Doorbell>)> = Vec::new();
@@ -841,12 +857,12 @@ fn routes_that_work(
         }
     }
     for (c, _) in &open {
-        println!("{}", crate::t!("==> Asking {target} whether it can reach {}", "==> {target} から {} に届くか訊いています", c.base));
+        println!("{}", crate::t!("==> Asking {target} whether the gateway answers at {}", "==> ゲートウェイが {} で答えるか {target} に訊いています", c.url));
     }
     let answered: Vec<bool> = std::thread::scope(|scope| {
         let asks: Vec<_> = open
             .iter()
-            .map(|(c, _)| scope.spawn(|| gateway_answers(target, &c.base)))
+            .map(|(c, _)| scope.spawn(|| gateway_answers(target, &probe_base(&c.url))))
             .collect();
         asks.into_iter().map(|a| a.join().unwrap_or(false)).collect()
     });
@@ -1095,6 +1111,13 @@ mod tests {
     }
 
     /// The ports the gateway accepts on, once each — a name reaches whatever address it resolves to.
+    #[test]
+    fn a_dial_url_points_at_where_status_lives() {
+        assert_eq!(probe_base("wss://dock.example.ts.net"), "https://dock.example.ts.net");
+        assert_eq!(probe_base("ws://dock.lan:8787"), "http://dock.lan:8787");
+        assert_eq!(probe_base("wss://dock.example.ts.net/"), "https://dock.example.ts.net");
+    }
+
     #[test]
     fn link_port_comes_from_what_is_open() {
         assert_eq!(link_port(Some("127.0.0.1:8788,192.168.10.11:8788")), "8788");
