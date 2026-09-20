@@ -100,7 +100,7 @@ impl SlackApp {
 }
 
 /// Reads one line from the terminal. Over a pipe (non-interactive) it returns "", which the caller rejects.
-fn prompt(question: &str) -> String {
+pub(crate) fn prompt(question: &str) -> String {
     print!("{question}");
     let _ = std::io::stdout().flush();
     let mut line = String::new();

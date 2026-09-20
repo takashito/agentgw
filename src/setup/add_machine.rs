@@ -226,6 +226,29 @@ pub fn tunnels_with(raw: &str, child: &str, target: Option<&str>) -> String {
         .join(",")
 }
 
+/// The route this gateway settled on for a machine last time. **A tunnel is already written down**
+/// (`AGENTGW_TUNNELS`, the gateway keeps it open); a direct one is remembered here so the next
+/// `add-machine` starts where the last one ended instead of measuring everything again.
+pub fn remembered_route(tunnels: &str, routes: &str, child: &str) -> Option<Transport> {
+    if crate::bridge::machine::child_urls(tunnels)
+        .iter()
+        .any(|(id, _)| id == child)
+    {
+        return Some(Transport::Tunnel {
+            remote_port: TUNNEL_PORT,
+        });
+    }
+    crate::bridge::machine::child_urls(routes)
+        .into_iter()
+        .find(|(id, _)| id == child)
+        .map(|(_, url)| Transport::Direct { url })
+}
+
+/// `AGENTGW_ROUTES` with this machine's direct URL written in (or taken out, when it moved to a tunnel).
+pub fn routes_with(raw: &str, child: &str, url: Option<&str>) -> String {
+    tunnels_with(raw, child, url)
+}
+
 // ── Execution ────────────────────────────────────────────────────────────────
 // This layer touches the OS and the remote machine. The decisions live in the pure functions above (which are tested).
 
@@ -253,6 +276,7 @@ pub async fn cli(args: &[String]) -> i32 {
     let mut name = None;
     let mut from = None;
     let mut access = ssh::Access::default();
+    let mut fresh = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -262,6 +286,8 @@ pub async fn cli(args: &[String]) -> i32 {
             // A flag, not a value: **the password stays between you and ssh** (in argv it would sit in
             // this machine's `ps` and shell history)
             "-p" | "--password" => access.ask_password = true,
+            // Work the route out again instead of taking the one that worked last time
+            "-n" | "--new" => fresh = true,
             s if s.starts_with("-i=") => access.identity = Some(s["-i=".len()..].to_string()),
             s if s.starts_with("--identity=") => access.identity = Some(s["--identity=".len()..].to_string()),
             s if s.starts_with("--name=") => name = Some(s["--name=".len()..].to_string()),
@@ -283,21 +309,23 @@ pub async fn cli(args: &[String]) -> i32 {
                  The destination can be a ~/.ssh/config alias; keys and jump hosts come from your ssh config.\n\
                  \n\
                    -i <key>  the private key to offer\n\
-                   -p        let ssh ask for a password (asked once; every later step shares that connection)",
+                   -p        let ssh ask for a password (asked once; every later step shares that connection)\n\
+                   -n        work out the route again instead of the one that worked last time",
                 "usage: agentgw add-machine <ssh先> [-i <鍵>] [-p] [--name <名前>] [--from <バイナリ>]\n\
                  \n\
                  例: agentgw add-machine user@host\n\
                  ssh 先は ~/.ssh/config の別名でも構いません(鍵も踏み台もそちらに任せます)。\n\
                  \n\
                    -i <鍵>   使う秘密鍵\n\
-                   -p        ssh にパスワードを訊かせる(訊かれるのは最初の1回。以降の処理は同じ接続を使います)"
+                   -p        ssh にパスワードを訊かせる(訊かれるのは最初の1回。以降の処理は同じ接続を使います)\n\
+                   -n        前回の経路を使わず、もう一度調べ直す"
             )
         );
         return 2;
     };
     // Every ssh / scp from here on uses these (set once, before anything connects)
     ssh::use_access(access);
-    match add_child(&target, name.as_deref(), from.as_deref()).await {
+    match add_child(&target, name.as_deref(), from.as_deref(), fresh).await {
         Ok(msg) => {
             println!("{msg}");
             0
@@ -310,7 +338,12 @@ pub async fn cli(args: &[String]) -> i32 {
 }
 
 /// Add one machine. **The order matters** — see each step's comment.
-async fn add_child(target: &str, name: Option<&str>, from: Option<&str>) -> Result<String, String> {
+async fn add_child(
+    target: &str,
+    name: Option<&str>,
+    from: Option<&str>,
+    fresh: bool,
+) -> Result<String, String> {
     let dir = StateDir::resolve();
 
     // 1. Look at the remote
@@ -404,34 +437,54 @@ async fn add_child(target: &str, name: Option<&str>, from: Option<&str>) -> Resu
     // 4. Prepare the gateway's listener and key
     let inlet = ensure_inlet(&dir)?;
 
-    // 5. Decide the route **from both sides**: the tailnet if the machine is on it too, otherwise the LAN
-    //    if the machine can really reach us there, otherwise a tunnel
-    let candidate = {
-        let env = RelayCli::env_of(&dir);
-        let by_hand = env.get("AGENTGW_LINK_PUBLIC_URL").map(String::as_str);
-        let tailnet = tailnet_name(ssh::tailscale_json().as_deref());
-        let machine_on_tailnet = !ssh::ssh_capture(target, "tailscale status --json 2>/dev/null | head -c 1")
-            .unwrap_or_default()
-            .is_empty();
-        let lan = match (by_hand.is_some(), machine_on_tailnet && tailnet.is_some()) {
-            // Only worth asking when the tailnet isn't the answer
-            (false, false) => reachable_lan_url(
-                target,
-                &lan_urls(
-                    ssh::fqdn().as_deref(),
-                    env.get("AGENTGW_LINK_LISTEN").map(String::as_str),
-                ),
-            ),
-            _ => None,
-        };
-        route_url(by_hand, tailnet.as_deref(), machine_on_tailnet, lan.as_deref())
+    // 5. Decide the route by **measuring it from the machine**, which is the side that dials. One way
+    //    that works is no question; several is a choice worth offering (and with nobody to ask, the
+    //    first — they are in preference order)
+    let env = RelayCli::env_of(&dir);
+    let by_hand = env.get("AGENTGW_LINK_PUBLIC_URL").cloned();
+    let known = (!fresh)
+        .then(|| {
+            remembered_route(
+                env.get("AGENTGW_TUNNELS").map(String::as_str).unwrap_or_default(),
+                env.get("AGENTGW_ROUTES").map(String::as_str).unwrap_or_default(),
+                &child,
+            )
+        })
+        .flatten();
+    let chosen = match (&by_hand, &known) {
+        // What worked last time, unless `-n` says to work it out again
+        (_, Some(Transport::Direct { url })) => {
+            println!("{}", crate::t!("==> {child} came in over {url} last time", "==> 前回 {child} は {url} でつながりました"));
+            Some(url.clone())
+        }
+        (_, Some(Transport::Tunnel { .. })) => {
+            println!("{}", crate::t!("==> {child} came in over the ssh tunnel last time", "==> 前回 {child} は ssh トンネルでつながりました"));
+            None
+        }
+        (Some(url), None) => Some(url.trim_end_matches('/').to_string()),
+        (None, None) => {
+            let tailnet = tailnet_name(ssh::tailscale_json().as_deref());
+            let machine_on_tailnet =
+                !ssh::ssh_capture(target, "tailscale status --json 2>/dev/null | head -c 1")
+                    .unwrap_or_default()
+                    .is_empty();
+            let lan = lan_urls(
+                ssh::fqdn().as_deref(),
+                env.get("AGENTGW_LINK_LISTEN").map(String::as_str),
+            );
+            let options = routes_that_work(target, tailnet.as_deref(), machine_on_tailnet, &lan);
+            let answer = ask_which_route(&options);
+            pick_route(&options, answer).and_then(|i| options[i].url.clone())
+        }
     };
+    remember_route(&dir, &child, chosen.as_deref());
+
     let state_prefix = remote_state_prefix(
         std::env::var("AGENTGW_STATE_DIR").ok().as_deref(),
         &std::env::var("HOME").unwrap_or_default(),
     );
 
-    let mut transport = match candidate {
+    let mut transport = match chosen {
         Some(url) => {
             println!("{}", crate::t!("==> Trying a direct connection to {url}", "==> {url} への直結を試しています"));
             Transport::Direct { url }
@@ -468,6 +521,7 @@ async fn add_child(target: &str, name: Option<&str>, from: Option<&str>) -> Resu
         // The direct connection failed, so fall back to the tunnel and try again
         if matches!(transport, Transport::Direct { .. }) {
             println!("{}", crate::t!("==> The direct connection didn't work. Switching to an ssh tunnel.", "==> 直結ではつながりませんでした。ssh トンネルに切り替えます。"));
+            remember_route(&dir, &child, None);
             set_tunnel(&dir, &child, Some(target))?;
             transport = Transport::Tunnel {
                 remote_port: TUNNEL_PORT,
@@ -585,6 +639,19 @@ fn link_child(
 
 /// Rewrite `AGENTGW_TUNNELS` in the gateway's `.env` and restart the gateway **only if it changed**
 /// (the gateway's agentgw reads it at startup to open tunnels; restart does not tear down agents).
+/// Write down the direct URL this machine came in on, so the next `add-machine` starts there.
+fn remember_route(dir: &StateDir, child: &str, url: Option<&str>) {
+    let env = RelayCli::env_of(dir);
+    let before = env.get("AGENTGW_ROUTES").cloned().unwrap_or_default();
+    let after = routes_with(&before, child, url);
+    if after == before {
+        return;
+    }
+    if let Err(e) = RelayCli::write_env(dir, &[("AGENTGW_ROUTES", after)]) {
+        eprintln!("{}", crate::t!("Couldn't write .env: {e}", ".env が書けません: {e}"));
+    }
+}
+
 fn set_tunnel(dir: &StateDir, child: &str, target: Option<&str>) -> Result<(), String> {
     let env = RelayCli::env_of(dir);
     let before = env.get("AGENTGW_TUNNELS").cloned().unwrap_or_default();
@@ -661,22 +728,95 @@ async fn watch_for_link(
     }
 }
 
-/// Ask the **machine** to open each LAN address in turn and keep the first that answers. Measured, not
-/// guessed: a name that resolves here may not resolve there, and a network may not carry the traffic.
-fn reachable_lan_url(target: &str, urls: &[String]) -> Option<String> {
-    for url in urls {
-        let hostport = url.trim_start_matches("ws://");
-        let (host, port) = hostport.rsplit_once(':')?;
-        println!("{}", crate::t!("==> Checking the LAN route {url}", "==> LAN 経路 {url} を確かめています"));
-        let probe = format!(
-            "timeout 5 bash -c 'exec 3<>/dev/tcp/{host}/{port}' >/dev/null 2>&1 && echo open || echo shut"
-        );
-        if ssh::ssh_capture(target, &probe).unwrap_or_default().trim() == "open" {
-            return Some(url.clone());
+/// One way the machine could reach the gateway, and whether it just did.
+pub struct RouteChoice {
+    /// What to show a person.
+    pub label: String,
+    /// `None` = the ssh tunnel (always available: we are already on ssh).
+    pub url: Option<String>,
+}
+
+/// Pick from what actually worked. **One option is no question**; several is a question worth asking,
+/// and with nobody to ask (a pipe, a script) the first one wins — they are in preference order.
+pub fn pick_route(options: &[RouteChoice], answer: Option<usize>) -> Option<usize> {
+    match options.len() {
+        0 => None,
+        1 => Some(0),
+        n => answer.filter(|i| *i < n).or(Some(0)),
+    }
+}
+
+/// Every route the machine can actually take, measured from the machine. In preference order:
+/// the tailnet, then the LAN, then the ssh tunnel (which is always there — we got here over ssh).
+fn routes_that_work(
+    target: &str,
+    tailnet: Option<&str>,
+    machine_on_tailnet: bool,
+    lan: &[String],
+) -> Vec<RouteChoice> {
+    let mut out: Vec<RouteChoice> = Vec::new();
+    if machine_on_tailnet
+        && let Some(name) = tailnet
+    {
+        println!("{}", crate::t!("==> Checking the tailnet route to {name}", "==> tailnet 経路({name})を確かめています"));
+        if tcp_opens(target, name, "443") {
+            out.push(RouteChoice {
+                label: crate::t!("tailnet · wss://{name}", "tailnet · wss://{name}"),
+                url: Some(format!("wss://{name}")),
+            });
         }
     }
-    None
+    for url in lan {
+        println!("{}", crate::t!("==> Checking the LAN route {url}", "==> LAN 経路 {url} を確かめています"));
+        let hostport = url.trim_start_matches("ws://");
+        if let Some((host, port)) = hostport.rsplit_once(':')
+            && tcp_opens(target, host, port)
+        {
+            out.push(RouteChoice {
+                label: crate::t!("LAN · {url}", "LAN · {url}"),
+                url: Some(url.clone()),
+            });
+        }
+    }
+    out.push(RouteChoice {
+        label: crate::t!(
+            "ssh tunnel · the gateway keeps one open to this machine",
+            "ssh トンネル · ゲートウェイがこのマシンへ張り続けます"
+        ),
+        url: None,
+    });
+    out
 }
+
+/// Show what worked and take the answer. **Only when there is a choice and someone to make it** —
+/// a pipe or a script gets the first (preference order), with a line saying which.
+fn ask_which_route(options: &[RouteChoice]) -> Option<usize> {
+    use std::io::IsTerminal;
+    if options.len() < 2 {
+        return None;
+    }
+    println!("{}", crate::t!("==> Ways this machine can reach the gateway:", "==> このマシンからゲートウェイへ届く経路:"));
+    for (i, o) in options.iter().enumerate() {
+        let n = i + 1;
+        println!("  {n}) {}", o.label);
+    }
+    if !std::io::stdin().is_terminal() {
+        let first = &options[0].label;
+        println!("{}", crate::t!("  Taking {first}", "  {first} を選びます"));
+        return None;
+    }
+    let answer = crate::setup::prompt(&crate::t!("  Which one? [1]: ", "  どれにしますか? [1]: "));
+    answer.trim().parse::<usize>().ok().map(|n| n.saturating_sub(1))
+}
+
+/// Can the **machine** open this address? Asked on the machine, because that is who will dial.
+fn tcp_opens(target: &str, host: &str, port: &str) -> bool {
+    let probe = format!(
+        "timeout 5 bash -c 'exec 3<>/dev/tcp/{host}/{port}' >/dev/null 2>&1 && echo open || echo shut"
+    );
+    ssh::ssh_capture(target, &probe).unwrap_or_default().trim() == "open"
+}
+
 
 /// The `cargo dist` artifact. Found **only when the repo is present**.
 fn dist_artifact(triple: &str) -> Option<std::path::PathBuf> {
@@ -814,6 +954,48 @@ mod tests {
                 url: "https://github.com/takashito/agentgw/releases/download/v0.18.5/agentgw-x86_64-unknown-linux-musl".to_string()
             }
         );
+    }
+
+    /// Once a machine has come in, the way it came is written down: `add-machine` starts there next time
+    /// instead of measuring everything again. `-n` is what asks for a fresh look.
+    #[test]
+    fn the_route_that_worked_is_remembered() {
+        assert_eq!(
+            remembered_route("", "pve=ws://dock.lan:8787", "pve"),
+            Some(Transport::Direct { url: "ws://dock.lan:8787".into() })
+        );
+        assert_eq!(
+            remembered_route("pve=root@pve.lan", "", "pve"),
+            Some(Transport::Tunnel { remote_port: TUNNEL_PORT })
+        );
+        // A tunnel is the gateway's own doing, so it wins over a stale direct URL
+        assert_eq!(
+            remembered_route("pve=root@pve.lan", "pve=ws://dock.lan:8787", "pve"),
+            Some(Transport::Tunnel { remote_port: TUNNEL_PORT })
+        );
+        assert_eq!(remembered_route("", "", "pve"), None);
+        assert_eq!(remembered_route("", "mac=ws://x:1", "pve"), None);
+
+        assert_eq!(routes_with("", "pve", Some("ws://dock.lan:8787")), "pve=ws://dock.lan:8787");
+        assert_eq!(routes_with("pve=ws://a:1,mac=ws://b:2", "pve", None), "mac=ws://b:2");
+    }
+
+    fn choice(label: &str, url: Option<&str>) -> RouteChoice {
+        RouteChoice { label: label.into(), url: url.map(str::to_string) }
+    }
+
+    /// One way that works needs no question. Several is a choice, and with nobody to ask (a pipe) the
+    /// first wins — they come in preference order.
+    #[test]
+    fn one_route_is_taken_and_several_are_offered() {
+        let tunnel = vec![choice("ssh tunnel", None)];
+        assert_eq!(pick_route(&tunnel, None), Some(0));
+        assert!(pick_route(&[], None).is_none());
+
+        let both = vec![choice("tailnet", Some("wss://a")), choice("ssh tunnel", None)];
+        assert_eq!(pick_route(&both, None), Some(0), "nobody to ask → the preferred one");
+        assert_eq!(pick_route(&both, Some(1)), Some(1), "the answer is taken");
+        assert_eq!(pick_route(&both, Some(9)), Some(0), "an answer out of range is not one");
     }
 
     /// The route is decided from **both** sides: the tailnet only when the machine is on it too, then a
