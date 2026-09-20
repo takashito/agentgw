@@ -263,6 +263,14 @@ impl Workers {
     }
 
     /// `(cwd, ready)` printed as is by the status Warm Pool section.
+    ///每 pool slot as (cwd, session_id, ready). `status` needs the session to say how long it has waited.
+    pub fn pool_entries(&self) -> Vec<(String, String, bool)> {
+        self.pools
+            .values()
+            .map(|p| (p.cwd.clone(), p.session_id.clone(), self.pool_ready(&p.session_id)))
+            .collect()
+    }
+
     pub fn pool_summary(&self) -> Vec<(String, bool)> {
         self.pools
             .values()

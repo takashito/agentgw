@@ -44,10 +44,8 @@ impl Bridge {
                 channel_id,
                 thread_ts: tts.clone(),
                 last_activity_ms,
-                repo_path: e.repo_path.clone(),
                 permalink: None,
                 topic: e.topic.clone(),
-                channel_name: None,
             });
         }
         ctx.debug(
@@ -67,15 +65,67 @@ impl Bridge {
         // $HOME is for folding paths into `~`. Host::home() is
         // "where an agent without a route starts", a different thing, so don't mix them here
         let home = std::env::var("HOME").unwrap_or_default();
-        // `self` cannot be carried into a 'static spawn — take the pool cwds out here and move them in
+        // `self` cannot be carried into a 'static spawn — build the whole picture here and move it in.
         // Count only **usable** pool entries (starting ones "don't exist yet"; given-up slots are already gone)
-        let pools: Vec<String> = self
+        let waiting: Vec<(String, u64)> = self
             .workers
-            .pool_summary()
+            .pool_entries()
             .into_iter()
-            .filter(|(_, ready)| *ready)
-            .map(|(cwd, _)| cwd)
+            .filter(|(_, _, ready)| *ready)
+            .map(|(cwd, sid, _)| {
+                let idle = self.deps.agent.last_activity_ms(None, &sid).unwrap_or(0);
+                (cwd, idle)
+            })
             .collect();
+        // Every channel handed to this machine, plus any that has something running (DMs have no route)
+        let mut ids: Vec<String> = self
+            .access
+            .routes
+            .iter()
+            .filter(|(_, r)| r.bridge.as_deref().is_none_or(|b| b == self.machine_name))
+            .map(|(ch, _)| ch.clone())
+            .collect();
+        for t in &threads {
+            if !ids.contains(&t.channel_id) {
+                ids.push(t.channel_id.clone());
+            }
+        }
+        let agent_home = Host::home();
+        let mut channels: Vec<StatusChannel> = ids
+            .into_iter()
+            .map(|channel_id| {
+                let folder = self.access.repo_path(&channel_id, &agent_home).0;
+                let mine: Vec<StatusThread> = threads
+                    .iter()
+                    .filter(|t| t.channel_id == channel_id)
+                    .cloned()
+                    .collect();
+                StatusChannel {
+                    warm_on: self
+                        .access
+                        .routes
+                        .get(&channel_id)
+                        .and_then(|r| r.warm)
+                        .unwrap_or(false),
+                    warm: waiting
+                        .iter()
+                        .filter(|(cwd, _)| *cwd == folder)
+                        .map(|(_, idle)| *idle)
+                        .collect(),
+                    threads: mine,
+                    folder,
+                    name: None,
+                    channel_id,
+                }
+            })
+            .collect();
+        // Busy channels first, then by id — the same shape every time it is asked
+        channels.sort_by(|a, b| {
+            b.threads
+                .len()
+                .cmp(&a.threads.len())
+                .then(a.channel_id.cmp(&b.channel_id))
+        });
         // Where we sit in the fleet. Read here (the spawn below can't hold `self`): the gateway asks its
         // own link server, a machine reads the link it keeps
         let machine = self.machine_name.clone();
@@ -119,7 +169,8 @@ impl Bridge {
             };
             // Resolve each channel name only once (one conversation can have many threads)
             let mut names: HashMap<String, Option<String>> = HashMap::new();
-            for t in &mut threads {
+            for c in &mut channels {
+                for t in &mut c.threads {
                 t.permalink = match slack.get_permalink(&t.channel_id, &t.thread_ts).await {
                     Ok(p) => Some(p),
                     Err(e) => {
@@ -133,11 +184,12 @@ impl Bridge {
                         None
                     }
                 };
-                if !names.contains_key(&t.channel_id) {
-                    let n = slack.channel_display_name(&t.channel_id).await;
-                    names.insert(t.channel_id.clone(), n);
                 }
-                t.channel_name = names[&t.channel_id].clone();
+                if !names.contains_key(&c.channel_id) {
+                    let n = slack.channel_display_name(&c.channel_id).await;
+                    names.insert(c.channel_id.clone(), n);
+                }
+                c.name = names[&c.channel_id].clone();
             }
             let report = StatusReport {
                 bridge_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -145,8 +197,7 @@ impl Bridge {
                 role,
                 now_ms: clock.now_ms(),
                 home,
-                threads,
-                pools,
+                channels,
             }
             .render();
             api.post_now(&channel, &root, report, &key).await;
@@ -402,18 +453,15 @@ impl Bridge {
 ///
 /// **Carries no version** — there is no mechanism for agents to report their version,
 /// so no version-skew display.
+#[derive(Clone)]
 pub struct StatusThread {
     pub channel_id: String,
     pub thread_ts: String,
     /// Last activity in epoch ms. 0 = unknown
     pub last_activity_ms: u64,
-    /// The repository the agent runs in (shown once per channel group)
-    pub repo_path: Option<String>,
     pub permalink: Option<String>,
     /// The thread's topic (first line of the opening message) — used as the link text
     pub topic: Option<String>,
-    /// The resolved channel name (`#general`, or `@alice` for a DM)
-    pub channel_name: Option<String>,
 }
 
 impl StatusThread {
@@ -513,10 +561,23 @@ pub struct StatusReport {
     pub now_ms: u64,
     /// $HOME. Used to fold long absolute paths into `~` for readability
     pub home: String,
-    /// Only threads whose agents are **actually running**
+    /// The channels this machine handles, each with its folder and what is running in it.
+    pub channels: Vec<StatusChannel>,
+}
+
+/// One channel this machine handles.
+pub struct StatusChannel {
+    pub channel_id: String,
+    /// The resolved name (`#general`, or `@alice` for a DM).
+    pub name: Option<String>,
+    /// Where its agents work.
+    pub folder: String,
+    /// Whether an agent is kept started ahead of time for it.
+    pub warm_on: bool,
+    /// Only threads whose agents are **actually running**.
     pub threads: Vec<StatusThread>,
-    /// Working directories that warm-pool agents are waiting in
-    pub pools: Vec<String>,
+    /// One per agent waiting in this channel's folder: when it last did anything (0 = unknown).
+    pub warm: Vec<u64>,
 }
 
 /// Where a Bridge sits: the gateway, a machine linked to one, or on its own.
@@ -618,70 +679,54 @@ impl StatusReport {
         // so the heading looks glued to the body. A line with one full-width space survives as a tall line
         lines.push("　".to_string());
 
-        if r.threads.is_empty() {
-            lines.push(crate::t!("*Active threads* — none", "*動いているスレッド* — なし"));
+        if r.channels.is_empty() {
+            lines.push(crate::t!(
+                "*My channels* — none yet",
+                "*このマシンのチャンネル* — まだありません"
+            ));
         } else {
-            // Group by channel, keeping **insertion order** (the sort below is stable)
-            let mut groups: Vec<(&str, Vec<&StatusThread>)> = Vec::new();
-            for t in &r.threads {
-                match groups.iter_mut().find(|(ch, _)| *ch == t.channel_id) {
-                    Some((_, g)) => g.push(t),
-                    None => groups.push((&t.channel_id, vec![t])),
-                }
-            }
-            let n = r.threads.len();
-            lines.push(crate::t!("*Active threads* — {n}", "*動いているスレッド* — {n}"));
-            // DMs first, then the busiest channels. Ties are broken by channel id.
-            let dm_rank = |ch: &str| u8::from(!ch.starts_with('D'));
-            groups.sort_by(|a, b| {
-                dm_rank(a.0)
-                    .cmp(&dm_rank(b.0))
-                    .then(b.1.len().cmp(&a.1.len()))
-                    .then(a.0.cmp(b.0))
-            });
-            for (i, (ch, ts)) in groups.iter_mut().enumerate() {
-                // Blank lines only **between** channels. Right after the heading it makes the count look detached
-                if i > 0 {
-                    lines.push(String::new());
-                }
-                let dm = ch.starts_with('D');
-                let name = ts
-                    .iter()
-                    .find_map(|t| t.channel_name.as_deref().filter(|n| !n.is_empty()));
-                // Bake the resolved name into the label — readable even where a bare `<#id>` isn't resolved.
-                // Slack strips the leading '#' itself, so pass the bare word.
-                let head = match (name, dm) {
-                    (Some(n), true) => n.to_string(),
-                    (Some(n), false) => format!("<#{ch}|{}>", n.strip_prefix('#').unwrap_or(n)),
-                    (None, true) => "DM".to_string(),
-                    (None, false) => format!("<#{ch}>"),
-                };
-                let repo = ts
-                    .iter()
-                    .find_map(|t| t.repo_path.as_deref().filter(|p| !p.is_empty()));
-                lines.push(match repo {
-                    Some(_) => format!("{head} · `{}`", Self::short_path(repo, &r.home)),
-                    None => head,
-                });
-                ts.sort_by_key(|t| t.last_activity_ms); // Longest idle first
-                lines.extend(ts.iter().map(|t| t.line(r.now_ms)));
-            }
+            lines.push(crate::t!("*My channels*", "*このマシンのチャンネル*"));
         }
-        lines.push(String::new());
-        // A list of just the folders that are waiting
-        if r.pools.is_empty() {
-            lines.push(crate::t!("*Warm agents* — none", "*待機中のエージェント* — なし"));
-        } else {
-            let n = r.pools.len();
-            lines.push(crate::t!("*Warm agents* — {n}", "*待機中のエージェント* — {n}"));
-            // One per line only makes it tall — lay the paths out horizontally as monospace chips
-            lines.push(
-                r.pools
-                    .iter()
-                    .map(|cwd| format!("`{}`", Self::short_path(Some(cwd), &r.home)))
-                    .collect::<Vec<_>>()
-                    .join("　"),
-            );
+        for (i, c) in r.channels.iter().enumerate() {
+            // Blank lines only **between** channels; right after the heading it looks detached
+            if i > 0 {
+                lines.push(String::new());
+            }
+            let dm = c.channel_id.starts_with('D');
+            // Bake the resolved name into the label — readable even where a bare `<#id>` isn't resolved.
+            // Slack strips the leading '#' itself, so pass the bare word
+            let head = match (c.name.as_deref().filter(|n| !n.is_empty()), dm) {
+                (Some(n), true) => n.to_string(),
+                (Some(n), false) => format!("<#{}|{}>", c.channel_id, n.strip_prefix('#').unwrap_or(n)),
+                (None, true) => "DM".to_string(),
+                (None, false) => format!("<#{}>", c.channel_id),
+            };
+            let folder = Self::short_path(Some(&c.folder), &r.home);
+            let warm = if c.warm_on {
+                crate::t!(" (warm on)", "(warm on)")
+            } else {
+                String::new()
+            };
+            lines.push(format!("{head} · `{folder}`{warm}"));
+            let mut rows: Vec<(u64, String)> = c
+                .threads
+                .iter()
+                .map(|t| (t.last_activity_ms, t.line(r.now_ms)))
+                .collect();
+            rows.extend(c.warm.iter().map(|idle| {
+                let label = crate::t!("waiting", "待機中");
+                let line = match StatusThread::idle_label(r.now_ms, *idle) {
+                    None => format!("　{label}"),
+                    Some(ago) => format!("`{ago}`　{label}"),
+                };
+                (*idle, line)
+            }));
+            if rows.is_empty() {
+                lines.push(crate::t!("　no active threads", "　動いているスレッドなし"));
+                continue;
+            }
+            rows.sort_by_key(|(idle, _)| *idle); // Longest idle first
+            lines.extend(rows.into_iter().map(|(_, line)| line));
         }
         lines.join("\n")
     }
@@ -843,93 +888,96 @@ mod tests {
         assert_eq!(StatusReport::short_path(None, "/Users/t"), "(unknown)");
     }
 
-    #[test]
-    fn status_report_groups_and_orders() {
-        let r = StatusReport {
-            bridge_version: "0.1.0-rs".into(),
-            now_ms: 1_000_000,
-            home: "/Users/t".into(),
-            machine: "dock".into(),
-            role: StatusRole::Gateway { machines: vec![("pve".into(), true), ("mac".into(), false)] },
-            threads: vec![
-                StatusThread {
-                    channel_id: "C1".into(),
-                    thread_ts: "1.0".into(),
-                    last_activity_ms: 940_000,
-                    repo_path: Some("/Users/t/dev/x".into()),
-                    permalink: Some("https://s/p1".into()),
-                    topic: Some("<@UBOT> READMEを要約して".into()),
-                    channel_name: Some("#general".into()),
-                },
-                StatusThread {
-                    channel_id: "D1".into(),
-                    thread_ts: "2.0".into(),
-                    last_activity_ms: 0,
-                    repo_path: None,
-                    permalink: None,
-                    topic: None,
-                    channel_name: Some("@alice".into()),
-                },
-            ],
-            pools: vec![],
-        };
-        let out = r.render();
-        // Version and mode on one line (a lone `mode: local` line looks like a log fragment)
-        // The name is the binary name as-is. Under the heading is a line with one full-width space (a bare blank line leaves too little gap)
-        assert!(
-            out.starts_with(
-                "*version*: `0.1.0-rs`\n*machine id*: `dock` (gateway)\n*connected machines*: `pve` 🟢, `mac` 🔴\n　\n"
-            ),
-            "{out}"
-        );
-        assert!(out.contains("*Active threads* — 2"));
-        // DMs first; the mention is stripped from the link text
-        assert!(out.find("@alice").unwrap() < out.find("general").unwrap());
-        assert!(!out.contains("UBOT"));
-        // Elapsed time is a monospace chip at the start of the line, followed by the linked topic
-        assert!(
-            out.contains("\n<#C1|general> · `~/dev/x`\n`1m ago`　<https://s/p1|READMEを要約して>")
-        );
-        // A thread with an unknown time gets no chip, only the leading alignment
-        assert!(out.contains("\n@alice\n　(untitled)\n"));
-        assert!(out.contains("*Warm agents* — none"));
-        // Empty thread
-        let empty = StatusReport {
-            threads: vec![],
-            ..r
-        };
-        assert!(empty.render().contains("*Active threads* — none"));
+    fn thread(channel: &str, ts: &str, idle: u64, topic: Option<&str>, link: Option<&str>) -> StatusThread {
+        StatusThread {
+            channel_id: channel.into(),
+            thread_ts: ts.into(),
+            last_activity_ms: idle,
+            permalink: link.map(str::to_string),
+            topic: topic.map(str::to_string),
+        }
     }
 
-    /// Minimal warm-pool section. threads may be empty (the sections are independent).
     fn sample_report() -> StatusReport {
         StatusReport {
             bridge_version: "0.1.0-rs".into(),
             now_ms: 1_000_000,
             home: "/Users/t".into(),
             machine: "dock".into(),
-            role: StatusRole::Gateway { machines: vec![("pve".into(), true), ("mac".into(), false)] },
-            threads: vec![],
-            pools: vec![],
+            role: StatusRole::Gateway {
+                machines: vec![("pve".into(), true), ("mac".into(), false)],
+            },
+            channels: vec![],
         }
     }
 
-    /// A count + a flat list of cwds (no internal keys shown).
+    /// Every channel this machine handles, each with its folder and what is running in it: threads and
+    /// agents waiting. A channel with nothing running still shows — "where can I work" is the question.
     #[test]
-    fn status_report_lists_warm_pools() {
+    fn status_lists_each_channel_with_its_threads() {
         let r = StatusReport {
-            pools: vec!["/repo/a".into(), "/Users/t/dev/b".into()],
+            channels: vec![
+                StatusChannel {
+                    channel_id: "C1".into(),
+                    name: Some("#general".into()),
+                    folder: "/Users/t/dev/x".into(),
+                    warm_on: true,
+                    threads: vec![thread(
+                        "C1",
+                        "1.0",
+                        940_000,
+                        Some("<@UBOT> READMEを要約して"),
+                        Some("https://s/p1"),
+                    )],
+                    warm: vec![700_000],
+                },
+                StatusChannel {
+                    channel_id: "C2".into(),
+                    name: Some("#agentgw".into()),
+                    folder: "/Users/t/dev/agentgw".into(),
+                    warm_on: false,
+                    threads: vec![],
+                    warm: vec![],
+                },
+            ],
             ..sample_report()
         };
         let out = r.render();
-        assert!(out.contains("*Warm agents* — 2"));
-        assert!(out.contains("\n\n*Warm agents")); // Blank line between it and the section above
-        assert!(out.contains("\n`/repo/a`　`~/dev/b`")); // One row / $HOME folded
+        assert!(out.contains("*My channels*\n"), "{out}");
+        // Folder next to the channel, warm flag only where it is on
+        assert!(out.contains("<#C1|general> · `~/dev/x` (warm on)\n"), "{out}");
+        assert!(out.contains("<#C2|agentgw> · `~/dev/agentgw`\n"), "{out}");
+        // Longest idle first: the waiting agent (5m) above the thread (1m)
+        assert!(
+            out.contains("`5m ago`　waiting\n`1m ago`　<https://s/p1|READMEを要約して>"),
+            "{out}"
+        );
+        assert!(!out.contains("UBOT"), "{out}");
+        assert!(out.contains("\n　no active threads"), "{out}");
     }
 
+    /// A DM has no channel name of its own and no route; it still shows what is running.
     #[test]
-    fn status_report_warm_pool_empty_unchanged() {
-        assert!(sample_report().render().contains("*Warm agents* — none"));
+    fn status_shows_a_dm_and_says_when_there_is_nothing() {
+        let r = StatusReport {
+            channels: vec![StatusChannel {
+                channel_id: "D1".into(),
+                name: Some("@alice".into()),
+                folder: "/Users/t".into(),
+                warm_on: false,
+                threads: vec![thread("D1", "2.0", 0, None, None)],
+                warm: vec![],
+            }],
+            ..sample_report()
+        };
+        let out = r.render();
+        assert!(out.contains("@alice · `~`\n　(untitled)"), "{out}");
+
+        let empty = StatusReport {
+            channels: vec![],
+            ..sample_report()
+        };
+        assert!(empty.render().contains("*My channels* — none yet"));
     }
 
     /// Net for the hand-written token scan (the three replaces) that avoids regex.
@@ -960,8 +1008,7 @@ mod tests {
             role,
             now_ms: 0,
             home: "/root".into(),
-            threads: vec![],
-            pools: vec![],
+            channels: vec![],
         }
         .render();
 
