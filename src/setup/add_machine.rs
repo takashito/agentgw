@@ -537,6 +537,7 @@ async fn add_child(
             );
             let mut options = routes_that_work(
                 target,
+                &child,
                 by_hand.as_deref(),
                 Some((tailnet.as_str(), tailnet_ip.as_str())),
                 machine_on_tailnet,
@@ -874,6 +875,7 @@ pub fn probe_base(url: &str) -> String {
 /// good afterwards.
 fn routes_that_work(
     target: &str,
+    child: &str,
     by_hand: Option<&str>,
     tailnet: Option<(&str, &str)>,
     machine_on_tailnet: bool,
@@ -931,8 +933,7 @@ fn routes_that_work(
             None => open.push((c, None)),
         }
     }
-    let who = target.rsplit('@').next().unwrap_or(target);
-    doing(&crate::t!("measuring the ways {who} could reach this gateway", "{who} からこのゲートウェイへ届く経路を測っています"));
+    doing(&crate::t!("measuring the ways {child} could reach this gateway", "{child} からこのゲートウェイへ届く経路を測っています"));
     let answered: Vec<bool> = std::thread::scope(|scope| {
         let asks: Vec<_> = open
             .iter()
