@@ -1001,6 +1001,12 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
                 }
             }
         }
+        // The gateway decided where notices go. Every machine writes to the same place
+        machine::FromRelay::Home { channel } => {
+            if adopt_home(dir, Some(channel)) {
+                let _ = reload.send(()).await;
+            }
+        }
         // `pwd <this machine>:<path>`. Only this machine can see its folders, so the gateway waits for this
         // answer before handing the channel over — a folder that isn't there changes nothing
         machine::FromRelay::SetProject {
@@ -1952,6 +1958,7 @@ mod tests {
 
         b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "<@U_BOT> channels")).await;
         b.on_inbound(&channel_msg("1782000001.000200", "U_OWNER", "<@U_BOT> pwd dock:~/x")).await;
+        b.on_inbound(&channel_msg("1782000001.000300", "U_OWNER", "<@U_BOT> set-home")).await;
         settle().await;
 
         assert_eq!(
@@ -1967,8 +1974,33 @@ mod tests {
                 path: Some("~/x".into()),
             })
         );
+        assert_eq!(
+            up_rx.try_recv(),
+            Ok(LinkFrame::SetHome { channel: "C1".into(), thread_ts: "1782000001.000300".into() }),
+            "one notice channel for the whole fleet, so the gateway decides"
+        );
         // The gateway answers in the thread; the machine says nothing of its own
         assert!(slack.calls().is_empty(), "{:?}", slack.calls());
+    }
+
+    /// A folder set on the machine itself is reported up, so the gateway's `channels` doesn't go stale.
+    #[tokio::test]
+    async fn a_folder_set_here_is_reported_to_the_gateway() {
+        use crate::bridge::gateway::link::LinkFrame;
+        let (d, _slack, _agent, _clock) = flow_deps("pwd-report");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let (up, mut up_rx) = mpsc::unbounded_channel();
+        b.ask_gateway = Some(up);
+        b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "<@U_BOT> pwd /work/app")).await;
+        settle().await;
+        assert_eq!(
+            up_rx.try_recv(),
+            Ok(LinkFrame::ProjectSet {
+                channel: "C1".into(),
+                thread_ts: String::new(),
+                result: Ok("/work/app".into()),
+            })
+        );
     }
 
     /// `pwd` names the machine in front of the path — the same path is a different folder elsewhere.

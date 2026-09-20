@@ -118,6 +118,10 @@ pub mod link {
             thread_ts: String,
             path: String,
         },
+        /// The notice channel changed. Sent to every machine so they all write to the same place.
+        Home { channel: String },
+        /// `set-home`, asked from a machine — same reason as [`LinkFrame::Channels`].
+        SetHome { channel: String, thread_ts: String },
         /// `channels`, asked from a machine. **The gateway only sees messages that mention the bot**, and a
         /// follow-up in a running thread doesn't; the machine that owns the thread asks on its behalf.
         Channels { channel: String, thread_ts: String },
@@ -1090,12 +1094,16 @@ impl CommandCtx<'_> {
                 "`set-home` は、通知を出したい *チャンネル* で実行してください。DM は通知先にできません。"
             ));
         }
-        let ch = ctx.channel_id;
-        SetHomeOutcome::Set(crate::t!(
-            "Notices from every machine will now go to <#{ch}>.",
-            "これからは、すべてのマシンの通知を <#{ch}> に出します。"
-        ))
+        SetHomeOutcome::Set(set_home_reply(ctx.channel_id))
     }
+}
+
+/// What `set-home` says once the notice channel is this one.
+fn set_home_reply(ch: &str) -> String {
+    crate::t!(
+        "Notices from every machine will now go to <#{ch}>.",
+        "これからは、すべてのマシンの通知を <#{ch}> に出します。"
+    )
 }
 
 /// Why a name isn't a machine we can hand a channel to, and what is online instead.
@@ -1948,26 +1956,8 @@ impl Fleet {
         //    (each passes it through its own gate)
         match ctx.set_home() {
             SetHomeOutcome::NotACommand => {}
-            SetHomeOutcome::Set(reply) => {
-                let home = channel.to_string();
-                self.edit_access(move |a| a.home_channel = Some(home)).await;
-                let frame = link::LinkFrame::Event {
-                    name: "message".to_string(),
-                    event: ev.raw.clone(),
-                };
-                let delivered = self
-                    .links
-                    .connected()
-                    .iter()
-                    .filter(|id| self.links.send_to(id, &frame))
-                    .count();
-                rlog(
-                    "info",
-                    &format!(
-                        "set-home chan={channel} — saved and broadcast to {delivered} machine(s)"
-                    ),
-                );
-                self.post(channel, Some(&thread), &reply).await;
+            SetHomeOutcome::Set(_) => {
+                self.set_home(channel, &thread).await;
                 return true;
             }
             SetHomeOutcome::Refused(reply) | SetHomeOutcome::NeedsChannel(reply) => {
@@ -2011,6 +2001,19 @@ impl Fleet {
         thread_ts: &str,
         result: Result<String, String>,
     ) {
+        if thread_ts.is_empty() {
+            // A folder set on the machine itself: record it so `channels` shows where the work happens
+            if let Ok(abs) = result {
+                let (ch, id) = (channel.to_string(), bridge_id.to_string());
+                self.edit_access(move |a| {
+                    let r = a.routes.entry(ch).or_default();
+                    r.bridge = Some(id);
+                    r.repo_path = Some(abs);
+                })
+                .await;
+            }
+            return;
+        }
         match result {
             Ok(abs) => {
                 let mut reply = handover_reply(channel, &self.access().bridges(), bridge_id);
@@ -2063,6 +2066,10 @@ impl Fleet {
                 );
                 self.post(&channel, Some(&thread_ts), &table).await;
             }
+            link::LinkFrame::SetHome {
+                channel,
+                thread_ts,
+            } => self.set_home(&channel, &thread_ts).await,
             link::LinkFrame::PwdOn {
                 channel,
                 thread_ts,
@@ -2071,6 +2078,28 @@ impl Fleet {
             } => self.assign_project(&channel, &thread_ts, &machine, path).await,
             _ => rlog("info", &format!("{bridge_id}: dropped an unexpected frame from a machine")),
         }
+    }
+
+    /// The notice channel. **Saved here and pushed to every machine**, so notices from the whole fleet
+    /// land in one place; a machine that was away catches up from the `home` in its next handshake.
+    async fn set_home(self: &Arc<Self>, channel: &str, thread_ts: &str) {
+        let home = channel.to_string();
+        self.edit_access(move |a| a.home_channel = Some(home)).await;
+        let frame = link::LinkFrame::Home {
+            channel: channel.to_string(),
+        };
+        let delivered = self
+            .links
+            .connected()
+            .iter()
+            .filter(|id| self.links.send_to(id, &frame))
+            .count();
+        rlog(
+            "info",
+            &format!("set-home chan={channel} — saved and sent to {delivered} machine(s)"),
+        );
+        let reply = set_home_reply(channel);
+        self.post(channel, Some(thread_ts), &reply).await;
     }
 
     /// `pwd <machine>[:<path>]` — check the machine is here, then let it check the folder.

@@ -188,6 +188,15 @@ impl Bridge {
                 match self.access.apply(op) {
                     Ok((access, message, warnings)) => {
                         self.adopt_access(access, ctx);
+                        // No thread = nothing to say, just keep the gateway's copy current (`channels`)
+                        self.ask_the_gateway(
+                            crate::bridge::gateway::link::LinkFrame::ProjectSet {
+                                channel: msg.channel.clone(),
+                                thread_ts: String::new(),
+                                result: Ok(path.clone()),
+                            },
+                            ctx,
+                        );
                         ctx.info(
                             "bridge",
                             &format!(
@@ -260,6 +269,17 @@ impl Bridge {
                         "`set-home` は、通知を出したい *チャンネル* で実行してください。DM は通知先にできません。"
                     );
                     self.post(&msg.channel, root_ts, refusal, key);
+                    return;
+                }
+                // Every machine writes its notices to the same place, so the gateway decides and tells
+                // them all; deciding it here alone would leave the others pointing somewhere else
+                if self.ask_the_gateway(
+                    crate::bridge::gateway::link::LinkFrame::SetHome {
+                        channel: msg.channel.clone(),
+                        thread_ts: root_ts.to_string(),
+                    },
+                    ctx,
+                ) {
                     return;
                 }
                 bridge::AccessOp::SetHome(msg.channel.clone())

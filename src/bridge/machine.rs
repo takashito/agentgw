@@ -92,6 +92,8 @@ pub enum FromRelay {
         channel: String,
         thread_ts: String,
     },
+    /// The notice channel decided by the gateway.
+    Home { channel: String },
     /// `pwd <this machine>:<path>` — check the folder here, store it, answer up the link.
     SetProject {
         channel: String,
@@ -151,8 +153,11 @@ impl FromRelay {
                 thread_ts,
                 path,
             },
+            F::Home { channel } => FromRelay::Home { channel },
             // Answers and asks only ever go the other way
-            F::ProjectSet { .. } | F::Channels { .. } | F::PwdOn { .. } => return None,
+            F::ProjectSet { .. } | F::Channels { .. } | F::PwdOn { .. } | F::SetHome { .. } => {
+                return None;
+            }
         })
     }
 }
