@@ -601,11 +601,41 @@ impl Access {
     }
 
     /// If missing, owner is empty = fail-closed.
+    ///
+    /// **Missing is normal, unreadable is an accident** — the same distinction [`Threads::load`] had to
+    /// learn. Fail-closed means a corrupt file turns the bot into a black hole: every message is dropped at
+    /// the door, including the one that would fix the owner. That must not happen without a word.
     pub fn load(dir: &StateDir) -> Self {
-        std::fs::read_to_string(dir.join("access.json"))
-            .ok()
-            .and_then(|s| Self::from_str(&s).ok())
-            .unwrap_or_default()
+        let (access, complaint) = Self::from_read(std::fs::read_to_string(dir.join("access.json")));
+        if let Some(why) = complaint {
+            LogCtx::default().error("bridge", &why);
+        }
+        access
+    }
+
+    /// What to make of what the file said, and what to complain about. **Pure**, so the two cases can be
+    /// told apart in a test: `None` = nothing to say.
+    fn from_read(read: std::io::Result<String>) -> (Self, Option<String>) {
+        match read {
+            Ok(src) => match Self::from_str(&src) {
+                Ok(access) => (access, None),
+                Err(e) => (
+                    Self::default(),
+                    Some(format!(
+                        "access.json is corrupt ({e}) — nobody is the owner, so every message is \
+                         refused until it is fixed or removed"
+                    )),
+                ),
+            },
+            // First start, or never set up. Fail-closed and quiet
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Self::default(), None),
+            Err(e) => (
+                Self::default(),
+                Some(format!(
+                    "could not read access.json ({e}) — nobody is the owner, so every message is refused"
+                )),
+            ),
+        }
     }
 
     pub fn to_string_pretty(&self) -> serde_json::Result<String> {
@@ -1910,6 +1940,36 @@ mod tests {
         // Dropping an unknown one doesn't break anything
         assert_eq!(p.release("/repo/zzz"), None);
         assert_eq!(p.release_session("sid-zzz"), None);
+    }
+
+    /// **Missing is normal, corrupt is an accident**, and the two lead to the same fail-closed result:
+    /// nobody is the owner, so every message is refused — including the one that would fix it. The
+    /// accident has to say so. `threads.json` learned this on a real machine; this file had the same
+    /// `.ok()` until it was pointed out.
+    #[test]
+    fn a_corrupt_access_file_is_told_apart_from_a_missing_one() {
+        let missing = Access::from_read(Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no such file",
+        )));
+        assert!(missing.0.owner.is_empty(), "fail-closed either way");
+        assert_eq!(missing.1, None, "a first start says nothing");
+
+        let corrupt = Access::from_read(Ok("{ not json".to_string()));
+        assert!(corrupt.0.owner.is_empty());
+        let said = corrupt.1.expect("a corrupt file must not pass in silence");
+        assert!(said.contains("access.json is corrupt"), "{said}");
+        assert!(said.contains("every message is"), "{said}");
+
+        let unreadable = Access::from_read(Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "denied",
+        )));
+        assert!(unreadable.1.is_some(), "there but unreadable is an accident too");
+
+        let good = Access::from_read(Ok(r#"{"owner":"U1"}"#.to_string()));
+        assert_eq!(good.0.owner, "U1");
+        assert_eq!(good.1, None);
     }
 
     /// A **corrupt** (not just unknown-field) pools.json starts empty (doesn't block startup).

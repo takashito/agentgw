@@ -1495,9 +1495,14 @@ impl HookIntake {
             });
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
         tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, app).await {
-                LogCtx::default().error("hooks", &format!("hook endpoint stopped: {e}"));
-            }
+            // Same as the MCP endpoint: agents hold this address, so a server that returns leaves every
+            // hook — receipts, permissions, turn failures — unanswered, in silence
+            let why = match axum::serve(listener, app).await {
+                Err(e) => format!("hook endpoint stopped: {e}"),
+                Ok(()) => "hook endpoint stopped".to_string(),
+            };
+            LogCtx::default().error("hooks", &why);
+            std::process::exit(1);
         });
         LogCtx::default().info("hooks", &format!("hook endpoint on 127.0.0.1:{port}"));
         Ok((port, token))

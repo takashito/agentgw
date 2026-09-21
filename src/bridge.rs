@@ -407,19 +407,21 @@ impl Bridge {
             &format!("shutting down ({reason}) pid={}", std::process::id()),
         );
         eprintln!("slack bridge: shutting down ({reason})");
+        // **Save first, before anything that can block.** Agents go down with us, so requests left in the
+        // queue can only be rescued here — and this is the only step whose loss is silent and permanent.
+        // It used to run after a `hostname` fork and a Slack round trip, both inside the 5-second budget
+        self.flush_pending_to_disk(&ctx);
+        self.save_ledger();
         // Always go down (5 seconds), even if something below gets stuck.
         // Teardown waits out tmux's SIGTERM grace, so this is the only upper bound
         tokio::spawn(async {
             tokio::time::sleep(Duration::from_secs(5)).await;
             std::process::exit(0);
         });
-        // Post offline **first**. Teardown takes seconds, so leaving it for later
-        // gets the notice eaten by the hard exit above (the same accident is noted there)
+        // Post offline **before tearing down**. Teardown takes seconds, so leaving it for later
+        // gets the notice eaten by the hard exit above
         let offline = offline_notice(&Host::name().await, env!("CARGO_PKG_VERSION"), reason);
         self.post_notice(&offline, &ctx).await;
-        // Save them before tearing down — agents go down with it, so requests left in the queue can only be rescued here
-        self.flush_pending_to_disk(&ctx);
-        self.save_ledger();
         self.teardown_all_workers("shutdown", "", &ctx).await;
         ctx.info("bridge", &format!("shutdown complete ({reason})"));
         std::process::exit(0);
@@ -623,7 +625,16 @@ impl Bridge {
                 let (fleet, up) = (fleet.clone(), uplink.clone());
                 let me = wiring.self_id.clone().unwrap_or_default();
                 tokio::spawn(async move {
-                    while let Some(frame) = up.lock().await.recv().await {
+                    // **Take the frame, then let go of the lock.** Written as one `while let`, the guard
+                    // lives through the body — so the lock was held across Slack I/O and access.json
+                    // writes, serializing every machine behind the slowest frame, and any future lock of
+                    // the uplink inside the handler would deadlock
+                    loop {
+                        let frame = {
+                            let mut rx = up.lock().await;
+                            rx.recv().await
+                        };
+                        let Some(frame) = frame else { break };
                         fleet.on_machine_frame(&me, frame).await;
                     }
                 });
@@ -684,10 +695,16 @@ impl Bridge {
         match (mode, relay_rx) {
             (machine::Mode::Direct { app_token, .. }, _) => {
                 tokio::spawn(async move {
-                    if let Err(e) = slack::Api::listen(&app_token, msg_tx, click_tx, fleet_tx).await
-                    {
-                        LogCtx::default().error("slack", &format!("socket mode stopped: {e}"));
-                    }
+                    // **Returning is a failure too.** `listen` ends with `Ok(())` when the socket closes for
+                    // good, so an `if let Err` here caught nothing: the Bridge stayed up with an empty inbox
+                    // and looked, from Slack, exactly like a hang. Going down hands it to the service manager
+                    let why = match slack::Api::listen(&app_token, msg_tx, click_tx, fleet_tx).await {
+                        Err(e) => format!("socket mode stopped: {e}"),
+                        Ok(()) => "socket mode closed and will not reopen".to_string(),
+                    };
+                    LogCtx::default().error("slack", &why);
+                    eprintln!("slack bridge: {why}");
+                    std::process::exit(1);
                 });
             }
             // Via the gateway (whether we dial or it comes to fetch us). **Fed into the same two

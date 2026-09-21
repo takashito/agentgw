@@ -216,9 +216,14 @@ impl Mcp {
             ));
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
         tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, app).await {
-                LogCtx::default().error("mcp", &format!("mcp endpoint stopped: {e}"));
-            }
+            // Agents bake this endpoint into their config, so a server that returns — for any reason —
+            // leaves every later tool call refused. Say so and let the service manager start us again
+            let why = match axum::serve(listener, app).await {
+                Err(e) => format!("mcp endpoint stopped: {e}"),
+                Ok(()) => "mcp endpoint stopped".to_string(),
+            };
+            LogCtx::default().error("mcp", &why);
+            std::process::exit(1);
         });
         LogCtx::default().info("mcp", &format!("mcp endpoint on 127.0.0.1:{port}/mcp"));
         Ok((port, token))
