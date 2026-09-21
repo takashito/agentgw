@@ -256,27 +256,23 @@ fn ask_parent(state_dir: &StateDir) -> Result<(), String> {
     .validate()?;
     std::fs::create_dir_all(state_dir.path())
         .map_err(|e| format!("{}: {e}", state_dir.path().display()))?;
-    state_dir
-        .write_atomic(
-            ".env",
-            &Tokens {
-                bot: bot.clone(),
-                app: app.clone(),
-            }
-            .apply_to_env(&text),
-        )
-        .map_err(|e| format!("{}: {e}", env_file.display()))?;
-    // Don't let anyone else read a file holding tokens
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&env_file, std::fs::Permissions::from_mode(0o600));
-    }
+    // **Owner-only from the moment it is created.** Writing it first and chmod-ing after leaves a window in
+    // which both Slack tokens are world-readable
+    crate::state_dir::write_atomic_mode(
+        &env_file,
+        &Tokens {
+            bot: bot.clone(),
+            app: app.clone(),
+        }
+        .apply_to_env(&text),
+        Some(0o600),
+    )
+    .map_err(|e| format!("{}: {e}", env_file.display()))?;
     println!(
         "{}",
         crate::t!(
-            "Saved the tokens: {} (chmod 600)",
-            "トークンを保存しました: {} (chmod 600)",
+            "Saved the tokens: {} (owner only)",
+            "トークンを保存しました: {}(自分だけが読めます)",
             env_file.display()
         )
     );

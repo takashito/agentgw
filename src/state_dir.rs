@@ -103,13 +103,21 @@ impl StateDir {
     }
 
     /// Writes a generated file and returns the path to pass to claude. Creates the parent directory.
+    ///
+    /// **Owner-only, directory included.** These files carry the hook and MCP tokens, and they live in the
+    /// shared OS temp area — at the default mode every local user could read them and then post to Slack or
+    /// forge a permission answer (measured on a real machine: `644` on `worker-hooks.json` and `mcp/<sid>.json`).
     pub fn write_runtime_json(
         &self,
         name: &str,
         value: &serde_json::Value,
     ) -> std::io::Result<PathBuf> {
         let path = self.runtime_dir().join(name);
-        write_json_at(&path, value)?;
+        private_dir(&self.runtime_dir())?;
+        if let Some(parent) = path.parent() {
+            private_dir(parent)?;
+        }
+        write_atomic_mode(&path, &serde_json::to_string_pretty(value)?, Some(0o600))?;
         Ok(path)
     }
 
@@ -163,11 +171,7 @@ impl StateDir {
         if let Some(t) = self.endpoint(which)["token"].as_str() {
             return t.to_string();
         }
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or_default();
-        let token = format!("{:x}{nanos:x}", std::process::id());
+        let token = mint_secret();
         let _ = self.put_endpoint(which, "token", serde_json::json!(token));
         token
     }
@@ -191,6 +195,45 @@ fn read_json_at(path: &Path, default: serde_json::Value) -> serde_json::Value {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or(default)
+}
+
+/// Mint one secret: 32 bytes of `/dev/urandom` as hex.
+///
+/// **Read exactly 32 bytes.** `/dev/urandom` never returns EOF, so `fs::read` reads forever (confirmed on
+/// a real machine on 2026-08-01, where it hung the connection string).
+///
+/// This is the one generator for every secret the Bridge makes. The hook and MCP tokens used to be
+/// `pid` + nanoseconds, which is guessable from a rough start time — and they are the only thing between a
+/// local process and posting to Slack or forging a permission answer.
+pub(crate) fn mint_secret() -> String {
+    let mut bytes = [0u8; 32];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        let _ = f.read_exact(&mut bytes);
+    }
+    // Even if it somehow can't be read, never use all zeros as the secret
+    let pid = std::process::id().to_be_bytes();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default()
+        .to_be_bytes();
+    for (i, b) in pid.iter().chain(now.iter()).enumerate() {
+        bytes[i] ^= b;
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Create a directory only its owner may enter. Applied to what is already there too: the runtime
+/// directory outlives one start, so a directory made before this rule existed stays open otherwise.
+fn private_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 fn write_json_at(path: &Path, value: &serde_json::Value) -> std::io::Result<()> {
@@ -348,7 +391,32 @@ SPACES = padded ";
             std::fs::read_to_string(&path).unwrap().trim(),
             "{\n  \"k\": 1\n}"
         );
+        // These carry the hook and MCP tokens and sit in the shared temp area: owner only, directory included
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &std::path::Path| {
+                std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+            };
+            assert_eq!(mode(&path), 0o600, "{}", path.display());
+            assert_eq!(mode(path.parent().unwrap()), 0o700);
+            assert_eq!(mode(&dir.runtime_dir()), 0o700);
+        }
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The hook and MCP tokens guard posting to Slack and answering permission prompts. They used to be
+    /// `pid` + nanoseconds — two starts a moment apart produced neighbouring values.
+    #[test]
+    fn a_minted_secret_is_random_and_full_length() {
+        let a = mint_secret();
+        let b = mint_secret();
+        assert_eq!(a.len(), 64, "{a}");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
+        assert_ne!(a, b, "two secrets in a row must not match");
+        assert_ne!(a, "0".repeat(64), "never all zeros");
+        // Nothing of the process id is readable in it (the old shape started with it)
+        assert!(!a.starts_with(&format!("{:x}", std::process::id())), "{a}");
     }
 
     #[test]

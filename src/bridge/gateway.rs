@@ -2995,23 +2995,10 @@ impl Cli {
         crate::state_dir::write_atomic_mode(&path, &after, Some(0o600))
     }
 
-    /// Mint one secret. `/dev/urandom` as hex.
-    ///
-    /// **Read only 32 bytes.** `/dev/urandom` never returns EOF, so `fs::read` reads forever
-    /// (confirmed on a real machine on 2026-08-01 — this one line brought over from the Relay hung the connection string).
+    /// Mint the key machines present. The generator lives in [`crate::state_dir::mint_secret`] — every
+    /// secret this Bridge makes comes from the same place.
     fn mint_token() -> String {
-        let mut bytes = [0u8; 32];
-        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-            use std::io::Read;
-            let _ = f.read_exact(&mut bytes);
-        }
-        // Even if it somehow can't be read, never use all zeros as the secret
-        let pid = std::process::id().to_be_bytes();
-        let now = now_ms().to_be_bytes();
-        for (i, b) in pid.iter().chain(now.iter()).enumerate() {
-            bytes[i] ^= b;
-        }
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
+        crate::state_dir::mint_secret()
     }
 
     /// The key shown to machines. **Once made, never changed** — remaking it would lock out every

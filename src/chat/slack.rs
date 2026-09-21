@@ -374,15 +374,34 @@ impl Api {
     /// ponytail: shells out to curl. Every slack-morphism HTTP helper assumes JSON deserialization and
     /// has no way to return raw bytes, and adding dependencies is not allowed. Revisit when attachments get serious.
     pub async fn download_to(&self, url: &str, dest: &std::path::Path) -> Result<(), String> {
-        let auth = format!("Authorization: Bearer {}", self.bot_token);
+        // **The token goes in on stdin, never in argv** — a bot token is workspace-wide, and anyone running
+        // `ps auxww` during a download would read it off the command line.
+        let config = format!("header = \"Authorization: Bearer {}\"\n", self.bot_token);
         // `--max-time` is the real limit on the process side. If the caller drops the future, curl lives on
         // and keeps writing into the inbox after we said "timed out", so the limit must apply to the child too
         let max_time = DOWNLOAD_TIMEOUT.as_secs().to_string();
-        let out = tokio::process::Command::new("/usr/bin/curl")
-            .args(["-sSfL", "--max-time", &max_time, "-H", &auth, "-o"])
+        let mut child = tokio::process::Command::new("/usr/bin/curl")
+            .args(["-sSfL", "--max-time", &max_time, "--config", "-", "-o"])
             .arg(dest)
             .arg(url)
-            .output()
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("curl: {e}"))?;
+        {
+            use tokio::io::AsyncWriteExt;
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| "curl: no stdin".to_string())?;
+            stdin
+                .write_all(config.as_bytes())
+                .await
+                .map_err(|e| format!("curl: {e}"))?;
+        }
+        let out = child
+            .wait_with_output()
             .await
             .map_err(|e| format!("curl: {e}"))?;
         if !out.status.success() {
