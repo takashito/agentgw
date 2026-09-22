@@ -849,6 +849,8 @@ impl Bridge {
             b.restore_pools(&LogCtx::default()).await;
             b.start_missing_pool_workers(&LogCtx::default());
         }
+        // Fold the permission prompts the previous process left waiting — their buttons answer nobody
+        b.fold_stale_perm_prompts(&LogCtx::default()).await;
         // Pick up threads the previous process was waiting to answer (only those with live agents)
         b.restore_pending(&LogCtx::default());
         // Re-deliver requests that never got handed over (start an agent to hand them to if there is none)
@@ -1735,6 +1737,35 @@ mod tests {
         {
             b.on_delivery_done(done).await;
         }
+    }
+
+    /// A permission prompt the previous Bridge left waiting has buttons that answer nobody: the way back
+    /// to the agent's hook died with that process. **Say so in the message** rather than deleting it —
+    /// deleting takes the question away too.
+    #[tokio::test]
+    async fn a_permission_prompt_left_by_the_previous_bridge_is_folded_at_startup() {
+        let (d, slack, _agent, _clock) = flow_deps("stale-perm");
+        std::fs::write(
+            d.dir.join("threads.json"),
+            r#"{"1.1":{"session_id":"s1","channel_id":"C1","permPrompts":["9.9"]}}"#,
+        )
+        .unwrap();
+        let (mut b, _fx) = Bridge::for_test(d);
+
+        b.fold_stale_perm_prompts(&LogCtx::default()).await;
+
+        let calls = slack.calls();
+        assert!(
+            calls.iter().any(|c| c.starts_with("update C1 9.9")),
+            "{calls:?}"
+        );
+        assert!(
+            b.threads.entries["1.1"].perm_prompts.is_empty(),
+            "folded once, not on every start"
+        );
+        // And it is gone from disk, so the next start has nothing to do
+        let on_disk = std::fs::read_to_string(b.deps.dir.join("threads.json")).unwrap();
+        assert!(!on_disk.contains("permPrompts"), "{on_disk}");
     }
 
     /// **One delivery per window at a time.** Two texts racing into the same input box interleave, so a

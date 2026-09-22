@@ -794,6 +794,7 @@ impl Bridge {
         );
         // From here the agent is silent waiting for a person. Stop the watch
         self.suspend_stall_for_perm(&ThreadKey::new(&channel, &thread_ts));
+        self.remember_perm_prompt(&thread_ts, &prompt_ts);
         self.perm_pending.insert(
             req_id,
             PermPending {
@@ -842,7 +843,12 @@ impl Bridge {
     /// An approval button was clicked. **Answer the agent the moment it's clicked** — then redraw the prompt
     /// to show the result (the agent doesn't wait even if rewriting the post is slow).
     pub(super) async fn on_perm_click(&mut self, click: slack::PermClick) {
-        let Some(p) = self.perm_pending.remove(&click.req_id) else {
+        let answered = self.perm_pending.remove(&click.req_id);
+        if let Some(p) = &answered {
+            let (thread_ts, prompt_ts) = (p.thread_ts.clone(), p.prompt_ts.clone());
+            self.forget_perm_prompt(&thread_ts, &prompt_ts);
+        }
+        let Some(p) = answered else {
             // Already clicked / folded on expiry. A second click does nothing
             return;
         };
@@ -895,6 +901,69 @@ impl Bridge {
         }
     }
 
+    /// Write down a prompt that is waiting for a person, so the **next** Bridge can fold it.
+    fn remember_perm_prompt(&mut self, thread_ts: &str, prompt_ts: &str) {
+        let Some(e) = self.threads.get(thread_ts).cloned() else {
+            return; // no entry yet = no agent yet; there is nothing a restart could strand
+        };
+        let mut e = e;
+        if !e.perm_prompts.iter().any(|t| t == prompt_ts) {
+            e.perm_prompts.push(prompt_ts.to_string());
+        }
+        self.threads.upsert(thread_ts, e);
+        if let Err(err) = self.threads.save() {
+            LogCtx::default().error("bridge", &format!("threads.json save failed: {err}"));
+        }
+    }
+
+    /// Answered, expired, or folded at startup — the paper is gone either way.
+    fn forget_perm_prompt(&mut self, thread_ts: &str, prompt_ts: &str) {
+        let Some(mut e) = self.threads.get(thread_ts).cloned() else {
+            return;
+        };
+        let before = e.perm_prompts.len();
+        e.perm_prompts.retain(|t| t != prompt_ts);
+        if e.perm_prompts.len() == before {
+            return;
+        }
+        self.threads.upsert(thread_ts, e);
+        if let Err(err) = self.threads.save() {
+            LogCtx::default().error("bridge", &format!("threads.json save failed: {err}"));
+        }
+    }
+
+    /// Prompts the previous Bridge left waiting. **Rewrite them, don't delete them** — deleting takes the
+    /// question away with the buttons, and a prompt left as it is answers a click with silence (the reqId
+    /// it carries means nothing to this process).
+    pub(super) async fn fold_stale_perm_prompts(&mut self, ctx: &LogCtx) {
+        let stale: Vec<(String, String, String)> = self
+            .threads
+            .entries
+            .iter()
+            .flat_map(|(thread_ts, e)| {
+                let channel = e.channel_id.clone().unwrap_or_default();
+                e.perm_prompts
+                    .iter()
+                    .map(move |ts| (channel.clone(), ts.clone(), thread_ts.clone()))
+            })
+            .filter(|(channel, ..)| !channel.is_empty())
+            .collect();
+        for (channel, prompt_ts, thread_ts) in stale {
+            ctx.info(
+                "bridge",
+                &format!("folding a permission prompt left waiting in {channel} ts={prompt_ts}"),
+            );
+            let text = crate::t!(
+                "⚠️ The Bridge restarted while this was waiting, so nothing was approved. Ask again.",
+                "⚠️ 待っている間に Bridge が再起動したので、何も許可されていません。もう一度依頼してください。"
+            );
+            if let Err(e) = self.deps.slack.update_message(&channel, &prompt_ts, &text).await {
+                ctx.debug("bridge", &format!("stale perm prompt {prompt_ts}: {e}"));
+            }
+            self.forget_perm_prompt(&thread_ts, &prompt_ts);
+        }
+    }
+
     /// Expired with nobody clicking. The agent already gave up and moved on, so **delete the leftover prompt** —
     /// left in place, a later Allow click would "work but do nothing".
     pub(super) async fn expire_perm_prompts(&mut self) {
@@ -909,6 +978,7 @@ impl Bridge {
             let Some(p) = self.perm_pending.remove(&id) else {
                 continue;
             };
+            self.forget_perm_prompt(&p.thread_ts, &p.prompt_ts);
             let ctx = LogCtx {
                 session_id: None,
                 thread_key: Some(ThreadKey::new(&p.channel, &p.thread_ts)),

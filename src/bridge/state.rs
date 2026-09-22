@@ -148,6 +148,14 @@ pub struct ThreadEntry {
     /// this uses the Bun version's name (inflight). Written in one place only: [`Ledger::flush`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inflight: Vec<Inflight>,
+    /// ts of permission prompts waiting for a person right now. **More than one** — tool calls can come
+    /// in parallel.
+    ///
+    /// Only the paper in Slack is kept. The way back to the agent's hook is a channel inside the process
+    /// and cannot be carried over, so a restart leaves a prompt whose buttons do nothing; this is what
+    /// lets the next start say so instead of leaving it there.
+    #[serde(rename = "permPrompts", default, skip_serializing_if = "Vec::is_empty")]
+    pub perm_prompts: Vec<String>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -1940,6 +1948,17 @@ mod tests {
         // Dropping an unknown one doesn't break anything
         assert_eq!(p.release("/repo/zzz"), None);
         assert_eq!(p.release_session("sid-zzz"), None);
+    }
+
+    /// The paper left in Slack rides threads.json. **Nothing is written when there is none** — a
+    /// threads.json from a Bridge that never had this field comes back byte for byte.
+    #[test]
+    fn permission_prompts_survive_a_round_trip_and_stay_invisible_when_empty() {
+        let mut t = Threads::from_str(r#"{"1.1":{"session_id":"s1","channel_id":"C1"}}"#).unwrap();
+        assert!(!t.to_string_pretty().unwrap().contains("permPrompts"));
+        t.entries.get_mut("1.1").unwrap().perm_prompts = vec!["9.9".to_string()];
+        let again = Threads::from_str(&t.to_string_pretty().unwrap()).unwrap();
+        assert_eq!(again.entries["1.1"].perm_prompts, vec!["9.9".to_string()]);
     }
 
     /// **Missing is normal, corrupt is an accident**, and the two lead to the same fail-closed result:
