@@ -1722,7 +1722,17 @@ impl Thinking {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let (channel, thread_ts) = (channel.to_string(), thread_ts.to_string());
         tokio::spawn(async move {
+            // **Only changes go out.** Slack draws the busy state itself now, so two "is typing…"
+            // in the same second are the same picture twice — and the compact tick re-sets every
+            // 800ms. A thread starts idle, so a guard that never showed anything sends nothing on
+            // Drop either
+            let mut sent = false;
             while let Some(s) = rx.recv().await {
+                let busy = !s.is_empty();
+                if busy == sent {
+                    continue;
+                }
+                sent = busy;
                 api.thinking(&channel, &thread_ts, &s).await;
             }
         });

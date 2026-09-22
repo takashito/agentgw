@@ -2271,9 +2271,14 @@ mod tests {
         settle().await;
         let thinking = format!("status C1 {ROOT} {}", slack::THINKING_STATUS);
         assert!(!slack.calls().contains(&thinking), "{:?}", slack.calls());
-        // …and the status that was up ("is typing…" from the delivery) is cleared
+        // …and the thread is not left looking busy. Either nothing was ever shown (a status that
+        // never went up needs no clear — the guard only sends changes), or the last word was the clear
         let last_status = slack.calls().into_iter().rev().find(|c| c.starts_with("status C1"));
-        assert_eq!(last_status, Some(format!("status C1 {ROOT} ")), "{:?}", slack.calls());
+        assert!(
+            last_status.is_none() || last_status == Some(format!("status C1 {ROOT} ")),
+            "{:?}",
+            slack.calls()
+        );
     }
 
     /// A failure that re-sending can fix, on an agent that isn't ready yet: the message stays

@@ -629,6 +629,15 @@ impl Bridge {
 
         let entry = self.threads.get(&root_ts).cloned();
         let is_new = entry.is_none();
+        if is_new {
+            // Name the session on the thread's first message, **whichever way it gets an agent**.
+            // A warm pool worker takes most threads (`pool: assigned` → `Dispatch::Deliver`), so
+            // naming from the cold-spawn branch missed nearly all of them
+            let (api, channel, ts) =
+                (self.deps.slack.clone(), msg.channel.clone(), root_ts.clone());
+            let topic: String = msg.text.trim().chars().take(60).collect();
+            tokio::spawn(async move { api.name_session(&channel, &ts, &topic).await });
+        }
         let sid = entry.as_ref().and_then(|e| e.agent_id.as_deref());
         // The window name depends only on session_id. A thread with no session yet has no
         // window; worker_state returns Absent without a sid, so an empty string is harmless
@@ -726,12 +735,6 @@ impl Bridge {
                 e.last_ts = Some(msg.ts.clone());
                 e.last_text = (!topic.is_empty()).then_some(topic.clone());
                 self.threads.upsert(&root_ts, e);
-                // Name the thread's session from the opening message, so it is findable in Slack's
-                // `Agents & tools` sidebar from the first message on. Fire-and-forget: the name is
-                // a convenience, and the agent starts whether or not Slack took it
-                let (api, channel, ts) =
-                    (self.deps.slack.clone(), msg.channel.clone(), root_ts.clone());
-                tokio::spawn(async move { api.name_session(&channel, &ts, &topic).await });
                 if let Err(err) = self.threads.save() {
                     ctx(Some(&sid)).error("bridge", &format!("threads.json save failed: {err}"));
                 }
@@ -1214,10 +1217,13 @@ impl Bridge {
             }
         };
         e.last_activity_ms = self.deps.clock.now_ms();
-        // Send **only when the display changes**: clearing a shown watch (shown), or showing
-        // something new (non-empty status). A burst of hooks mid-turn sends nothing if nothing is shown
-        let was_shown = std::mem::replace(&mut e.shown, false);
-        if was_shown || !status.is_empty() {
+        // **The idle one never goes out from here.** Slack draws the busy state itself, with a
+        // stop button beside it, so "activity, but nothing new to show" used to lift a line of text
+        // and now takes the button away and puts it back a moment later (seen on a live thread: it
+        // blinked through the whole turn). A turn ends where it always ended — the entry is
+        // dropped, and its guard sends the clear from the tail of the queue
+        e.shown = false;
+        if !status.is_empty() {
             e.thinking.set(status);
         }
     }
