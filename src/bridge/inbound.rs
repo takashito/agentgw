@@ -37,6 +37,12 @@ const DELIVERY_STUCK_MS: u64 = 30_000;
 /// instead of a column of them, short enough that a passing modal costs one wait.
 const DELIVERY_RETRY_WAIT_MS: u64 = 30_000;
 
+/// How long a delivered body may go unproven before the person is told. **Generous on purpose**: a body
+/// taken as mid-turn steering is only recorded when the turn reaches it, which is as long as the tool
+/// call it lands in. Short enough and a long build would produce a warning about a message that arrives
+/// fine.
+const RECEIPT_GRACE_MS: u64 = 180_000;
+
 pub fn envelope(msg: &InboundMsg, root_ts: &str, now_ms: u64) -> String {
     envelope_guarded(msg, root_ts, None, now_ms)
 }
@@ -1359,6 +1365,11 @@ impl Bridge {
                 // It went through: this window is out of trouble, and the next failure is news again
                 self.delivery_trouble.remove(&done.window);
                 self.pending_envelopes.remove(&done.msg_ts);
+                // Typed in, not yet proven to be in. [`Bridge::warn_unreceived`] comes back to it
+                self.awaiting_receipt.insert(
+                    done.msg_ts.clone(),
+                    (done.key.clone(), self.deps.clock.now_ms() + RECEIPT_GRACE_MS),
+                );
                 if let Some(q) = self.pending.get_mut(&root_ts) {
                     q.retain(|m| m.ts != done.msg_ts);
                     if q.is_empty() {
@@ -1405,6 +1416,50 @@ impl Bridge {
                     );
                 }
             }
+        }
+    }
+
+    /// A body that was typed in and never turned up anywhere. **Told once, and never retyped** — retyping
+    /// is what stacked four copies of the same request in one input box. The ledger is the judge: an id
+    /// still unreceived after [`RECEIPT_GRACE_MS`] reached no one, whatever the screen looked like.
+    ///
+    /// The thread is settled with it, as a told failure is elsewhere: left unanswered, the silence watcher
+    /// puts up `is thinking…` for a turn that will never start.
+    pub(super) fn warn_unreceived(&mut self, ctx: &LogCtx) {
+        let now = self.deps.clock.now_ms();
+        let due: Vec<String> = self
+            .awaiting_receipt
+            .iter()
+            .filter(|(_, (_, at))| now >= *at)
+            .map(|(ts, _)| ts.clone())
+            .collect();
+        for ts in due {
+            let Some((key, _)) = self.awaiting_receipt.remove(&ts) else {
+                continue;
+            };
+            if !self.ledger.unreceived(&key).contains(&ts) {
+                continue; // it went in — the hook or the transcript said so
+            }
+            let ctx = LogCtx {
+                thread_key: Some(key.clone()),
+                ..ctx.clone()
+            };
+            ctx.error(
+                "bridge",
+                &format!("message_id={ts} was typed in but never reached the agent"),
+            );
+            self.settle_told(&key);
+            let (channel, Some(thread_ts)) = key.split() else {
+                continue;
+            };
+            self.post_error_frame(
+                channel,
+                thread_ts,
+                crate::t!(
+                    "This never reached the agent — it was typed in, but nothing came back. Send it again if it still matters.",
+                    "これはエージェントに届きませんでした。入力は通りましたが、取り込まれた形跡がありません。必要なら送り直してください。"
+                ),
+            );
         }
     }
 

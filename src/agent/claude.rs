@@ -61,7 +61,12 @@ const WORKER_STARTUP_PROMPT: &str = "You are a Slack thread worker. There is no 
 
 /// How many times to press Enter again when the delivered body is still in the input box, and the pause between.
 /// Same idea as the slash commands' `SUBMIT_RETRY_CAP`, only the target is the body.
-const DELIVER_SUBMIT_RETRIES: u32 = 4;
+///
+/// **Four presses (≈1s) is less than a busy TUI takes.** A pane measured on 2026-09-22 while a turn ran
+/// took longer than that to swallow a body, and the box still holding the text was then read as a failed
+/// delivery: the message stayed queued and the tick **typed the whole body in again**, stacking copies
+/// (one thread received the same request four times).
+const DELIVER_SUBMIT_RETRIES: u32 = 9;
 const DELIVER_SUBMIT_POLL: Duration = Duration::from_millis(200);
 
 /// Levels `/effort` accepts (checked on a real machine 2026-07-17: the slider's 5 steps + `ultracode` / `auto`).
@@ -253,26 +258,22 @@ impl Claude {
             if let Some(why) = Self::not_accepting_keys(&pane) {
                 return Err(format!("{w}: {why}"));
             }
-            let screen = Pane::new(&pane);
-            if screen.input_box_empty() {
-                return Ok(());
-            }
-            // **A turn is running: the box holding the text is where it belongs.** Claude Code keeps
-            // steering typed mid-turn in the box and takes it when the turn allows, so an empty box is
-            // not something to wait for. Calling it a failure made the tick type the same message in
-            // again every couple of seconds — stacking it in the box — and, from 0.37.0, say so in the
-            // thread each time (seen on a real machine 2026-09-22)
-            if screen.turn_running() {
+            if Pane::new(&pane).input_box_empty() {
                 return Ok(());
             }
             if attempt < DELIVER_SUBMIT_RETRIES {
                 self.tmux.send_enter(w)?;
             }
         }
-        Err(format!(
-            "typed into {w} but it never submitted — the input box still holds it after \
-             {DELIVER_SUBMIT_RETRIES} extra Enter(s)"
-        ))
+        // **A full box is not proof of failure, so it is not reported as one.** A running turn takes keys
+        // (measured 2026-09-22: a pane mid-turn showed `✶ …ing… (2m 7s …)` over an *empty* box, the text
+        // having gone in), it is only slower to swallow them. Reporting failure here kept the message
+        // queued, and the queue types the body in again — which is how the same request arrived four times.
+        //
+        // **Receipt is settled where it is actually known**: the `user_prompt` hook, or, for a body taken
+        // as mid-turn steering (which fires no hook), `Bridge::scan_transcripts`. A body that never gets
+        // in is caught by [`crate::bridge::Bridge::warn_unreceived`] — once, without retyping.
+        Ok(())
     }
 
     /// Whether this window can accept typing. If not, returns **a reason a human can be shown**.
@@ -1895,33 +1896,19 @@ mod tests {
         assert_eq!(enters(&calls.lock().unwrap()), 2, "最初の1発 + 押し直し1回");
     }
 
-    /// **Text left in the box while a turn runs is delivered, not lost.** Claude Code keeps what is
-    /// typed mid-turn and takes it when the turn allows, so waiting for an empty box never ends. Read as
-    /// a failure, the tick typed the same message in again every couple of seconds and told the thread
-    /// about each attempt (seen on a real machine 2026-09-22).
+    /// **A box that will not empty is not a failed delivery.** A busy TUI is only slower to swallow
+    /// keys (measured on a real pane 2026-09-22: mid-turn, the body went in and the box came back
+    /// empty), and reporting failure here left the message queued — where the tick typed the whole
+    /// body in again, four copies of one request. Enter is pressed up to the cap, and whether the body
+    /// truly went in is settled by the ledger (`user_prompt` / the transcript), not by this screen.
     #[test]
-    fn steering_a_running_turn_counts_as_delivered() {
-        // A real footer (2026-09-22). There is no `esc to interrupt` on it — the first version of
-        // this test invented one, so it passed while real deliveries kept reporting failure.
-        let busy = "✶ Actualizing… (3m 41s · ↓ 10.5k tokens)\n  ⎿  Tip: /focus shows just your prompt\n❯ have a look at this\n";
-        let (calls, c) = deliver_probe(vec![busy, busy, busy]);
-        c.deliver(&Window::of("@42"), "have a look at this").unwrap();
-        assert_eq!(
-            enters(&calls.lock().unwrap()),
-            1,
-            "the turn will take it — no pressing Enter at a working agent"
-        );
-    }
-
-    #[test]
-    fn deliver_gives_up_loudly_instead_of_pressing_enter_forever() {
+    fn a_box_that_never_empties_is_not_reported_as_a_failure() {
         let (calls, c) = deliver_probe(vec!["❯ </channel>\n"]); // stays there forever
-        let err = c.deliver(&Window::of("@42"), "hello").unwrap_err();
-        assert!(err.contains("never submitted"), "{err}");
+        c.deliver(&Window::of("@42"), "hello").unwrap();
         assert_eq!(
             enters(&calls.lock().unwrap()),
             1 + DELIVER_SUBMIT_RETRIES as usize,
-            "押し直しは上限で止まる"
+            "the pressing stops at the cap"
         );
     }
 

@@ -71,6 +71,13 @@ pub struct Bridge {
     /// of trouble, and no retry until the wait is over** — the tick would otherwise type the same
     /// message in every half second and say so in the thread every time.
     delivery_trouble: HashMap<String, DeliveryTrouble>,
+    /// Bodies typed in but not yet proven to have gone in: message ts → the thread, and when to look.
+    ///
+    /// **Delivery no longer reads the screen for "was this submitted?"** — a busy TUI is simply slow to
+    /// swallow keys, and calling that a failure made the queue type the same body in again. Receipt is
+    /// proven by the `user_prompt` hook or by the transcript, and this is what keeps a body that never
+    /// got in from disappearing without a word.
+    awaiting_receipt: HashMap<String, (ThreadKey, u64)>,
     /// The exact text built for a message that has not been confirmed yet, by message ts.
     ///
     /// **Only the first hand-over has it.** A message built with a loop guard ("this bot has posted N
@@ -210,6 +217,7 @@ impl Bridge {
             workers: worker::Workers::default(),
             pending: HashMap::new(),
             delivering: HashMap::new(),
+            awaiting_receipt: HashMap::new(),
             pending_envelopes: HashMap::new(),
             delivery_trouble: HashMap::new(),
             deliv_tx: config.deliv_tx,
@@ -898,6 +906,7 @@ impl Bridge {
                     b.flush_stickies().await;
                     b.expire_perm_prompts().await;
                     b.retry_pending(&LogCtx::default());
+                    b.warn_unreceived(&LogCtx::default());
                     b.give_up_stuck_deliveries(&LogCtx::default());
                     b.give_up_stale_pools(&LogCtx::default()).await;
                     b.sweep_pools(&LogCtx::default());
@@ -2001,6 +2010,42 @@ mod tests {
             delivered.iter().any(|(_, t)| t.contains("and this")),
             "the message was never handed over after the wait: {delivered:?}"
         );
+    }
+
+    /// **A body that turns up nowhere is told once, and never typed in again.** Delivery stopped
+    /// judging submission by the screen (a busy TUI is only slow, not stuck), so the ledger is what
+    /// stands between a body that never got in and silence. Retyping is the other half of the lesson:
+    /// it is how one input box collected four copies of the same request.
+    #[tokio::test]
+    async fn a_body_that_never_reaches_the_agent_is_told_once() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (d, slack, agent, clock) = flow_deps("unreceived");
+        let ((mut b, _fx), mut deliv) = Bridge::for_test_with_deliveries(d);
+        running_thread(&mut b, &agent).await;
+
+        b.on_inbound(&in_thread("1782000000.000200", "hello")).await;
+        settle_deliveries(&mut b, &mut deliv).await;
+        assert_eq!(b.awaiting_receipt.len(), 1, "typed in, not proven yet");
+        let told = |s: &FakeChat| {
+            s.calls()
+                .iter()
+                .filter(|c| c.contains("never reached the agent"))
+                .count()
+        };
+
+        b.warn_unreceived(&LogCtx::default());
+        settle().await;
+        assert_eq!(told(&slack), 0, "steering is only recorded when the turn reaches it");
+
+        clock.advance(200_000);
+        b.warn_unreceived(&LogCtx::default());
+        settle().await;
+        assert_eq!(told(&slack), 1, "{:?}", slack.calls());
+        assert_eq!(agent.deliver_attempts.load(SeqCst), 1, "typed in again");
+
+        b.warn_unreceived(&LogCtx::default());
+        settle().await;
+        assert_eq!(told(&slack), 1, "said again: {:?}", slack.calls());
     }
 
     #[tokio::test]
