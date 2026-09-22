@@ -43,9 +43,13 @@ impl Bridge {
             threads.push(StatusThread {
                 channel_id,
                 thread_ts: tts.clone(),
+                // **The link goes to the newest message we saw, not the thread's first.** Slack's
+                // permalink for a reply carries the root in `thread_ts`, so it opens the same thread
+                // already scrolled down. Older records have no such ts and still link to the root
+                link_ts: e.last_ts.clone().unwrap_or_else(|| tts.clone()),
                 last_activity_ms,
                 permalink: None,
-                topic: e.topic.clone(),
+                topic: e.last_text.clone().or_else(|| e.topic.clone()),
             });
         }
         ctx.debug(
@@ -213,7 +217,7 @@ impl Bridge {
             let mut names: HashMap<String, Option<String>> = HashMap::new();
             for c in &mut channels {
                 for t in &mut c.threads {
-                t.permalink = match slack.get_permalink(&t.channel_id, &t.thread_ts).await {
+                t.permalink = match slack.get_permalink(&t.channel_id, &t.link_ts).await {
                     Ok(p) => Some(p),
                     Err(e) => {
                         ctx.debug(
@@ -502,6 +506,8 @@ pub struct StatusThread {
     /// Last activity in epoch ms. 0 = unknown
     pub last_activity_ms: u64,
     pub permalink: Option<String>,
+    /// The message the link points at: the newest one seen, falling back to the thread root.
+    pub link_ts: String,
     /// The thread's topic (first line of the opening message) — used as the link text
     pub topic: Option<String>,
 }
@@ -554,29 +560,38 @@ impl StatusThread {
         let mut rest = raw;
         while let Some(i) = rest.find('<') {
             let after = &rest[i + 1..];
-            let end = after
-                .starts_with(['@', '#', '!'])
-                .then(|| after.find('>'))
-                .flatten();
-            match end {
-                Some(j) => {
-                    stripped.push_str(&rest[..i]);
-                    rest = &after[j + 1..];
-                }
-                // A `<` that is not a token is just a character — don't delete it, move on
-                None => {
-                    stripped.push_str(&rest[..=i]);
-                    rest = after;
-                }
+            let Some(j) = after.find('>') else {
+                // A `<` that closes nowhere is just a character — don't delete it, move on
+                stripped.push_str(&rest[..=i]);
+                rest = after;
+                continue;
+            };
+            let (token, tail) = (&after[..j], &after[j + 1..]);
+            stripped.push_str(&rest[..i]);
+            // Slack's own tokens (`<@U1>`, `<#C1|general>`, `<!here>`) say nothing about the thread.
+            // A link keeps the half people wrote: `<url|label>` → `label`, and a bare `<url>` → nothing
+            if !token.starts_with(['@', '#', '!'])
+                && let Some((_, label)) = token.split_once('|')
+            {
+                stripped.push_str(label);
             }
+            rest = tail;
         }
         stripped.push_str(rest);
         let cleaned: String = stripped
             .chars()
             .filter(|c| !matches!(c, '<' | '>' | '|'))
             .collect();
+        // **A bare URL inside the label breaks the link.** Slack linkifies it and the surrounding
+        // `<permalink|label>` stops working: confirmed on a real client 2026-09-22, where the same
+        // permalink jumped to the thread with a plain label and did nothing with a URL in it. A URL
+        // is not a title anyway, and a long one ate most of the 50 characters below.
         // `\s+` → ' ' plus trim, in one pass
-        let t = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+        let t = cleaned
+            .split_whitespace()
+            .filter(|w| !w.starts_with("http://") && !w.starts_with("https://"))
+            .collect::<Vec<_>>()
+            .join(" ");
         if t.is_empty() {
             return crate::t!("(untitled)", "(無題)");
         }
@@ -929,6 +944,7 @@ mod tests {
         StatusThread {
             channel_id: channel.into(),
             thread_ts: ts.into(),
+            link_ts: ts.into(),
             last_activity_ms: idle,
             permalink: link.map(str::to_string),
             topic: topic.map(str::to_string),
@@ -1030,10 +1046,16 @@ mod tests {
             "(untitled)"
         ); // All tokens → empty
         assert_eq!(StatusThread::link_text(Some("a<b\nc  d")), "ab c d"); // An unclosed `<` just disappears (no gap left)
+        // A URL in the label breaks the link Slack builds around it (confirmed on a real client:
+        // the same permalink jumped to the thread only once the URL was out of the label)
         assert_eq!(
-            StatusThread::link_text(Some("<https://x|見出し>")),
-            "https://x見出し"
-        ); // A non-token `<`
+            StatusThread::link_text(Some("I got error again https://example.slack.com/archives/C1/p1790077014781109")),
+            "I got error again"
+        );
+        assert_eq!(StatusThread::link_text(Some("https://example.com/only")), "(untitled)");
+        // A link written in Slack's own form keeps what a person wrote, not the address
+        assert_eq!(StatusThread::link_text(Some("<https://x|見出し>")), "見出し");
+        assert_eq!(StatusThread::link_text(Some("<https://x> 見出し")), "見出し");
         let long = "あ".repeat(60);
         let cut = StatusThread::link_text(Some(&long));
         assert!(cut.ends_with('…') && cut.chars().count() == 51);

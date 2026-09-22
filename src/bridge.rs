@@ -2014,6 +2014,28 @@ mod tests {
         );
     }
 
+    /// **`status` links to where the conversation is now.** Linking to the thread's first message
+    /// left a long thread to be scrolled by hand (user, 2026-09-22), so each message seen is
+    /// remembered on the record and the link is built from that.
+    #[tokio::test]
+    async fn a_thread_remembers_the_message_to_link_to() {
+        let (d, _slack, agent, _clock) = flow_deps("last-message");
+        let ((mut b, _fx), mut deliv) = Bridge::for_test_with_deliveries(d);
+        running_thread(&mut b, &agent).await;
+        assert_eq!(
+            b.threads.get(ROOT).and_then(|e| e.last_ts.clone()),
+            Some(ROOT.to_string()),
+            "the opening message is the newest one so far"
+        );
+
+        b.on_inbound(&in_thread("1782000000.000200", "and then this")).await;
+        settle_deliveries(&mut b, &mut deliv).await;
+        let e = b.threads.get(ROOT).expect("thread on the books");
+        assert_eq!(e.last_ts.as_deref(), Some("1782000000.000200"));
+        assert_eq!(e.last_text.as_deref(), Some("and then this"));
+        assert!(e.topic.is_some(), "the opening line stays as the topic");
+    }
+
     /// **A record is kept for `--resume`, so it is dropped when there is nothing left to resume.**
     /// Records outlived their agents forever otherwise (78 on a real machine, 21 of them resumable).
     /// A live window overrides the disk: a just-spawned agent has no transcript yet.

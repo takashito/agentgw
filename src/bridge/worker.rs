@@ -507,7 +507,15 @@ impl Bridge {
             // a bare name to -t makes tmux target **the current session** — always qualify with the session
             let target = Window::of(window_id.as_deref().unwrap_or(&name));
             if let Err(e) = self.deps.agent.terminate(&target) {
-                ctx.error("bridge", &format!("exit: kill-window failed: {e}"));
+                // **Killing the process usually closes the window with it**, so "can't find window"
+                // here is the normal ending, not a fault. Logged as one, it made every clean
+                // teardown look like a failure
+                let gone = e.contains("can't find window");
+                let line = format!("exit: kill-window failed: {e}");
+                match gone {
+                    true => ctx.debug("bridge", &line),
+                    false => ctx.error("bridge", &line),
+                }
             }
             // 3. Drop only the session-key memory (threads.json intact → the next message uses --resume)
             self.workers.forget(sid);

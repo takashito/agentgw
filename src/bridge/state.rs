@@ -141,6 +141,16 @@ pub struct ThreadEntry {
     /// Written in the same shape as before — so production values are read as-is on switchover day
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
+    /// The newest message this Bridge saw in the thread: its ts, and the first 60 characters.
+    ///
+    /// **`status` links to this, not to the root.** A permalink to the root opens the thread at its
+    /// first message, leaving a long thread to be scrolled by hand (user, 2026-09-22). Slack's
+    /// permalink for a reply carries the root in `thread_ts`, so it opens the same thread, already
+    /// down where the conversation is.
+    #[serde(rename = "lastTs", skip_serializing_if = "Option::is_none")]
+    pub last_ts: Option<String>,
+    #[serde(rename = "lastText", skip_serializing_if = "Option::is_none")]
+    pub last_text: Option<String>,
     /// Requests handed over that **have no reply yet** (moved from pending.json on 2026-08-02).
     ///
     /// **Not the same as** the entry's `pending` (inside `extra`) — that one is the delivery queue of

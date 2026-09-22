@@ -619,6 +619,8 @@ impl Bridge {
         )
         .await;
         self.ledger.track(&key, &msg.ts);
+        // Where `status` should link to from now on: the newest message, not the thread's first one
+        self.remember_last_message(&root_ts, msg);
 
         // Attachments are downloaded **on receipt** and the envelope carries local paths. The
         // agent just Reads them and never needs download_attachment for the triggering message
@@ -719,7 +721,10 @@ impl Bridge {
                 // The topic used as the link text in status: trimmed, first 60 characters
                 // (counted in chars so multi-byte text isn't split)
                 let topic: String = msg.text.trim().chars().take(60).collect();
-                e.topic = (!topic.is_empty()).then_some(topic);
+                e.topic = (!topic.is_empty()).then_some(topic.clone());
+                // The record is created here, after `remember_last_message` ran and found nothing
+                e.last_ts = Some(msg.ts.clone());
+                e.last_text = (!topic.is_empty()).then_some(topic);
                 self.threads.upsert(&root_ts, e);
                 if let Err(err) = self.threads.save() {
                     ctx(Some(&sid)).error("bridge", &format!("threads.json save failed: {err}"));
@@ -1440,6 +1445,24 @@ impl Bridge {
                     );
                 }
             }
+        }
+    }
+
+    /// Remembers the newest message of a thread on its record, for `status` to link to.
+    ///
+    /// **Only what a person sent.** The agent's own replies would need the posted ts carried back
+    /// through the disposition channel; a person's last message sits a line or two above it, which
+    /// lands on the same screen, and reads better as the thread's title than its opening line.
+    fn remember_last_message(&mut self, root_ts: &str, msg: &InboundMsg) {
+        let Some(e) = self.threads.entries.get_mut(root_ts) else {
+            return; // a thread whose record is written a moment later, by the spawn path
+        };
+        e.last_ts = Some(msg.ts.clone());
+        // Same shape as `topic`: trimmed, 60 characters, counted in chars so multi-byte text is whole
+        let text: String = msg.text.trim().chars().take(60).collect();
+        e.last_text = (!text.is_empty()).then_some(text);
+        if let Err(err) = self.threads.save() {
+            LogCtx::default().error("bridge", &format!("threads.json save failed: {err}"));
         }
     }
 
