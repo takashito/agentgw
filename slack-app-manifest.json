@@ -9,6 +9,9 @@
     "background_color": "#262626"
   },
   "features": {
+    "agent_view": {
+      "agent_description": "Run Claude Code on your own machines and drive it from Slack"
+    },
     "app_home": {
       "home_tab_enabled": false,
       "messages_tab_enabled": true,
@@ -45,7 +48,9 @@
   "settings": {
     "event_subscriptions": {
       "bot_events": [
+        "agent_session_stopped",
         "app_mention",
+        "app_home_opened",
         "member_joined_channel",
         "message.channels",
         "message.groups",
