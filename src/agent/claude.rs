@@ -69,6 +69,10 @@ const WORKER_STARTUP_PROMPT: &str = "You are a Slack thread worker. There is no 
 const DELIVER_SUBMIT_RETRIES: u32 = 9;
 const DELIVER_SUBMIT_POLL: Duration = Duration::from_millis(200);
 
+/// How much of a transcript's end to read when asking when it last moved. One entry is a few hundred
+/// bytes at most, so 64KB always spans several.
+const ACTIVITY_TAIL: u64 = 64 * 1024;
+
 /// Levels `/effort` accepts (checked on a real machine 2026-07-17: the slider's 5 steps + `ultracode` / `auto`).
 const EFFORT_LEVELS: [&str; 7] = ["low", "medium", "high", "xhigh", "max", "ultracode", "auto"];
 
@@ -1131,7 +1135,8 @@ impl crate::agent::Agent for Claude {
     }
 
     fn last_activity_ms(&self, remembered: Option<&str>, session_id: &str) -> Option<u64> {
-        Transcript::locate(remembered, session_id).and_then(|t| t.mtime_ms())
+        let t = Transcript::locate(remembered, session_id)?;
+        t.last_entry_ms(ACTIVITY_TAIL).or_else(|| t.mtime_ms())
     }
 
     fn current_model(
@@ -1339,6 +1344,27 @@ impl Transcript {
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
             .map(|d| d.as_millis() as u64)
+    }
+
+    /// When the conversation itself last moved: the `timestamp` of the final entry in the last `n`
+    /// bytes. `None` if the tail holds no readable timestamp (an empty or brand-new file).
+    ///
+    /// **Not the file's mtime.** Measured on a real machine 2026-09-22: transcripts of idle agents
+    /// are rewritten long after the conversation stops, with the same bytes — seven live agents were
+    /// 0, 17min, 2.5h, 3.3h, 4.4h, 14.8h and 15.0h past their last entry. Idle measured by mtime
+    /// therefore kept resetting below the hour that tears an agent down, and nothing was ever
+    /// reclaimed. What is written inside the file cannot be moved by whatever touches it.
+    pub fn last_entry_ms(&self, n: u64) -> Option<u64> {
+        let tail = self.tail(n).ok()?;
+        // Backwards, whole entries only: the first line of a tail is usually cut in half, and a
+        // half-parsed one is simply skipped
+        tail.lines().rev().find_map(|l| {
+            let entry: serde_json::Value = serde_json::from_str(l).ok()?;
+            let ts = entry.get("timestamp")?.as_str()?;
+            chrono::DateTime::parse_from_rfc3339(ts)
+                .ok()
+                .map(|t| t.timestamp_millis() as u64)
+        })
     }
 
     /// The **last** model id named in the final `n` bytes. `Ok(None)` = readable but no id.
@@ -1797,6 +1823,31 @@ mod tests {
         let hit = t.limit_error(256 * 1024, now).unwrap().expect("limit hit");
         assert!(hit.detail.contains("usage limit reached"), "{hit:?}");
         assert_eq!(hit.reset_ms, 1_785_420_000_000); // 23:00 JST on the 30th
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **The file's own mtime is not activity.** Real transcripts of idle agents are rewritten hours
+    /// after their last entry (measured 2026-09-22: up to 15 hours), which kept resetting the idle
+    /// clock below the hour that reclaims an agent, so none ever was.
+    #[test]
+    fn activity_is_the_last_entry_not_the_file_mtime() {
+        let dir = std::env::temp_dir().join(format!("scr-activity-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.jsonl");
+        // Two real shapes: an assistant turn, then the system entry Claude Code writes after it
+        let lines = [
+            serde_json::json!({"type": "assistant", "timestamp": "2026-09-22T11:15:29.850Z"}),
+            serde_json::json!({"type": "system", "timestamp": "2026-09-22T11:15:31.433Z", "hookCount": 2}),
+        ];
+        let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        std::fs::write(&path, &body).unwrap();
+        let t = Transcript::at_offset(path.to_string_lossy().into_owned(), 0);
+
+        // 2026-09-22T11:15:31.433Z — the last entry, whatever the file was touched at since
+        assert_eq!(t.last_entry_ms(64 * 1024), Some(1_790_075_731_433));
+        // Nothing to read = nothing claimed; the caller falls back to the file
+        std::fs::write(&path, "\n").unwrap();
+        assert_eq!(t.last_entry_ms(64 * 1024), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -872,6 +872,8 @@ impl Bridge {
         }
         // Temp files a crashed predecessor left next to the state files
         crate::state_dir::sweep_write_leftovers(b.deps.dir.path());
+        // Threads whose agent's history is gone: nothing left to resume, so nothing to remember
+        b.forget_unresumable_threads(&LogCtx::default());
         // Fold the permission prompts the previous process left waiting — their buttons answer nobody
         b.fold_stale_perm_prompts(&LogCtx::default()).await;
         // Pick up threads the previous process was waiting to answer (only those with live agents)
@@ -2010,6 +2012,41 @@ mod tests {
             delivered.iter().any(|(_, t)| t.contains("and this")),
             "the message was never handed over after the wait: {delivered:?}"
         );
+    }
+
+    /// **A record is kept for `--resume`, so it is dropped when there is nothing left to resume.**
+    /// Records outlived their agents forever otherwise (78 on a real machine, 21 of them resumable).
+    /// A live window overrides the disk: a just-spawned agent has no transcript yet.
+    #[tokio::test]
+    async fn start_up_forgets_threads_that_can_never_resume() {
+        let (d, _slack, agent, _clock) = flow_deps("unresumable");
+        let ((mut b, _fx), _deliv) = Bridge::for_test_with_deliveries(d);
+        let live = running_thread(&mut b, &agent).await;
+        agent.histories.lock().unwrap().push(live.clone());
+
+        // One with history but no window, one with neither, one still waiting for an agent
+        b.threads.entries.insert("1.1".into(), crate::bridge::state::ThreadEntry {
+            channel_id: Some("C1".into()),
+            agent_id: Some("resumable".into()),
+            ..Default::default()
+        });
+        agent.histories.lock().unwrap().push("resumable".into());
+        b.threads.entries.insert("2.2".into(), crate::bridge::state::ThreadEntry {
+            channel_id: Some("C1".into()),
+            agent_id: Some("long-gone".into()),
+            ..Default::default()
+        });
+        b.threads.entries.insert("3.3".into(), crate::bridge::state::ThreadEntry {
+            channel_id: Some("C1".into()),
+            ..Default::default()
+        });
+
+        b.forget_unresumable_threads(&LogCtx::default());
+
+        assert!(b.threads.get("1.1").is_some(), "history on disk = still resumable");
+        assert!(b.threads.get("3.3").is_some(), "no agent yet = not stale");
+        assert!(b.threads.get(ROOT).is_some(), "a live window outranks the disk");
+        assert!(b.threads.get("2.2").is_none(), "nothing to resume, nothing to remember");
     }
 
     /// **Deleting the thread's root deletes the conversation, so the agent goes with it.** Slack takes
