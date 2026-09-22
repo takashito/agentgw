@@ -839,9 +839,39 @@ fn session_status(status: &str) -> SlackAgentSessionStatus {
 /// Japanese all pass). Dropping the four is enough, and losing them from a topic costs nothing.
 /// The limit is 200 characters, counted in chars so multi-byte text is not cut mid-character.
 pub fn session_title(topic: &str) -> Option<String> {
-    let kept: String = topic.chars().filter(|c| !matches!(c, ':' | '/' | '@' | '#')).collect();
+    let kept: String = without_markup(topic)
+        .chars()
+        .filter(|c| !matches!(c, ':' | '/' | '@' | '#'))
+        .collect();
     let kept = kept.trim();
     (!kept.is_empty()).then(|| kept.chars().take(200).collect())
+}
+
+/// The text with Slack's `<@U…>` / `<#C…|name>` / `<!here>` spans taken out. A title is read by a
+/// person, and Slack does not resolve the markup there — the first thread named this way came out
+/// as `<U0B6P89FM4N> new session 2`, with even the `@` eaten.
+fn without_markup(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find('<') {
+        let after = &rest[i + 1..];
+        match after.chars().next() {
+            Some('@' | '#' | '!') => match after.find('>') {
+                Some(end) => {
+                    out.push_str(&rest[..i]);
+                    rest = &after[end + 1..];
+                }
+                // An unclosed `<@…` is not markup, it is just text
+                None => break,
+            },
+            _ => {
+                out.push_str(&rest[..i + 1]);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Helpers every Slack port gets, real or fake.
@@ -1970,6 +2000,16 @@ mod tests {
             Some("Slack thread titles can we?")
         );
         assert_eq!(session_title("@alice #general a/b").as_deref(), Some("alice general ab"));
+        assert_eq!(
+            session_title("<@U0B6P89FM4N> new session 2").as_deref(),
+            Some("new session 2"),
+            "a mention is markup, not a word"
+        );
+        assert_eq!(
+            session_title("ask <#C1|team> and <!here> about x < y").as_deref(),
+            Some("ask  and  about x < y"),
+            "only the markup goes; a bare < stays"
+        );
         assert_eq!(session_title("  ### "), None, "nothing usable is left");
         assert_eq!(session_title("").as_deref(), None);
         assert_eq!(session_title(&"あ".repeat(300)).unwrap().chars().count(), 200);
