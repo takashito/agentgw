@@ -2012,6 +2012,30 @@ mod tests {
         );
     }
 
+    /// **Deleting the thread's root deletes the conversation, so the agent goes with it.** Slack takes
+    /// the replies along, leaving nowhere to post and nobody waiting; the seat would otherwise be held
+    /// until the idle rules reached it, up to an hour later. The thread entry goes too, which no other
+    /// teardown does: every other one keeps it so the next message can resume.
+    #[tokio::test]
+    async fn deleting_the_thread_root_ends_its_agent() {
+        let (d, _slack, agent, _clock) = flow_deps("root-deleted");
+        let ((mut b, _fx), _deliv) = Bridge::for_test_with_deliveries(d);
+        let sid = running_thread(&mut b, &agent).await;
+        assert!(b.threads.get(ROOT).is_some(), "the thread is on the books");
+
+        let mut gone = in_thread(ROOT, "");
+        gone.ts = ROOT.into();
+        gone.deleted_ts = Some(ROOT.into());
+        b.on_inbound(&gone).await;
+
+        let name = crate::agent::SessionId::from(sid.clone()).window_name();
+        assert!(
+            crate::agent::Agent::pid_of(&*agent, None, &name).is_none(),
+            "the window was left open"
+        );
+        assert!(b.threads.get(ROOT).is_none(), "the thread stayed on the books");
+    }
+
     /// **A body that turns up nowhere is told once, and never typed in again.** Delivery stopped
     /// judging submission by the screen (a busy TUI is only slow, not stuck), so the ledger is what
     /// stands between a body that never got in and silence. Retyping is the other half of the lesson:

@@ -21,13 +21,14 @@ use crate::bridge::state::{PoolKey, ThreadEntry};
 use crate::chat::ThreadKey;
 use std::collections::{HashMap, HashSet};
 
-/// Rules for tearing down cold agents (four numbers the user decided on 2026-08-02).
+/// Rules for tearing down cold agents (four numbers the user decided on 2026-08-02; the
+/// concurrency cap went 10 → 8 on 2026-09-22).
 /// Hard-coded rather than read from env vars — add that when someone needs to tune them.
 const CLEANUP: CleanupPolicy = CleanupPolicy {
     idle_ttl_ms: 30 * 60_000,
     idle_slots: 5,
     idle_max_ms: 60 * 60_000,
-    max_concurrent: 10,
+    max_concurrent: 8,
 };
 
 /// How long to watch the startup screen: 30s (sync) + 120s (linger) = 150s.

@@ -480,7 +480,7 @@ impl Bridge {
         // The user deleted their own request. Report the cancellation **only if it's still in
         // progress**: deleting an old, already answered message leaves no work to withdraw
         if let Some(deleted) = msg.deleted_ts.clone() {
-            self.on_message_deleted(msg, &key, &root_ts, &deleted, &ctx(None));
+            self.on_message_deleted(msg, &key, &root_ts, &deleted, &ctx(None)).await;
             return;
         }
 
@@ -945,7 +945,7 @@ impl Bridge {
     ///
     /// Finally drop it from the ledger: the person who deleted it isn't waiting for a reply,
     /// and leaving it would keep the "awaiting reply" watch around for the whole cancellation (a fixed hole).
-    fn on_message_deleted(
+    async fn on_message_deleted(
         &mut self,
         msg: &InboundMsg,
         key: &ThreadKey,
@@ -953,6 +953,30 @@ impl Bridge {
         deleted: &str,
         ctx: &LogCtx,
     ) {
+        // **The thread's own root: the conversation is gone, not just one request.** Slack takes the
+        // replies with it, so there is nowhere left to post and nobody left waiting. Left alone, the
+        // agent holds one of the seats until the idle rules reach it up to an hour later.
+        if deleted == root_ts {
+            let sid = self.threads.get(root_ts).and_then(|e| e.agent_id.clone());
+            ctx.info(
+                "bridge",
+                &format!(
+                    "message_deleted chan={} ts={deleted} -> thread root gone, ending session={}",
+                    msg.channel,
+                    sid.as_deref().unwrap_or("none")
+                ),
+            );
+            self.terminate(key, sid.as_deref(), None).await;
+            // Nothing may be posted into it later either
+            self.awaiting_receipt.retain(|_, (k, _)| k != key);
+            // **And the thread itself goes**, unlike every other teardown: `terminate` keeps the entry so
+            // the next message can `--resume`, and here there will never be a next message
+            self.threads.entries.remove(root_ts);
+            if let Err(e) = self.threads.save() {
+                ctx.error("bridge", &format!("threads.json save failed: {e}"));
+            }
+            return;
+        }
         if !self.ledger.pending(key).iter().any(|id| id == deleted) {
             ctx.info(
                 "bridge",
