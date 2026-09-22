@@ -532,10 +532,17 @@ impl Bridge {
                 ),
             );
         }
+        // **Say which of the two endings this was.** The record normally outlives the worker so the
+        // next message can `--resume`; a caller that has already dropped it (a deleted thread) leaves
+        // nothing to come back to, and the line used to claim the opposite
         ctx.info(
             "bridge",
             &format!(
-                "exit: worker terminated, thread kept for resume key={key} session={}",
+                "exit: worker terminated, {} key={key} session={}",
+                match self.threads.get(&root_ts).is_some() {
+                    true => "thread kept for resume",
+                    false => "thread record gone with it",
+                },
                 sid.unwrap_or("none")
             ),
         );

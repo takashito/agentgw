@@ -971,15 +971,16 @@ impl Bridge {
                     sid.as_deref().unwrap_or("none")
                 ),
             );
-            self.terminate(key, sid.as_deref(), None).await;
-            // Nothing may be posted into it later either
-            self.awaiting_receipt.retain(|_, (k, _)| k != key);
-            // **And the thread itself goes**, unlike every other teardown: `terminate` keeps the entry so
-            // the next message can `--resume`, and here there will never be a next message
+            // **The thread itself goes first**, unlike every other teardown: `terminate` keeps the
+            // entry so the next message can `--resume`, and here there will never be a next message.
+            // Dropping it before the teardown also lets that log line say which ending it was
             self.threads.entries.remove(root_ts);
             if let Err(e) = self.threads.save() {
                 ctx.error("bridge", &format!("threads.json save failed: {e}"));
             }
+            self.terminate(key, sid.as_deref(), None).await;
+            // Nothing may be posted into it later either
+            self.awaiting_receipt.retain(|_, (k, _)| k != key);
             return;
         }
         if !self.ledger.pending(key).iter().any(|id| id == deleted) {
