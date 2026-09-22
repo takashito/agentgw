@@ -1468,7 +1468,7 @@ mod tests {
         std::fs::create_dir_all(dir.path()).unwrap();
         std::fs::write(
             dir.join("access.json"),
-            r#"{"owner":"U1","routes":{"C_MINE":{"bridge":"pve","repo_path":"/srv/app"},"C_THEIRS":{"bridge":"pve"}}}"#,
+            r#"{"owner":"U1","routes":{"C_MINE":{"bridge":"build-box","repo_path":"/srv/app"},"C_THEIRS":{"bridge":"build-box"}}}"#,
         )
         .unwrap();
 
@@ -1627,9 +1627,9 @@ mod tests {
         std::fs::create_dir_all(&path).unwrap();
         std::fs::write(path.join("access.json"), r#"{"owner":"U_OWNER"}"#).unwrap();
         let slack = Arc::new(FakeChat::in_channels(&[
-            ("C_LAN", "dock-lan"),
+            ("C_LAN", "hub-lan"),
             ("C_ADMIN", "claude-admin"),
-            ("C_THEIRS", "pve-lan"),
+            ("C_THEIRS", "build-box-lan"),
         ]));
         let agent = Arc::new(FakeAgent::default());
         let clock = FakeClock::at(1_782_000_000_000);
@@ -2191,7 +2191,7 @@ mod tests {
         b.ask_gateway = Some(up);
 
         b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "<@U_BOT> channels")).await;
-        b.on_inbound(&channel_msg("1782000001.000200", "U_OWNER", "<@U_BOT> pwd dock:~/x")).await;
+        b.on_inbound(&channel_msg("1782000001.000200", "U_OWNER", "<@U_BOT> pwd hub:~/x")).await;
         b.on_inbound(&channel_msg("1782000001.000300", "U_OWNER", "<@U_BOT> set-home")).await;
         b.on_inbound(&channel_msg("1782000001.000400", "U_OWNER", "<@U_BOT> machines")).await;
         settle().await;
@@ -2205,7 +2205,7 @@ mod tests {
             Ok(LinkFrame::PwdOn {
                 channel: "C1".into(),
                 thread_ts: "1782000001.000200".into(),
-                machine: "dock".into(),
+                machine: "hub".into(),
                 path: Some("~/x".into()),
             })
         );
@@ -2240,7 +2240,7 @@ mod tests {
         .unwrap();
         let (up, mut up_rx) = mpsc::unbounded_channel();
 
-        report_folders(&dir, &up, "pve", None);
+        report_folders(&dir, &up, "build-box", None);
 
         assert_eq!(
             up_rx.try_recv(),
@@ -2296,7 +2296,7 @@ mod tests {
         b.access.home_channel = Some("C_ADMIN".into());
         b.access.routes.insert(
             "C_THEIRS".into(),
-            bridge::Route { bridge: Some("pve".into()), ..Default::default() },
+            bridge::Route { bridge: Some("build-box".into()), ..Default::default() },
         );
         b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "<@U_BOT> status")).await;
         settle().await;

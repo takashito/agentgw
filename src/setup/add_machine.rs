@@ -154,7 +154,7 @@ pub fn local_ip_toward(host: &str, port: u16) -> Option<String> {
     }
 }
 
-/// `host` and port from a dial URL: `ws://dock.lan:8787` → `("dock.lan", 8787)`, `wss://x` → `("x", 443)`.
+/// `host` and port from a dial URL: `ws://hub.lan:8787` → `("hub.lan", 8787)`, `wss://x` → `("x", 443)`.
 pub fn host_port_of(url: &str) -> Option<(String, u16)> {
     let (scheme, rest) = url.trim().split_once("://")?;
     let rest = rest.split('/').next()?;
@@ -234,7 +234,7 @@ pub fn link_port(listen: Option<&str>) -> String {
 }
 
 /// What a machine on the same network would dial, and the address the gateway must hold for it:
-/// `(ws://dock.lan:8787, 192.168.10.11:8787)`. A name others can resolve reads better in `.env`, but
+/// `(ws://hub.lan:8787, 192.0.2.10:8787)`. A name others can resolve reads better in `.env`, but
 /// the address is the one we know is ours to open.
 pub fn lan_route(host: Option<&str>, ip: Option<&str>, port: &str) -> Option<(String, String)> {
     let ip = ip.map(str::trim).filter(|i| !i.is_empty())?;
@@ -1072,40 +1072,40 @@ mod tests {
     /// point at an interface the link doesn't use (seen on a real machine).
     #[test]
     fn reachable_at_names_the_interface_the_link_uses() {
-        let json = r#"{"Self":{"DNSName":"pve.tail1234.ts.net.","TailscaleIPs":["100.89.207.102"]}}"#;
+        let json = r#"{"Self":{"DNSName":"build-box.tail1234.ts.net.","TailscaleIPs":["100.64.0.20"]}}"#;
         assert_eq!(
-            reachable_at(Some(json), "pve", Some("pve.lan"), Some("100.89.207.102")),
-            ("pve.tail1234.ts.net".to_string(), "100.89.207.102".to_string()),
+            reachable_at(Some(json), "build-box", Some("build-box.lan"), Some("100.64.0.20")),
+            ("build-box.tail1234.ts.net".to_string(), "100.64.0.20".to_string()),
             "out over the tailnet"
         );
         assert_eq!(
-            reachable_at(Some(json), "pve", Some("pve.lan"), Some("192.168.10.20")),
-            ("pve.lan".to_string(), "192.168.10.20".to_string()),
+            reachable_at(Some(json), "build-box", Some("build-box.lan"), Some("192.0.2.20")),
+            ("build-box.lan".to_string(), "192.0.2.20".to_string()),
             "tailscale is installed, but the link goes over the LAN"
         );
         // No tailscale at all is the normal case on a plain server, and `hostname -f` may say nothing
         assert_eq!(
-            reachable_at(None, "pve", None, Some("192.168.10.20")),
-            ("pve".to_string(), "192.168.10.20".to_string())
+            reachable_at(None, "build-box", None, Some("192.0.2.20")),
+            ("build-box".to_string(), "192.0.2.20".to_string())
         );
         // Nothing dialled (the gateway asking about itself): a name, and no interface to name
-        assert_eq!(reachable_at(None, " pve\n", None, None), ("pve".to_string(), String::new()));
+        assert_eq!(reachable_at(None, " build-box\n", None, None), ("build-box".to_string(), String::new()));
     }
 
     #[test]
     fn a_dial_url_gives_the_host_and_port_to_ask_the_routing_table_about() {
-        assert_eq!(host_port_of("ws://dock.lan:8787"), Some(("dock.lan".to_string(), 8787)));
-        assert_eq!(host_port_of("wss://dock.example.ts.net"), Some(("dock.example.ts.net".to_string(), 443)));
-        assert_eq!(host_port_of("wss://dock.example.ts.net/bridge/pve"), Some(("dock.example.ts.net".to_string(), 443)));
-        assert_eq!(host_port_of("dock.lan"), None);
+        assert_eq!(host_port_of("ws://hub.lan:8787"), Some(("hub.lan".to_string(), 8787)));
+        assert_eq!(host_port_of("wss://hub.example.ts.net"), Some(("hub.example.ts.net".to_string(), 443)));
+        assert_eq!(host_port_of("wss://hub.example.ts.net/bridge/build-box"), Some(("hub.example.ts.net".to_string(), 443)));
+        assert_eq!(host_port_of("hub.lan"), None);
     }
 
     #[test]
     fn tailnet_identity_reads_the_name_and_the_v4_address() {
-        let json = r#"{"Self":{"DNSName":"pve.tail1234.ts.net.","TailscaleIPs":["fd7a::1","100.89.207.102"]}}"#;
+        let json = r#"{"Self":{"DNSName":"build-box.tail1234.ts.net.","TailscaleIPs":["fd7a::1","100.64.0.20"]}}"#;
         assert_eq!(
             tailnet_identity(Some(json)),
-            ("pve.tail1234.ts.net".to_string(), "100.89.207.102".to_string())
+            ("build-box.tail1234.ts.net".to_string(), "100.64.0.20".to_string())
         );
         assert_eq!(tailnet_identity(None), (String::new(), String::new()));
         assert_eq!(tailnet_identity(Some("not json")), (String::new(), String::new()));
@@ -1199,14 +1199,14 @@ mod tests {
     /// The ports the gateway accepts on, once each — a name reaches whatever address it resolves to.
     #[test]
     fn a_dial_url_points_at_where_status_lives() {
-        assert_eq!(probe_base("wss://dock.example.ts.net"), "https://dock.example.ts.net");
-        assert_eq!(probe_base("ws://dock.lan:8787"), "http://dock.lan:8787");
-        assert_eq!(probe_base("wss://dock.example.ts.net/"), "https://dock.example.ts.net");
+        assert_eq!(probe_base("wss://hub.example.ts.net"), "https://hub.example.ts.net");
+        assert_eq!(probe_base("ws://hub.lan:8787"), "http://hub.lan:8787");
+        assert_eq!(probe_base("wss://hub.example.ts.net/"), "https://hub.example.ts.net");
     }
 
     #[test]
     fn link_port_comes_from_what_is_open() {
-        assert_eq!(link_port(Some("127.0.0.1:8788,192.168.10.11:8788")), "8788");
+        assert_eq!(link_port(Some("127.0.0.1:8788,192.0.2.10:8788")), "8788");
         // Nothing set yet → the default, which is what `install` writes
         assert_eq!(link_port(None), "8787");
         assert_eq!(link_port(Some("")), "8787");
@@ -1217,23 +1217,23 @@ mod tests {
     #[test]
     fn the_route_that_worked_is_remembered() {
         assert_eq!(
-            remembered_route("", "pve=ws://dock.lan:8787", "pve"),
-            Some(Transport::Direct { url: "ws://dock.lan:8787".into() })
+            remembered_route("", "build-box=ws://hub.lan:8787", "build-box"),
+            Some(Transport::Direct { url: "ws://hub.lan:8787".into() })
         );
         assert_eq!(
-            remembered_route("pve=root@pve.lan", "", "pve"),
+            remembered_route("build-box=user@build-box.lan", "", "build-box"),
             Some(Transport::Tunnel { remote_port: TUNNEL_PORT })
         );
         // A tunnel is the gateway's own doing, so it wins over a stale direct URL
         assert_eq!(
-            remembered_route("pve=root@pve.lan", "pve=ws://dock.lan:8787", "pve"),
+            remembered_route("build-box=user@build-box.lan", "build-box=ws://hub.lan:8787", "build-box"),
             Some(Transport::Tunnel { remote_port: TUNNEL_PORT })
         );
-        assert_eq!(remembered_route("", "", "pve"), None);
-        assert_eq!(remembered_route("", "mac=ws://x:1", "pve"), None);
+        assert_eq!(remembered_route("", "", "build-box"), None);
+        assert_eq!(remembered_route("", "mac=ws://x:1", "build-box"), None);
 
-        assert_eq!(routes_with("", "pve", Some("ws://dock.lan:8787")), "pve=ws://dock.lan:8787");
-        assert_eq!(routes_with("pve=ws://a:1,mac=ws://b:2", "pve", None), "mac=ws://b:2");
+        assert_eq!(routes_with("", "build-box", Some("ws://hub.lan:8787")), "build-box=ws://hub.lan:8787");
+        assert_eq!(routes_with("build-box=ws://a:1,mac=ws://b:2", "build-box", None), "mac=ws://b:2");
     }
 
     fn choice(label: &str, url: Option<&str>) -> RouteChoice {
@@ -1293,17 +1293,17 @@ mod tests {
     #[test]
     fn the_route_follows_what_both_sides_have() {
         assert_eq!(
-            route_url(Some("wss://set.by.hand/"), Some("dock.tailnet.ts.net"), true, None).as_deref(),
+            route_url(Some("wss://set.by.hand/"), Some("hub.example.ts.net"), true, None).as_deref(),
             Some("wss://set.by.hand")
         );
         assert_eq!(
-            route_url(None, Some("dock.tailnet.ts.net"), true, Some("ws://dock.lan:8787")).as_deref(),
-            Some("wss://dock.tailnet.ts.net")
+            route_url(None, Some("hub.example.ts.net"), true, Some("ws://hub.lan:8787")).as_deref(),
+            Some("wss://hub.example.ts.net")
         );
         // The gateway is on the tailnet, the machine is not → the LAN it proved it can reach
         assert_eq!(
-            route_url(None, Some("dock.tailnet.ts.net"), false, Some("ws://dock.lan:8787")).as_deref(),
-            Some("ws://dock.lan:8787")
+            route_url(None, Some("hub.example.ts.net"), false, Some("ws://hub.lan:8787")).as_deref(),
+            Some("ws://hub.lan:8787")
         );
         assert_eq!(route_url(None, None, false, None), None); // nothing left but a tunnel
     }
@@ -1313,16 +1313,16 @@ mod tests {
     #[test]
     fn lan_route_pairs_a_name_with_the_address_to_open() {
         assert_eq!(
-            lan_route(Some("dock.lan"), Some("192.168.10.11"), "8787"),
-            Some(("ws://dock.lan:8787".to_string(), "192.168.10.11:8787".to_string()))
+            lan_route(Some("hub.lan"), Some("192.0.2.10"), "8787"),
+            Some(("ws://hub.lan:8787".to_string(), "192.0.2.10:8787".to_string()))
         );
         // No name others can resolve → dial the address itself
         assert_eq!(
-            lan_route(Some("dock"), Some("192.168.10.11"), "8787"),
-            Some(("ws://192.168.10.11:8787".to_string(), "192.168.10.11:8787".to_string()))
+            lan_route(Some("hub"), Some("192.0.2.10"), "8787"),
+            Some(("ws://192.0.2.10:8787".to_string(), "192.0.2.10:8787".to_string()))
         );
         // No LAN address of our own → no LAN route to offer
-        assert_eq!(lan_route(Some("dock.lan"), None, "8787"), None);
+        assert_eq!(lan_route(Some("hub.lan"), None, "8787"), None);
     }
 
     #[test]

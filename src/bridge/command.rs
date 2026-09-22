@@ -1130,9 +1130,9 @@ mod tests {
         let on = |m: &str, p: Option<&str>| {
             Some(PwdMode::On { machine: m.into(), path: p.map(str::to_string) })
         };
-        assert_eq!(Cmd::pwd(&Message::new("pwd tyo-mpv5l", None)), on("tyo-mpv5l", None));
-        assert_eq!(Cmd::pwd(&Message::new("pwd tyo-mpv5l:", None)), on("tyo-mpv5l", None));
-        assert_eq!(Cmd::pwd(&Message::new("pwd dock:~/a b", None)), on("dock", Some("~/a b")));
+        assert_eq!(Cmd::pwd(&Message::new("pwd laptop", None)), on("laptop", None));
+        assert_eq!(Cmd::pwd(&Message::new("pwd laptop:", None)), on("laptop", None));
+        assert_eq!(Cmd::pwd(&Message::new("pwd hub:~/a b", None)), on("hub", Some("~/a b")));
         assert_eq!(Cmd::pwd(&Message::new("pwd ./dev", None)), Some(PwdMode::Set("./dev".into())));
         assert_eq!(Cmd::pwd(&Message::new("pwd /a:b", None)), Some(PwdMode::Set("/a:b".into())));
         assert_eq!(Cmd::pwd(&Message::new("pwd is handy", None)), Some(PwdMode::Usage));

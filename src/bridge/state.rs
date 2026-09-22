@@ -2166,7 +2166,7 @@ mod tests {
 
     #[test]
     fn machine_names_are_narrow() {
-        for ok in ["dock", "tyo-mpv5l", "a.b_c", "9"] {
+        for ok in ["hub", "laptop", "a.b_c", "9"] {
             assert!(is_machine_name(ok), "{ok}");
         }
         for bad in ["", "-x", ".x", "a b", "の使い方", "a/b", "<@U1>"] {

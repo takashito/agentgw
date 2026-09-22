@@ -308,7 +308,7 @@ pub mod link {
                 LinkFrame::Ready {
                     bot_token: "xoxb-1".into(),
                     home: Some("C_HOME".into()),
-                    gateway: Some("dock".into()),
+                    gateway: Some("hub".into()),
                 },
                 LinkFrame::Ready {
                     bot_token: "xoxb-1".into(),
@@ -402,7 +402,7 @@ pub mod link {
         #[test]
         fn the_gateway_is_asked_at_the_first_address_it_accepts_on() {
             assert_eq!(
-                super::super::first_addr("127.0.0.1:8787,192.168.10.11:8787"),
+                super::super::first_addr("127.0.0.1:8787,192.0.2.10:8787"),
                 "127.0.0.1:8787"
             );
             assert_eq!(super::super::first_addr("127.0.0.1:8787"), "127.0.0.1:8787");
@@ -1516,8 +1516,8 @@ pub type Tunnels = HashMap<String, Tunnel>;
 /// The name **this** resolver gives an address, asked of the OS. `None` when nothing answers.
 ///
 /// Looked up here and not on the machine: the name is read by someone sitting here, and a machine can
-/// call itself something nobody else can resolve — a Proxmox host naming itself `pve.local` out of its
-/// own `/etc/hosts` while the network's DNS calls it `pve.lan` (seen on a real machine).
+/// call itself something nobody else can resolve — a Proxmox host naming itself `build-box.local` out of its
+/// own `/etc/hosts` while the network's DNS calls it `build-box.lan` (seen on a real machine).
 async fn name_here(ip: &str) -> Option<String> {
     if ip.is_empty() {
         return None;
@@ -1547,7 +1547,7 @@ async fn name_here(ip: &str) -> Option<String> {
     said.filter(|n| !n.is_empty() && n != ip)
 }
 
-/// `192.168.10.20   pve.lan pve` → `pve.lan`. The first name is the canonical one.
+/// `192.0.2.20   build-box.lan build-box` → `build-box.lan`. The first name is the canonical one.
 fn name_from_getent(out: &str) -> Option<String> {
     out.lines()
         .next()?
@@ -1556,14 +1556,14 @@ fn name_from_getent(out: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// `20.10.168.192.in-addr.arpa domain name pointer pve.lan.` → `pve.lan`.
+/// `20.2.0.192.in-addr.arpa domain name pointer build-box.lan.` → `build-box.lan`.
 fn name_from_host(out: &str) -> Option<String> {
     out.lines()
         .find_map(|l| l.rsplit_once("pointer "))
         .map(|(_, name)| name.trim().trim_end_matches('.').to_string())
 }
 
-/// The host part of an ssh target: `root@pve.lan` → `pve.lan`.
+/// The host part of an ssh target: `user@build-box.lan` → `build-box.lan`.
 pub fn ssh_host_of(target: &str) -> &str {
     target.rsplit_once('@').map(|(_, host)| host).unwrap_or(target)
 }
@@ -3903,14 +3903,14 @@ mod tests {
     /// one behind, offer it by name.
     #[test]
     fn the_tunnel_offers_the_gateways_key_when_there_is_one() {
-        let without = tunnel_ssh_args_with("root@pve", 8799, "127.0.0.1:8787", false);
+        let without = tunnel_ssh_args_with("user@build-box", 8799, "127.0.0.1:8787", false);
         assert_eq!(without.first().map(String::as_str), Some("-N"));
         assert!(!without.iter().any(|a| a == "-i"), "{without:?}");
 
-        let with = tunnel_ssh_args_with("root@pve", 8799, "127.0.0.1:8787", true);
+        let with = tunnel_ssh_args_with("user@build-box", 8799, "127.0.0.1:8787", true);
         assert_eq!(with.first().map(String::as_str), Some("-i"));
         assert!(with[1].ends_with("agentgw_ed25519"), "{with:?}");
-        assert!(with.contains(&"-N".to_string()) && with.last().unwrap() == "root@pve", "{with:?}");
+        assert!(with.contains(&"-N".to_string()) && with.last().unwrap() == "user@build-box", "{with:?}");
     }
 
     /// A channel the bot is in that nobody was assigned is the gateway's — and the assignments say
@@ -4255,23 +4255,23 @@ mod tests {
     #[test]
     fn a_reverse_lookup_gives_the_name_this_resolver_uses() {
         assert_eq!(
-            name_from_getent("192.168.10.20   pve.lan pve\n"),
-            Some("pve.lan".to_string())
+            name_from_getent("192.0.2.20   build-box.lan build-box\n"),
+            Some("build-box.lan".to_string())
         );
         assert_eq!(name_from_getent(""), None);
         assert_eq!(
-            name_from_host("20.10.168.192.in-addr.arpa domain name pointer pve.lan.\n"),
-            Some("pve.lan".to_string())
+            name_from_host("20.2.0.192.in-addr.arpa domain name pointer build-box.lan.\n"),
+            Some("build-box.lan".to_string())
         );
         // Nothing answered: no name to show, so the machine's own stands
-        assert_eq!(name_from_host("Host 192.168.10.20 not found: 3(NXDOMAIN)\n"), None);
+        assert_eq!(name_from_host("Host 192.0.2.20 not found: 3(NXDOMAIN)\n"), None);
     }
 
     /// A tunnelled machine dials its own loopback, so that is the interface it names — and `127.0.0.1`
     /// tells nobody where it is. The gateway's ssh target does.
     #[test]
     fn an_ssh_target_names_the_host() {
-        assert_eq!(ssh_host_of("root@pve.lan"), "pve.lan");
+        assert_eq!(ssh_host_of("user@build-box.lan"), "build-box.lan");
         assert_eq!(ssh_host_of("build-box"), "build-box");
     }
 

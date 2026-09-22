@@ -638,7 +638,7 @@ pub enum StatusRole {
     Alone,
 }
 
-/// A machine and whether it is connected, as one word: `` `pve` 🟢 ``.
+/// A machine and whether it is connected, as one word: `` `build-box` 🟢 ``.
 fn machine_mark(name: &str, online: bool) -> String {
     let dot = if online { "🟢" } else { "🔴" };
     format!("`{name}` {dot}")
@@ -787,7 +787,7 @@ impl StatusReport {
 /// `is_fallback` means it comes from the Home fallback (the channel has no explicit `repo_path`
 /// route).
 pub struct PwdEntry {
-    /// The machine that works in it. Written in front of the path (`dock:/srv/app`), because the same
+    /// The machine that works in it. Written in front of the path (`hub:/srv/app`), because the same
     /// path means different folders on different machines.
     pub machine: String,
     pub repo_path: String,
@@ -795,7 +795,7 @@ pub struct PwdEntry {
 
 /// One channel's project directory (the `pwd` answer) as Slack mrkdwn.
 impl PwdEntry {
-    /// One line: where this channel's agents work, machine first (`pve:/root`). A channel with no folder
+    /// One line: where this channel's agents work, machine first (`build-box:/root`). A channel with no folder
     /// of its own shows the machine's home — the folder it actually starts in, so there is nothing to note.
     pub fn render(&self) -> String {
         let (machine, path) = (&self.machine, &self.repo_path);
@@ -940,9 +940,9 @@ mod tests {
             bridge_version: "0.1.0-rs".into(),
             now_ms: 1_000_000,
             home: "/Users/t".into(),
-            machine: "dock".into(),
+            machine: "hub".into(),
             role: StatusRole::Gateway {
-                machines: vec![("pve".into(), true), ("mac".into(), false)],
+                machines: vec![("build-box".into(), true), ("mac".into(), false)],
             },
             channels: vec![],
         }
@@ -1045,7 +1045,7 @@ mod tests {
     fn status_header_of_a_machine_names_its_gateway() {
         let head = |role| StatusReport {
             bridge_version: "1.2.3".into(),
-            machine: "pve".into(),
+            machine: "build-box".into(),
             role,
             now_ms: 0,
             home: "/root".into(),
@@ -1054,22 +1054,22 @@ mod tests {
         .render();
 
         let direct = head(StatusRole::Machine {
-            gateway: Some("dock".into()),
-            address: "wss://dock.example".into(),
+            gateway: Some("hub".into()),
+            address: "wss://hub.example".into(),
             online: true,
         });
-        assert!(direct.contains("*machine id*: `pve`\n"), "{direct}");
-        assert!(direct.contains("*gateway*: `dock` (`wss://dock.example`) 🟢"), "{direct}");
+        assert!(direct.contains("*machine id*: `build-box`\n"), "{direct}");
+        assert!(direct.contains("*gateway*: `hub` (`wss://hub.example`) 🟢"), "{direct}");
 
         let tunnel = head(StatusRole::Machine {
-            gateway: Some("dock".into()),
+            gateway: Some("hub".into()),
             address: "ws://127.0.0.1:8799".into(),
             online: false,
         });
         assert!(tunnel.contains("(`ws://127.0.0.1:8799` · via ssh) 🔴"), "{tunnel}");
 
         let alone = head(StatusRole::Alone);
-        assert!(alone.contains("*machine id*: `pve`"), "{alone}");
+        assert!(alone.contains("*machine id*: `build-box`"), "{alone}");
         assert!(!alone.contains("gateway"), "{alone}");
     }
 
