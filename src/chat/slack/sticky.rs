@@ -18,13 +18,17 @@ pub enum ToolStatus {
 }
 
 impl ToolStatus {
-    /// hook event → tool state. Anything other than PostToolUse is still running (Pending).
-    /// Among failures, permission denials go to 🚫 instead of 💥 (judged by the result text).
+    /// hook event → tool state. Anything that is not the end of a call is still running (Pending).
+    /// A call that **fails gets no PostToolUse** — Claude Code sends `PostToolUseFailure` instead, so
+    /// without it a failed row would sit at ◌ forever and break the fold run around it.
+    /// Among failures, permission denials go to 🚫 instead of × (judged by the result text).
     pub fn of(hook_event_name: &str, is_error: bool, result_text: &str) -> ToolStatus {
-        if hook_event_name != "PostToolUse" {
-            return ToolStatus::Pending;
-        }
-        if !is_error {
+        let failed = match hook_event_name {
+            "PostToolUseFailure" => true,
+            "PostToolUse" => is_error,
+            _ => return ToolStatus::Pending,
+        };
+        if !failed {
             return ToolStatus::Done;
         }
         let t = result_text.to_lowercase();
@@ -42,14 +46,15 @@ impl ToolStatus {
         match self {
             ToolStatus::Pending => "◌",
             ToolStatus::Done => "•",
-            ToolStatus::Error => "💥",
+            // A plain × , not an emoji: it lines up with ◌ / • / ● at the same width
+            ToolStatus::Error => "×",
             ToolStatus::Deny => "🚫",
         }
     }
 }
 
 /// What gets folded. Rows are merged into one line **only when completed ones run consecutively**.
-/// Running (◌) and failed (💥/🚫) rows are never folded — what is happening now must always stay visible.
+/// Running (◌) and failed (×/🚫) rows are never folded — what is happening now must always stay visible.
 const FOLD_READ: [&str; 1] = ["Read"];
 const FOLD_SEARCH: [&str; 2] = ["Grep", "Glob"];
 
@@ -271,6 +276,10 @@ const NARR_GLYPH: &str = "●";
 /// Indent of a tool row. **NBSP, not a plain space** — Slack collapses leading whitespace
 /// and reformats lines starting with `• ` as a bulleted list.
 const TOOL_INDENT: &str = "\u{A0}\u{A0}\u{A0}";
+/// Slack strips the leading whitespace of a message's **first line** — NBSP included — so the top
+/// tool row came out flush left while every row under it kept its indent. A zero-width space is not
+/// whitespace and renders as nothing, so it holds the indent in place (added in `wrap_fences`).
+const INDENT_GUARD: &str = "\u{200B}";
 /// Line appended to the progress message when a permission prompt expires without anyone pressing it.
 /// It carries TOOL_INDENT so it reads as a **note under**
 /// the stalled tool row.
@@ -461,7 +470,12 @@ impl StickyBoard {
         if in_fence {
             parts.push("```");
         }
-        (parts.join("\n"), in_fence)
+        let text = parts.join("\n");
+        let text = match text.starts_with('\u{A0}') {
+            true => format!("{INDENT_GUARD}{text}"),
+            false => text,
+        };
+        (text, in_fence)
     }
 
     /// Build one page starting at line `from`. Returns (body, first line of the next page, fence state at the end of the page).
@@ -535,7 +549,7 @@ impl StickyBoard {
         self.held.remove(key);
     }
 
-    /// A PostToolUse with the same tool_use_id replaces the PreToolUse ◌ row with •/💥/🚫.
+    /// A PostToolUse with the same tool_use_id replaces the PreToolUse ◌ row with •/×/🚫.
     pub fn upsert_tool(
         &mut self,
         key: &ThreadKey,
@@ -916,7 +930,7 @@ impl StickyBoard {
 
         // ── Stage 1: fold and decide which lines to show ─────────────────────
         // Completed Read/search/Bash rows that are **consecutive** become one line. Running (◌) rows
-        // are "what is happening now", so they are not folded. Failures (💥/🚫) also stay visible.
+        // are "what is happening now", so they are not folded. Failures (×/🚫) also stay visible.
         let mut lines: Vec<String> = Vec::new();
         let mut run: Vec<&RenderItem> = Vec::new();
         for it in items {
@@ -1240,7 +1254,7 @@ mod tests {
         let mut b = StickyBoard::default();
         b.tool("t0", "Agent", "調査", ToolStatus::Pending);
         let body = b.take_dirty(10_000).pop().unwrap().2;
-        assert_eq!(body, format!("{TOOL_INDENT}◌ Agent `調査`"), "{body}");
+        assert_eq!(body, format!("{INDENT_GUARD}{TOOL_INDENT}◌ Agent `調査`"), "{body}");
     }
 
     #[test]
@@ -1421,7 +1435,7 @@ mod tests {
         let body = b.take_dirty(10_000).pop().unwrap().2;
         assert_eq!(
             body,
-            format!("{TOOL_INDENT}•  Read 2 files, Searched for 1 pattern"),
+            format!("{INDENT_GUARD}{TOOL_INDENT}•  Read 2 files, Searched for 1 pattern"),
             "{body}"
         );
     }
@@ -1432,7 +1446,7 @@ mod tests {
         let mut b = StickyBoard::default();
         b.tool("t1", "Read", "/a.rs", ToolStatus::Done);
         let body = b.take_dirty(10_000).pop().unwrap().2;
-        assert_eq!(body, format!("{TOOL_INDENT}• Read `/a.rs`"), "{body}");
+        assert_eq!(body, format!("{INDENT_GUARD}{TOOL_INDENT}• Read `/a.rs`"), "{body}");
     }
 
     #[test]
@@ -1445,7 +1459,7 @@ mod tests {
         // A run with only one completed row is not folded; running and failed rows each keep their own line
         assert!(body.contains("`/a.rs`"), "{body}");
         assert!(body.contains("◌ Read `/b.rs`"), "{body}");
-        assert!(body.contains("💥 Read `/c.rs`"), "{body}");
+        assert!(body.contains("× Read `/c.rs`"), "{body}");
         assert!(!body.contains("Read 2 files"), "{body}");
     }
 
@@ -1504,6 +1518,9 @@ mod tests {
             ("PostToolUse", false, "", ToolStatus::Done),
             ("PostToolUse", true, "permission denied", ToolStatus::Deny),
             ("PostToolUse", true, "boom", ToolStatus::Error),
+            // A failed call arrives as PostToolUseFailure — it ends the row even if is_error is missing
+            ("PostToolUseFailure", false, "no such file", ToolStatus::Error),
+            ("PostToolUseFailure", true, "permission denied", ToolStatus::Deny),
         ] {
             assert_eq!(ToolStatus::of(event, is_error, text), want);
         }
@@ -1643,6 +1660,31 @@ mod tests {
         );
     }
 
+    /// The first row keeps its indent: Slack strips the leading whitespace of a message's first
+    /// line, so a zero-width space goes in front of it.
+    #[test]
+    fn the_top_row_keeps_its_indent() {
+        let items = vec![RenderItem::Tool {
+            id: "t1".into(),
+            name: "WebFetch".into(),
+            summary: "https://x".into(),
+            status: ToolStatus::Done,
+            agent: AgentRef::default(),
+            diff: None,
+        }];
+        let out = StickyBoard::page(&StickyBoard::lines_of(&items, false), 0, false).0;
+        assert!(out.starts_with(&format!("{INDENT_GUARD}{TOOL_INDENT}")), "{out:?}");
+
+        // A narration row starts flush left anyway — nothing to guard
+        let out = StickyBoard::page(
+            &StickyBoard::lines_of(&[RenderItem::Narration { text: "hi".into() }], false),
+            0,
+            false,
+        )
+        .0;
+        assert!(out.starts_with(NARR_GLYPH), "{out:?}");
+    }
+
     /// Work continuing after the answer goes to **a new progress message** (one under the answer).
     /// Rounds that chose silence (no_reply / react) stay silent after settling.
     #[test]
@@ -1741,7 +1783,7 @@ mod tests {
         // Goes "under" the progress rows as its own paragraph after one blank line (not a replacement)
         assert_eq!(
             dirty[0].2,
-            "\u{A0}\u{A0}\u{A0}◌ Bash `x`\n\n└ `Interrupted by user.`"
+            "\u{200B}\u{A0}\u{A0}\u{A0}◌ Bash `x`\n\n└ `Interrupted by user.`"
         );
         // After settling, new rows stay silent (until the next on_turn_start)
         b.push_narration(&ThreadKey::parse("k"), "続き");

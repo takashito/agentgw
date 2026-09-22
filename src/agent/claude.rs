@@ -1555,6 +1555,8 @@ impl HookIntake {
                 // Reporting hooks get a short timeout — so a slow Bridge does not stall the agent's turn.
                 "PreToolUse": http_("progress", 3),
                 "PostToolUse": http_("progress", 3),
+                // A tool call that fails gets no PostToolUse — without this the row stays ◌ for good
+                "PostToolUseFailure": http_("progress", 3),
                 "MessageDisplay": http_("narration", 3),
                 // Why the turn failed (`error_type`). **Not a decision hook** — it only takes the report and
                 // tells the human, so it returns `{}` right away.
@@ -2096,6 +2098,11 @@ mod tests {
                 "{kind}"
             );
         }
+        // A failed tool call only reports through PostToolUseFailure — without it the row stays ◌
+        assert_eq!(
+            v["hooks"]["PostToolUseFailure"][0]["hooks"][0]["url"],
+            "http://127.0.0.1:8791/hook/progress"
+        );
     }
 
     #[tokio::test]

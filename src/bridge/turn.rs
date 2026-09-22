@@ -1036,14 +1036,22 @@ impl Bridge {
         if name.is_empty() {
             return;
         }
-        let content = &p["tool_response"]["content"];
+        // A failed call comes as `PostToolUseFailure`, which carries `error` / `is_error` at the
+        // top level instead of `tool_response`
+        let content = match p["error"].is_null() {
+            true => &p["tool_response"]["content"],
+            false => &p["error"],
+        };
         let result_text = content
             .as_str()
             .map(str::to_string)
             .unwrap_or_else(|| serde_json::to_string(content).unwrap_or_default());
         let status = slack::ToolStatus::of(
             p["hook_event_name"].as_str().unwrap_or_default(),
-            p["tool_response"]["is_error"].as_bool().unwrap_or(false),
+            p["tool_response"]["is_error"]
+                .as_bool()
+                .or_else(|| p["is_error"].as_bool())
+                .unwrap_or(false),
             &result_text,
         );
         let summary = slack::StickyBoard::summarize(name, &p["tool_input"]);
