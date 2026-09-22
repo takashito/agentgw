@@ -33,6 +33,10 @@ const RETRY_NUM: u32 = 0;
 /// this is twenty-five times that, so it only ever fires on something genuinely wedged.
 const DELIVERY_STUCK_MS: u64 = 30_000;
 
+/// How long a window that refused a delivery is left alone. Long enough that a person reads one notice
+/// instead of a column of them, short enough that a passing modal costs one wait.
+const DELIVERY_RETRY_WAIT_MS: u64 = 30_000;
+
 pub fn envelope(msg: &InboundMsg, root_ts: &str, now_ms: u64) -> String {
     envelope_guarded(msg, root_ts, None, now_ms)
 }
@@ -1269,6 +1273,15 @@ impl Bridge {
         if self.delivering.contains_key(window) {
             return; // busy: the report will come back and ask for the next one
         }
+        // A window that just refused is left alone for a while. Typing the same message in again every
+        // tick stacks it in the input box, and the person hears about each attempt
+        if self
+            .delivery_trouble
+            .get(window)
+            .is_some_and(|t| self.deps.clock.now_ms() < t.retry_after_ms)
+        {
+            return;
+        }
         let Some(msg) = self.pending.get(root_ts).and_then(|q| q.first()).cloned() else {
             return;
         };
@@ -1343,6 +1356,8 @@ impl Bridge {
         match &done.result {
             Ok(()) => {
                 // Confirmed, so it leaves the queue. Until now it stayed there on purpose
+                // It went through: this window is out of trouble, and the next failure is news again
+                self.delivery_trouble.remove(&done.window);
                 self.pending_envelopes.remove(&done.msg_ts);
                 if let Some(q) = self.pending.get_mut(&root_ts) {
                     q.retain(|m| m.ts != done.msg_ts);
@@ -1369,11 +1384,26 @@ impl Bridge {
                     "bridge",
                     &format!("delivery failed: {e} — left queued for retry"),
                 );
-                self.post_error_frame(
-                    channel,
-                    root_ts,
-                    crate::t!("Couldn't hand this to the agent: {e}", "エージェントに渡せませんでした: {e}"),
+                // **Told once per spell of trouble.** The message stays queued and the tick keeps trying,
+                // so without this the thread fills with the same warning every couple of seconds
+                let told = self
+                    .delivery_trouble
+                    .get(&done.window)
+                    .is_some_and(|t| t.told);
+                self.delivery_trouble.insert(
+                    done.window.clone(),
+                    crate::bridge::DeliveryTrouble {
+                        retry_after_ms: self.deps.clock.now_ms() + DELIVERY_RETRY_WAIT_MS,
+                        told: true,
+                    },
                 );
+                if !told {
+                    self.post_error_frame(
+                        channel,
+                        root_ts,
+                        crate::t!("Couldn't hand this to the agent: {e}", "エージェントに渡せませんでした: {e}"),
+                    );
+                }
             }
         }
     }

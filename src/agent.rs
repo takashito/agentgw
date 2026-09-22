@@ -548,6 +548,9 @@ pub mod fake {
         /// Set by [`FakeAgent::hold_deliveries`]: `deliver` blocks on this until released.
         pub hold_deliver: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
         hold_release: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        /// Every call to `deliver`, successful or not. A refused delivery records nothing else, so this
+        /// is the only way to see the Bridge trying the same window again.
+        pub deliver_attempts: AtomicU64,
         pub spawned: Mutex<Vec<SpawnReq>>,
         /// (window id, text)
         pub delivered: Mutex<Vec<(String, String)>>,
@@ -605,6 +608,7 @@ pub mod fake {
             Ok(Window::of(&id))
         }
         fn deliver(&self, w: &Window, text: &str) -> Result<(), String> {
+            self.deliver_attempts.fetch_add(1, Ordering::SeqCst);
             if self.fail_deliver.load(Ordering::SeqCst) {
                 return Err(format!("{w}: a dialog is open"));
             }

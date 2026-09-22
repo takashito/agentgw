@@ -253,7 +253,16 @@ impl Claude {
             if let Some(why) = Self::not_accepting_keys(&pane) {
                 return Err(format!("{w}: {why}"));
             }
-            if Pane::new(&pane).input_box_empty() {
+            let screen = Pane::new(&pane);
+            if screen.input_box_empty() {
+                return Ok(());
+            }
+            // **A turn is running: the box holding the text is where it belongs.** Claude Code keeps
+            // steering typed mid-turn in the box and takes it when the turn allows, so an empty box is
+            // not something to wait for. Calling it a failure made the tick type the same message in
+            // again every couple of seconds — stacking it in the box — and, from 0.37.0, say so in the
+            // thread each time (seen on a real machine 2026-09-22)
+            if screen.turn_running() {
                 return Ok(());
             }
             if attempt < DELIVER_SUBMIT_RETRIES {
@@ -1884,6 +1893,22 @@ mod tests {
         let (calls, c) = deliver_probe(vec!["❯ \u{a0}", "❯ </channel>\n", "❯ \u{a0}"]);
         c.deliver(&Window::of("@42"), "hello").unwrap();
         assert_eq!(enters(&calls.lock().unwrap()), 2, "最初の1発 + 押し直し1回");
+    }
+
+    /// **Text left in the box while a turn runs is delivered, not lost.** Claude Code keeps what is
+    /// typed mid-turn and takes it when the turn allows, so waiting for an empty box never ends. Read as
+    /// a failure, the tick typed the same message in again every couple of seconds and told the thread
+    /// about each attempt (seen on a real machine 2026-09-22).
+    #[test]
+    fn steering_a_running_turn_counts_as_delivered() {
+        let busy = "❯ have a look at this\n  ⏵⏵ esc to interrupt\n";
+        let (calls, c) = deliver_probe(vec![busy, busy, busy]);
+        c.deliver(&Window::of("@42"), "have a look at this").unwrap();
+        assert_eq!(
+            enters(&calls.lock().unwrap()),
+            1,
+            "the turn will take it — no pressing Enter at a working agent"
+        );
     }
 
     #[test]

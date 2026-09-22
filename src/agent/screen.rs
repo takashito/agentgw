@@ -243,6 +243,15 @@ impl<'a> Pane<'a> {
             .find(|l| l.to_ascii_lowercase().contains("esc to cancel"))
     }
 
+    /// Is a turn running right now? The footer says `esc to interrupt` while one is
+    /// (`modal_footer` above leans on the same phrase being different from `esc to cancel`).
+    ///
+    /// **It changes what an occupied input box means.** While a turn runs, text typed into the box stays
+    /// there until the turn can take it — that is steering, not a failure to submit.
+    pub fn turn_running(&self) -> bool {
+        self.0.to_ascii_lowercase().contains("esc to interrupt")
+    }
+
     /// The TUI's live input box = the **last** `❯` line of the pane. A command **already sent**
     /// stays on screen as the echoed `❯ /effort high`, shaped exactly like a line being typed;
     /// only its position tells them apart.

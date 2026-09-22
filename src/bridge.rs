@@ -67,6 +67,10 @@ pub struct Bridge {
     /// Deliveries running off the loop, by window. One per window: two at once would interleave in the
     /// agent's input box.
     delivering: HashMap<String, DeliveryInFlight>,
+    /// Windows a delivery just failed to, and whether the person has been told. **One notice per spell
+    /// of trouble, and no retry until the wait is over** — the tick would otherwise type the same
+    /// message in every half second and say so in the thread every time.
+    delivery_trouble: HashMap<String, DeliveryTrouble>,
     /// The exact text built for a message that has not been confirmed yet, by message ts.
     ///
     /// **Only the first hand-over has it.** A message built with a loop guard ("this bot has posted N
@@ -163,6 +167,14 @@ pub struct DeliveryDone {
     pub result: Result<(), String>,
 }
 
+/// A window that would not take a delivery.
+pub(crate) struct DeliveryTrouble {
+    /// Nothing is tried again before this.
+    pub retry_after_ms: u64,
+    /// The thread has been told once; saying it again on every retry is noise, not news.
+    pub told: bool,
+}
+
 /// One delivery in flight, keyed by window. **Set in one place, cleared in one place.**
 pub(crate) struct DeliveryInFlight {
     #[allow(dead_code)] // kept for the log line when a delivery has to be given up
@@ -199,6 +211,7 @@ impl Bridge {
             pending: HashMap::new(),
             delivering: HashMap::new(),
             pending_envelopes: HashMap::new(),
+            delivery_trouble: HashMap::new(),
             deliv_tx: config.deliv_tx,
             lifecycle: bridge::Lifecycle::new(),
             sticky: slack::StickyBoard::default(),
@@ -1944,6 +1957,52 @@ mod tests {
     /// A new thread handed to a warm pool agent whose delivery fails is not lost: it waits in
     /// the queue for the retry, and the person is told (same as a failed delivery to a running
     /// thread).
+    /// **One warning per spell of trouble, and a wait before trying again.** The message stays queued
+    /// and the tick keeps coming round, so a window that refuses a delivery used to fill the thread with
+    /// the same line every couple of seconds — and type the same text into the box each time (seen on a
+    /// real machine 2026-09-22).
+    #[tokio::test]
+    async fn a_window_that_refuses_is_reported_once_and_left_alone_for_a_while() {
+        let (d, slack, agent, clock) = flow_deps("refuses");
+        let ((mut b, _fx), mut deliv) = Bridge::for_test_with_deliveries(d);
+        running_thread(&mut b, &agent).await;
+        agent.fail_deliver.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        b.on_inbound(&in_thread("1782000000.000200", "and this")).await;
+        settle_deliveries(&mut b, &mut deliv).await;
+        let complaints = |s: &FakeChat| {
+            s.calls()
+                .iter()
+                .filter(|c| c.contains("Couldn't hand this to the agent"))
+                .count()
+        };
+        assert_eq!(complaints(&slack), 1, "{:?}", slack.calls());
+        let tried_once = agent.deliver_attempts.load(std::sync::atomic::Ordering::SeqCst);
+
+        // The tick comes round again and again while the window is still refusing
+        for _ in 0..5 {
+            b.retry_pending(&LogCtx::default());
+            settle_deliveries(&mut b, &mut deliv).await;
+        }
+        assert_eq!(complaints(&slack), 1, "said again: {:?}", slack.calls());
+        assert_eq!(
+            agent.deliver_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            tried_once,
+            "typed in again while the window was still refusing"
+        );
+
+        // Once the wait is over it is tried again — and the message is still there to be delivered
+        clock.advance(60_000);
+        agent.fail_deliver.store(false, std::sync::atomic::Ordering::SeqCst);
+        b.retry_pending(&LogCtx::default());
+        settle_deliveries(&mut b, &mut deliv).await;
+        let delivered = agent.delivered.lock().unwrap().clone();
+        assert!(
+            delivered.iter().any(|(_, t)| t.contains("and this")),
+            "the message was never handed over after the wait: {delivered:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_failed_delivery_to_a_pool_agent_is_kept_and_reported() {
         use crate::agent::{SessionId, SpawnReq};
