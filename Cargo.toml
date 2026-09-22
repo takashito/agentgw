@@ -1,6 +1,6 @@
 [package]
 name = "agentgw"
-version = "0.39.1"
+version = "0.39.2"
 edition = "2024"
 license = "MIT"
 
@@ -18,6 +18,20 @@ debug = 0
 # much in this repo, where parallel workers compete for target/
 [profile.release]
 strip = true
+# **Only this crate is built at 1.** Measured on 2026-09-22 (Mac target, dependencies cached, our
+# crate rebuilt alone): 182s at 3, 116s at 1, 67s at 0. Level 1 takes ~36% off every deploy build
+# and leaves the binary the same size; 0 is faster still but grows it from 13MB to 19MB.
+#
+# What stays at 3 is everything that does the work worth optimizing: TLS, the JSON parser, the
+# async runtime, the HTTP stack. What drops to 1 is this crate, whose per-message work is building
+# strings and reading a terminal screen, between network waits that dwarf it.
+opt-level = 1
+
+# **Dependencies stay at 3, which also keeps their cache.** Their artifacts are fingerprinted with
+# the profile, so letting the knob above reach them would rebuild ~150 crates on every change of it
+# (measured: 9m21s).
+[profile.release.package."*"]
+opt-level = 3
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
