@@ -1934,6 +1934,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_new_thread_names_its_session() {
+        // Observed: Slack lists a thread in `Agents & tools` by its session name, and the name is
+        // asked for while the thread is being created — one setStatus call carries both.
+        let (d, slack, agent, _clock) = flow_deps("session");
+        let (mut b, _fx) = Bridge::for_test(d);
+        running_thread(&mut b, &agent).await;
+        settle().await;
+        let named: Vec<_> = slack
+            .calls()
+            .into_iter()
+            .filter(|c| c.starts_with(&format!("session C1 {ROOT} ")))
+            .collect();
+        assert_eq!(named.len(), 1, "{:?}", slack.calls());
+        assert!(named[0].ends_with("fix the tests"), "{named:?}");
+    }
+
+    #[tokio::test]
     async fn silence_shows_the_thinking_status_once() {
         // Observed: the user_prompt hook arms the watchdog quietly; after SILENCE_MS with the
         // request unanswered, stall_tick sets "is thinking…" once and a second tick is a no-op.

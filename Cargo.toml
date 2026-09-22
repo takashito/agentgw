@@ -1,6 +1,6 @@
 [package]
 name = "agentgw"
-version = "0.39.7"
+version = "0.40.0"
 edition = "2024"
 license = "MIT"
 
@@ -35,7 +35,7 @@ opt-level = 3
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-slack-morphism = { version = "2", features = ["hyper"] }
+slack-morphism = { version = "2.29", features = ["hyper"] }
 rmcp = { version = "0.8", features = ["server", "transport-streamable-http-server"] }
 axum = { version = "0.8", features = ["ws"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }

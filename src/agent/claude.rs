@@ -161,40 +161,55 @@ impl Claude {
         let line = self.launch_line(&mode, &req.hooks_file, &req.mcp_config, &prompt);
         // Settle the trust confirmation without answering on screen (the official way). Failing to write does not stop startup —
         // if the confirmation appears, the startup-screen watcher answers it
-        match Self::pre_trust(&req.cwd) {
-            Ok(Some(key)) => LogCtx::default().info(
+        match Self::pre_answer_dialogs(&req.cwd) {
+            Ok(written) if !written.is_empty() => LogCtx::default().info(
                 "spawn",
-                &format!("pre-trusted {} in ~/.claude.json (no trust dialog)", key.display()),
+                &format!("recorded in ~/.claude.json (no dialog): {}", written.join(", ")),
             ),
-            Ok(None) => {}
-            Err(e) => LogCtx::default().error("spawn", &format!("could not pre-trust {}: {e}", req.cwd)),
+            Ok(_) => {}
+            Err(e) => LogCtx::default().error("spawn", &format!("could not pre-answer dialogs for {}: {e}", req.cwd)),
         }
         self.tmux.spawn(&req.window, &req.cwd, &line)
     }
 
-    /// Marks `cwd` as trusted in `~/.claude.json` so the workspace-trust dialog never shows.
-    /// This is the documented way (Claude Code permissions docs: set
-    /// `projects["<path>"].hasTrustDialogAccepted` to `true`, keyed on the repository root).
-    /// Returns the key it wrote, or `None` when nothing needed writing (already trusted, or
-    /// the home directory, whose trust Claude Code never persists).
-    fn pre_trust(cwd: &str) -> Result<Option<std::path::PathBuf>, String> {
+    /// Records in `~/.claude.json` the answers to the dialogs Claude Code would otherwise put on
+    /// the startup screen, the way Claude Code itself records them:
+    ///
+    /// - `projects["<repo root>"].hasTrustDialogAccepted` — the workspace-trust confirmation
+    ///   (the documented way; keyed on the repository root, and never persisted for the home directory)
+    /// - `autoModeEnvSetup.dismissed` — "Teach auto mode about your environment?". Measured on a
+    ///   real machine 2026-09-22: an older `dismissedAt` is no longer read and the modal came back,
+    ///   holding a queued message for minutes; answering "Don't show again" writes `dismissed`.
+    ///
+    /// Returns what it wrote, for the log. These are Claude Code's own keys and it may rename them
+    /// again — when that happens the dialog simply shows up as before, and the startup-screen
+    /// watcher is still there to answer it.
+    fn pre_answer_dialogs(cwd: &str) -> Result<Vec<String>, String> {
         // Tests spawn with made-up folders: never touch the real user's config from a test
         if cfg!(test) {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         let home = std::env::var("HOME").map_err(|e| format!("HOME: {e}"))?;
-        let Some(key) = Self::trust_key(std::path::Path::new(cwd), std::path::Path::new(&home)) else {
-            return Ok(None);
-        };
         let path = std::path::Path::new(&home).join(".claude.json");
         let config: serde_json::Value = match std::fs::read_to_string(&path) {
             Ok(text) => serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
             Err(e) => return Err(format!("{}: {e}", path.display())),
         };
-        let Some(updated) = Self::with_trust(&config, &key.to_string_lossy()) else {
-            return Ok(None);
-        };
+        let (mut updated, mut written) = (config.clone(), Vec::new());
+        if let Some(key) = Self::trust_key(std::path::Path::new(cwd), std::path::Path::new(&home))
+            && let Some(next) = Self::with_trust(&updated, &key.to_string_lossy())
+        {
+            updated = next;
+            written.push(format!("trust for {}", key.display()));
+        }
+        if let Some(next) = Self::with_auto_mode_dismissed(&updated) {
+            updated = next;
+            written.push("auto mode environment setup dismissed".to_string());
+        }
+        if written.is_empty() {
+            return Ok(Vec::new());
+        }
         // Claude Code rewrites this file too: write a sibling and rename, so a reader never
         // sees half a file. Keep the original's permissions (it is private to the user).
         let tmp = path.with_extension("json.agentgw-tmp");
@@ -204,7 +219,7 @@ impl Claude {
             let _ = std::fs::set_permissions(&tmp, meta.permissions());
         }
         std::fs::rename(&tmp, &path).map_err(|e| format!("{}: {e}", path.display()))?;
-        Ok(Some(key))
+        Ok(written)
     }
 
     /// Where Claude Code keys the trust for `cwd`: the git repository root when `cwd` is inside
@@ -227,6 +242,23 @@ impl Claude {
         let projects = root.entry("projects").or_insert_with(|| serde_json::json!({}));
         let project = projects.as_object_mut()?.entry(key).or_insert_with(|| serde_json::json!({}));
         project.as_object_mut()?.insert("hasTrustDialogAccepted".into(), serde_json::Value::Bool(true));
+        Some(updated)
+    }
+
+    /// `config` with `autoModeEnvSetup.dismissed = true`, or `None` if it already says so.
+    /// The sibling `denials` / `dismissedAt` that Claude Code keeps there are left untouched.
+    pub fn with_auto_mode_dismissed(config: &serde_json::Value) -> Option<serde_json::Value> {
+        if config["autoModeEnvSetup"]["dismissed"] == serde_json::Value::Bool(true) {
+            return None;
+        }
+        let mut updated = config.clone();
+        let root = updated.as_object_mut()?;
+        let setup = root
+            .entry("autoModeEnvSetup")
+            .or_insert_with(|| serde_json::json!({}));
+        setup
+            .as_object_mut()?
+            .insert("dismissed".into(), serde_json::Value::Bool(true));
         Some(updated)
     }
 
@@ -2284,6 +2316,20 @@ mod tests {
         assert_eq!(Claude::with_trust(&updated, "/srv/app"), None, "already trusted: no write");
         let fresh = Claude::with_trust(&serde_json::json!({}), "/x").unwrap();
         assert_eq!(fresh["projects"]["/x"]["hasTrustDialogAccepted"], true);
+    }
+
+    /// The modal came back on a real machine although `dismissedAt` was set: the current Claude Code
+    /// reads `dismissed`. Writing it keeps the queue moving instead of holding a message on a modal.
+    #[test]
+    fn auto_mode_env_setup_is_dismissed_without_touching_its_siblings() {
+        let old = serde_json::json!({"autoModeEnvSetup": {"dismissedAt": 1786800743891i64, "denials": 5}});
+        let updated = Claude::with_auto_mode_dismissed(&old).expect("needs writing");
+        assert_eq!(updated["autoModeEnvSetup"]["dismissed"], true);
+        assert_eq!(updated["autoModeEnvSetup"]["denials"], 5, "siblings kept");
+        assert_eq!(updated["autoModeEnvSetup"]["dismissedAt"], 1786800743891i64);
+        assert_eq!(Claude::with_auto_mode_dismissed(&updated), None, "already dismissed: no write");
+        let fresh = Claude::with_auto_mode_dismissed(&serde_json::json!({})).unwrap();
+        assert_eq!(fresh["autoModeEnvSetup"]["dismissed"], true);
     }
 
     #[tokio::test]

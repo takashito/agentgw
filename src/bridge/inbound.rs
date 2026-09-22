@@ -724,8 +724,14 @@ impl Bridge {
                 e.topic = (!topic.is_empty()).then_some(topic.clone());
                 // The record is created here, after `remember_last_message` ran and found nothing
                 e.last_ts = Some(msg.ts.clone());
-                e.last_text = (!topic.is_empty()).then_some(topic);
+                e.last_text = (!topic.is_empty()).then_some(topic.clone());
                 self.threads.upsert(&root_ts, e);
+                // Name the thread's session from the opening message, so it is findable in Slack's
+                // `Agents & tools` sidebar from the first message on. Fire-and-forget: the name is
+                // a convenience, and the agent starts whether or not Slack took it
+                let (api, channel, ts) =
+                    (self.deps.slack.clone(), msg.channel.clone(), root_ts.clone());
+                tokio::spawn(async move { api.name_session(&channel, &ts, &topic).await });
                 if let Err(err) = self.threads.save() {
                     ctx(Some(&sid)).error("bridge", &format!("threads.json save failed: {err}"));
                 }

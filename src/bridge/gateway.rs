@@ -805,7 +805,9 @@ impl<'a> Event<'a> {
     /// "this has expired", which would be a lie).
     pub fn channel(&self) -> Option<&'a str> {
         match self.name {
-            "message" | "member_joined_channel" => self.str_at("channel"),
+            "message" | "member_joined_channel" | "agent_session_stopped" => {
+                self.str_at("channel")
+            }
             "reaction_added" | "reaction_removed" => self.raw.get("item")?.get("channel")?.as_str(),
             _ => None,
         }

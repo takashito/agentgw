@@ -302,6 +302,13 @@ pub trait Chat: Send + Sync + 'static {
         thread_ts: &str,
         status: &str,
     ) -> Result<(), String>;
+    /// Register a thread as an agent session named `title` — what the `Agents & tools` sidebar lists.
+    async fn start_session(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        title: &str,
+    ) -> Result<(), String>;
 }
 
 pub type ChatRef = Arc<dyn Chat>;
@@ -534,6 +541,9 @@ pub mod fake {
         }
         async fn set_thinking_status(&self, c: &str, th: &str, s: &str) -> Result<(), String> {
             self.record(format!("status {c} {th} {s}"))
+        }
+        async fn start_session(&self, c: &str, th: &str, title: &str) -> Result<(), String> {
+            self.record(format!("session {c} {th} {title}"))
         }
     }
 

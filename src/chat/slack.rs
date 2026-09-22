@@ -500,6 +500,30 @@ impl Api {
             .map_err(|e| e.to_string())
     }
 
+    /// Register this thread as an agent session, named `title`.
+    ///
+    /// **`setStatus` is what creates the session** — `rename` on its own answers `not_authorized`
+    /// (measured against a live channel thread), and it carries the title in the same call, so
+    /// naming a thread costs one round trip. Only an app declared as an agent (`agent_view` in
+    /// the manifest) has sessions at all; without that, every call here is `not_authorized`.
+    pub async fn start_session(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        title: &str,
+    ) -> Result<(), String> {
+        let req = SlackApiAgentsSessionsSetStatusRequest::new(SlackAgentSessionStatus::Active)
+            .with_channel_id(channel.into())
+            .with_thread_ts(thread_ts.into())
+            .with_title(title.to_string());
+        self.client
+            .open_session(&self.token)
+            .agents_sessions_set_status(&req)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
     /// GET read as raw JSON. For reading fields that slack-morphism's typed models **drop**
     /// (a DM's `channel.user`, `user.profile.bot_id` — neither is in the 2.24.0 models).
     /// `ok:false` is already turned into Err by the connector before it gets here.
@@ -793,6 +817,18 @@ impl Api {
     }
 }
 
+/// The name for a thread's agent session, or `None` when nothing usable is left.
+///
+/// **Slack checks a session title the way it checks a channel name** (measured 2026-09-22:
+/// `:` `/` `@` `#` come back as `invalid_name`, while `?` `.` `,` `!` `(` `)` `-` `_`, spaces and
+/// Japanese all pass). Dropping the four is enough, and losing them from a topic costs nothing.
+/// The limit is 200 characters, counted in chars so multi-byte text is not cut mid-character.
+pub fn session_title(topic: &str) -> Option<String> {
+    let kept: String = topic.chars().filter(|c| !matches!(c, ':' | '/' | '@' | '#')).collect();
+    let kept = kept.trim();
+    (!kept.is_empty()).then(|| kept.chars().take(200).collect())
+}
+
 /// Helpers every Slack port gets, real or fake.
 impl dyn Chat {
     /// Send one assistant status call and log it. **best-effort, but never silent** —
@@ -810,6 +846,23 @@ impl dyn Chat {
         match self.set_thinking_status(channel, thread_ts, status).await {
             Ok(()) => ctx.debug("bridge", &format!("thinking status {what}")),
             Err(e) => ctx.debug("bridge", &format!("thinking status {what} failed: {e}")),
+        }
+    }
+
+    /// Name the thread's agent session, so it is findable in Slack's `Agents & tools` sidebar.
+    /// Best-effort and logged either way: a thread without a name still works.
+    /// Says nothing when the topic is only characters Slack rejects.
+    pub async fn name_session(&self, channel: &str, thread_ts: &str, topic: &str) {
+        let Some(title) = session_title(topic) else {
+            return;
+        };
+        let ctx = LogCtx {
+            session_id: None,
+            thread_key: Some(ThreadKey::new(channel, thread_ts)),
+        };
+        match self.start_session(channel, thread_ts, &title).await {
+            Ok(()) => ctx.debug("bridge", &format!("session named \"{title}\"")),
+            Err(e) => ctx.debug("bridge", &format!("session named \"{title}\" failed: {e}")),
         }
     }
 
@@ -960,6 +1013,14 @@ impl crate::chat::Chat for Api {
     ) -> Result<(), String> {
         Api::set_thinking_status(self, channel, thread_ts, status).await
     }
+    async fn start_session(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        title: &str,
+    ) -> Result<(), String> {
+        Api::start_session(self, channel, thread_ts, title).await
+    }
 }
 
 // ── reading what Slack sends (Socket Mode events, button clicks) ────────────
@@ -987,6 +1048,9 @@ fn fleet_event_of(ev: &SlackEventCallbackBody) -> Option<FleetEvent> {
         SlackEventCallbackBody::ReactionRemoved(e) => ("reaction_removed", serde_json::to_value(e)),
         SlackEventCallbackBody::MemberJoinedChannel(e) => {
             ("member_joined_channel", serde_json::to_value(e))
+        }
+        SlackEventCallbackBody::AgentSessionStopped(e) => {
+            ("agent_session_stopped", serde_json::to_value(e))
         }
         _ => return None,
     };
@@ -1331,6 +1395,41 @@ fn edit_of(ev: &SlackMessageEvent) -> Option<InboundMsg> {
 /// Emoji on exchanges between people are not passed to the agent.
 ///
 /// The thread root is the reacted-to message's `thread_ts`, or the message itself if absent. `ts` is
+/// Slack's own stop button on an agent session. **It is a `stop`, just not typed** — the Bridge
+/// already knows what to do with that word, so this hands it the same message instead of growing a
+/// second stop path. One debug line keeps the origin traceable.
+fn session_stopped_of(ev: &SlackAgentSessionStoppedEvent) -> Option<InboundMsg> {
+    let thread_ts = ev.thread_ts.as_ref()?.to_string();
+    let channel = ev.channel.to_string();
+    let ts = ev
+        .event_ts
+        .as_ref()
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| thread_ts.clone());
+    LogCtx {
+        session_id: None,
+        thread_key: Some(ThreadKey::new(&channel, &thread_ts)),
+    }
+    .debug("slack", "agent_session_stopped: Slack's stop button → stop");
+    Some(InboundMsg {
+        channel,
+        // Sessions live in channels and DMs alike; the Bridge only needs the thread
+        channel_kind: ChannelKind::Channel,
+        ts,
+        thread_ts: Some(thread_ts),
+        user: ev.user.as_ref().map(|u| u.to_string()),
+        is_bot: false,
+        bot_id: None,
+        text: "stop".to_string(),
+        files: Vec::new(),
+        file_paths: Vec::new(),
+        file_errors: Vec::new(),
+        reaction: None,
+        deleted_ts: None,
+        edited: None,
+    })
+}
+
 /// **the reacted-to message's ts** — that is where 👀 goes and what the dedup key is.
 fn reaction_of(
     item: &SlackReactionsItem,
@@ -1379,6 +1478,10 @@ fn reaction_of(
 /// a second copy would one day make the gate's decisions differ by path.
 fn inbound_of(event: SlackEventCallbackBody) -> Option<InboundMsg> {
     let msg = match event {
+        SlackEventCallbackBody::AgentSessionStopped(ev) => match session_stopped_of(&ev) {
+            Some(msg) => msg,
+            None => return None,
+        },
         // A delete is a "cancel". It has no text, so from_event cannot pick it up; separate path
         SlackEventCallbackBody::Message(ev) if ev.deleted_ts.is_some() => {
             match deletion_of(&ev) {
@@ -1473,6 +1576,9 @@ pub fn inbound_from_relay(name: &str, event: &serde_json::Value) -> Option<Inbou
         }
         "member_joined_channel" => {
             serde_json::from_value(event.clone()).map(SlackEventCallbackBody::MemberJoinedChannel)
+        }
+        "agent_session_stopped" => {
+            serde_json::from_value(event.clone()).map(SlackEventCallbackBody::AgentSessionStopped)
         }
         other => {
             LogCtx::default().debug(
@@ -1803,6 +1909,37 @@ impl SlackId {
 
 #[cfg(test)]
 mod tests {
+
+    /// Slack's native stop button on a session. Measured shape: `channel`, `thread_ts`, `user`, `event_ts`.
+    #[test]
+    fn slacks_stop_button_arrives_as_a_stop() {
+        let ev = serde_json::json!({
+            "channel": "C1", "thread_ts": "1.1", "user": "U_OWNER", "event_ts": "2.2"
+        });
+        let msg = inbound_from_relay("agent_session_stopped", &ev).expect("a stop");
+        assert_eq!(msg.text, "stop", "the word the Bridge already acts on");
+        assert_eq!(msg.thread_ts.as_deref(), Some("1.1"));
+        assert_eq!(msg.ts, "2.2");
+        assert_eq!(msg.user.as_deref(), Some("U_OWNER"));
+        assert!(msg.reaction.is_none(), "nobody reacted — do not claim they did");
+
+        // A session channel carries no thread. There is no turn to stop, so nothing is invented
+        let channel_session = serde_json::json!({"channel": "C1", "event_ts": "2.2"});
+        assert!(inbound_from_relay("agent_session_stopped", &channel_session).is_none());
+    }
+
+    /// Slack checks a session title like a channel name — measured against the live API.
+    #[test]
+    fn a_session_title_drops_what_slack_rejects() {
+        assert_eq!(
+            session_title("Slack thread titles: can we?").as_deref(),
+            Some("Slack thread titles can we?")
+        );
+        assert_eq!(session_title("@alice #general a/b").as_deref(), Some("alice general ab"));
+        assert_eq!(session_title("  ### "), None, "nothing usable is left");
+        assert_eq!(session_title("").as_deref(), None);
+        assert_eq!(session_title(&"あ".repeat(300)).unwrap().chars().count(), 200);
+    }
     /// **Up to two of our own is normal** (slack-morphism's default; confirmed in the startup log on a real machine).
     /// From the third on, another process is consuming the same app = an accident.
     #[test]
