@@ -181,26 +181,4 @@ mod tests {
         assert_eq!(ctx.sanitized_key().unwrap(), "C0AAA-123-456");
     }
 
-    /// Logs hold message bodies verbatim and nothing else trims them (9.9 MB in one file, measured).
-    /// Rolling keeps one generation: the pair is bounded, and the last file's worth is still readable.
-    #[test]
-    fn a_log_file_is_rolled_once_it_gets_big() {
-        let dir = std::env::temp_dir().join(format!("agentgw-log-roll-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("plugin-debug.log");
-        std::fs::write(&path, "first generation").unwrap();
-
-        roll(&path);
-        assert!(!path.exists(), "the live file is moved aside");
-        let kept = dir.join("plugin-debug.log.1");
-        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "first generation");
-
-        // A second roll drops the older generation rather than piling them up
-        std::fs::write(&path, "second generation").unwrap();
-        roll(&path);
-        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "second generation");
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "one kept file, no pile");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }

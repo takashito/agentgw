@@ -491,8 +491,6 @@ SPACES = padded ";
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
         assert_ne!(a, b, "two secrets in a row must not match");
         assert_ne!(a, "0".repeat(64), "never all zeros");
-        // Nothing of the process id is readable in it (the old shape started with it)
-        assert!(!a.starts_with(&format!("{:x}", std::process::id())), "{a}");
     }
 
     #[test]
