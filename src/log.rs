@@ -39,6 +39,14 @@ impl LogCtx {
     }
 
     fn write(&self, level: &str, component: &str, message: &str) {
+        // **A test must not write into the live logs.** The state directory is resolved from the
+        // environment, so a test that logs anything lands in the production `plugin-debug.log` and
+        // `logs/by-thread/` unless it was told where to go (lines from the suite were found there:
+        // `C1-1-0`, and a delivery watchdog firing on a fake clock)
+        #[cfg(test)]
+        if std::env::var_os("AGENTGW_STATE_DIR").is_none() {
+            return;
+        }
         // Logging must never break the hot path — failures are swallowed
         let path = self.path(&StateDir::resolve());
         if let Some(parent) = path.parent() {
