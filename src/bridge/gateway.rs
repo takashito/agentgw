@@ -698,6 +698,9 @@ pub enum Joined {
 
 /// Bridge ID → the link currently serving that name. **Forwarding looks only at this table.**
 #[derive(Default)]
+/// A panic while one of these locks is held poisons it. **Recover instead of panicking on it**: the
+/// connection book and the tunnel list are read on every frame, so one poisoned lock would take the whole
+/// fleet down, task by task, with the machines still connected and nothing forwarding.
 pub struct LinkServer {
     bridges: Mutex<HashMap<String, Conn>>,
 }
@@ -713,7 +716,7 @@ impl LinkServer {
     /// knows it's dead. Refusing the newcomer would leave that machine missing until the dead
     /// socket times out.
     pub fn register(&self, bridge_id: &str, conn: Conn) -> (Joined, Option<Conn>) {
-        let mut bridges = self.bridges.lock().unwrap();
+        let mut bridges = self.bridges.lock().unwrap_or_else(|e| e.into_inner());
         match bridges.insert(bridge_id.to_string(), conn) {
             Some(old) => {
                 rlog(
@@ -738,7 +741,7 @@ impl LinkServer {
     /// the live new link's registration down with it, and the machine would go missing
     /// (the same trap as the original removing the bridgeId first).
     pub fn unregister(&self, bridge_id: &str, conn: &Conn) -> bool {
-        let mut bridges = self.bridges.lock().unwrap();
+        let mut bridges = self.bridges.lock().unwrap_or_else(|e| e.into_inner());
         match bridges.get(bridge_id) {
             Some(current) if current.is(conn) => {
                 bridges.remove(bridge_id);
@@ -763,19 +766,19 @@ impl LinkServer {
 
     /// The Bridge IDs connected right now. Only these can be a `pwd <machine>` target, and forwarding looks at them too.
     pub fn connected(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self.bridges.lock().unwrap().keys().cloned().collect();
+        let mut ids: Vec<String> = self.bridges.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect();
         ids.sort();
         ids
     }
 
     pub fn is_connected(&self, bridge_id: &str) -> bool {
-        self.bridges.lock().unwrap().contains_key(bridge_id)
+        self.bridges.lock().unwrap_or_else(|e| e.into_inner()).contains_key(bridge_id)
     }
 
     /// Send a frame to one machine. `false` = it wasn't there (including dropping between looking up the
     /// table and sending). **Never pretend it arrived.**
     pub fn send_to(&self, bridge_id: &str, frame: &link::LinkFrame) -> bool {
-        let conn = self.bridges.lock().unwrap().get(bridge_id).cloned();
+        let conn = self.bridges.lock().unwrap_or_else(|e| e.into_inner()).get(bridge_id).cloned();
         conn.is_some_and(|c| c.send(frame))
     }
 
@@ -2688,7 +2691,7 @@ async fn on_status(
     if !secret_eq(presented, &fleet.token) {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
-    let tunnels = fleet.tunnels.lock().unwrap().clone();
+    let tunnels = fleet.tunnels.lock().unwrap_or_else(|e| e.into_inner()).clone();
     axum::Json(serde_json::json!({ "connected": fleet.links.connected(), "tunnels": tunnels }))
         .into_response()
 }
@@ -2820,7 +2823,7 @@ pub async fn keep_tunnel(
         };
         if was_ok != Some(ok) {
             // Keep the current state on the gateway so `status` can show the route
-            fleet.tunnels.lock().unwrap().insert(
+            fleet.tunnels.lock().unwrap_or_else(|e| e.into_inner()).insert(
                 child.clone(),
                 Tunnel {
                     target: target.clone(),

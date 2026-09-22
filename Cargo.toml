@@ -1,6 +1,6 @@
 [package]
 name = "agentgw"
-version = "0.38.0"
+version = "0.38.1"
 edition = "2024"
 license = "MIT"
 
@@ -39,7 +39,7 @@ chrono = "0.4"
 # To build the Slack app creation link (a URL carrying the manifest). url / reqwest already
 # pull the same version, so there is no new compile
 percent-encoding = "2"
-# Async traits that can sit behind `Arc<dyn …>` (the ports in `ports.rs`).
+# Async traits that can sit behind `Arc<dyn …>` (Chat, Agent — each next to its own module).
 # slack-morphism already pulls the same version, so there is no new compile
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }

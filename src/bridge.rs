@@ -849,6 +849,8 @@ impl Bridge {
             b.restore_pools(&LogCtx::default()).await;
             b.start_missing_pool_workers(&LogCtx::default());
         }
+        // Temp files a crashed predecessor left next to the state files
+        crate::state_dir::sweep_write_leftovers(b.deps.dir.path());
         // Fold the permission prompts the previous process left waiting — their buttons answer nobody
         b.fold_stale_perm_prompts(&LogCtx::default()).await;
         // Pick up threads the previous process was waiting to answer (only those with live agents)

@@ -74,7 +74,8 @@ impl StateDir {
     ///
     /// access.json has several owners (settings come from the fleet side and Slack commands; `endpoints`
     /// and `pools` belong to the Bridge). Overwriting the whole file drops whatever we changed between
-    /// the other side's read and its write. **Always writing per key** removes that window by construction.
+    /// the other side's read and its write. **Writing per key narrows that window to one key** — two
+    /// writers touching the *same* key can still lose one, since this is read-modify-write with no lock.
     pub fn patch_json(
         &self,
         name: &str,
@@ -257,23 +258,56 @@ pub(crate) fn write_atomic_mode(path: &Path, text: &str, mode: Option<u32>) -> s
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = path.with_extension(format!("tmp{}-{seq}", std::process::id()));
-    match mode {
-        None => std::fs::write(&tmp, text)?,
-        Some(m) => {
-            let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(m);
-            }
-            #[cfg(not(unix))]
-            let _ = m;
-            use std::io::Write;
-            opts.open(&tmp)?.write_all(text.as_bytes())?;
+    // **Flush the contents before the rename.** The rename is atomic, but a power loss can land it while
+    // the bytes are still in the page cache, leaving a file that is there and empty — the worst of both
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    if let Some(m) = mode {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(m);
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    {
+        use std::io::Write;
+        let mut f = opts.open(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    // And the directory entry itself, so the rename survives too
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::File::open(parent).and_then(|d| d.sync_all());
+    }
+    Ok(())
+}
+
+/// Sweep the temp files a crash left behind. **Only ours, only old ones**: the name carries the pid and a
+/// counter, and a write in flight right now must not be touched.
+pub(crate) fn sweep_write_leftovers(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        let ours = name.rsplit_once(".tmp").is_some_and(|(_, tail)| {
+            tail.split_once('-')
+                .is_some_and(|(pid, seq)| !pid.is_empty() && pid.chars().all(|c| c.is_ascii_digit()) && seq.chars().all(|c| c.is_ascii_digit()))
+        });
+        if !ours {
+            continue;
+        }
+        let old = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t < hour_ago);
+        if old {
+            let _ = std::fs::remove_file(e.path());
         }
     }
-    std::fs::rename(&tmp, path)
 }
 
 fn parse_env(text: &str) -> Vec<(String, String)> {
@@ -407,6 +441,48 @@ SPACES = padded ";
 
     /// The hook and MCP tokens guard posting to Slack and answering permission prompts. They used to be
     /// `pid` + nanoseconds — two starts a moment apart produced neighbouring values.
+    /// A crash leaves the temp file of a write that never finished. Nothing swept them before.
+    /// **Only ours and only old ones** — a write happening right now must survive the sweep.
+    #[test]
+    fn leftover_temp_files_are_swept_but_only_the_old_ones() {
+        let dir = std::env::temp_dir().join(format!("agentgw-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("access.tmp1234-7");
+        let fresh = dir.join("threads.tmp999-1");
+        let theirs = dir.join("something.tmp");
+        for f in [&old, &fresh, &theirs] {
+            std::fs::write(f, "x").unwrap();
+        }
+        // Age only the first one
+        let two_hours_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600);
+        filetime_set(&old, two_hours_ago);
+
+        sweep_write_leftovers(&dir);
+
+        assert!(!old.exists(), "an hour-old leftover goes");
+        assert!(fresh.exists(), "a write in flight stays");
+        assert!(theirs.exists(), "a name that is not ours is not ours to delete");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `filetime` is not a dependency, so set it the way the OS lets us.
+    fn filetime_set(path: &Path, when: std::time::SystemTime) {
+        let secs = when
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let stamp = chrono::DateTime::from_timestamp(secs as i64, 0)
+            .unwrap()
+            .format("%Y%m%d%H%M.%S")
+            .to_string();
+        let _ = std::process::Command::new("touch")
+            .args(["-t", &stamp])
+            .arg(path)
+            .status();
+    }
+
     #[test]
     fn a_minted_secret_is_random_and_full_length() {
         let a = mint_secret();

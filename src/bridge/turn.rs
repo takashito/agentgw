@@ -767,8 +767,13 @@ impl Bridge {
             ));
             return;
         }
-        // reqId is a tag that only means something inside the Bridge. Time + pid + counter is unique enough
-        let req_id = format!("{:x}-{}", self.deps.clock.now_ms(), self.perm_pending.len());
+        // reqId is a tag that only means something inside the Bridge, but it has to be unique: two prompts
+        // sharing one id means the second `insert` drops the first, and that agent's hook then hangs for
+        // its full 125 s. **A counter, not the map's length** — the length goes back down as prompts are
+        // answered, so two prompts in the same millisecond at the same size used to collide
+        static NEXT_REQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT_REQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let req_id = format!("{:x}-{n}", self.deps.clock.now_ms());
         let input = ev.payload["tool_input"].clone();
         let prompt_ts = match self
             .deps.slack
