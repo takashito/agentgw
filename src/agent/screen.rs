@@ -243,13 +243,34 @@ impl<'a> Pane<'a> {
             .find(|l| l.to_ascii_lowercase().contains("esc to cancel"))
     }
 
-    /// Is a turn running right now? The footer says `esc to interrupt` while one is
-    /// (`modal_footer` above leans on the same phrase being different from `esc to cancel`).
+    /// Is a turn running right now? **Not by an `esc to interrupt` hint** — the TUI stopped showing
+    /// one (real pane sampled once a second for 10s on 2026-09-22: the hint never appeared, the
+    /// footer read `✶ Actualizing… (3m 41s · ↓ 10.5k tokens)` with a rotating tip under it). Read as
+    /// "no turn", every mid-turn steering reported itself as never submitted, once per tick.
     ///
     /// **It changes what an occupied input box means.** While a turn runs, text typed into the box stays
     /// there until the turn can take it — that is steering, not a failure to submit.
     pub fn turn_running(&self) -> bool {
-        self.0.to_ascii_lowercase().contains("esc to interrupt")
+        self.0.split('\n').any(Self::is_status_line)
+    }
+
+    /// The running footer: an animated glyph, a random word, then the elapsed time —
+    /// `✶ Actualizing… (3m 41s · ↓ 10.5k tokens)`. The glyph and the word both change, so the only
+    /// stable part is `… (` followed by a duration.
+    ///
+    /// **Column 0 is part of the shape.** The same line echoed back inside tool output (this is a
+    /// pane that reads panes) is indented under `⎿`, and taking that for a running turn would make
+    /// an idle agent swallow a delivery.
+    fn is_status_line(line: &str) -> bool {
+        if line.starts_with(char::is_whitespace) {
+            return false;
+        }
+        let Some((_, after)) = line.split_once("… (") else {
+            return false;
+        };
+        let head = after.split([' ', '\u{b7}', ')']).next().unwrap_or("");
+        let digits = head.trim_end_matches(['h', 'm', 's']);
+        !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
     }
 
     /// The TUI's live input box = the **last** `❯` line of the pane. A command **already sent**
@@ -851,6 +872,20 @@ fn capitalize(s: &str) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// The running footer, captured off a real pane on 2026-09-22. **The idle half matters as much**:
+    /// this agent reads panes, so a footer can end up echoed inside its own tool output, and taking
+    /// that for a running turn makes an idle agent swallow the delivery it never submitted.
+    #[test]
+    fn a_running_turn_is_the_footer_not_a_hint() {
+        let running = "✶ Actualizing… (3m 41s · ↓ 10.5k tokens)\n❯ \n";
+        assert!(Pane::new(running).turn_running());
+        assert!(Pane::new("· Calculating… (12s)\n❯ \n").turn_running());
+
+        let echoed = "  ⎿  ✶ Actualizing… (3m 41s · ↓ 10.5k tokens)\n❯ \n";
+        assert!(!Pane::new(echoed).turn_running(), "indented = tool output, not the footer");
+        assert!(!Pane::new("❯ \n  ~/dev/agentgw  ctx:10%\n").turn_running());
+    }
 
     // ── Reading the screen and output ─────────────────────────────────────────
     // Everything below **guards against TUI drift** (two cases confirmed on real machines).

@@ -1901,7 +1901,9 @@ mod tests {
     /// about each attempt (seen on a real machine 2026-09-22).
     #[test]
     fn steering_a_running_turn_counts_as_delivered() {
-        let busy = "❯ have a look at this\n  ⏵⏵ esc to interrupt\n";
+        // A real footer (2026-09-22). There is no `esc to interrupt` on it — the first version of
+        // this test invented one, so it passed while real deliveries kept reporting failure.
+        let busy = "✶ Actualizing… (3m 41s · ↓ 10.5k tokens)\n  ⎿  Tip: /focus shows just your prompt\n❯ have a look at this\n";
         let (calls, c) = deliver_probe(vec![busy, busy, busy]);
         c.deliver(&Window::of("@42"), "have a look at this").unwrap();
         assert_eq!(
