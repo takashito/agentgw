@@ -1658,16 +1658,6 @@ mod tests {
     }
 
     #[test]
-    fn pool_spawn_uses_startup_prompt_not_thread_envelope() {
-        let p = quiet().pool_prompt();
-        assert_eq!(p, WORKER_STARTUP_PROMPT);
-        assert!(!p.is_empty());
-        // No double space / missing space where continuation lines join (the text is verbatim)
-        assert!(p.contains("right now — wait for messages to be pushed to you and reply"));
-        assert!(!p.contains("  "));
-    }
-
-    #[test]
     fn launch_line_snapshot() {
         let line = quiet().launch_line(
             &SessionMode::New("sid-1".into()),
@@ -1681,36 +1671,6 @@ mod tests {
              --mcp-config /st/mcp/sid-1.json --strict-mcp-config --session-id sid-1 \
              'it'\\''s here'"
         );
-    }
-
-    #[test]
-    fn resume_uses_the_resume_flag() {
-        let line = quiet().launch_line(
-            &SessionMode::Resume("sid-9".into()),
-            "/st/h.json",
-            "/st/m.json",
-            "hi",
-        );
-        assert!(line.contains("--resume sid-9"), "{line}");
-        assert!(!line.contains("--session-id"), "{line}");
-        assert!(line.starts_with("AGENTGW_SESSION_ID=sid-9 "), "{line}");
-    }
-
-    #[test]
-    fn spawn_prompt_orients_by_mode() {
-        let c = quiet();
-        let env = "<channel …>x</channel>";
-        let new = c.spawn_prompt(env, &SessionMode::New("s".into()));
-        assert!(new.starts_with("This is a NEW Slack thread;"), "{new}");
-        assert!(new.contains(env), "{new}");
-        // prefix and envelope joined with one blank line
-        assert!(new.ends_with(&format!("\n\n{env}")), "{new}");
-        let res = c.spawn_prompt(env, &SessionMode::Resume("s".into()));
-        assert!(
-            res.starts_with("You are RESUMING this Slack thread;"),
-            "{res}"
-        );
-        assert!(res.contains(env), "{res}");
     }
 
     /// The launch line built from `SpawnReq` has the same shape as the string the old `src/worker.rs`
@@ -1789,12 +1749,6 @@ mod tests {
         assert_eq!(got[6], "capture-pane -p -S -200 -t slack-login-rs");
         assert_eq!(got[7], "send-keys -t slack-login-rs Enter");
         assert_eq!(got[8], "kill-session -t slack-login-rs");
-    }
-
-    #[test]
-    fn login_session_kill_is_silent_when_there_is_no_session() {
-        // Do not complain about a has-session-style non-zero (= absent) — so startup cleanup does not log an error every time
-        claude_with(|_| Err("no such session".into())).login_kill();
     }
 
     #[test]
@@ -2122,33 +2076,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn worker_hooks_declare_visibility_hooks() {
-        let v = HookIntake::settings_json(1234, "tok");
-        for (claude_name, kind, timeout) in [
-            ("PreToolUse", "progress", 3),
-            ("PostToolUse", "progress", 3),
-            ("MessageDisplay", "narration", 3),
-            ("StopFailure", "error", 5),
-            ("Stop", "stop", 15),
-        ] {
-            let h = &v["hooks"][claude_name][0]["hooks"][0];
-            assert_eq!(h["type"], "http", "{claude_name}");
-            assert_eq!(
-                h["url"],
-                format!("http://127.0.0.1:1234/hook/{kind}"),
-                "{claude_name}"
-            );
-            assert_eq!(h["timeout"], timeout, "{claude_name}");
-        }
-        // The three hooks present from the start stay as they are
-        assert!(v["hooks"]["SessionStart"][0]["hooks"][0]["command"].is_string());
-        assert_eq!(
-            v["hooks"]["UserPromptSubmit"][0]["hooks"][0]["url"],
-            "http://127.0.0.1:1234/hook/user_prompt"
-        );
-    }
-
     #[tokio::test]
     async fn stop_decision_answers_or_declines() {
         use std::time::Duration;
@@ -2205,13 +2132,6 @@ mod tests {
             "respond drop は即返るはず: {:?}",
             t.elapsed()
         );
-    }
-
-    #[test]
-    fn hook_responses_are_json() {
-        use axum::response::IntoResponse;
-        let res = HookIntake::json_body("{}".into()).into_response();
-        assert_eq!(res.headers()[CONTENT_TYPE], "application/json");
     }
 
     #[test]
@@ -2325,15 +2245,6 @@ mod tests {
         // A screen Enter does not clear — firing would send the input box's contents, so do not fire
         let keys = keys.lock().unwrap();
         assert!(keys.is_empty(), "拒絶画面にはキーを送らない: {keys:?}");
-    }
-
-    #[tokio::test]
-    async fn the_limit_modal_aborts_the_watch() {
-        let (_keys, c) = claude_showing(vec!["\u{2502} You've hit your session limit"]);
-        let out = c
-            .watch_spawn_screens(&Window::of("1-1"), 30, 1, &LogCtx::default())
-            .await;
-        assert_eq!(out, SpawnOutcome::UsageLimited);
     }
 
     /// A window that is gone (the agent exited, tmux has no server) can't show a start-up

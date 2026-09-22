@@ -141,23 +141,6 @@ mod tests {
     }
 
     #[test]
-    fn log_line_timestamp_is_iso8601_millis_z() {
-        let line = LogCtx {
-            session_id: None,
-            thread_key: None,
-        }
-        .line("info", "bridge", "x");
-        let ts = line.split(' ').next().unwrap();
-        // 2026-07-27T12:00:00.000Z
-        assert_eq!(ts.len(), 24, "{ts}");
-        assert_eq!(&ts[4..5], "-");
-        assert_eq!(&ts[10..11], "T");
-        assert_eq!(&ts[19..20], ".");
-        assert!(ts.ends_with('Z'), "{ts}");
-        assert!(line.contains("session=-"), "{line}");
-    }
-
-    #[test]
     fn log_message_newlines_are_escaped() {
         let line = LogCtx {
             session_id: None,

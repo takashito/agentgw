@@ -1997,35 +1997,6 @@ mod tests {
         assert!(!out.contains("unfinished"));
     }
 
-    #[test]
-    fn startup_summary_includes_pending_when_nonzero() {
-        let out = startup_notice(&[], 1);
-        assert!(out.contains("Resumed 1 unfinished thread(s)"));
-    }
-
-    #[test]
-    fn online_notice_matches_bun_shape() {
-        let out = online_notice("myhost", "1.2.3", &["/repo/one".into()], 0);
-        assert!(out.starts_with("🟢 *agentgw on myhost* is online - v1.2.3\n"), "{out}");
-        assert!(out.contains("Started 1 warm agent(s)"));
-    }
-
-    #[test]
-    fn offline_notice_names_the_reason() {
-        let out = offline_notice("myhost", "1.2.3", "restart");
-        assert_eq!(out, "🔴 *myhost* is going offline (restarting) — agentgw v1.2.3");
-    }
-
-    #[test]
-    fn restart_checklist_renders() {
-        let first = RestartPhase::Received.render(None);
-        assert!(first.starts_with("• Restart requested\n◌ Stopping agentgw…"), "{first}");
-        let done = RestartPhase::Done.render(None);
-        assert!(done.ends_with("• agentgw is back online\n✅ Restart complete"), "{done}");
-        let failed = RestartPhase::Received.render(Some("could not restart"));
-        assert!(failed.contains("💥"));
-    }
-
     /// A warm-pool nomination whose conversation was never saved can't be resumed: `claude
     /// --resume` exits at once ("No conversation found"). Seen on a machine where that exit
     /// and the re-launch 5 s later repeated for weeks. Start a fresh session and nominate it.

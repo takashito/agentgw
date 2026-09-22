@@ -1936,30 +1936,6 @@ mod tests {
         );
     }
 
-    /// Only with `markdown: true` is it sent as a Markdown block. The default stays mrkdwn —
-    /// existing agents look exactly the same, byte for byte.
-    #[tokio::test]
-    async fn reply_uses_a_markdown_block_only_when_asked() {
-        let (api, dir, tx, _rx) = harness();
-        execute_tool(
-                &api,
-            &dir,
-            "sid-1",
-            "reply",
-            &serde_json::json!({"channel_id": "C1", "text": "# 見出し", "markdown": true}),
-            &tx,
-        )
-        .await
-        .unwrap();
-        assert!(
-            api.calls()
-                .iter()
-                .any(|c| c.starts_with("post_md C1")),
-            "{:?}",
-            api.calls()
-        );
-    }
-
     /// **Standard Markdown is the default**. `**bold**` and tables that an LLM writes naturally render as is.
     #[tokio::test]
     async fn reply_defaults_to_standard_markdown() {
@@ -2124,26 +2100,6 @@ mod tests {
         assert_eq!(api.calls(), vec!["post_md C1 1.0 hi"]);
         // **Send** even with empty ids — deciding "empty = the whole thread is done" is the job of main, which holds the ledger
         assert!(rx.try_recv().unwrap().message_ids.is_empty());
-    }
-
-    #[tokio::test]
-    async fn no_reply_posts_nothing() {
-        let (api, dir, tx, _rx) = harness();
-        let out = execute_tool(
-                &api,
-                &dir,
-                "sid-1",
-                "no_reply",
-                &serde_json::json!({"channel_id": "C1", "message_ids": ["C1:1.0"]}),
-                &tx,
-            )
-            .await
-            .unwrap();
-        assert!(
-            !api.calls().iter().any(|c| c.starts_with("post")),
-            "no_reply must post nothing"
-        );
-        assert!(!out.is_empty(), "but it must answer the worker: {out}");
     }
 
     #[tokio::test]

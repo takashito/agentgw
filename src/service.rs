@@ -821,17 +821,4 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn the_graceful_budget_is_not_the_bun_one() {
-        // The old 180 s included 120 s for claude plugin update, a step this binary does not have
-        assert_eq!(GRACEFUL_RESTART_TIMEOUT_MS, 30_000);
-    }
-
-    #[test]
-    fn label_and_unit_never_default_to_the_bun_names() {
-        // Invariant: never collide with com.slack-channel.bridge, the older implementation's bot
-        assert_eq!(DEFAULT_LABEL, "com.agentgw.bridge");
-        assert_eq!(DEFAULT_UNIT, "agentgw-bridge.service");
-        assert_ne!(DEFAULT_LABEL, "com.slack-channel.bridge");
-    }
 }

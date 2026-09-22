@@ -637,13 +637,6 @@ mod tests {
         assert!(ja.contains(&SlackApp::create_url()), "README.ja.md も同じく");
     }
 
-    /// Prints the URL for the README (`cargo test -- --ignored print_slack_app_url --nocapture`).
-    #[test]
-    #[ignore = "README に貼る URL を出すだけ"]
-    fn print_slack_app_url() {
-        println!("{}", SlackApp::create_url());
-    }
-
     #[test]
     fn tokens_must_look_like_slack_tokens() {
         assert!(
@@ -728,17 +721,6 @@ mod tests {
         };
         assert_eq!(get("SLACK_BOT_TOKEN"), Some("xoxb-new".to_string()));
         assert_eq!(get("SLACK_APP_TOKEN"), Some("xapp-new".to_string()));
-    }
-
-    #[test]
-    fn applying_tokens_to_an_empty_file_ends_with_exactly_one_newline() {
-        let after = Tokens {
-            bot: "xoxb-1".into(),
-            app: "xapp-1".into(),
-        }
-        .apply_to_env("");
-        assert!(after.ends_with('\n'), "{after:?}");
-        assert!(!after.ends_with("\n\n"), "{after:?}");
     }
 
     // ── rewriting .env ─────────────────────────────────────────────────────

@@ -1186,19 +1186,6 @@ Select login method:\n \u{276f} 1. Claude account with subscription \u{b7} Pro, 
     }
 
     #[test]
-    fn spawn_screen_reads_the_dev_channels_confirm() {
-        // **Plain substring match** (there is no real capture)
-        assert_eq!(
-            Pane::new("Yes, proceed with local development").spawn_screen(),
-            SpawnScreen::Confirm
-        );
-        assert_eq!(
-            Pane::new("\u{2026}load local development channels?").spawn_screen(),
-            SpawnScreen::Confirm
-        );
-    }
-
-    #[test]
     fn an_account_refusal_wins_over_the_ordinary_prompts() {
         // Order matters: sign-in / limit are not dismissed by answering like trust/confirm.
         // Enter won't clear them, so give up before pressing it

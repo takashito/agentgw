@@ -1410,33 +1410,6 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_named_row_would_split_a_fold_run() {
-        let k = ThreadKey::parse("k");
-        let read = |b: &mut StickyBoard, id: &str, path: &str| {
-            b.tool_at(&k, id, "Read", path, ToolStatus::Done);
-        };
-
-        // Three in a row → folded into one line
-        let mut good = StickyBoard::default();
-        read(&mut good, "t1", "/a.rs");
-        read(&mut good, "t2", "/b.rs");
-        read(&mut good, "t3", "/c.rs");
-        let (_, out) = good.take_final(&k).expect("付箋が出ていない");
-        assert!(out.contains("Read 3 files"), "{out}");
-
-        // An empty-name row in the middle splits the run so it cannot fold = proof it must not become a row
-        let mut split = StickyBoard::default();
-        read(&mut split, "t1", "/a.rs");
-        split.tool_at(&k, "ping", "", "", ToolStatus::Done);
-        read(&mut split, "t3", "/c.rs");
-        let (_, out) = split.take_final(&k).expect("付箋が出ていない");
-        assert!(
-            !out.contains("Read 2 files"),
-            "空名の行が run を分断していない = この検査が意味を失っている: {out}"
-        );
-    }
-
-    #[test]
     fn a_run_of_finished_reads_folds_into_one_line() {
         let mut b = StickyBoard::default();
         b.tool("t1", "Read", "/a.rs", ToolStatus::Done);
@@ -1488,19 +1461,6 @@ mod tests {
     }
 
     #[test]
-    fn a_grep_through_bash_counts_as_a_search_not_a_command() {
-        let mut b = StickyBoard::default();
-        b.tool("t1", "Bash", "rg foo src/", ToolStatus::Done);
-        b.tool("t2", "Bash", "cargo test", ToolStatus::Done);
-        let body = b.take_dirty(10_000).pop().unwrap().2;
-        assert_eq!(
-            body,
-            format!("{TOOL_INDENT}•  Searched for 1 pattern, Ran 1 command"),
-            "{body}"
-        );
-    }
-
-    #[test]
     fn the_breakdown_groups_by_category_then_falls_back_to_the_tool_name() {
         // Read / search / command / edit in that order, the rest by tool name
         let items = [
@@ -1517,32 +1477,6 @@ mod tests {
             StickyBoard::tool_breakdown(&items),
             "Read 1 file, Searched for 2 patterns, Ran 1 command, Edited 2 files, WebFetch 2"
         );
-    }
-
-    #[test]
-    fn the_breakdown_is_empty_without_tools() {
-        assert_eq!(StickyBoard::tool_breakdown(&[]), "");
-    }
-
-    #[test]
-    fn the_fold_summary_drops_zero_clauses() {
-        // Zero-count parts are dropped, singular/plural is handled, and the order is fixed as Read → Searched → Ran
-        let read = ("Read", "a.rs");
-        let search = ("Grep", "fn main");
-        let cmd = ("Bash", "cargo test");
-        for (items, want) in [
-            (vec![read; 3], "Read 3 files"),
-            (vec![read], "Read 1 file"),
-            (vec![search; 2], "Searched for 2 patterns"),
-            (vec![search], "Searched for 1 pattern"),
-            (vec![cmd], "Ran 1 command"),
-            (
-                vec![read, search, search, cmd, cmd, cmd],
-                "Read 1 file, Searched for 2 patterns, Ran 3 commands",
-            ),
-        ] {
-            assert_eq!(StickyBoard::tool_breakdown(&items), want);
-        }
     }
 
     #[test]

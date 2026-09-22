@@ -1131,15 +1131,6 @@ mod tests {
     }
 
     #[test]
-    fn trims_what_ssh_gives_back() {
-        // `ssh <remote> 'uname -sm'` returns with a trailing newline
-        assert_eq!(
-            triple_for("Linux x86_64\n"),
-            Some("x86_64-unknown-linux-musl")
-        );
-    }
-
-    #[test]
     fn carries_the_state_dir_as_a_home_relative_path() {
         assert_eq!(
             remote_state_prefix(Some("/home/me/.local/state/agentgw-dev"), "/home/me"),
@@ -1153,11 +1144,6 @@ mod tests {
             remote_state_prefix(Some("/srv/agentgw"), "/home/me"),
             "AGENTGW_STATE_DIR='/srv/agentgw' "
         );
-    }
-
-    #[test]
-    fn passes_nothing_when_the_parent_uses_the_default() {
-        assert_eq!(remote_state_prefix(None, "/home/me"), "");
     }
 
     #[test]

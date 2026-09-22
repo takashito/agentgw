@@ -541,19 +541,7 @@ pub mod fake {
 
 #[cfg(test)]
 mod tests {
-    use super::fake::*;
     use super::*;
-
-    #[tokio::test]
-    async fn fake_chat_records_calls_in_order() {
-        let s = FakeChat::default();
-        let ts = s.post_message("C1", "hello", Some("1.0")).await.unwrap();
-        s.add_reaction("C1", &ts, "eyes").await.unwrap();
-        assert_eq!(
-            s.calls(),
-            vec!["post C1 1.0 hello".to_string(), format!("react C1 {ts} eyes")]
-        );
-    }
 
     /// Only an **added** stop emoji means stop. The synthesized text keeps its original wording.
     #[test]

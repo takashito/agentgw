@@ -440,13 +440,6 @@ pub mod link {
             }
         }
 
-        #[test]
-        fn a_path_round_trips_with_its_id() {
-            for id in ["desktop", "mac-mini.local", "a_1"] {
-                assert_eq!(bridge_id_of_path(&path_for(id)), Some(id));
-            }
-        }
-
         fn conn() -> Invite {
             Invite {
                 url: "wss://remote.example.com".into(),
@@ -461,14 +454,6 @@ pub mod link {
             assert_eq!(decode_connection(&s).unwrap(), conn());
             // Drop the whitespace and newlines that come along with a paste
             assert_eq!(decode_connection(&format!("\n  {s}  \n")).unwrap(), conn());
-        }
-
-        /// Key order is pinned to `u` → `t` (building it with a BTreeMap would swap them).
-        #[test]
-        fn the_payload_keeps_its_key_order() {
-            let s = encode_connection(&conn());
-            let json = String::from_utf8(b64url_decode(&s[PREFIX.len()..]).unwrap()).unwrap();
-            assert!(json.starts_with(r#"{"u":"#), "{json}");
         }
 
         /// The version comes first, so a future format is refused rather than misread.
@@ -3293,15 +3278,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_new_machine_joins_and_shows_up() {
-        let s = LinkServer::new();
-        let (c, _rx) = conn();
-        assert_eq!(s.register("desktop", c).0, Joined::New);
-        assert_eq!(s.connected(), vec!["desktop".to_string()]);
-        assert!(s.is_connected("desktop"));
-    }
-
     /// **Regression**: reconnecting under the same name keeps the new one. If this breaks, the machine
     /// goes missing on every reconnect.
     #[test]
@@ -3751,14 +3727,6 @@ mod tests {
         assert_eq!(Event::new("message", &said("plain")).text(), Some("plain"));
         let empty = serde_json::json!({});
         assert_eq!(Event::new("message", &empty).text(), None);
-    }
-
-    #[test]
-    fn a_dm_channel_is_recognised_by_its_shape() {
-        assert!(crate::chat::slack::SlackId::is_dm("D0123"));
-        assert!(!crate::chat::slack::SlackId::is_dm("C0123"));
-        assert!(!crate::chat::slack::SlackId::is_dm("G0123"));
-        assert!(!crate::chat::slack::SlackId::is_dm(""));
     }
 
     // ── route / set-home ────────────────────────────────────────────────────

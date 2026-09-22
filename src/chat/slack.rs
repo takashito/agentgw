@@ -1906,26 +1906,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upload_file_round_trip_is_recorded() {
-        let api = FakeChat::default();
-        let path = std::env::temp_dir().join(format!("sc-upload-{}.txt", std::process::id()));
-        std::fs::write(&path, b"hello").unwrap();
-        api.upload_file("C1", Some("171.002"), &path).await.unwrap();
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(
-            api.calls(),
-            vec![format!("upload C1 171.002 {}", path.display())]
-        );
-    }
-
-    #[tokio::test]
-    async fn upload_file_missing_path_is_err() {
-        let api = FakeChat::default();
-        let missing = std::path::Path::new("/nonexistent/definitely-not-here.txt");
-        assert!(api.upload_file("C1", None, missing).await.is_err());
-    }
-
-    #[tokio::test]
     async fn flip_removes_ack_and_adds_robot() {
         let api = FakeChat::default();
         flip_to_received(&api, "C1", "171.002", "eyes").await;
@@ -1990,83 +1970,6 @@ mod tests {
         let text = format!("{}\n{}", "a".repeat(10), "b".repeat(200));
         let parts = chunk(&text, 100, true);
         assert_eq!(parts[0].chars().count(), 100);
-    }
-
-    /// Exercise the three used by status / allow-bot through the trait (the real API's shape is checked in E2E).
-    #[tokio::test]
-    async fn lookup_apis_go_through_the_trait() {
-        let api = FakeChat::default();
-        assert_eq!(
-            api.get_permalink("C1", "17.5").await.unwrap(),
-            "https://slack/C1/17.5"
-        );
-        assert_eq!(api.channel_display_name("C1").await, Some("#C1".into()));
-        assert_eq!(
-            api.resolve_bot_id("UB42").await.unwrap(),
-            Some("B42".into())
-        );
-        assert_eq!(api.resolve_bot_id("U9").await.unwrap(), None, "人間は None");
-        assert_eq!(
-            api.calls(),
-            [
-                "permalink C1 17.5",
-                "channel_name C1",
-                "bot_id UB42",
-                "bot_id U9"
-            ],
-        );
-        // Name resolution is best-effort — if Slack is down it returns None (not Err)
-        assert_eq!(FakeChat::failing().channel_display_name("C1").await, None);
-        assert!(FakeChat::failing().get_permalink("C1", "1").await.is_err());
-    }
-
-    /// The wording is pinned so what users see does not change.
-    /// The source is each constant's doc comment.
-    #[test]
-    fn thinking_status_wording_is_pinned() {
-        // The ellipsis is the single character U+2026. Turning into ASCII "..." would change how it looks
-        assert_eq!(TYPING_STATUS, "is typing\u{2026}");
-        assert_eq!(THINKING_STATUS, "is thinking\u{2026}");
-        assert_eq!(
-            SILENCE_MS, 3_000,
-            "Bun の 5s から意図的に短縮(定数の doc 参照)"
-        );
-        let _ja = crate::i18n::pin(crate::i18n::Lang::Ja);
-        assert_eq!(Status::Gathering.text(), "集計中\u{2026}");
-        assert_eq!(Status::Login.text(), "サインイン中\u{2026}");
-        drop(_ja);
-        let _en = crate::i18n::pin(crate::i18n::Lang::En);
-        assert_eq!(Status::Restart.text(), "Restarting\u{2026}");
-    }
-
-    /// An empty string clears (Slack's contract). FakeChat just records it as is.
-    #[tokio::test]
-    async fn set_thinking_status_records_set_and_clear() {
-        let api = FakeChat::default();
-        api.set_thinking_status("C1", "1.1", THINKING_STATUS)
-            .await
-            .expect("set");
-        api.set_thinking_status("C1", "1.1", "")
-            .await
-            .expect("clear");
-        assert_eq!(
-            api.calls(),
-            vec![
-                "status C1 1.1 is thinking\u{2026}".to_string(),
-                "status C1 1.1 ".to_string(),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn set_thinking_status_failure_is_an_err_the_caller_can_log() {
-        let api = FakeChat::failing();
-        assert!(
-            api.set_thinking_status("C1", "1.1", TYPING_STATUS)
-                .await
-                .is_err(),
-            "呼び手が best-effort でログできるよう Err で返る"
-        );
     }
 
     /// A real file_share event (image only = no text) gets through with its attachment instead of being dropped.

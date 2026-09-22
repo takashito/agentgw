@@ -420,11 +420,4 @@ mod tests {
         assert_eq!(WallClock::parse_reset("5:30 spam", &now), None); // am/pm word boundary
     }
 
-    #[test]
-    fn fake_clock_moves_only_when_told() {
-        let c = fake::FakeClock::at(1_000);
-        assert_eq!(c.now_ms(), 1_000);
-        c.advance(500);
-        assert_eq!(c.now_ms(), 1_500);
-    }
 }

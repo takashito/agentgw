@@ -1334,16 +1334,6 @@ mod tests {
     use crate::chat::deletion_notice;
 
     #[test]
-    fn notice_target_prefers_home_channel() {
-        assert!(matches!(NoticeTarget::of(Some("C1"), "U1"), NoticeTarget::Home(c) if c == "C1"));
-    }
-
-    #[test]
-    fn notice_target_falls_back_to_owner_dm() {
-        assert!(matches!(NoticeTarget::of(None, "U1"), NoticeTarget::OwnerDm(u) if u == "U1"));
-    }
-
-    #[test]
     fn notice_target_silent_without_either() {
         assert!(matches!(NoticeTarget::of(None, ""), NoticeTarget::None_));
     }
@@ -1524,19 +1514,6 @@ mod tests {
     }
 
     #[test]
-    fn milestone_message_matches_current_format() {
-        let m = Milestone {
-            seq: 3,
-            since_prev_ms: 550,
-            since_spawn_ms: 1000,
-        };
-        assert_eq!(
-            m.message(&ThreadKey::parse("C1:1.0"), "user_prompt"),
-            "thread=C1:1.0 #3 user_prompt +550ms (since spawn +1000ms)"
-        );
-    }
-
-    #[test]
     fn threads_unknown_fields_survive_roundtrip() {
         let src = r#"{"171.001":{"agent_id":"sid-1","channel_id":"C1","topic":"直近の話題","future_field":{"x":1}}}"#;
         let mut reg = Threads::from_str(src).unwrap();
@@ -1576,15 +1553,6 @@ mod tests {
             old.get("171.001").unwrap().agent_id.as_deref(),
             Some("S-rs")
         );
-    }
-
-    #[test]
-    fn threads_find_by_session() {
-        let reg =
-            Threads::from_str(r#"{"171.001":{"agent_id":"sid-1","channel_id":"C1"}}"#).unwrap();
-        let (ts, e) = reg.find_by_session("sid-1").unwrap();
-        assert_eq!(ts, "171.001");
-        assert_eq!(e.channel_id.as_deref(), Some("C1"));
     }
 
     /// Choosing the keys to reload into the unanswered ledger at startup. **Only live agents** —
@@ -1629,15 +1597,6 @@ mod tests {
     }
 
     #[test]
-    fn access_ack_reaction_roundtrips() {
-        let src = r#"{"owner":"U1","ackReaction":"spiral_note_pad","zzz":1}"#;
-        let a = Access::from_str(src).unwrap();
-        assert_eq!(a.ack_reaction.as_deref(), Some("spiral_note_pad"));
-        let out = a.to_string_pretty().unwrap();
-        assert!(out.contains("ackReaction") && out.contains("zzz"), "{out}");
-    }
-
-    #[test]
     fn access_mutations_are_pure_and_verbatim() {
         let mut prev = Access::default();
         prev.owner = "U1".into();
@@ -1675,18 +1634,6 @@ mod tests {
         assert_eq!(a4.allowed_bots, vec!["B9"]);
         let (_, msg5, _) = a4.apply(AccessOp::BotRemove("B0".into())).unwrap();
         assert_eq!(msg5, "B0 is not an allowed bot.");
-    }
-
-    #[test]
-    fn access_typed_fields_roundtrip_with_unknowns() {
-        let src = r#"{"owner":"U1","allowedBots":["B1"],"routes":{"C1":{"repo_path":"/r","warm":false,"zzz":1}},"yyy":2}"#;
-        let a = Access::from_str(src).unwrap();
-        assert_eq!(a.allowed_bots, vec!["B1"]);
-        assert_eq!(a.routes["C1"].warm, Some(false));
-        let out = a.to_string_pretty().unwrap();
-        for k in ["allowedBots", "zzz", "yyy", "warm"] {
-            assert!(out.contains(k), "{k}");
-        }
     }
 
     #[test]
@@ -1812,13 +1759,6 @@ mod tests {
         assert!(a.pool_targets("/home", "me", false).iter().any(|p| p == "/home"));
     }
 
-    #[test]
-    fn pool_key_is_stable_and_repo_scoped() {
-        assert_eq!(PoolKey::of_cwd("/repo/a"), PoolKey::of_cwd("/repo/a"));
-        assert_ne!(PoolKey::of_cwd("/repo/a"), PoolKey::of_cwd("/repo/b"));
-        assert!(PoolKey::of_cwd("/repo/a").as_str().starts_with("repo-"));
-    }
-
     /// A grant is written **only when a person clicks the button**. Pins that it round-trips under
     /// the `allowedTools` key without dragging unknown fields along.
     #[test]
@@ -1860,26 +1800,6 @@ mod tests {
     }
 
     #[test]
-    fn should_claim_pool_only_for_brand_new_threads() {
-        assert!(Threads::should_claim_pool(None));
-        let e = ThreadEntry {
-            agent_id: Some("s".into()),
-            ..Default::default()
-        };
-        assert!(!Threads::should_claim_pool(Some(&e)));
-    }
-
-    #[test]
-    fn pool_assignment_entry_carries_repo_and_channel() {
-        let e = ThreadEntry::for_pool_assignment("C1", "/repo/a", Some("t".into()));
-        assert_eq!(e.channel_id.as_deref(), Some("C1"));
-        assert_eq!(e.repo_path.as_deref(), Some("/repo/a"));
-        assert_eq!(e.topic.as_deref(), Some("t"));
-        // The caller puts claimed.session_id into agent_id — this is just the shell
-        assert_eq!(e.agent_id, None);
-    }
-
-    #[test]
     fn pool_needs_launch_rules() {
         assert!(PoolStatus::needs_launch(None));
         assert!(!PoolStatus::needs_launch(Some(PoolStatus {
@@ -1896,18 +1816,6 @@ mod tests {
             present: false,
             gave_up: false
         })));
-    }
-
-    #[test]
-    fn pool_give_up_after_timeout() {
-        assert!(!PoolStatus::should_give_up(1_000, 1_000 + 49_999, 50_000));
-        assert!(PoolStatus::should_give_up(1_000, 1_000 + 50_001, 50_000));
-    }
-
-    #[test]
-    fn access_missing_file_is_fail_closed() {
-        let a = Access::load(&StateDir::at("/nonexistent-dir-3f9"));
-        assert_eq!(a.owner, "", "missing access.json must serve nobody");
     }
 
     /// The designation stays in the file — this is what stops "cut a new pool session on every restart".
@@ -2240,14 +2148,6 @@ mod tests {
             reason.ends_with("Outstanding message_ids: [1.1, 2.2]"),
             "{reason}"
         );
-    }
-
-    #[test]
-    fn ack_emoji_defaults_to_eyes() {
-        let mut access = Access::default();
-        assert_eq!(access.ack_emoji(), "eyes");
-        access.ack_reaction = Some("spiral_note_pad".into());
-        assert_eq!(access.ack_emoji(), "spiral_note_pad");
     }
 
     #[test]

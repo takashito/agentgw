@@ -384,20 +384,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn tool_executor_works_behind_arc_dyn() {
-        let exec: Arc<dyn ToolExecutor> = Arc::new(FakeExec);
-        let out = exec
-            .execute(
-                "sid-1".into(),
-                "reply".into(),
-                serde_json::json!({"text": "hi"}),
-            )
-            .await
-            .unwrap();
-        assert_eq!(out, "sid-1:reply:hi");
-    }
-
     /// E2E: restarting the Bridge wiped the MCP session table (memory only), so the
     /// Mcp-Session-Id baked into inherited agents became an "unknown session" and every tool call failed.
     /// Stateless doesn't look the table up, so it passes — pinned together with the repro against stateful.

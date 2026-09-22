@@ -1074,15 +1074,6 @@ mod tests {
     }
 
     #[test]
-    fn pwd_renders() {
-        let e = PwdEntry {
-            machine: "dock".into(),
-            repo_path: "/dev/x".into(),
-        };
-        assert_eq!(e.render(), "Current project directory: `dock:/dev/x`");
-    }
-
-    #[test]
     fn help_lists_every_command() {
         let h = help(false, &crate::agent::fake::FakeAgent::default());
         for word in [

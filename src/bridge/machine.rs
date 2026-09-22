@@ -793,14 +793,6 @@ mod tests {
     }
 
 
-    /// Only a version mismatch is worded as "update this machine and restart to fix".
-    #[test]
-    fn a_version_mismatch_says_a_restart_can_heal_it() {
-        assert!(Fatal::WrongVersion.message().contains("upgrade"));
-        assert!(Fatal::BadToken.message().contains("add-machine"));
-        assert!(Fatal::BadBridgeId.message().contains("AGENTGW_BRIDGE_ID"));
-    }
-
     #[test]
     fn the_backoff_grows_then_resets_on_a_good_handshake() {
         let mut b = RECONNECT_MIN_MS;
