@@ -1638,7 +1638,13 @@ pub const INBOX_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 /// Body limit per post. Replies over this are sent in pieces.
 /// Slack rejects bodies that are too long, so without splitting **the whole reply is lost**.
-pub const MAX_CHUNK_LIMIT: usize = 3900;
+///
+/// **11,500, measured against Slack on 2026-09-22.** A `markdown` block takes 11,900 characters and is
+/// refused at 12,100 with `msg_too_long`, and the count is **characters, not bytes** — 11,900 Japanese
+/// characters go through as a 70 KB request. The old value was 3,900, from the days of `section` blocks
+/// (3,000 each); keeping it there cut tables and fenced code blocks that would now fit in one post.
+/// The 500 left over is room for whatever Slack counts that we cannot see.
+pub const MAX_CHUNK_LIMIT: usize = 11_500;
 
 /// Split a reply into lengths that fit in Slack.
 ///
@@ -1797,6 +1803,19 @@ impl SlackId {
 
 #[cfg(test)]
 mod tests {
+    /// The limit is what Slack measured at, **in characters**: 11,900 goes through, 12,100 comes back
+    /// `msg_too_long`, and 11,900 Japanese characters (a 70 KB request) go through too. Raising this
+    /// constant past what was measured loses whole replies, which is what the splitting exists to prevent.
+    #[test]
+    fn the_chunk_limit_stays_inside_what_slack_takes() {
+        assert!(MAX_CHUNK_LIMIT <= 11_900, "measured ceiling");
+        assert!(MAX_CHUNK_LIMIT > 3_900, "the old section-block value");
+        // Counted in characters, so a body of multi-byte text is not split early
+        let ja: String = "あ".repeat(MAX_CHUNK_LIMIT);
+        assert_eq!(chunk(&ja, MAX_CHUNK_LIMIT, false).len(), 1, "one post");
+        assert_eq!(chunk(&"あ".repeat(MAX_CHUNK_LIMIT + 1), MAX_CHUNK_LIMIT, false).len(), 2);
+    }
+
     /// **Up to two of our own is normal** (slack-morphism's default; confirmed in the startup log on a real machine).
     /// From the third on, another process is consuming the same app = an accident.
     #[test]
