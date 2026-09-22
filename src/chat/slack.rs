@@ -478,23 +478,28 @@ impl Api {
         Ok(res.permalink.to_string())
     }
 
-    /// Show Slack's native assistant status (a quiet shimmer) on a thread.
-    /// **Sending an empty string clears it**. Unlike a post, it makes no notification and leaves nothing to read later.
-    /// It is a DM-only API, so in channels it is a harmless no-op.
+    /// Mark the thread's session busy or idle. **An empty string means idle.**
+    ///
+    /// Slack draws this one itself: while a session is `processing` it shows its own "working"
+    /// indicator and, because the app subscribes to `agent_session_stopped`, a stop button next to
+    /// it. **The wording no longer reaches the screen** (measured 2026-09-22 on a live thread: a
+    /// status of "is checking the plumbing…" came out as "Claude is working…"), so the text that
+    /// callers pass only decides busy from idle.
+    ///
+    /// ponytail: that leaves [`Status`]'s wordings as prose nobody reads. Delete them once it is
+    /// clear Slack will not take a status line again — keeping them costs one `&str` per call.
     pub async fn set_thinking_status(
         &self,
         channel: &str,
         thread_ts: &str,
         status: &str,
     ) -> Result<(), String> {
-        let req = SlackApiAssistantThreadsSetStatusRequest::new(
-            channel.into(),
-            status.to_string(),
-            thread_ts.into(),
-        );
+        let req = SlackApiAgentsSessionsSetStatusRequest::new(session_status(status))
+            .with_channel_id(channel.into())
+            .with_thread_ts(thread_ts.into());
         self.client
             .open_session(&self.token)
-            .assistant_threads_set_status(&req)
+            .agents_sessions_set_status(&req)
             .await
             .map(|_| ())
             .map_err(|e| e.to_string())
@@ -814,6 +819,16 @@ impl Api {
             text: m.content.text.clone().unwrap_or_default(),
             thread_ts: m.origin.thread_ts.as_ref().map(|t| t.to_string()),
         }
+    }
+}
+
+/// Busy or idle, from the status line a caller wanted to show. Empty is the caller's way of
+/// saying "nothing in flight", which is what closes Slack's working indicator and its stop button.
+fn session_status(status: &str) -> SlackAgentSessionStatus {
+    if status.is_empty() {
+        SlackAgentSessionStatus::Active
+    } else {
+        SlackAgentSessionStatus::Processing
     }
 }
 
@@ -1909,6 +1924,15 @@ impl SlackId {
 
 #[cfg(test)]
 mod tests {
+
+    /// The empty status is what ends a turn on screen: it closes the working indicator and takes
+    /// the stop button with it. Anything else means a turn is in flight.
+    #[test]
+    fn an_empty_status_is_the_idle_one() {
+        assert_eq!(session_status(""), SlackAgentSessionStatus::Active);
+        assert_eq!(session_status(THINKING_STATUS), SlackAgentSessionStatus::Processing);
+        assert_eq!(session_status(TYPING_STATUS), SlackAgentSessionStatus::Processing);
+    }
 
     /// Slack's native stop button on a session. Measured shape: `channel`, `thread_ts`, `user`, `event_ts`.
     #[test]
