@@ -59,8 +59,9 @@ const EDIT_TOOLS: [&str; 3] = ["Edit", "MultiEdit", "Write"];
 /// Edit/MultiEdit/Write show **what changed** as a git-style unified diff under the row.
 /// No new plumbing is needed: PostToolUse's `tool_input` already carries
 /// `old_string`/`new_string` (Edit), `edits[]` (MultiEdit) and `content` (Write).
-/// Slack code blocks cannot be colored, so we put git's one-character prefix (`-` removed / `+` added /
-/// ` ` context) inside a ``` fence. Shown **only on done rows** and **only on main-session rows**
+/// The fence is tagged ```diff, so Slack colors removed lines red and added lines green — that needs the
+/// message to go out as a `markdown` block (the sticky does; see `flush_sticky`), since plain mrkdwn drops
+/// the language hint. The one-character prefix (`-` removed / `+` added / ` ` context) is git's own. Shown **only on done rows** and **only on main-session rows**
 /// (a folded subagent window stays one line per row).
 const DIFF_CTX: usize = 3;
 const DIFF_MAX_LINES: usize = 16;
@@ -221,7 +222,7 @@ pub fn render_edit_diff(name: &str, input: &serde_json::Value) -> Option<String>
         capped.push("…".to_string());
     }
     Some(format!(
-        " (+{added} -{removed})\n```\n{}\n```",
+        " (+{added} -{removed})\n```diff\n{}\n```",
         capped.join("\n")
     ))
 }
@@ -452,7 +453,9 @@ impl StickyBoard {
         }
         let mut parts: Vec<&str> = Vec::new();
         if open_in {
-            parts.push("```");
+            // Reopen tagged: the only fences the sticky writes are diffs, and an untagged
+            // reopen would leave page 2 of a long diff uncolored
+            parts.push("```diff");
         }
         parts.extend(page.iter().map(String::as_str));
         if in_fence {
@@ -1068,7 +1071,7 @@ mod tests {
             &serde_json::json!({"old_string": old, "new_string": new}),
         )
         .unwrap();
-        assert!(d.starts_with(" (+1 -1)\n```\n"), "{d}");
+        assert!(d.starts_with(" (+1 -1)\n```diff\n"), "{d}");
         assert!(d.contains("-line1\n+LINE1\n line2"), "{d}");
         assert!(d.contains("\n…"), "離れた文脈は … 1行に畳む: {d}");
         assert!(d.ends_with("\n```"), "{d}");
@@ -1132,7 +1135,7 @@ mod tests {
         );
         let body = done.take_dirty(10_000).pop().unwrap().2;
         assert!(body.contains("Edit `/x.rs` (+1 -1)"), "{body}");
-        assert!(body.contains("```\n-a\n+b\n```"), "{body}");
+        assert!(body.contains("```diff\n-a\n+b\n```"), "{body}");
 
         let mut folded = StickyBoard::default();
         folded.upsert_tool(
@@ -1607,7 +1610,7 @@ mod tests {
         assert!(next < lines.len());
 
         let (p2, end, still_open) = StickyBoard::page(&lines, next, open);
-        assert!(p2.starts_with("```\n"), "次のページで開き直す: {p2}");
+        assert!(p2.starts_with("```diff\n"), "次のページで開き直す: {p2}");
         assert_eq!(end, lines.len());
         assert!(!still_open, "最後の ``` で閉じている");
     }

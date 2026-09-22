@@ -1237,6 +1237,9 @@ impl Bridge {
     }
 
     /// Pushes one progress message to Slack. Only post waits, since it remembers the ts (update is fire-and-forget).
+    /// **The sticky goes out as a `markdown` block** (`post_markdown` / `update_markdown`), not as mrkdwn:
+    /// that is what makes the ```diff fences in the Edit rows render red/green. The body carries no
+    /// mrkdwn-only markup (indentation is NBSP, there is no `*bold*`), so nothing else changes.
     async fn flush_sticky(&mut self, key: &ThreadKey, posted: Option<String>, body: String) {
         if body.is_empty() {
             return; // Slack rejects an update with empty text
@@ -1250,14 +1253,14 @@ impl Bridge {
             Some(ts) => {
                 let api = self.deps.slack.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = api.update_message(&channel, &ts, &body).await {
+                    if let Err(e) = api.update_markdown(&channel, &ts, &body).await {
                         ctx.error("bridge", &format!("sticky update failed: {e}"));
                     }
                 });
             }
             None => match self
                 .deps.slack
-                .post_message(&channel, &body, root.as_deref())
+                .post_markdown(&channel, &body, root.as_deref())
                 .await
             {
                 Ok(ts) => self.sticky.set_posted(key, &ts),
