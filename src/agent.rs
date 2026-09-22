@@ -545,6 +545,9 @@ pub mod fake {
     /// Records spawns and deliveries; windows live until terminated.
     #[derive(Default)]
     pub struct FakeAgent {
+        /// Set by [`FakeAgent::hold_deliveries`]: `deliver` blocks on this until released.
+        pub hold_deliver: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        hold_release: Mutex<Option<std::sync::mpsc::Sender<()>>>,
         pub spawned: Mutex<Vec<SpawnReq>>,
         /// (window id, text)
         pub delivered: Mutex<Vec<(String, String)>>,
@@ -566,6 +569,22 @@ pub mod fake {
         pub missing_dirs: Mutex<Vec<String>>,
         windows: Mutex<Vec<WindowRow>>,
         next: AtomicU64,
+    }
+
+    impl FakeAgent {
+        /// Make every delivery block until [`FakeAgent::release_delivery`] is called.
+        pub fn hold_deliveries(&self) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            *self.hold_deliver.lock().unwrap() = Some(rx);
+            *self.hold_release.lock().unwrap() = Some(tx);
+        }
+
+        /// Let one held delivery through.
+        pub fn release_delivery(&self) {
+            if let Some(tx) = &*self.hold_release.lock().unwrap() {
+                let _ = tx.send(());
+            }
+        }
     }
 
     #[async_trait]
@@ -593,6 +612,13 @@ pub mod fake {
                 .lock()
                 .unwrap()
                 .push((w.as_str().to_string(), text.to_string()));
+            // **Then hold here until released**, in the place the real one sleeps: keys are sent, and it
+            // waits for the input box to empty, pressing Enter again. A fake that returns at once would
+            // let a test pass with the delivery still sitting on the loop.
+            // The wait is bounded so a failing assertion ends the test instead of hanging it
+            if let Some(gate) = &*self.hold_deliver.lock().unwrap() {
+                let _ = gate.recv_timeout(std::time::Duration::from_secs(2));
+            }
             Ok(())
         }
         async fn watch_spawn_screens(

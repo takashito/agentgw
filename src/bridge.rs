@@ -64,6 +64,16 @@ pub struct Bridge {
     /// **root_ts** → the texts waiting for delivery. Not a thread key (it's the queue that fills while the agent
     /// isn't warm yet, and lookups always happen within the same channel).
     pending: HashMap<String, Vec<InboundMsg>>,
+    /// Deliveries running off the loop, by window. One per window: two at once would interleave in the
+    /// agent's input box.
+    delivering: HashMap<String, DeliveryInFlight>,
+    /// The exact text built for a message that has not been confirmed yet, by message ts.
+    ///
+    /// **Only the first hand-over has it.** A message built with a loop guard ("this bot has posted N
+    /// times in a row") must reach the agent with that guard; a re-send after a restart has to rebuild a
+    /// plain one, which is what the queued path always did.
+    pending_envelopes: HashMap<String, String>,
+    deliv_tx: mpsc::Sender<DeliveryDone>,
     lifecycle: bridge::Lifecycle,
     ledger: bridge::Ledger,
     sticky: slack::StickyBoard,
@@ -131,11 +141,35 @@ struct Config {
     fleet: bool,
     machine_name: String,
     cmd_tx: mpsc::Sender<CmdFx>,
+    deliv_tx: mpsc::Sender<DeliveryDone>,
     ask_gateway: Option<mpsc::UnboundedSender<crate::bridge::gateway::link::LinkFrame>>,
     /// Set on a machine: the gateway it is linked to (`status` says so).
     link: Option<LinkStatus>,
     /// Set on the gateway: the machines connected right now, read when `status` is asked.
     machines_now: Option<Arc<dyn Fn() -> Vec<String> + Send + Sync>>,
+}
+
+/// What a delivery task reports back. **The one way news of a finished delivery enters the loop.**
+///
+/// Delivery sleeps — up to 1.2 s of it, pressing Enter until the input box empties — so it happens off
+/// the loop. Everything that used to follow the call (the shimmer, the queue, the error frame) now
+/// happens here instead, in [`Bridge::on_delivery_done`].
+pub struct DeliveryDone {
+    /// tmux window the text was handed to.
+    pub window: String,
+    pub key: ThreadKey,
+    /// The message that was handed over, so the queue can drop exactly it.
+    pub msg_ts: String,
+    pub result: Result<(), String>,
+}
+
+/// One delivery in flight, keyed by window. **Set in one place, cleared in one place.**
+pub(crate) struct DeliveryInFlight {
+    #[allow(dead_code)] // kept for the log line when a delivery has to be given up
+    pub key: ThreadKey,
+    pub msg_ts: String,
+    /// For the watchdog: a report that never comes must not silence the thread for good.
+    pub since_ms: u64,
 }
 
 /// How this machine reaches its gateway, for `status`.
@@ -163,6 +197,9 @@ impl Bridge {
             dedup: inbound::RecentDeliveries::new(),
             workers: worker::Workers::default(),
             pending: HashMap::new(),
+            delivering: HashMap::new(),
+            pending_envelopes: HashMap::new(),
+            deliv_tx: config.deliv_tx,
             lifecycle: bridge::Lifecycle::new(),
             sticky: slack::StickyBoard::default(),
             perm_pending: HashMap::new(),
@@ -190,7 +227,17 @@ impl Bridge {
 
     #[cfg(test)]
     fn for_test(deps: Deps) -> (Bridge, mpsc::Receiver<CmdFx>) {
+        Self::for_test_with_deliveries(deps).0
+    }
+
+    /// The same, plus the delivery reports. **The receiver has to be held**: dropped, every report a
+    /// delivery task sends goes nowhere and the latch is never cleared.
+    #[cfg(test)]
+    fn for_test_with_deliveries(
+        deps: Deps,
+    ) -> ((Bridge, mpsc::Receiver<CmdFx>), mpsc::Receiver<DeliveryDone>) {
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (deliv_tx, deliv_rx) = mpsc::channel(64);
         let config = Config {
             hooks_file: String::new(),
             mcp_port: 0,
@@ -200,11 +247,12 @@ impl Bridge {
             fleet: false,
             machine_name: "test-machine".into(),
             cmd_tx,
+            deliv_tx,
             ask_gateway: None,
             link: None,
             machines_now: None,
         };
-        (Bridge::new(deps, config), cmd_rx)
+        ((Bridge::new(deps, config), cmd_rx), deliv_rx)
     }
 
     /// Posts one start / stop notice to home. **Failures are only logged**;
@@ -569,6 +617,8 @@ impl Bridge {
         let hooks_file = HookIntake::write_settings(&dir, hook_port, &hook_token)?;
         let hooks_file = hooks_file.to_string_lossy().to_string();
         let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        // Deliveries run off the loop and report back here. 64 is plenty: one per window in flight
+        let (deliv_tx, mut deliv_rx) = mpsc::channel::<DeliveryDone>(64);
         let (reload_tx, mut reload_rx) = mpsc::channel(4);
         // The signal that the link to the gateway was re-established (only machines use it)
         let (relink_tx, mut relink_rx) = mpsc::channel(4);
@@ -769,6 +819,7 @@ impl Bridge {
                 started_at_ms,
                 fleet: fleet.is_some(),
                 machine_name: machine_name.clone(),
+                deliv_tx,
                 cmd_tx,
                 ask_gateway: (fleet.is_some() || up_is_linked).then(|| up_tx.clone()),
                 link: up_is_linked.then(|| LinkStatus {
@@ -820,6 +871,8 @@ impl Bridge {
                 // If this clogs, agents freeze on every MCP tool call — always take it
                 Some(d) = dispo_rx.recv() => b.on_disposition(d).await,
                 Some(fx) = cmd_rx.recv() => b.on_cmd_fx(fx).await,
+                // A delivery finished off the loop. Everything that used to follow the call happens here
+                Some(d) = deliv_rx.recv() => b.on_delivery_done(d).await,
                 Some(c) = click_rx.recv() => b.on_perm_click(c).await,
                 _ = flush.tick() => {
                     b.scan_transcripts();
@@ -828,6 +881,7 @@ impl Bridge {
                     b.flush_stickies().await;
                     b.expire_perm_prompts().await;
                     b.retry_pending(&LogCtx::default());
+                    b.give_up_stuck_deliveries(&LogCtx::default());
                     b.give_up_stale_pools(&LogCtx::default()).await;
                     b.sweep_pools(&LogCtx::default());
                     b.cleanup_workers().await;
@@ -1672,15 +1726,83 @@ mod tests {
         sid
     }
 
+    /// Deliveries run off the loop, so a test has to do what the select loop does: wait for the report
+    /// and hand it back. **Not a formality** — the queue only clears on the report, and the next queued
+    /// message is only sent from there.
+    async fn settle_deliveries(b: &mut Bridge, rx: &mut mpsc::Receiver<DeliveryDone>) {
+        while let Ok(Some(done)) =
+            tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+        {
+            b.on_delivery_done(done).await;
+        }
+    }
+
+    /// **One delivery per window at a time.** Two texts racing into the same input box interleave, so a
+    /// message that arrives while a delivery is still running waits in the queue, and the report of the
+    /// first one is what sends it. The fake holds its delivery open so the test can look in between —
+    /// with a fake that returns at once this would pass even with the delivery back on the loop.
+    #[tokio::test]
+    async fn one_delivery_per_window_at_a_time() {
+        let (d, _slack, agent, _clock) = flow_deps("one-at-a-time");
+        let ((mut b, _fx), mut deliv) = Bridge::for_test_with_deliveries(d);
+        running_thread(&mut b, &agent).await;
+
+        agent.hold_deliveries();
+        b.on_inbound(&in_thread("1782000000.000200", "first")).await;
+        b.on_inbound(&in_thread("1782000000.000300", "second")).await;
+        // The loop kept going while the first delivery sat there
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let so_far = agent.delivered.lock().unwrap().clone();
+        assert_eq!(so_far.len(), 1, "the second went into the same input box: {so_far:?}");
+        assert_eq!(b.pending.get(ROOT).map(|q| q.len()), Some(2), "both stay queued until confirmed");
+
+        // Let them through: the first report sends the second, and each confirmation clears its message
+        agent.release_delivery();
+        agent.release_delivery();
+        settle_deliveries(&mut b, &mut deliv).await;
+        let delivered = agent.delivered.lock().unwrap().clone();
+        assert_eq!(delivered.len(), 2, "{delivered:?}");
+        assert!(delivered[0].1.contains("first"), "{delivered:?}");
+        assert!(delivered[1].1.contains("second"), "order kept: {delivered:?}");
+        assert!(b.pending.get(ROOT).is_none(), "confirmed messages leave the queue");
+    }
+
+    /// A delivery that never reports must not silence its window for good. The watchdog gives up on it,
+    /// and **the message is still queued**, so the next tick tries again.
+    #[tokio::test]
+    async fn a_delivery_that_never_reports_is_given_up() {
+        let (d, _slack, agent, clock) = flow_deps("stuck");
+        let ((mut b, _fx), _deliv) = Bridge::for_test_with_deliveries(d);
+        running_thread(&mut b, &agent).await;
+
+        agent.hold_deliveries();
+        b.on_inbound(&in_thread("1782000000.000200", "held")).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(b.delivering.len(), 1, "a delivery is in flight");
+
+        b.give_up_stuck_deliveries(&LogCtx::default());
+        assert_eq!(b.delivering.len(), 1, "not yet — it has only just started");
+
+        clock.advance(60_000);
+        b.give_up_stuck_deliveries(&LogCtx::default());
+        assert!(b.delivering.is_empty(), "the latch has to come off");
+        assert_eq!(
+            b.pending.get(ROOT).map(|q| q.len()),
+            Some(1),
+            "and the message stays queued for the next try"
+        );
+    }
+
     #[tokio::test]
     async fn a_reply_in_a_running_thread_reaches_the_same_agent() {
         // Observed: once user_prompt clears the latch, the entry's session is Ready and
         // Dispatch::Deliver types the envelope into the window the spawn returned (@0).
         let (d, _slack, agent, _clock) = flow_deps("reply");
-        let (mut b, _fx) = Bridge::for_test(d);
+        let ((mut b, _fx), mut deliv) = Bridge::for_test_with_deliveries(d);
         running_thread(&mut b, &agent).await;
         b.on_inbound(&in_thread("1782000000.000200", "and also this"))
             .await;
+        settle_deliveries(&mut b, &mut deliv).await;
         assert_eq!(agent.spawned.lock().unwrap().len(), 1, "no second agent");
         let delivered = agent.delivered.lock().unwrap().clone();
         assert_eq!(delivered.len(), 1, "{delivered:?}");
@@ -1794,7 +1916,7 @@ mod tests {
         use crate::agent::{SessionId, SpawnReq};
         use crate::agent::Agent;
         let (d, slack, agent, _clock) = flow_deps("pool-fail");
-        let (mut b, _fx) = Bridge::for_test(d);
+        let ((mut b, _fx), mut deliv) = Bridge::for_test_with_deliveries(d);
         let sid = "pool-sid".to_string();
         let home = Host::home();
         let req = SpawnReq {
@@ -1824,6 +1946,7 @@ mod tests {
             Some("pool-sid"),
             "the thread went to the warm pool agent"
         );
+        settle_deliveries(&mut b, &mut deliv).await;
         assert_eq!(b.pending.get("1.0").map(Vec::len), Some(1), "the message waits for the retry");
         settle().await;
         assert!(

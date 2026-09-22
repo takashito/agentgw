@@ -348,6 +348,11 @@ impl Bridge {
             .and_then(|s| self.workers.warm(s))
             .and_then(|h| h.window_id.clone())
             .unwrap_or(window);
+        // **The one delivery still made on the loop.** Whether the re-send reached the agent decides
+        // whether the user is told and the thread is settled (`false` below), and that answer is needed
+        // here, not a second later. It runs only after a failed turn, at most a couple of messages.
+        // Moving it off the loop means carrying "tell the user" into the report — worth doing, not worth
+        // guessing at: the settle rules here were got wrong twice before (0.23.21, 0.23.23)
         for (id, envelope) in &undisposed {
             if let Err(e) = self.deps.agent.deliver(&Window::of(&target), envelope) {
                 ctx.error(

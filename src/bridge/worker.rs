@@ -1167,7 +1167,6 @@ impl Bridge {
         root_ts: &str,
         channel: &str,
         cwd: &str,
-        envelope: &str,
         topic: &str,
         message_id: &str,
         key: &ThreadKey,
@@ -1205,27 +1204,19 @@ impl Bridge {
             .workers
             .window_of(&sid)
             .unwrap_or_else(|| SessionId::from(sid.clone()).window_name());
-        let delivered = match self.deps.agent.deliver(&Window::of(&target), envelope) {
-            // Same delivery record as Dispatch::Deliver.
-            // This path assigns a new thread, so new is always true
-            Ok(()) => {
-                ctx.info(
-                    "bridge",
-                    &format!(
-                        "slack-events: deliver message_id={message_id} chat={channel} \
-                         thread={root_ts} new=true -> worker {channel}"
-                    ),
-                );
-                // Same as Dispatch::Deliver — show the shimmer the moment it is handed over
-                self.touch_thread(key, slack::TYPING_STATUS);
-                Ok(())
-            }
-            // The caller takes back the one message it could not hand over (the caller holds the original)
-            Err(e) => {
-                ctx.error("bridge", &format!("delivery failed: {e} — queued for retry"));
-                Err(e)
-            }
-        };
+        // Off the loop, like every other delivery. The caller has already put the message in the queue,
+        // so a failure leaves it there and the report posts the error frame
+        self.start_delivery(&target, key, root_ts, &ctx);
+        ctx.info(
+            "bridge",
+            &format!(
+                "slack-events: hand over message_id={message_id} chat={channel} \
+                 thread={root_ts} new=true -> worker {channel}"
+            ),
+        );
+        // Same as Dispatch::Deliver — show the shimmer the moment it is handed over
+        self.touch_thread(key, slack::TYPING_STATUS);
+        let delivered: Result<(), String> = Ok(());
 
         // The refill starts a different session — do not let it carry the assigned session_id
         self.start_missing_pool_workers(&LogCtx {

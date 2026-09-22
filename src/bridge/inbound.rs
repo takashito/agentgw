@@ -29,6 +29,10 @@ const RETRY_NUM: u32 = 0;
 
 /// This message → the envelope text handed to the agent. `ts` is now **at delivery** (`now_ms`),
 /// `thread_ts` is the resolved thread root (the thread's ts, or the message's own ts).
+/// How long a delivery may run before the watchdog gives up on it. The real one takes at most 1.2 s;
+/// this is twenty-five times that, so it only ever fires on something genuinely wedged.
+const DELIVERY_STUCK_MS: u64 = 30_000;
+
 pub fn envelope(msg: &InboundMsg, root_ts: &str, now_ms: u64) -> String {
     envelope_guarded(msg, root_ts, None, now_ms)
 }
@@ -628,6 +632,8 @@ impl Bridge {
             .and_then(|h| h.window_id.clone())
             .unwrap_or_else(|| window.clone());
         let envelope = envelope_guarded(msg, &root_ts, loop_guard, self.deps.clock.now_ms());
+        // Hold on to it: the hand-over reads it back, so the guard is not lost on the way
+        self.pending_envelopes.insert(msg.ts.clone(), envelope.clone());
         // Needed to resend after a failed turn. `track` runs right after the ack (before the
         // envelope exists), so store it in the ledger **here**, once built; every delivery path below comes after this
         self.ledger.remember_envelope(&key, &msg.ts, &envelope);
@@ -659,23 +665,25 @@ impl Bridge {
             if let Some(claimed) = self.claim_pool_worker(&key_pool) {
                 // Same topic as SpawnNew (trimmed, first 60 characters, counted in chars)
                 let topic: String = msg.text.trim().chars().take(60).collect();
+                // **Queued before it is handed over**, like every other delivery: the queue is what says
+                // "not confirmed yet", and the report clears it
+                self.pending
+                    .entry(root_ts.clone())
+                    .or_default()
+                    .push(msg.clone());
                 let assigned = self.assign_pool_worker(
                     claimed,
                     &root_ts,
                     &msg.channel,
                     &cwd,
-                    &envelope,
                     &topic,
                     &msg.ts,
                     &key,
                     &ctx(None),
                 );
-                // Same as a failed Dispatch::Deliver: keep it and tell the person waiting
+                // Assignment itself can fail before any delivery starts (threads.json, the pool). The
+                // message is already queued, so say so and leave it for the next tick
                 if let Err(e) = assigned {
-                    self.pending
-                        .entry(root_ts.clone())
-                        .or_default()
-                        .push(msg.clone());
                     self.post_error_frame(
                         msg.channel.clone(),
                         root_ts.clone(),
@@ -688,7 +696,9 @@ impl Bridge {
 
         // Once delivered, start the silence watch. `&mut self` can't be taken while `entry` is
         // borrowed, so carry the flag out of the match
-        let mut delivered = false;
+        // **Handed off, not yet confirmed.** The shimmer means "received and working", and that is true the
+        // moment the delivery task takes it; a failure a second later posts its own error frame
+        let mut handed_off = false;
         match Dispatch::decide(entry.as_ref(), state) {
             Dispatch::SpawnNew => {
                 let sid = SessionId::new().as_str().to_string();
@@ -738,44 +748,21 @@ impl Bridge {
                 self.spawn_worker(&req, &key, &ctx(Some(&sid)), &sid);
             }
             Dispatch::Deliver => {
-                let sid = entry.as_ref().and_then(|e| e.agent_id.clone());
-                // A warm agent gets the bare envelope with no prefix (same shape as push)
-                match self.deps.agent.deliver(&Window::of(&target), &envelope) {
-                    // One delivery log line per message
-                    Ok(()) => {
-                        ctx(sid.as_deref()).info(
-                            "bridge",
-                            &format!(
-                                "slack-events: deliver message_id={} chat={} thread={root_ts} \
-                                 new={is_new} -> worker {}",
-                                msg.ts, msg.channel, msg.channel
-                            ),
-                        );
-                        delivered = true;
-                    }
-                    // Not delivered = this message **reached nobody**. A log line alone leaves 👀
-                    // on it in silence (2026-08-18: two threads stuck behind a modal were silent
-                    // for 18 minutes this way), so tell the person waiting.
-                    // ponytail: while stuck, one notice per message. If that's noisy, throttle
-                    // per thread (like the `cannot_deliver` cooldown)
-                    Err(e) => {
-                        ctx(sid.as_deref()).error(
-                            "bridge",
-                            &format!("delivery failed: {e} — queued for retry"),
-                        );
-                        // Unless kept, **this message never arrives**, even after the cover clears
-                        // (see [`Bridge::retry_pending`] for why there is no other redelivery path)
-                        self.pending
-                            .entry(root_ts.clone())
-                            .or_default()
-                            .push(msg.clone());
-                        self.post_error_frame(
-                            msg.channel.clone(),
-                            root_ts.clone(),
-                            crate::t!("Couldn't hand this to the agent: {e}", "エージェントに渡せませんでした: {e}"),
-                        );
-                    }
-                }
+                // **Queue first, hand over second.** The queue is the record of what has not been
+                // confirmed; a delivery that never reports leaves the message there for the next tick
+                self.pending
+                    .entry(root_ts.clone())
+                    .or_default()
+                    .push(msg.clone());
+                self.start_delivery(&target, &key, &root_ts, &ctx(None));
+                ctx(entry.as_ref().and_then(|e| e.agent_id.as_deref())).info(
+                    "bridge",
+                    &format!(
+                        "slack-events: hand over message_id={} chat={} thread={root_ts} new={is_new}",
+                        msg.ts, msg.channel
+                    ),
+                );
+                handed_off = true;
             }
             Dispatch::Queue => {
                 self.pending
@@ -795,7 +782,7 @@ impl Bridge {
         let for_someone_else = !is_mention
             && crate::bridge::command::Message::new(&msg.text, self.bot_user_id.as_deref())
                 .mentions_someone_else();
-        if delivered && msg.reaction.is_none() && !for_someone_else {
+        if handed_off && msg.reaction.is_none() && !for_someone_else {
             self.touch_thread(&key, slack::TYPING_STATUS);
         }
     }
@@ -864,10 +851,9 @@ impl Bridge {
             ),
         );
         let envelope = envelope(&notice, root_ts, self.deps.clock.now_ms());
-        if let Err(e) = self.deps.agent.deliver(&Window::of(&target), &envelope) {
-            ctx.error("bridge", &format!("message_changed delivery failed: {e}"));
-            return;
-        }
+        // **Off the loop like every other delivery.** The edit stands whether or not the notice lands, so
+        // the interrupt below no longer waits for it; a failure reports itself
+        self.hand_notice(&target, key, &envelope);
         // Push first, then cut (same order as deletion). The other way round, the interrupted
         // agent waits for the next input without knowing about the edit
         if is_current {
@@ -978,17 +964,14 @@ impl Bridge {
         match target {
             Some(w) => {
                 let envelope = envelope(msg, root_ts, self.deps.clock.now_ms());
-                match self.deps.agent.deliver(&Window::of(&w), &envelope) {
-                    Ok(()) => ctx.info(
-                        "bridge",
-                        &format!(
-                            "message_deleted chan={} ts={deleted} thread={root_ts} \
-                             -> interrupt notify",
-                            msg.channel
-                        ),
+                ctx.info(
+                    "bridge",
+                    &format!(
+                        "message_deleted chan={} ts={deleted} thread={root_ts} -> interrupt notify",
+                        msg.channel
                     ),
-                    Err(e) => ctx.error("bridge", &format!("message_deleted delivery failed: {e}")),
-                }
+                );
+                self.hand_notice(&w, key, &envelope);
                 self.user_stop(msg, key, root_ts, ctx);
             }
             None => ctx.info(
@@ -1241,7 +1224,9 @@ impl Bridge {
         }
     }
 
-    /// The moment it becomes Ready, push what was held back.
+    /// The moment it becomes Ready, push what was held back. **One at a time**: the report of a finished
+    /// delivery asks for the next one, so the queue drains in order without two texts ever racing into the
+    /// same input box.
     pub(super) fn flush_queued(
         &mut self,
         session_id: &str,
@@ -1250,46 +1235,170 @@ impl Bridge {
         ctx: &LogCtx,
     ) {
         let Some(root_ts) = owning else { return };
-        let Some(mut queued) = self.pending.remove(&root_ts) else {
+        if !self.pending.contains_key(&root_ts) {
             return;
-        };
+        }
         let window = self
             .workers
             .window_of(session_id)
             .unwrap_or_else(|| SessionId::from(session_id.to_string()).window_name());
-        let mut delivered = false;
-        let mut i = 0;
-        while i < queued.len() {
-            let text = envelope(&queued[i], &root_ts, self.deps.clock.now_ms());
-            match self.deps.agent.deliver(&Window::of(&window), &text) {
-                Ok(()) => {
-                    ctx.info("bridge", "flushed queued message");
-                    delivered = true;
-                    i += 1;
+        let key = key
+            .cloned()
+            .or_else(|| {
+                self.threads
+                    .get(&root_ts)
+                    .and_then(|e| e.channel_id.clone())
+                    .map(|ch| ThreadKey::new(&ch, &root_ts))
+            })
+            .unwrap_or_else(|| ThreadKey::new("", &root_ts));
+        self.start_delivery(&window, &key, &root_ts, ctx);
+    }
+
+    /// Hand the first queued message of a thread to the agent, **off the loop**.
+    ///
+    /// Delivery sleeps (up to 1.2 s, pressing Enter until the input box empties), and the loop answers
+    /// hooks — the `PreToolUse` budget is 3 s — so it cannot be done here. One per window: a second text
+    /// arriving mid-delivery would interleave in the agent's input box.
+    pub(super) fn start_delivery(
+        &mut self,
+        window: &str,
+        key: &ThreadKey,
+        root_ts: &str,
+        ctx: &LogCtx,
+    ) {
+        if self.delivering.contains_key(window) {
+            return; // busy: the report will come back and ask for the next one
+        }
+        let Some(msg) = self.pending.get(root_ts).and_then(|q| q.first()).cloned() else {
+            return;
+        };
+        let text = self
+            .pending_envelopes
+            .get(&msg.ts)
+            .cloned()
+            .unwrap_or_else(|| envelope(&msg, root_ts, self.deps.clock.now_ms()));
+        self.delivering.insert(
+            window.to_string(),
+            crate::bridge::DeliveryInFlight {
+                key: key.clone(),
+                msg_ts: msg.ts.clone(),
+                since_ms: self.deps.clock.now_ms(),
+            },
+        );
+        ctx.debug(
+            "bridge",
+            &format!("handing message_id={} to {window}", msg.ts),
+        );
+        let agent = self.deps.agent.clone();
+        let tx = self.deliv_tx.clone();
+        let report = crate::bridge::DeliveryDone {
+            window: window.to_string(),
+            key: key.clone(),
+            msg_ts: msg.ts.clone(),
+            result: Ok(()),
+        };
+        let w = Window::of(window);
+        tokio::spawn(async move {
+            // **One report, whatever happens** — a panic in the blocking task included. Without it the
+            // latch below never clears and that thread goes quiet for good
+            let result = tokio::task::spawn_blocking(move || agent.deliver(&w, &text))
+                .await
+                .unwrap_or_else(|e| Err(format!("delivery task died: {e}")));
+            let _ = tx.send(crate::bridge::DeliveryDone { result, ..report }).await;
+        });
+    }
+
+    /// Hand a notice to an agent off the loop — an edit or a deletion, not a request of its own.
+    ///
+    /// **Not queued**: a notice that misses its moment is worth nothing, and there is no one waiting on a
+    /// reply to it. It also does not take the per-window latch, so it can go out while a request is being
+    /// delivered; the text is short and the TUI takes it in one go.
+    pub(super) fn hand_notice(&self, window: &str, key: &ThreadKey, text: &str) {
+        let agent = self.deps.agent.clone();
+        let (w, text) = (Window::of(window), text.to_string());
+        let key = key.clone();
+        tokio::spawn(async move {
+            let why = match tokio::task::spawn_blocking(move || agent.deliver(&w, &text)).await {
+                Ok(Ok(())) => return,
+                Ok(Err(e)) => e,
+                Err(e) => format!("delivery task died: {e}"),
+            };
+            LogCtx {
+                session_id: None,
+                thread_key: Some(key),
+            }
+            .error("bridge", &format!("notice delivery failed: {why}"));
+        });
+    }
+
+    /// A delivery finished. **Everything that used to follow the call happens here.**
+    pub(super) async fn on_delivery_done(&mut self, done: crate::bridge::DeliveryDone) {
+        let (channel, thread_ts) = done.key.split();
+        let root_ts = thread_ts.unwrap_or_default();
+        let ctx = LogCtx {
+            session_id: None,
+            thread_key: Some(done.key.clone()),
+        };
+        self.delivering.remove(&done.window);
+        match &done.result {
+            Ok(()) => {
+                // Confirmed, so it leaves the queue. Until now it stayed there on purpose
+                self.pending_envelopes.remove(&done.msg_ts);
+                if let Some(q) = self.pending.get_mut(&root_ts) {
+                    q.retain(|m| m.ts != done.msg_ts);
+                    if q.is_empty() {
+                        self.pending.remove(&root_ts);
+                    }
                 }
-                // Put what couldn't be delivered **back** in the queue (dropped, it never arrives).
-                // They all go to the same window, so if one is stuck the rest are too: stop there
-                // and put them back at the front, in order
-                Err(e) => {
-                    let back: Vec<InboundMsg> = queued.split_off(i);
-                    ctx.error(
-                        "bridge",
-                        &format!("flush failed: {e} — {} message(s) re-queued", back.len()),
-                    );
-                    self.pending
-                        .entry(root_ts.clone())
-                        .or_default()
-                        .splice(0..0, back);
-                    break;
-                }
+                ctx.info(
+                    "bridge",
+                    &format!(
+                        "slack-events: deliver message_id={} thread={root_ts} -> worker {}",
+                        done.msg_ts, channel
+                    ),
+                );
+                self.touch_thread(&done.key, slack::TYPING_STATUS);
+                // Next in line for this window
+                self.start_delivery(&done.window.clone(), &done.key.clone(), &root_ts, &ctx);
+            }
+            // Not delivered = this message **reached nobody**, and it is still in the queue. A log line
+            // alone leaves 👀 on it in silence (2026-08-18: two threads behind a modal were silent for
+            // 18 minutes that way), so tell the person waiting
+            Err(e) => {
+                ctx.error(
+                    "bridge",
+                    &format!("delivery failed: {e} — left queued for retry"),
+                );
+                self.post_error_frame(
+                    channel,
+                    root_ts,
+                    crate::t!("Couldn't hand this to the agent: {e}", "エージェントに渡せませんでした: {e}"),
+                );
             }
         }
-        // A flush is a delivery too: show the shimmer the moment it's handed over (as direct delivery does).
-        // Without this, messages queued while an agent was starting stay unmarked to the end
-        if delivered {
-            if let Some(key) = key {
-                self.touch_thread(key, slack::TYPING_STATUS);
-            }
+    }
+
+    /// A delivery that never reported. **Give up on it** — the message is still queued, so the next tick
+    /// tries again; leaving the latch set would silence that window for good.
+    pub(super) fn give_up_stuck_deliveries(&mut self, ctx: &LogCtx) {
+        let now = self.deps.clock.now_ms();
+        let stuck: Vec<String> = self
+            .delivering
+            .iter()
+            .filter(|(_, d)| now.saturating_sub(d.since_ms) > DELIVERY_STUCK_MS)
+            .map(|(w, _)| w.clone())
+            .collect();
+        for window in stuck {
+            let Some(d) = self.delivering.remove(&window) else {
+                continue;
+            };
+            ctx.error(
+                "bridge",
+                &format!(
+                    "delivery to {window} never reported (message_id={}) — giving up; it stays queued",
+                    d.msg_ts
+                ),
+            );
         }
     }
 }
