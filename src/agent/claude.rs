@@ -244,7 +244,7 @@ impl Claude {
         if let Ok(pane) = self.tmux.capture(w)
             && let Some(why) = Self::not_accepting_keys(&pane)
         {
-            return Err(format!("{w}: {why}"));
+            return Err(why.to_string());
         }
         self.tmux.deliver(w, text)?;
         for attempt in 0..=DELIVER_SUBMIT_RETRIES {
@@ -256,7 +256,7 @@ impl Claude {
             // A modal that appears mid-send is caught here too. Pressing again would **confirm the dialog**,
             // so back out without firing a single key
             if let Some(why) = Self::not_accepting_keys(&pane) {
-                return Err(format!("{w}: {why}"));
+                return Err(why.to_string());
             }
             if Pane::new(&pane).input_box_empty() {
                 return Ok(());
@@ -295,14 +295,20 @@ impl Claude {
     fn not_accepting_keys(pane: &str) -> Option<String> {
         let p = Pane::new(pane);
         if let Some(footer) = p.modal_footer() {
-            return Some(format!(
-                "a dialog has the keyboard — {}",
-                Self::dialog_title(pane, footer)
+            // **Written for the person waiting in the thread**, not for the log: they can act on
+            // "answer the dialog", not on a window id or a footer string
+            let title = Self::dialog_title(pane, footer);
+            return Some(crate::t!(
+                "the agent is waiting on a dialog ({title}) — answer it on its screen and this goes through",
+                "エージェントの画面で確認待ちになっています（{title}）。画面で答えると、これはそのまま渡ります"
             ));
         }
-        p.input_line()
-            .is_empty()
-            .then(|| "no input box on screen".to_string())
+        p.input_line().is_empty().then(|| {
+            crate::t!(
+                "the agent's input box is not on screen",
+                "エージェントの入力欄が画面に見当たりません"
+            )
+        })
     }
 
     /// The one line shown with ⚠️. The known-text table ([`Pane::spawn_screen`]) is not used — unknown modals
@@ -1924,9 +1930,11 @@ mod tests {
         for (label, modal, want) in REAL_MODALS {
             let (calls, c) = deliver_probe(vec![modal]);
             let err = c.deliver(&Window::of("@42"), "hello").unwrap_err();
-            assert!(err.contains("a dialog has the keyboard"), "{label}: {err}");
-            // We can tell a human what is blocking — the one line shown with Slack's ⚠️
+            assert!(err.contains("waiting on a dialog"), "{label}: {err}");
+            // What the person waiting sees: which dialog, and that answering it lets the message through.
+            // No window id, no footer string — they can act on neither
             assert!(err.contains(want), "{label}: {err}");
+            assert!(!err.contains("@42"), "{label}: internal id leaked into the notice: {err}");
             let calls = calls.lock().unwrap();
             assert_eq!(enters(&calls), 0, "{label}: Enter を撃たない");
             assert!(
