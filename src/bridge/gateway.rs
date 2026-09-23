@@ -1588,7 +1588,8 @@ pub fn route_of(id: &str, tunnels: &Tunnels) -> String {
     }
 }
 
-/// One line of the `machines` table.
+/// One line of the `machines` table. **The gateway takes one line per way in**, so several rows can
+/// be the gateway — only the first of them carries the name.
 struct MachineRow {
     id: String,
     host: String,
@@ -1598,18 +1599,62 @@ struct MachineRow {
     online: bool,
     /// Why the tunnel is down. Kept out of the table — a long reason pulls the columns apart
     down: Option<String>,
+    /// This row is one of the gateway's own ways in, not a machine.
+    gateway: bool,
 }
 
-/// The address machines actually reach the gateway at, out of everything it accepts.
-/// The gateway dials nobody, so it has no interface of its own to name — where it takes machines is
-/// the next best thing. **Loopback and `0.0.0.0` reach nobody**, so they are skipped.
-fn listen_ip(listen: &str) -> String {
-    listen
-        .split(',')
-        .filter_map(|a| a.trim().rsplit_once(':').map(|(host, _)| host))
-        .find(|h| !h.starts_with("127.") && *h != "localhost" && *h != "0.0.0.0")
-        .unwrap_or_default()
-        .to_string()
+/// One way in to this gateway. The gateway dials nobody, so it has no interface of its own to name —
+/// what it has is the ways machines arrive.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Entrance {
+    /// `host:port` as a machine would dial it.
+    pub at: String,
+    /// What terminates TLS in front, when anything does (`tailscale serve`).
+    pub front: Option<String>,
+}
+
+/// Every way in to this gateway: the addresses it holds itself, then the ones a front hands it.
+///
+/// **The two are not the same list.** A machine dialling `wss://<name>` reaches `tailscale serve` on
+/// the tailnet's 443, which forwards to our loopback — so that entrance never appears among the
+/// addresses we bind, and reading `AGENTGW_LINK_LISTEN` alone misses the one actually in use.
+/// Loopback is listed first because it is the gateway's own way in, and what the fronts forward to.
+///
+/// `serve_json` is `tailscale serve status --json`. **Only its top-level `Web`** — `Services` holds
+/// other machines' services, which say nothing about us.
+///
+/// **Pure function** — the caller does the I/O.
+pub(crate) fn entrances(listen: &str, serve_json: Option<&str>) -> Vec<Entrance> {
+    let held: Vec<&str> = listen.split(',').map(str::trim).filter(|a| !a.is_empty()).collect();
+    let mut out: Vec<Entrance> = held
+        .iter()
+        .map(|a| Entrance { at: a.to_string(), front: None })
+        .collect();
+    let Some(web) = serve_json
+        .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+        .and_then(|v| v.get("Web").cloned())
+        .and_then(|w| w.as_object().cloned())
+    else {
+        return out;
+    };
+    for (at, entry) in web {
+        // Ours only when it forwards to an address we hold. Anything else on 443 is someone else's
+        let ours = entry
+            .get("Handlers")
+            .and_then(|h| h.as_object())
+            .is_some_and(|hs| {
+                hs.values().any(|h| {
+                    h.get("Proxy")
+                        .and_then(|p| p.as_str())
+                        .and_then(|p| p.split("//").nth(1))
+                        .is_some_and(|dest| held.contains(&dest))
+                })
+            });
+        if ours && !out.iter().any(|e| e.at == at) {
+            out.push(Entrance { at, front: Some("tailscale serve".to_string()) });
+        }
+    }
+    out
 }
 
 /// The `machines` answer as a standard-Markdown table (so it must go out with `post_markdown`).
@@ -1641,8 +1686,8 @@ fn machines_md(rows: &[MachineRow]) -> String {
         };
         out.push(format!("| {id} | {host} | {ip} | {link} | {state} |"));
     }
-    // Only ourselves in the table
-    if rows.len() == 1 {
+    // Only the gateway's own ways in — no machine has been added
+    if rows.iter().all(|r| r.gateway) {
         out.push(String::new());
         out.push(crate::t!(
             "(no machines yet — run `agentgw add-machine user@host` here)",
@@ -1809,13 +1854,17 @@ impl Fleet {
     /// and whether it is connected. Hosts come from the machines themselves — only they can see their tailnet.
     async fn machines_table(self: &Arc<Self>) -> String {
         let hosts = self.hosts.lock().await.clone();
-        // The gateway doesn't dial anyone, so there is no interface of its own to name
-        let (me_host, me_ip) = crate::setup::add_machine::reachable_at(
-            crate::setup::ssh::tailscale_json().as_deref(),
+        // The gateway dials nobody, so `reachable_at` has no interface to measure — it answers with
+        // this host's own name, which is what an address of ours is known by
+        let tailscale = crate::setup::ssh::tailscale_json();
+        let (me_host, _) = crate::setup::add_machine::reachable_at(
+            tailscale.as_deref(),
             &crate::bridge::Host::name().await,
             crate::setup::ssh::fqdn().as_deref(),
             None,
         );
+        let (tailnet, tailnet_ip) =
+            crate::setup::add_machine::tailnet_identity(tailscale.as_deref());
         let tunnels = self.tunnels.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let connected = self.links.connected();
         let mut names: Vec<String> = connected.clone();
@@ -1827,18 +1876,49 @@ impl Fleet {
         names.sort();
         names.dedup();
 
-        // The gateway is a row like any other — it just has no route to itself
-        let mut rows = vec![MachineRow {
-            id: self.self_id.clone(),
-            host: me_host,
-            ip: match me_ip.is_empty() {
-                false => me_ip,
-                true => listen_ip(&std::env::var("AGENTGW_LINK_LISTEN").unwrap_or_default()),
-            },
-            link: crate::t!("gateway", "ゲートウェイ"),
-            online: true,
-            down: None,
-        }];
+        // **One row per way in.** The gateway has no route to itself, so what it has to say is where
+        // machines arrive — and there can be several (an address it holds, a front that hands it on)
+        let mut rows: Vec<MachineRow> = Vec::new();
+        for e in entrances(
+            &std::env::var("AGENTGW_LINK_LISTEN").unwrap_or_default(),
+            crate::setup::ssh::tailscale_serve_json().as_deref(),
+        ) {
+            let (host, port) = e.at.rsplit_once(':').unwrap_or((e.at.as_str(), ""));
+            // An address names no interface, so our own name goes beside it. A name that resolves
+            // here (the tailnet's) gets its address spelled out instead
+            let (name, at) = match host.parse::<std::net::IpAddr>() {
+                Ok(_) => (me_host.clone(), e.at.clone()),
+                Err(_) if host == tailnet && !tailnet_ip.is_empty() => {
+                    (host.to_string(), format!("{tailnet_ip}:{port}"))
+                }
+                Err(_) => (host.to_string(), e.at.clone()),
+            };
+            rows.push(MachineRow {
+                // Only the first of them carries the name — the rest are the same machine
+                id: rows.is_empty().then(|| self.self_id.clone()).unwrap_or_default(),
+                host: name,
+                ip: at,
+                link: match &e.front {
+                    None => crate::t!("gateway", "ゲートウェイ"),
+                    Some(f) => crate::t!("gateway ({f})", "ゲートウェイ({f})"),
+                },
+                online: true,
+                down: None,
+                gateway: true,
+            });
+        }
+        // Nothing open at all (a Bridge that was never given a way in): still say who we are
+        if rows.is_empty() {
+            rows.push(MachineRow {
+                id: self.self_id.clone(),
+                host: me_host,
+                ip: String::new(),
+                link: crate::t!("gateway", "ゲートウェイ"),
+                online: true,
+                down: None,
+                gateway: true,
+            });
+        }
         for id in &names {
             let (host, ip) = hosts.get(id).cloned().unwrap_or_default();
             // A machine behind an ssh tunnel dials its own loopback, so loopback is the interface it
@@ -1863,6 +1943,7 @@ impl Fleet {
                 link,
                 online: connected.iter().any(|c| c == id),
                 down,
+                gateway: false,
             });
         }
         machines_md(&rows)
@@ -4297,33 +4378,74 @@ mod tests {
     }
 
     #[test]
-    fn the_gateway_shows_the_address_machines_reach_it_at() {
-        // Loopback is written first and reaches nobody — the address after it is the answer
-        assert_eq!(listen_ip("127.0.0.1:8787,203.0.113.10:8787"), "203.0.113.10");
-        // Nothing but loopback: nothing to show, rather than an address nobody can use
-        assert_eq!(listen_ip("127.0.0.1:8787"), "");
-        assert_eq!(listen_ip(""), "");
-        assert_eq!(listen_ip("0.0.0.0:8787"), "");
+    fn a_front_is_a_way_in_that_no_address_of_ours_shows() {
+        let serve = r#"{
+          "Web": {
+            "dock.example.ts.net:443": {
+              "Handlers": {"/": {"Proxy": "http://127.0.0.1:8787"}}
+            },
+            "other.example.ts.net:443": {
+              "Handlers": {"/": {"Proxy": "http://127.0.0.1:3000"}}
+            }
+          },
+          "Services": {
+            "svc:elsewhere": {
+              "Web": {
+                "elsewhere.example.ts.net:443": {
+                  "Handlers": {"/": {"Proxy": "http://127.0.0.1:8787"}}
+                }
+              }
+            }
+          }
+        }"#;
+        let got = entrances("127.0.0.1:8787,203.0.113.10:8787", Some(serve));
+        assert_eq!(
+            got,
+            vec![
+                // What we hold comes first — loopback is our own way in, and what a front hands to
+                Entrance { at: "127.0.0.1:8787".into(), front: None },
+                Entrance { at: "203.0.113.10:8787".into(), front: None },
+                // Forwards to an address we hold, so it is a way in to us
+                Entrance {
+                    at: "dock.example.ts.net:443".into(),
+                    front: Some("tailscale serve".into()),
+                },
+            ],
+            // `other` forwards somewhere else, and `Services` is another machine's
+        );
+        // No tailscale, or nothing served: only what we hold
+        assert_eq!(
+            entrances("127.0.0.1:8787", None),
+            vec![Entrance { at: "127.0.0.1:8787".into(), front: None }]
+        );
+        assert_eq!(entrances("", None), vec![]);
     }
 
     #[test]
     fn the_machines_table_keeps_a_broken_tunnel_out_of_the_columns() {
         let row = |id: &str, host: &str, ip: &str, link: &str, online, down: Option<&str>| {
             MachineRow {
-                    id: id.into(),
+                id: id.into(),
                 host: host.into(),
                 ip: ip.into(),
                 link: link.into(),
                 online,
                 down: down.map(str::to_string),
+                gateway: link.starts_with("gateway"),
             }
         };
         let out = machines_md(&[
-            row("dock", "dock.lan", "", "gateway", true, None),
+            row("dock", "dock.lan", "127.0.0.1:8787", "gateway", true, None),
+            row("", "dock.example.ts.net", "100.64.0.1:443", "gateway (tailscale serve)", true, None),
             row("pve", "pve.example.ts.net", "100.64.0.9", "direct", true, None),
             row("mac", "", "", "ssh tunnel (me@mac)", false, Some("connection refused")),
         ]);
-        assert!(out.contains("| `dock` | `dock.lan` |  | gateway | 🟢 |"), "{out}");
+        // The gateway takes a row per way in, and only the first of them carries the name
+        assert!(out.contains("| `dock` | `dock.lan` | `127.0.0.1:8787` | gateway | 🟢 |"), "{out}");
+        assert!(
+            out.contains("|  | `dock.example.ts.net` | `100.64.0.1:443` | gateway (tailscale serve) | 🟢 |"),
+            "{out}"
+        );
         assert!(
             out.contains("| `pve` | `pve.example.ts.net` | `100.64.0.9` | direct | 🟢 |"),
             "{out}"
@@ -4338,8 +4460,11 @@ mod tests {
             out.ends_with("`mac` — the ssh tunnel is down: connection refused"),
             "{out}"
         );
-        // A lone gateway says how to add one
-        let alone = machines_md(&[row("dock", "dock.lan", "", "gateway", true, None)]);
+        // Several gateway rows and no machine still means "none yet"
+        let alone = machines_md(&[
+            row("dock", "dock.lan", "127.0.0.1:8787", "gateway", true, None),
+            row("", "dock.example.ts.net", "100.64.0.1:443", "gateway (tailscale serve)", true, None),
+        ]);
         assert!(alone.contains("agentgw add-machine user@host"), "{alone}");
     }
 

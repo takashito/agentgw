@@ -322,12 +322,23 @@ pub fn gh_download(
 
 /// `tailscale status --json`. `None` if it's not installed or not running.
 pub fn tailscale_json() -> Option<String> {
+    tailscale(&["status", "--json"])
+}
+
+/// `tailscale serve status --json`. **What terminates TLS in front of us**, when anything does:
+/// a machine dialling `wss://<name>` never reaches an address we hold, it reaches this and is
+/// forwarded to our loopback. `None` if tailscale isn't there or nothing is served.
+pub fn tailscale_serve_json() -> Option<String> {
+    tailscale(&["serve", "status", "--json"])
+}
+
+fn tailscale(args: &[&str]) -> Option<String> {
     for bin in [
         "tailscale",
         "/usr/local/bin/tailscale",
         "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
     ] {
-        if let Ok(out) = Command::new(bin).args(["status", "--json"]).output()
+        if let Ok(out) = Command::new(bin).args(args).output()
             && out.status.success()
         {
             return Some(String::from_utf8_lossy(&out.stdout).to_string());
