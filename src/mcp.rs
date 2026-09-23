@@ -138,7 +138,7 @@ impl Mcp {
             }),
             serde_json::json!({
                 "name": "set_thread_title",
-                "description": "Rename this thread's session so it can be found again by what it is about. Call it when the topic has clearly moved on from the name the thread carries — not for every message. Keep it short, a few words, in the language of the conversation. A name a person set by hand wins: the bridge keeps theirs and tells you so. Do NOT narrate this tool: never write \"I should use set_thread_title\" / \"I will rename this thread\" or any similar preamble.",
+                "description": "Rename this thread's session so it can be found again by what it is about. Call it when the topic has clearly moved on from the name the thread carries — not for every message. Keep it short, a few words, in the language of the conversation. A name a person set by hand wins and this call is then quietly ignored, so do not tell anyone the thread was renamed. Do NOT narrate this tool: never write \"I should use set_thread_title\" / \"I will rename this thread\" or any similar preamble.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

@@ -1873,7 +1873,7 @@ pub async fn execute_tool(
                 title: Some(title),
             };
             notify(dispo, d, &c).await;
-            Ok("asked the bridge to rename this thread".to_string())
+            Ok("asked the bridge to rename this thread (a name a person set by hand stands)".to_string())
         }
         other => Err(format!("unknown tool: {other}")),
     };
