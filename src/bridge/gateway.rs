@@ -1648,6 +1648,14 @@ struct MachineRow {
     gateway: bool,
 }
 
+/// `localhost:8787` and `127.0.0.1:8787` are the same door; compared as text they are not.
+fn loopback_named(addr: &str) -> String {
+    match addr.rsplit_once(':') {
+        Some((host, port)) if host.eq_ignore_ascii_case("localhost") => format!("127.0.0.1:{port}"),
+        _ => addr.to_string(),
+    }
+}
+
 /// One way in to this gateway. The gateway dials nobody, so it has no interface of its own to name —
 /// what it has is the ways machines arrive.
 #[derive(Debug, PartialEq, Eq)]
@@ -1675,6 +1683,7 @@ pub(crate) fn entrances(listen: &str, serve_json: Option<&str>) -> Vec<Entrance>
         .iter()
         .map(|a| Entrance { at: a.to_string(), front: None })
         .collect();
+    let same_door = |a: &str| held.iter().any(|h| loopback_named(h) == loopback_named(a));
     let Some(web) = serve_json
         .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
         .and_then(|v| v.get("Web").cloned())
@@ -1692,7 +1701,7 @@ pub(crate) fn entrances(listen: &str, serve_json: Option<&str>) -> Vec<Entrance>
                     h.get("Proxy")
                         .and_then(|p| p.as_str())
                         .and_then(|p| p.split("//").nth(1))
-                        .is_some_and(|dest| held.contains(&dest))
+                        .is_some_and(same_door)
                 })
             });
         if ours && !out.iter().any(|e| e.at == at) {
@@ -4508,6 +4517,13 @@ mod tests {
             vec![Entrance { at: "127.0.0.1:8787".into(), front: None }]
         );
         assert_eq!(entrances("", None), vec![]);
+        // `localhost` and `127.0.0.1` name the same door, whichever side spells it which way
+        let by_name = r#"{"Web":{"h.example.ts.net:443":
+            {"Handlers":{"/":{"Proxy":"http://localhost:8787"}}}}}"#;
+        assert_eq!(entrances("127.0.0.1:8787", Some(by_name)).len(), 2);
+        assert_eq!(entrances("localhost:8787", Some(serve)).len(), 2);
+        // A different port is still a different door
+        assert_eq!(entrances("127.0.0.1:9999", Some(by_name)).len(), 1);
     }
 
     #[test]
