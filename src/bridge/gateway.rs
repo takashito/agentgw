@@ -1832,6 +1832,12 @@ pub struct Fleet {
     pub reload: Sender<()>,
     /// The ssh tunnels we keep open (to show the route in `status`).
     pub tunnels: std::sync::Mutex<Tunnels>,
+    /// machine → the address of ours it arrived on. **Memory only.** A machine behind a front
+    /// arrives on our loopback, which is the truth: that is the way in being used.
+    ///
+    /// **Never cleared when a machine goes away.** It is read to decide which addresses may be
+    /// closed, and a machine that is merely offline right now must not have its way in taken away.
+    pub entrance: tokio::sync::Mutex<HashMap<String, String>>,
 }
 
 impl Fleet {
@@ -2745,8 +2751,13 @@ pub(super) fn admit_upgrade(
 }
 
 /// Where machines dial in. `/bridge/{id}`.
+/// The address a request came in on, carried from the listener that accepted it.
+#[derive(Clone)]
+struct Entered(String);
+
 async fn on_upgrade(
     State(fleet): State<Arc<Fleet>>,
+    axum::Extension(Entered(at)): axum::Extension<Entered>,
     headers: HeaderMap,
     uri: axum::http::Uri,
     ws: WebSocketUpgrade,
@@ -2765,7 +2776,7 @@ async fn on_upgrade(
     }
     // Returning the subprotocol in the upgrade response is the convention (strict clients hang up otherwise)
     ws.protocols([LINK_SUBPROTOCOL])
-        .on_upgrade(move |socket| on_socket(fleet, bridge_id, socket))
+        .on_upgrade(move |socket| on_socket(fleet, bridge_id, at, socket))
 }
 
 /// The axum-side reader. It only bridges the difference — the watch clock and state machine live only in `link::beat`.
@@ -2783,7 +2794,8 @@ impl LinkRead for WebSocket {
 }
 
 /// The life of one link (**the side a machine dialed**).
-async fn on_socket(fleet: Arc<Fleet>, bridge_id: String, mut socket: WebSocket) {
+async fn on_socket(fleet: Arc<Fleet>, bridge_id: String, at: String, mut socket: WebSocket) {
+    fleet.entrance.lock().await.insert(bridge_id.clone(), at);
     let (conn, mut rx) = fleet.attach(&bridge_id).await;
 
     // Don't split the socket (don't use futures_util's Sink side). **After the handshake the machine sends
@@ -2838,8 +2850,13 @@ async fn on_status(
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
     let tunnels = fleet.tunnels.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    axum::Json(serde_json::json!({ "connected": fleet.links.connected(), "tunnels": tunnels }))
-        .into_response()
+    let entrance = fleet.entrance.lock().await.clone();
+    axum::Json(serde_json::json!({
+        "connected": fleet.links.connected(),
+        "tunnels": tunnels,
+        "entrances": entrance,
+    }))
+    .into_response()
 }
 
 /// Open the endpoint that accepts machines. **Never returns.**
@@ -2873,10 +2890,17 @@ pub(super) async fn bind_link_port(addr: std::net::SocketAddr, what: &str) -> Op
 /// **a different port**, guarded by loopback + token. This one is exposed through a front proxy, so putting
 /// them on the same port would let hooks and MCP be hit from outside.
 async fn serve_children_on(fleet: Arc<Fleet>, listener: tokio::net::TcpListener) {
+    // **Which of our addresses this listener is.** There is one listener per address, so a machine
+    // that arrives here arrived on this one — nothing has to be inferred later
+    let at = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
     let app = Router::new()
         .route("/status", get(on_status))
         .route(link::PROBE_PATH, get(on_upgrade))
         .route("/bridge/{id}", get(on_upgrade))
+        .layer(axum::Extension(Entered(at)))
         .with_state(fleet);
     if let Err(e) = axum::serve(listener, app).await {
         rlog("error", &format!("the link server stopped: {e}"));
@@ -3224,8 +3248,15 @@ impl Cli {
         Self::ask_status(listen, token).await.map(|r| r.0)
     }
 
-    /// The answer from the running gateway's `status` endpoint — connected machines, and the tunnels the gateway keeps open.
-    async fn ask_status(listen: &str, token: &str) -> Option<(Vec<String>, Tunnels)> {
+    /// The addresses of ours that machines have actually arrived on. `None` = it didn't answer, which
+    /// is **not** the same as "none" — with no answer, nothing may be closed.
+    pub(crate) async fn ask_entrances(listen: &str, token: &str) -> Option<Vec<String>> {
+        Self::ask_status(listen, token).await.map(|r| r.2)
+    }
+
+    /// The answer from the running gateway's `status` endpoint — connected machines, the tunnels the
+    /// gateway keeps open, and the addresses of ours machines have come in on.
+    async fn ask_status(listen: &str, token: &str) -> Option<(Vec<String>, Tunnels, Vec<String>)> {
         for i in 0..3 {
             if i > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(700)).await;
@@ -3237,7 +3268,7 @@ impl Cli {
         None
     }
 
-    async fn ask_status_once(listen: &str, token: &str) -> Option<(Vec<String>, Tunnels)> {
+    async fn ask_status_once(listen: &str, token: &str) -> Option<(Vec<String>, Tunnels, Vec<String>)> {
         let listen = first_addr(listen);
         // Ask curl to avoid a dependency (no HTTP client declared for this one-off job)
         let out = tokio::process::Command::new("curl")
@@ -3264,7 +3295,14 @@ impl Cli {
             .get("tunnels")
             .and_then(|t| serde_json::from_value(t.clone()).ok())
             .unwrap_or_default();
-        Some((connected, tunnels))
+        let mut entrances: Vec<String> = v
+            .get("entrances")
+            .and_then(|e| e.as_object())
+            .map(|e| e.values().filter_map(|a| a.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        entrances.sort();
+        entrances.dedup();
+        Some((connected, tunnels, entrances))
     }
 
     /// id → readable name (best-effort). Anything that can't be looked up is shown as the raw id.
@@ -3621,6 +3659,7 @@ mod tests {
             click_tx,
             reload,
             tunnels: Default::default(),
+            entrance: Default::default(),
         });
         (fleet, msg_rx)
     }

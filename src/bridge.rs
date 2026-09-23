@@ -684,6 +684,7 @@ impl Bridge {
                 click_tx: click_tx.clone(),
                 reload: reload_tx.clone(),
                 tunnels: Default::default(),
+                entrance: Default::default(),
             });
             // One listener per address: loopback for whatever terminates TLS in front, the LAN address
             // for machines on the same network

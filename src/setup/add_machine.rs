@@ -294,6 +294,77 @@ pub fn routes_with(raw: &str, child: &str, url: Option<&str>) -> String {
     tunnels_with(raw, child, url)
 }
 
+/// What the gateway should listen on once a route is settled: **loopback always**, plus every address
+/// still needed. Anything else was opened to try a route that nothing uses any more — `add_listen`
+/// opens an address before each attempt, so the losing attempts leave theirs behind.
+///
+/// Three things are kept:
+///
+/// 1. **loopback** — where a front that terminates TLS forwards to, and where an ssh tunnel comes out
+/// 2. **`in_use`** — what the running gateway says machines have actually arrived on. The records can
+///    be incomplete (a machine linked before they were kept), so this is what stops a live machine
+///    from losing its way in
+/// 3. **what the remembered routes ask for** — a `ws://` route arrives at an address of ours; a
+///    `wss://` one arrives at a front and asks for nothing
+///
+/// **Closing nothing is always allowed; closing the wrong thing is not.** A name that can't be placed,
+/// or a result with nothing left, returns the list unchanged.
+///
+/// Pure so it can be tested without a gateway.
+pub fn listen_after_prune(
+    listen: &str,
+    routes: &str,
+    in_use: &[String],
+    tailnet: (&str, &str),
+    fqdn: Option<&str>,
+    lan_ip: Option<&str>,
+) -> String {
+    let mut wanted: Vec<String> = Vec::new();
+    for (_, url) in crate::bridge::machine::child_urls(routes) {
+        let url = url.trim();
+        // A front terminates TLS and hands it to our loopback, so it asks for no address of ours
+        if url.starts_with("wss://") || url.starts_with("https://") {
+            continue;
+        }
+        let Some((host, port)) = host_port_of(url) else {
+            continue;
+        };
+        let ip = if host.parse::<std::net::IpAddr>().is_ok() {
+            host
+        } else if host == tailnet.0 && !tailnet.1.is_empty() {
+            tailnet.1.to_string()
+        } else if Some(host.as_str()) == fqdn && lan_ip.is_some_and(|i| !i.is_empty()) {
+            lan_ip.unwrap_or_default().to_string()
+        } else {
+            // A name nothing here can place. **Don't guess, and don't close anything**
+            return listen.to_string();
+        };
+        wanted.push(format!("{ip}:{port}"));
+    }
+    let kept: Vec<&str> = listen
+        .split(',')
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .filter(|a| {
+            is_loopback_addr(a) || in_use.iter().any(|u| u == a) || wanted.iter().any(|w| w == a)
+        })
+        .collect();
+    match kept.is_empty() {
+        // Never leave the gateway with nowhere to listen
+        true => listen.to_string(),
+        false => kept.join(","),
+    }
+}
+
+/// `127.0.0.1:8787` → true. The host part only — the port says nothing about who can reach it.
+fn is_loopback_addr(addr: &str) -> bool {
+    addr.rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(addr)
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
 // ── Execution ────────────────────────────────────────────────────────────────
 // This layer touches the OS and the remote machine. The decisions live in the pure functions above (which are tested).
 
@@ -638,6 +709,10 @@ async fn add_child(
         Transport::Tunnel { .. } => remember_route(&dir, &child, None),
     }
 
+    // 8. Close what the losing attempts left open. **Only now** — while routes were being tried, every
+    //    attempt needed its address open
+    close_unused_addresses(&dir).await;
+
     let how = match &transport {
         Transport::Direct { url } => crate::t!("directly, at {url}", "直結({url})"),
         Transport::Tunnel { .. } => crate::t!("over an ssh tunnel ({target})", "ssh トンネル経由({target})"),
@@ -647,6 +722,45 @@ async fn add_child(
         "\nHand {child} a Slack channel by typing this in that channel:\n  pwd {child}:<path>",
         "\n{child} に Slack のチャンネルを任せるには、そのチャンネルでこう打ちます:\n  pwd {child}:<パス>"
     ))
+}
+
+/// Take back the addresses nothing uses any more, and restart if the list changed.
+///
+/// **Asks the running gateway first.** It knows which of its addresses machines actually came in on,
+/// which the records alone don't say. If it doesn't answer, nothing is closed — an address left open
+/// costs a port, closing the wrong one costs a machine.
+async fn close_unused_addresses(dir: &StateDir) {
+    let env = RelayCli::env_of(dir);
+    let listen = env.get("AGENTGW_LINK_LISTEN").cloned().unwrap_or_default();
+    let token = env.get("AGENTGW_LINK_TOKEN").cloned().unwrap_or_default();
+    let Some(in_use) = RelayCli::ask_entrances(&listen, &token).await else {
+        detail(&crate::t!(
+            "the gateway didn't answer, so no address was closed",
+            "ゲートウェイが応答しないので、口は閉じませんでした"
+        ));
+        return;
+    };
+    let (tailnet, tailnet_ip) = tailnet_identity(ssh::tailscale_json().as_deref());
+    let after = listen_after_prune(
+        &listen,
+        env.get("AGENTGW_ROUTES").map(String::as_str).unwrap_or_default(),
+        &in_use,
+        (&tailnet, &tailnet_ip),
+        ssh::fqdn().as_deref(),
+        ssh::lan_ip().as_deref(),
+    );
+    if after == listen {
+        return;
+    }
+    if let Err(e) = RelayCli::write_env(dir, &[("AGENTGW_LINK_LISTEN", after.clone())]) {
+        eprintln!("{}", crate::t!("Couldn't write .env: {e}", ".env が書けません: {e}"));
+        return;
+    }
+    ok(&crate::t!(
+        "this gateway now accepts machines on {after} — the rest was opened to try a route and is not used",
+        "このゲートウェイがマシンを受け付けるのは {after} になりました(残りは経路を試すために開いたもので、使われていません)"
+    ));
+    crate::service::Service::run_quiet("restart", &[]);
 }
 
 /// The gateway's listener and key. Create them in `.env` if missing, and restart **only when a new key was made**
@@ -1310,6 +1424,44 @@ mod tests {
 
     /// What a machine could dial from the LAN: the gateway's own listeners, minus the ones that mean
     /// "this machine" on the other side.
+    #[test]
+    fn closing_takes_back_only_what_nothing_uses() {
+        let tailnet = ("hub.example.ts.net", "100.64.0.1");
+        let fqdn = Some("hub.lan");
+        let lan = Some("192.0.2.10");
+        let all = "127.0.0.1:8787,192.0.2.10:8787,100.64.0.1:8787";
+
+        // A front hands the machine to our loopback, so neither of the open addresses is needed
+        assert_eq!(
+            listen_after_prune(all, "pve=wss://hub.example.ts.net", &[], tailnet, fqdn, lan),
+            "127.0.0.1:8787"
+        );
+        // A route straight to us keeps its own address, and only that one
+        assert_eq!(
+            listen_after_prune(all, "pve=ws://hub.lan:8787", &[], tailnet, fqdn, lan),
+            "127.0.0.1:8787,192.0.2.10:8787"
+        );
+        assert_eq!(
+            listen_after_prune(all, "pve=ws://hub.example.ts.net:8787", &[], tailnet, fqdn, lan),
+            "127.0.0.1:8787,100.64.0.1:8787"
+        );
+        // **A machine that came in on it keeps it**, even with nothing written down — the records
+        // can be incomplete, a live machine cannot be
+        assert_eq!(
+            listen_after_prune(all, "", &["192.0.2.10:8787".to_string()], tailnet, fqdn, lan),
+            "127.0.0.1:8787,192.0.2.10:8787"
+        );
+        // Loopback stays even when nothing at all is remembered
+        assert_eq!(listen_after_prune(all, "", &[], tailnet, fqdn, lan), "127.0.0.1:8787");
+        // A name nothing here can place: don't guess, don't close
+        assert_eq!(
+            listen_after_prune(all, "pve=ws://elsewhere.invalid:8787", &[], tailnet, fqdn, lan),
+            all
+        );
+        // Nothing would be left: keep what is there rather than listen nowhere
+        assert_eq!(listen_after_prune("192.0.2.10:8787", "", &[], tailnet, fqdn, lan), "192.0.2.10:8787");
+    }
+
     #[test]
     fn lan_route_pairs_a_name_with_the_address_to_open() {
         assert_eq!(

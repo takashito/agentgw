@@ -299,7 +299,8 @@ fn default_listen(state_dir: &StateDir) {
 ///
 /// **Called before each route is tried**, not at install time: a route can only be tried once the
 /// address it needs is open. So this opens the address of **every route attempted**, not just the one
-/// that wins, and nothing takes an address back out again.
+/// that wins. What the losers opened is taken back out once the route is settled
+/// (`add_machine::close_unused_addresses`).
 pub(crate) fn add_listen(state_dir: &StateDir, addr: &str) -> bool {
     let current = state_dir
         .load_env()
