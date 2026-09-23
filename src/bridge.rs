@@ -498,6 +498,21 @@ impl Bridge {
 
     /// SIGHUP. access.json / threads.json are **authoritative in memory**, so
     /// this is the only way to take in hand edits.
+    /// Write down which machine a thread belongs to, for the gateway to read back after a restart.
+    ///
+    /// Nothing else about the row is touched, and a row that says something else already is left
+    /// alone — the gateway only asks about threads it has not written down yet, and an answer that
+    /// arrived late must not undo a move made since.
+    fn remember_thread_route(&mut self, thread_ts: &str, machine: &str) {
+        if self.threads.get(thread_ts).and_then(|e| e.bridge.as_deref()) == Some(machine) {
+            return;
+        }
+        self.threads.set_bridge(thread_ts, machine);
+        if let Err(e) = self.threads.save() {
+            LogCtx::default().error("bridge", &format!("threads.json save failed: {e}"));
+        }
+    }
+
     fn reload_from_disk(&mut self) {
         let ctx = LogCtx::default();
         let access = bridge::Access::load(&self.deps.dir);
@@ -621,6 +636,9 @@ impl Bridge {
         // Deliveries run off the loop and report back here. 64 is plenty: one per window in flight
         let (deliv_tx, mut deliv_rx) = mpsc::channel::<DeliveryDone>(64);
         let (reload_tx, mut reload_rx) = mpsc::channel(4);
+        // The gateway asking for a thread's machine to be written down. **Only this loop writes
+        // threads.json**, so the gateway hands the pair over instead of saving the file itself.
+        let (remember_tx, mut remember_rx) = mpsc::channel::<(String, String)>(64);
         // The signal that the link to the gateway was re-established (only machines use it)
         let (relink_tx, mut relink_rx) = mpsc::channel(4);
         consume_restart_marker(&dir, api.as_ref()).await;
@@ -662,6 +680,11 @@ impl Bridge {
                 msg_tx: msg_tx.clone(),
                 click_tx: click_tx.clone(),
                 reload: reload_tx.clone(),
+                // Seeded from disk so a restart keeps sending each thread where it was going
+                thread_routes: tokio::sync::Mutex::new(
+                    crate::bridge::state::Threads::load(&dir).bridges(),
+                ),
+                remember: remember_tx.clone(),
                 tunnels: Default::default(),
             });
             // One listener per address: loopback for whatever terminates TLS in front, the LAN address
@@ -898,6 +921,9 @@ impl Bridge {
                 _ = sighup.recv() => b.reload_from_disk(),
                 // The fleet side wrote access.json (route / set-home / owner). Same as SIGHUP
                 Some(()) = reload_rx.recv() => b.reload_from_disk(),
+                // The gateway decided which machine a thread belongs to. Writing it is this loop's
+                // job alone — see `Threads::set_bridge`
+                Some((thread_ts, machine)) = remember_rx.recv() => b.remember_thread_route(&thread_ts, &machine),
                 // The link to the gateway was re-established. **Post online again** — for a machine
                 // this one line is the only way to tell a person "connected" (the gateway's presence
                 // only reports 🔴. Don't say the same thing in two places)

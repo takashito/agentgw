@@ -832,9 +832,28 @@ impl<'a> Event<'a> {
             .or_else(|| self.raw.get("message")?.get("text")?.as_str())
     }
 
-    /// Where a reply to this message goes. Inside the thread if in one, otherwise under it.
+    /// The ts of the post this event is **about**.
+    ///
+    /// For an edit or a deletion that is the post under `message`, not the ts at the top level:
+    /// that one is the change itself, a number belonging to no post and no thread.
+    fn posted_ts(&self) -> Option<&'a str> {
+        self.raw
+            .get("message")
+            .or_else(|| self.raw.get("previous_message"))
+            .and_then(|m| m.get("ts")?.as_str())
+            .or_else(|| self.str_at("ts"))
+    }
+
+    /// Where a reply to this message goes, and which thread it belongs to: the thread it is in, or
+    /// the post itself when the post is the one that opened the thread.
     pub fn thread(&self) -> Option<&'a str> {
-        self.str_at("thread_ts").or_else(|| self.str_at("ts"))
+        self.str_at("thread_ts").or_else(|| self.posted_ts())
+    }
+
+    /// The post a reaction was put on. **Not the thread** — on a reply it names the reply, which is
+    /// why the post has to be read before this can say anything about a thread.
+    pub fn reacted_ts(&self) -> Option<&'a str> {
+        self.raw.get("item")?.get("ts")?.as_str()
     }
 
     /// Written by the bot itself — **including these very refusals**. Without this, a channel with no
@@ -899,6 +918,18 @@ impl Click<'_> {
     pub fn channel(&self) -> Option<&str> {
         self.0.get("channel")?.get("id")?.as_str()
     }
+
+    /// The thread the prompt is sitting in. **A permission prompt is always posted inside one**, so
+    /// the press has to follow the thread — routing it by channel would send the answer to whichever
+    /// machine the channel points at now, and the agent waiting on it would never hear.
+    pub fn thread(&self) -> Option<&str> {
+        for at in ["container", "message"] {
+            if let Some(ts) = self.0.get(at).and_then(|c| c.get("thread_ts")?.as_str()) {
+                return Some(ts);
+            }
+        }
+        None
+    }
 }
 
 /// The delivery decision. **Never picks a machine on its own, and never holds messages for an absent machine** —
@@ -916,8 +947,30 @@ pub enum Delivery {
 }
 
 impl Delivery {
+    /// The machine this decision names, `Local` included (it names this one).
+    ///
+    /// `None` for [`Delivery::UnknownChannel`] — nothing was decided, so there is nothing to write down.
+    pub fn bridge_id(&self, self_id: &str) -> Option<String> {
+        match self {
+            Delivery::Forward(b) | Delivery::Offline(b) => Some(b.clone()),
+            Delivery::Local => Some(self_id.to_string()),
+            Delivery::UnknownChannel => None,
+        }
+    }
+
+    /// Where one Slack event goes.
+    ///
+    /// **A thread that has a machine of its own wins over its channel's.** A channel's assignment
+    /// says where its *next* thread starts; it must not move a conversation already under way, which
+    /// is what it did until 2026-09-23 — repointing a channel sent a live thread's messages to a
+    /// machine that had no record of it, and they were dropped as addressed to nobody.
+    ///
+    /// `thread` is `None` when the event does not say which thread it belongs to; then the channel
+    /// decides, exactly as every event did before.
     pub fn decide(
         channel_id: Option<&str>,
+        thread: Option<&str>,
+        thread_routes: &Routes,
         routes: &Routes,
         self_id: &str,
         is_connected: impl Fn(&str) -> bool,
@@ -925,6 +978,13 @@ impl Delivery {
         let Some(channel) = channel_id else {
             return Delivery::UnknownChannel;
         };
+        if let Some(bridge_id) = thread.and_then(|t| thread_routes.get(t)) {
+            return match bridge_id {
+                b if b == self_id => Delivery::Local,
+                b if is_connected(b) => Delivery::Forward(b.clone()),
+                b => Delivery::Offline(b.clone()),
+            };
+        }
         match routes.get(channel) {
             // **A channel with no machine assigned is handled here.** A Bridge with no machines has
             // an empty table, so it passes through here and works as before
@@ -1890,6 +1950,15 @@ pub struct Fleet {
     pub click_tx: Sender<PermClick>,
     /// Tells the Bridge itself that access.json was written (the same reload as SIGHUP).
     pub reload: Sender<()>,
+    /// thread → the machine handling it. Read on **every** event, so it is kept here rather than
+    /// loaded from threads.json each time.
+    ///
+    /// **Memory is the copy that decides; the file is only how it survives a restart.** Writing it
+    /// is asked of the Bridge over [`Self::remember`], because the Bridge is the one process that
+    /// writes threads.json — a second writer would save a whole file built from its own older copy.
+    pub thread_routes: AsyncMutex<Routes>,
+    /// Asks the Bridge to write a thread's machine into threads.json. `(thread_ts, machine)`.
+    pub remember: Sender<(String, String)>,
     /// The ssh tunnels we keep open (to show the route in `status`).
     pub tunnels: std::sync::Mutex<Tunnels>,
 }
@@ -2167,6 +2236,23 @@ impl Fleet {
         }
     }
 
+    /// Which thread an event belongs to.
+    ///
+    /// **A reaction does not say.** It carries the channel and the ts of the post it was put on, and
+    /// on a reply that names the reply. So the post is read once — the same `message_at` the machine
+    /// side already uses for the same reason. **Taking the ts for the thread instead is a known bug**:
+    /// right on a thread's opening message and wrong on every reply, which is the exact shape of the
+    /// misdelivery found on 2026-08-02.
+    ///
+    /// Everything else is already in the event, [`Event::thread`] reads it, and `None` leaves the
+    /// channel's assignment to decide — what every event did before there was a thread to consult.
+    async fn thread_of(&self, ev: &Event<'_>) -> Option<String> {
+        match ev.reacted_ts() {
+            Some(ts) => Some(self.api.message_at(ev.channel()?, ts).await?.thread_ts),
+            None => ev.thread().map(str::to_string),
+        }
+    }
+
     async fn on_event(self: &Arc<Self>, name: &str, raw: &serde_json::Value) {
         let ev = Event::new(name, raw);
         let channel = ev.channel();
@@ -2183,10 +2269,28 @@ impl Fleet {
             return;
         }
 
+        let thread = self.thread_of(&ev).await;
         let (routes, connected) = (self.access().bridges(), self.links.connected());
-        match Delivery::decide(channel, &routes, &self.self_id, |b| {
-            connected.iter().any(|c| c == b)
-        }) {
+        let thread_routes = self.thread_routes.lock().await.clone();
+        let decision = Delivery::decide(
+            channel,
+            thread.as_deref(),
+            &thread_routes,
+            &routes,
+            &self.self_id,
+            |b| connected.iter().any(|c| c == b),
+        );
+        // **Remember where it went, the moment it is decided.** A thread whose machine came from its
+        // channel this time keeps that machine afterwards, so repointing the channel later leaves it
+        // alone. Only a thread we can name, and only when it is not already written down.
+        if let Some(t) = thread.as_deref()
+            && !thread_routes.contains_key(t)
+            && let Some(id) = decision.bridge_id(&self.self_id)
+        {
+            let _ = self.remember.send((t.to_string(), id.clone())).await;
+            self.thread_routes.lock().await.insert(t.to_string(), id);
+        }
+        match decision {
             // This machine's job. Goes through **the same conversion as direct mode** into the same channel
             Delivery::Local => {
                 rlog("debug", &format!("{name} chan={channel:?} → local"));
@@ -2646,11 +2750,18 @@ impl Fleet {
 
     async fn on_click(self: &Arc<Self>, action: serde_json::Value, body: serde_json::Value) {
         let channel = Click(&body).channel().map(str::to_string);
+        let thread = Click(&body).thread().map(str::to_string);
         let (routes, connected) = (self.access().bridges(), self.links.connected());
+        let thread_routes = self.thread_routes.lock().await.clone();
 
-        match Delivery::decide(channel.as_deref(), &routes, &self.self_id, |b| {
-            connected.iter().any(|c| c == b)
-        }) {
+        match Delivery::decide(
+            channel.as_deref(),
+            thread.as_deref(),
+            &thread_routes,
+            &routes,
+            &self.self_id,
+            |b| connected.iter().any(|c| c == b),
+        ) {
             Delivery::Local => {
                 rlog("debug", &format!("action chan={channel:?} → local"));
                 if let Some(click) = crate::chat::slack::perm_click_from_relay(&action, &body) {
@@ -3680,7 +3791,8 @@ mod tests {
     fn delivery_has_four_outcomes() {
         let r = routes(&[("C1", "desktop"), ("C2", "laptop"), ("C3", "vps")]);
         let up = |id: &str| id == "desktop";
-        let d = |ch: Option<&str>| Delivery::decide(ch, &r, "vps", up);
+        let none = Routes::new();
+        let d = |ch: Option<&str>| Delivery::decide(ch, None, &none, &r, "vps", up);
         assert_eq!(d(Some("C1")), Delivery::Forward("desktop".into()));
         assert_eq!(d(Some("C2")), Delivery::Offline("laptop".into()));
         // A route naming ourselves (`pwd <own id>`) is handled here
@@ -3696,10 +3808,104 @@ mod tests {
         let r = Routes::new();
         for ch in ["C1", "D9", "C_WHATEVER"] {
             assert_eq!(
-                Delivery::decide(Some(ch), &r, "me", |_| false),
+                Delivery::decide(Some(ch), None, &r, &r, "me", |_| false),
                 Delivery::Local
             );
         }
+    }
+
+    /// **A thread keeps the machine it is on, whatever its channel says now.** Repointing a channel
+    /// used to drag every live thread with it, to a machine that had never heard of them
+    /// (measured 2026-09-23); the thread's own row is what stops that.
+    #[test]
+    fn a_thread_outranks_its_channel() {
+        let by_channel = routes(&[("C1", "desktop")]);
+        let by_thread = routes(&[("111.1", "laptop"), ("222.2", "vps")]);
+        let up = |_: &str| true;
+        let d =
+            |t: Option<&str>| Delivery::decide(Some("C1"), t, &by_thread, &by_channel, "vps", up);
+
+        assert_eq!(d(Some("111.1")), Delivery::Forward("laptop".into()));
+        // Ours, named by the thread rather than the channel
+        assert_eq!(d(Some("222.2")), Delivery::Local);
+        // A thread nobody has written down yet follows its channel — every thread did, before
+        assert_eq!(d(Some("999.9")), Delivery::Forward("desktop".into()));
+        // An event that does not say which thread it is: the channel decides
+        assert_eq!(d(None), Delivery::Forward("desktop".into()));
+    }
+
+    /// A thread's machine is read the same way whether it is here, away, or elsewhere.
+    #[test]
+    fn a_threads_machine_can_also_be_away() {
+        let by_thread = routes(&[("111.1", "laptop")]);
+        assert_eq!(
+            Delivery::decide(
+                Some("C1"),
+                Some("111.1"),
+                &by_thread,
+                &Routes::new(),
+                "vps",
+                |_| false
+            ),
+            Delivery::Offline("laptop".into())
+        );
+    }
+
+    /// What a decision says to write down. `UnknownChannel` decided nothing, so it writes nothing.
+    #[test]
+    fn a_decision_names_the_machine_to_remember() {
+        assert_eq!(
+            Delivery::Forward("a".into()).bridge_id("me"),
+            Some("a".into())
+        );
+        assert_eq!(
+            Delivery::Offline("b".into()).bridge_id("me"),
+            Some("b".into())
+        );
+        assert_eq!(Delivery::Local.bridge_id("me"), Some("me".into()));
+        assert_eq!(Delivery::UnknownChannel.bridge_id("me"), None);
+    }
+
+    /// **An edit's own ts belongs to no post and no thread.** Reading it as the thread is what the
+    /// top-level `ts` fallback used to do; the post being edited sits one level down.
+    #[test]
+    fn an_edit_names_the_post_it_changed_not_the_change() {
+        let edit = serde_json::json!({
+            "channel": "C1", "subtype": "message_changed", "ts": "999.9",
+            "message": {"ts": "111.1", "text": "after"}
+        });
+        assert_eq!(Event::new("message", &edit).thread(), Some("111.1"));
+
+        // Inside a thread, the thread itself is named and wins
+        let in_thread = serde_json::json!({
+            "channel": "C1", "subtype": "message_changed", "ts": "999.9", "thread_ts": "111.1",
+            "message": {"ts": "222.2", "text": "after"}
+        });
+        assert_eq!(Event::new("message", &in_thread).thread(), Some("111.1"));
+
+        // A plain post is unchanged: it is its own thread
+        let plain = serde_json::json!({"channel": "C1", "ts": "111.1"});
+        assert_eq!(Event::new("message", &plain).thread(), Some("111.1"));
+    }
+
+    /// A reaction names the **post it was put on**, never the thread — on a reply those differ, and
+    /// reading one as the other is the 2026-08-02 misdelivery.
+    #[test]
+    fn a_reaction_names_the_post_it_was_put_on() {
+        let r = serde_json::json!({"item": {"channel": "C1", "ts": "222.2"}});
+        assert_eq!(Event::new("reaction_added", &r).reacted_ts(), Some("222.2"));
+        assert_eq!(Event::new("message", &serde_json::json!({})).reacted_ts(), None);
+    }
+
+    /// A press has to follow the thread its prompt is in, not the channel's current machine.
+    #[test]
+    fn a_click_carries_the_thread_its_prompt_sits_in() {
+        let c = serde_json::json!({"channel": {"id": "C9"}, "container": {"thread_ts": "111.1"}});
+        assert_eq!(Click(&c).thread(), Some("111.1"));
+        // Older payloads put it on the message instead
+        let m = serde_json::json!({"channel": {"id": "C9"}, "message": {"thread_ts": "222.2"}});
+        assert_eq!(Click(&m).thread(), Some("222.2"));
+        assert_eq!(Click(&serde_json::json!({"channel": {"id": "C9"}})).thread(), None);
     }
 
     // ── Gateway endpoints, key, order ──────────────────────────
@@ -3726,6 +3932,8 @@ mod tests {
             msg_tx,
             click_tx,
             reload,
+            thread_routes: Default::default(),
+            remember: tokio::sync::mpsc::channel(4).0,
             tunnels: Default::default(),
         });
         (fleet, msg_rx)

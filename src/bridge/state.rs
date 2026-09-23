@@ -170,6 +170,18 @@ pub struct ThreadEntry {
     /// lets the next start say so instead of leaving it there.
     #[serde(rename = "permPrompts", default, skip_serializing_if = "Vec::is_empty")]
     pub perm_prompts: Vec<String>,
+    /// The machine this thread is being handled by. **Written and read by the gateway only** — a
+    /// machine has no use for it, since everything reaching a machine is already its own.
+    ///
+    /// **This is what stops a channel's assignment from dragging live threads with it.** Before it,
+    /// forwarding went by channel alone: pointing a channel at another machine sent an ongoing
+    /// thread's messages somewhere that had never heard of it, and they were dropped as not
+    /// addressed to anyone (measured 2026-09-23).
+    ///
+    /// Absent means the thread started before this was recorded, or belongs to the gateway's own
+    /// channel. Then the channel's assignment decides, which is what every thread did before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bridge: Option<String>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -420,6 +432,26 @@ impl Threads {
 
     pub fn upsert(&mut self, thread_ts: &str, entry: ThreadEntry) {
         self.entries.insert(thread_ts.to_string(), entry);
+    }
+
+    /// Every thread that has a machine recorded — the gateway's forwarding table.
+    pub fn bridges(&self) -> BTreeMap<String, String> {
+        self.entries
+            .iter()
+            .filter_map(|(ts, e)| Some((ts.clone(), e.bridge.clone()?)))
+            .collect()
+    }
+
+    /// Record which machine is handling a thread, leaving the row's other settings alone.
+    ///
+    /// **Only the Bridge writes threads.json**, so the gateway asks for this instead of writing the
+    /// file itself — two writers would each save a whole file built from its own older copy, and
+    /// whichever finished last would silently undo the other.
+    pub fn set_bridge(&mut self, thread_ts: &str, bridge_id: &str) {
+        self.entries
+            .entry(thread_ts.to_string())
+            .or_default()
+            .bridge = Some(bridge_id.to_string());
     }
 
     /// Keeps only the keys that may be put back on the ledger at startup (`Bridge::restore_pending`).
