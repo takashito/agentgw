@@ -588,6 +588,78 @@ pub struct Route {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+/// One end of a link, as access.json records it. **The gateway keeps one per machine, a machine keeps
+/// one for its gateway** — the key it sits under (`machines` / `gateway`) says which.
+///
+/// This is the whole record of how a machine connects. It used to be three `.env` keys — the ssh
+/// targets, the dial URLs, and the addresses to open — and one fact split three ways is a fact that
+/// can disagree with itself: an address stayed open long after the route that asked for it was gone.
+///
+/// Unknown fields round-trip through `extra`, like the rest of access.json.
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
+pub struct Link {
+    /// Which kind of route this is — see the `LAN` / `TAILSCALE` / `TUNNEL` / `PUBLIC` constants.
+    /// Kept as text so a kind written by a newer version survives a round trip.
+    #[serde(rename = "type", default, skip_serializing_if = "String::is_empty")]
+    pub kind: String,
+    /// **What the machine dials.** Everything about which address must be open is read off this.
+    #[serde(rename = "linkUrl", default, skip_serializing_if = "String::is_empty")]
+    pub link_url: String,
+    /// The machine's own hostname, as it says on connecting.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub host: String,
+    /// The machine's own address, as it says on connecting.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub address: String,
+    /// Where the gateway ssh's to hold the tunnel open. `TUNNEL` only.
+    #[serde(rename = "sshTarget", skip_serializing_if = "Option::is_none")]
+    pub ssh_target: Option<String>,
+    /// When this link last carried a connection.
+    #[serde(rename = "lastSeen", default, skip_serializing_if = "String::is_empty")]
+    pub last_seen: String,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Link {
+    /// On the same network as the gateway.
+    pub const LAN: &'static str = "lan";
+    /// Over a tailnet — either through what terminates TLS on 443, or straight to the link port.
+    pub const TAILSCALE: &'static str = "tailscale";
+    /// Through an ssh tunnel the gateway holds open.
+    pub const TUNNEL: &'static str = "tunnel";
+    /// At a URL someone wrote down by hand.
+    pub const PUBLIC: &'static str = "public";
+
+    /// The address the gateway must hold open for this link, if any. **Read off `linkUrl`**: that is
+    /// what the machine dials, so what has to answer there is exactly what has to be open.
+    ///
+    /// Nothing to open for a tunnel (its exit is our loopback) or for `wss://` (a front terminates TLS
+    /// and forwards to our loopback). Loopback itself is always open, so neither is named here.
+    ///
+    /// The name in the URL is **ours**, so `resolve` is ours to do — the caller asks the OS.
+    pub fn required_address(&self, resolve: impl Fn(&str) -> Option<String>) -> Option<String> {
+        if self.kind == Self::TUNNEL {
+            return None;
+        }
+        let (scheme, rest) = self.link_url.trim().split_once("://")?;
+        if scheme == "wss" || scheme == "https" {
+            return None;
+        }
+        let (host, port) = rest.split('/').next()?.rsplit_once(':')?;
+        if host.parse::<std::net::IpAddr>().is_ok() {
+            return (!is_loopback(host)).then(|| format!("{host}:{port}"));
+        }
+        let ip = resolve(host)?;
+        (!is_loopback(&ip)).then(|| format!("{ip}:{port}"))
+    }
+}
+
+fn is_loopback(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
 /// access.json. Empty owner = nobody gets in (fail-closed).
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct Access {
@@ -609,6 +681,12 @@ pub struct Access {
     /// How to split. `"newline"` looks for a break at paragraph → line → word. By default it cuts hard at the limit.
     #[serde(rename = "chunkMode", skip_serializing_if = "Option::is_none")]
     pub chunk_mode: Option<String>,
+    /// **A gateway's machines**, one record each. Empty on a machine.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub machines: BTreeMap<String, Link>,
+    /// **A machine's gateway.** Unset on a gateway.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<Link>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -1350,6 +1428,63 @@ mod tests {
 
     use super::*;
     use crate::chat::deletion_notice;
+
+    #[test]
+    fn a_link_says_which_address_has_to_be_open() {
+        let here = |name: &str| match name {
+            "hub.lan" => Some("192.0.2.10".to_string()),
+            "hub.example.ts.net" => Some("100.64.0.1".to_string()),
+            _ => None,
+        };
+        let link = |kind: &str, url: &str| Link {
+            kind: kind.into(),
+            link_url: url.into(),
+            ..Default::default()
+        };
+        // Straight to us: the name is ours, so the address it resolves to is what must be open
+        assert_eq!(
+            link(Link::LAN, "ws://hub.lan:8787").required_address(here),
+            Some("192.0.2.10:8787".to_string())
+        );
+        assert_eq!(
+            link(Link::TAILSCALE, "ws://hub.example.ts.net:8787").required_address(here),
+            Some("100.64.0.1:8787".to_string())
+        );
+        // A front terminates TLS and hands it to our loopback — nothing of ours to open
+        assert_eq!(
+            link(Link::TAILSCALE, "wss://hub.example.ts.net").required_address(here),
+            None
+        );
+        // The tunnel comes out of our loopback, whatever the machine dials at its own end
+        assert_eq!(
+            link(Link::TUNNEL, "ws://127.0.0.1:8799").required_address(here),
+            None
+        );
+        // Loopback is open anyway, so it is never named
+        assert_eq!(link(Link::LAN, "ws://127.0.0.1:8787").required_address(here), None);
+        assert_eq!(link(Link::LAN, "ws://localhost:8787").required_address(here), None);
+        // An address needs no resolver; a name nothing can place asks for nothing
+        assert_eq!(
+            link(Link::PUBLIC, "ws://192.0.2.99:8787").required_address(here),
+            Some("192.0.2.99:8787".to_string())
+        );
+        assert_eq!(link(Link::LAN, "ws://elsewhere.invalid:8787").required_address(here), None);
+    }
+
+    /// A record written by a newer version keeps its unknown fields, like the rest of access.json.
+    #[test]
+    fn a_link_round_trips_what_it_does_not_know() {
+        let src = r#"{"owner":"U1","machines":{"pve":{"type":"lan",
+            "linkUrl":"ws://hub.lan:8787","host":"pve.lan","address":"192.0.2.20",
+            "lastSeen":"2026-09-23T00:00:00Z","somethingNew":42}}}"#;
+        let access = Access::from_str(src).unwrap();
+        let pve = &access.machines["pve"];
+        assert_eq!(pve.kind, Link::LAN);
+        assert_eq!(pve.address, "192.0.2.20");
+        assert_eq!(pve.extra["somethingNew"], 42);
+        assert!(access.gateway.is_none());
+        assert!(access.to_string_pretty().unwrap().contains("somethingNew"));
+    }
 
     #[test]
     fn notice_target_silent_without_either() {
