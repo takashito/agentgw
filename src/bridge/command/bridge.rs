@@ -685,14 +685,13 @@ impl StatusReport {
         } else {
             r.bridge_version.as_str()
         };
-        lines.push(crate::t!("*version*: `{version}`", "*版*: `{version}`"));
         let me = &r.machine;
+        // **The version sits beside the machine it runs on.** On a line of its own it read as a heading
+        // for everything below it, when it says something about this one machine
+        let who = crate::t!("*machine id*: `{me}` `{version}`", "*マシン*: `{me}` `{version}`");
         match &r.role {
             StatusRole::Gateway { machines } => {
-                lines.push(crate::t!(
-                    "*machine id*: `{me}` (gateway)",
-                    "*マシン*: `{me}`(ゲートウェイ)"
-                ));
+                lines.push(crate::t!("{who} (gateway)", "{who}(ゲートウェイ)"));
                 let list = machines
                     .iter()
                     .map(|(name, online)| machine_mark(name, *online))
@@ -713,7 +712,7 @@ impl StatusReport {
                 address,
                 online,
             } => {
-                lines.push(crate::t!("*machine id*: `{me}`", "*マシン*: `{me}`"));
+                lines.push(who);
                 let name = gateway.as_deref().unwrap_or("?");
                 let dot = if *online { "🟢" } else { "🔴" };
                 // A loopback address is the ssh tunnel `add-machine` sets up when there is no direct route
@@ -730,9 +729,7 @@ impl StatusReport {
                     "*ゲートウェイ*: `{name}`(`{address}`{via}) {dot}"
                 ));
             }
-            StatusRole::Alone => {
-                lines.push(crate::t!("*machine id*: `{me}`", "*マシン*: `{me}`"));
-            }
+            StatusRole::Alone => lines.push(who),
         }
         // A bare blank line only gives a paragraph gap in Slack, which loses to the bullet spacing below,
         // so the heading looks glued to the body. A line with one full-width space survives as a tall line
@@ -791,7 +788,10 @@ impl StatusReport {
                 continue;
             }
             rows.sort_by_key(|(idle, _)| *idle); // Longest idle first
-            lines.extend(rows.into_iter().map(|(_, line)| line));
+            // **Indented under their channel**, like "no active threads" above — they belong to the line
+            // before them, and read as a list of their own without it. Slack keeps leading whitespace on
+            // every line but a message's first
+            lines.extend(rows.into_iter().map(|(_, line)| format!("　{line}")));
         }
         lines.join("\n")
     }
@@ -1003,9 +1003,10 @@ mod tests {
         assert!(out.contains("<#C1|general> · `~/dev/x` (warm on)\n"), "{out}");
         // The notice channel says so
         assert!(out.contains("<#C2|agentgw> · `~/dev/agentgw` (notices)\n"), "{out}");
-        // Longest idle first: the waiting agent (5m) above the thread (1m)
+        // Longest idle first: the waiting agent (5m) above the thread (1m), both indented under
+        // their channel like "no active threads" is
         assert!(
-            out.contains("`5m ago`　waiting\n`1m ago`　<https://s/p1|READMEを要約して>"),
+            out.contains("　`5m ago`　waiting\n　`1m ago`　<https://s/p1|READMEを要約して>"),
             "{out}"
         );
         assert!(!out.contains("UBOT"), "{out}");
@@ -1028,7 +1029,7 @@ mod tests {
             ..sample_report()
         };
         let out = r.render();
-        assert!(out.contains("@alice · `~`\n　(untitled)"), "{out}");
+        assert!(out.contains("@alice · `~`\n　　(untitled)"), "{out}");
 
         let empty = StatusReport {
             channels: vec![],
@@ -1080,7 +1081,9 @@ mod tests {
             address: "wss://hub.example".into(),
             online: true,
         });
-        assert!(direct.contains("*machine id*: `build-box`\n"), "{direct}");
+        // **The version rides on this line**, not one of its own
+        assert!(direct.contains("*machine id*: `build-box` `1.2.3`\n"), "{direct}");
+        assert!(!direct.contains("*version*"), "{direct}");
         assert!(direct.contains("*gateway*: `hub` (`wss://hub.example`) 🟢"), "{direct}");
 
         let tunnel = head(StatusRole::Machine {
@@ -1091,7 +1094,7 @@ mod tests {
         assert!(tunnel.contains("(`ws://127.0.0.1:8799` · via ssh) 🔴"), "{tunnel}");
 
         let alone = head(StatusRole::Alone);
-        assert!(alone.contains("*machine id*: `build-box`"), "{alone}");
+        assert!(alone.contains("*machine id*: `build-box` `1.2.3`"), "{alone}");
         assert!(!alone.contains("gateway"), "{alone}");
     }
 
