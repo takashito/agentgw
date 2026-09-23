@@ -259,6 +259,11 @@ pub struct SpawnReq {
     pub hooks_file: String,
     /// Absolute path of the MCP config file written for this session.
     pub mcp_config: String,
+    /// Where this conversation was before it was carried here.
+    ///
+    /// **Said to the agent before anything else.** Its whole record was written somewhere else: the
+    /// paths in it are the old machine's, and nothing promises the same files are here.
+    pub moved_from: Option<crate::bridge::state::MovedFrom>,
 }
 
 /// The envelope handed to an agent — one inbound message, in a form that can go straight into the prompt.

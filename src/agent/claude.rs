@@ -135,6 +135,23 @@ impl Claude {
         format!("{prefix}\n\n{envelope}")
     }
 
+    /// What a conversation carried here from another machine is told first.
+    ///
+    /// **Every path in its own record is the old machine's.** It will read that record as its own
+    /// memory and act on what it says about files, so it has to know the ground under those paths
+    /// has changed — a checkout here may be at a different commit, or missing entirely.
+    fn moved_notice(m: &crate::bridge::state::MovedFrom, here: &str) -> String {
+        format!(
+            "This conversation was running on the machine `{}`, in `{}`. It has been moved: you are \
+             on a different machine now, working in `{here}`. Everything written above happened in \
+             the old place, so **every path in it belongs to that machine** — the same file is not \
+             promised to exist here, or to hold the same thing if it does. Before acting on anything \
+             the record says about a file, look at it here first, and say plainly if what you find \
+             does not match.",
+            m.machine, m.path,
+        )
+    }
+
     /// A pool agent has no body waiting for delivery — it always starts on the idle prompt.
     fn pool_prompt(&self) -> &'static str {
         WORKER_STARTUP_PROMPT
@@ -154,10 +171,18 @@ impl Claude {
             None => SessionMode::New(req.session_id.as_str().to_string()),
         };
         // No body (= warming a pool agent) uses the idle prompt; otherwise an envelope with the orientation prepended
-        let prompt = match &req.prompt {
+        let mut prompt = match &req.prompt {
             Some(envelope) => self.spawn_prompt(envelope, &mode),
             None => self.pool_prompt().to_string(),
         };
+        // **Before the first message, not after.** It has to know the paths in its own record belong
+        // to another machine before it acts on any of them
+        if let Some(m) = &req.moved_from {
+            prompt = format!(
+                "{}\n\n{prompt}",
+                Self::moved_notice(m, &req.cwd)
+            );
+        }
         let line = self.launch_line(&mode, &req.hooks_file, &req.mcp_config, &prompt);
         // Settle the trust confirmation without answering on screen (the official way). Failing to write does not stop startup —
         // if the confirmation appears, the startup-screen watcher answers it
@@ -1812,6 +1837,7 @@ mod tests {
             state,
             hooks_file: "/st/h.json".to_string(),
             mcp_config: "/st/m.json".to_string(),
+            moved_from: None,
         }
     }
 
@@ -2576,6 +2602,54 @@ mod tests {
             Some(at + 3_600_000)
         );
         assert!(Transcript::limit_hit(&no_time, at + 2 * 3_600_000).is_none());
+    }
+
+    /// **A moved conversation is told so before its first message.** Its own record is the other
+    /// machine's, and it will read that record as memory and act on the paths in it.
+    #[test]
+    fn a_moved_conversation_is_told_where_it_came_from() {
+        let mut r = req("sid-2", Some("<channel …>hello</channel>"), WorkerState::Absent);
+        r.resume_from = Some(SessionId::from("sid-2".to_string()));
+        r.moved_from = Some(crate::bridge::state::MovedFrom {
+            machine: "tyo-mpv5l".into(),
+            path: "/Users/t/dev/agentgw".into(),
+        });
+        let mut seen = String::new();
+        let claude = claude_with(move |args| {
+            Ok(args.join(" "))
+        });
+        // The notice has to be in the launch line, ahead of the message
+        let line = claude.launch_line(
+            &SessionMode::Resume("sid-2".into()),
+            &r.hooks_file,
+            &r.mcp_config,
+            &format!(
+                "{}\n\n{}",
+                Claude::moved_notice(r.moved_from.as_ref().unwrap(), &r.cwd),
+                "<channel …>hello</channel>"
+            ),
+        );
+        seen.push_str(&line);
+        assert!(seen.contains("tyo-mpv5l"), "the old machine is not named: {seen}");
+        assert!(seen.contains("/Users/t/dev/agentgw"), "the old folder is not named");
+        assert!(seen.contains("/repo"), "where it is now is not named");
+        let notice_at = seen.find("has been moved").expect("no notice");
+        let msg_at = seen.find("hello").expect("no message");
+        assert!(notice_at < msg_at, "the message comes before the notice");
+    }
+
+    /// A conversation that was not moved says nothing extra — the usual startup, unchanged.
+    #[test]
+    fn a_conversation_that_stayed_put_is_told_nothing_extra() {
+        let r = req("sid-1", Some("<channel …>hi</channel>"), WorkerState::Absent);
+        assert!(r.moved_from.is_none());
+        let line = quiet().launch_line(
+            &SessionMode::New("sid-1".into()),
+            &r.hooks_file,
+            &r.mcp_config,
+            r.prompt.as_deref().unwrap(),
+        );
+        assert!(!line.contains("has been moved"), "{line}");
     }
 
     /// **Against real git, because git's own answer is the thing being relied on.** A fake would only

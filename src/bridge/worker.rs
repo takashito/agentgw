@@ -737,6 +737,8 @@ impl Bridge {
                 cwd: cwd.clone(),
                 // No body waiting for delivery = start on the agent's idle prompt
                 prompt: None,
+                // A pool agent is nobody's conversation yet, so it was never moved
+                moved_from: None,
                 resume_from: nominated.clone().map(SessionId::from),
                 window: SessionId::from(sid.clone()).window_name(),
                 // Reaching here means no pool entry = no window either

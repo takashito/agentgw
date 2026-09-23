@@ -757,6 +757,8 @@ impl Bridge {
                     state,
                     hooks_file: self.hooks_file.clone(),
                     mcp_config: mcp,
+                    // A conversation starting here has no record from anywhere else
+                    moved_from: None,
                 };
                 self.spawn_worker(&req, &key, &ctx(Some(&sid)), &sid);
             }
@@ -774,8 +776,19 @@ impl Bridge {
                     state,
                     hooks_file: self.hooks_file.clone(),
                     mcp_config: mcp,
+                    // **Said once, on the waking that follows the move.** Cleared below, so the rest
+                    // of the conversation is not prefaced with it again
+                    moved_from: self.threads.get(&root_ts).and_then(|e| e.moved_from.clone()),
                 };
                 self.spawn_worker(&req, &key, &ctx(Some(&sid)), &sid);
+                if req.moved_from.is_some()
+                    && let Some(e) = self.threads.entries.get_mut(&root_ts)
+                {
+                    e.moved_from = None;
+                    if let Err(err) = self.threads.save() {
+                        ctx(Some(&sid)).error("bridge", &format!("threads.json save failed: {err}"));
+                    }
+                }
             }
             Dispatch::Deliver => {
                 // **Queue first, hand over second.** The queue is the record of what has not been

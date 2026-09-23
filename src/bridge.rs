@@ -2696,6 +2696,7 @@ mod tests {
             state: crate::agent::WorkerState::Absent,
             hooks_file: String::new(),
             mcp_config: String::new(),
+            moved_from: None,
         };
         let w = agent.spawn(&req).unwrap();
         b.workers.insert_pool(
