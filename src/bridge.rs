@@ -1067,7 +1067,13 @@ fn report_folders(
         crate::setup::ssh::fqdn().as_deref(),
         local_ip.as_deref(),
     );
-    let _ = up.send(crate::bridge::gateway::link::LinkFrame::MachineHost { host, ip });
+    // **The gateway can't see which URL we dialled**, and that is what decides the address it has to
+    // keep open for us — so say it here, beside where we are
+    let _ = up.send(crate::bridge::gateway::link::LinkFrame::MachineHost {
+        host,
+        ip,
+        url: gateway_url.unwrap_or_default().to_string(),
+    });
     for (channel, route) in bridge::Access::load(dir).routes {
         let Some(path) = route.repo_path.filter(|p| !p.is_empty()) else {
             continue;
@@ -2469,19 +2475,21 @@ mod tests {
         .unwrap();
         let (up, mut up_rx) = mpsc::unbounded_channel();
 
-        report_folders(&dir, &up, "build-box", None);
+        report_folders(&dir, &up, "build-box", Some("ws://hub.lan:8787"));
 
         assert_eq!(
             up_rx.try_recv(),
             Ok(LinkFrame::MachineHome { path: Host::home() }),
             "where a channel with no folder of its own works"
         );
-        // …and where it can be reached. With no tailnet at hand, the hostname is still something
-        let host = match up_rx.try_recv() {
-            Ok(LinkFrame::MachineHost { host, .. }) => host,
+        // …and where it can be reached. With no tailnet at hand, the hostname is still something —
+        // and **the URL it dialled**, which the gateway has no way of seeing for itself
+        let (host, url) = match up_rx.try_recv() {
+            Ok(LinkFrame::MachineHost { host, url, .. }) => (host, url),
             other => panic!("{other:?}"),
         };
         assert!(!host.is_empty(), "a machine always knows its own name");
+        assert_eq!(url, "ws://hub.lan:8787");
         assert_eq!(
             up_rx.try_recv(),
             Ok(LinkFrame::ProjectSet {

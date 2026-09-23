@@ -128,8 +128,16 @@ pub mod link {
         /// Where this machine's agents start when a channel has no folder of its own. Sent on connecting,
         /// so `channels` can show a real path for every channel instead of just the machine's name.
         MachineHome { path: String },
-        /// Where this machine can be reached: its tailnet name and IP (empty when there is no tailnet).
-        MachineHost { host: String, ip: String },
+        /// Where this machine can be reached: its tailnet name and IP (empty when there is no tailnet),
+        /// and **the URL it dialled to get here**. Only the machine knows the last one for certain, and
+        /// it is what decides which address the gateway has to keep open for it.
+        MachineHost {
+            host: String,
+            ip: String,
+            /// Absent from a machine too old to send it.
+            #[serde(default, skip_serializing_if = "String::is_empty")]
+            url: String,
+        },
         /// `machines`, asked from a machine — same reason as [`LinkFrame::Channels`].
         Machines { channel: String, thread_ts: String },
         /// `channels`, asked from a machine. **The gateway only sees messages that mention the bot**, and a
@@ -2496,7 +2504,7 @@ impl Fleet {
             link::LinkFrame::MachineHome { path } => {
                 self.homes.lock().await.insert(bridge_id.to_string(), path);
             }
-            link::LinkFrame::MachineHost { host, ip } => {
+            link::LinkFrame::MachineHost { host, ip, url } => {
                 // **Only the machine can see its own tailnet**, so this is the one place these two
                 // come from. Kept on its record so `machines` can still say where an absent one is
                 let id = bridge_id.to_string();
@@ -2504,6 +2512,16 @@ impl Fleet {
                     let link = a.machines.entry(id).or_default();
                     link.host = host;
                     link.address = ip;
+                    // **What it actually dialled wins.** A machine linked before these records existed
+                    // has nothing written down, and what it dials is the only thing that says which
+                    // address has to be open for it. An unchanged URL keeps the kind it was given,
+                    // so a route someone labelled by hand stays labelled
+                    if !url.is_empty() && link.link_url != url {
+                        link.kind = crate::setup::link_kind(&url).to_string();
+                        link.link_url = url;
+                    } else if !url.is_empty() && link.kind.is_empty() {
+                        link.kind = crate::setup::link_kind(&url).to_string();
+                    }
                 })
                 .await;
             }
