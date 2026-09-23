@@ -738,11 +738,14 @@ impl Bridge {
         if let Some(fleet) = &fleet
             && let Ok(raw) = std::env::var("AGENTGW_TUNNELS")
         {
-            // The exit is the gateway's port. Even listening on 0.0.0.0, loopback is enough for the tunnel's exit
+            // The exit is the gateway's port. **The first address is its own way in** (loopback, written
+            // first) — reading the port off the whole list took the *last* address's instead
             let port = std::env::var("AGENTGW_LINK_LISTEN")
                 .ok()
-                .and_then(|l| l.rsplit(':').next().map(str::to_string))
-                .unwrap_or_else(|| "8787".to_string());
+                .and_then(|l| {
+                    gateway::first_addr(&l).rsplit(':').next().map(str::to_string)
+                })
+                .unwrap_or_else(|| gateway::DEFAULT_PORT.to_string());
             for (child, target) in machine::child_urls(&raw) {
                 tokio::spawn(gateway::keep_tunnel(
                     fleet.clone(),

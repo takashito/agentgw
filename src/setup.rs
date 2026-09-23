@@ -280,8 +280,10 @@ fn ask_parent(state_dir: &StateDir) -> Result<(), String> {
     Ok(())
 }
 
-/// Where the gateway accepts machines. **Loopback only to begin with**: `add-machine` opens the one
-/// address a machine turns out to need, so nothing wider than this is open until something uses it.
+/// Where the gateway accepts machines. Loopback to start with, and **loopback stays** whatever else
+/// is added: it is where `tailscale serve` (or any front that terminates TLS) forwards to, and where
+/// an ssh tunnel comes out. Nothing wider is opened until `add-machine` measures that a machine
+/// needs it.
 fn default_listen(state_dir: &StateDir) {
     let set = state_dir
         .load_env()
@@ -295,8 +297,9 @@ fn default_listen(state_dir: &StateDir) {
 
 /// Add one address to what the gateway listens on, keeping what is there. `false` = it already had it.
 ///
-/// **Called when a route is chosen**, not at install time: the address a machine needs is only known
-/// once it has been measured from that machine.
+/// **Called before each route is tried**, not at install time: a route can only be tried once the
+/// address it needs is open. So this opens the address of **every route attempted**, not just the one
+/// that wins, and nothing takes an address back out again.
 pub(crate) fn add_listen(state_dir: &StateDir, addr: &str) -> bool {
     let current = state_dir
         .load_env()
