@@ -16,8 +16,21 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
-root="${CARGO_TARGET_DIR:-$repo_root/target}"
-[ -d "$root" ] || { echo "No target directory at $root — nothing to do."; exit 0; }
+
+# **Every checkout, not just this one.** Each worktree builds into its own target/, and whoever
+# runs this (a hook, a person) is in one of them — the others would then never be swept. Measured:
+# a day's work in one worktree left 3.6GB of incremental while the main checkout sat at 243MB.
+# CARGO_TARGET_DIR, when set, is the one place everything lands, so it is the only one to sweep.
+roots=()
+if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+  roots+=("$CARGO_TARGET_DIR")
+else
+  while read -r dir; do
+    [ -d "$dir/target" ] && roots+=("$dir/target")
+  done < <(git -C "$repo_root" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}')
+  # Not a git checkout (a tarball, a CI copy): fall back to this one
+  [ ${#roots[@]} -gt 0 ] || roots+=("$repo_root/target")
+fi
 
 crate="$(sed -n 's/^name *= *"\(.*\)"/\1/p' "$repo_root/Cargo.toml" | head -1)"
 age=30   # minutes
@@ -29,22 +42,25 @@ if pgrep -qf '[c]argo|[r]ustc'; then
   exit 0
 fi
 
-before="$(du -sk "$root" | cut -f1)"
+for root in "${roots[@]}"; do
+  [ -d "$root" ] || continue
+  before="$(du -sk "$root" | cut -f1)"
 
-# Old incremental sessions: one directory per crate fingerprint, the live one is refreshed
-# by each build. They live at <profile>/incremental/<crate>-<hash> (one level deeper per target triple).
-stale_dirs=$(find "$root" -mindepth 3 -maxdepth 4 -type d -path '*/incremental/*' -name "${crate}-*" -mmin +$age 2>/dev/null || true)
-# Old copies of our own crate: rlib/rmeta/.o/.d and the test binaries, all named after it.
-stale_files=$(find "$root" -type f \( -name "*${crate}*" -o -name "*lib${crate}*" \) -mmin +$age ! -path '*/incremental/*' 2>/dev/null || true)
+  # Old incremental sessions: one directory per crate fingerprint, the live one is refreshed
+  # by each build. They live at <profile>/incremental/<crate>-<hash> (one level deeper per target triple).
+  stale_dirs=$(find "$root" -mindepth 3 -maxdepth 4 -type d -path '*/incremental/*' -name "${crate}-*" -mmin +$age 2>/dev/null || true)
+  # Old copies of our own crate: rlib/rmeta/.o/.d and the test binaries, all named after it.
+  stale_files=$(find "$root" -type f \( -name "*${crate}*" -o -name "*lib${crate}*" \) -mmin +$age ! -path '*/incremental/*' 2>/dev/null || true)
 
-if [ "${1:-}" = "--dry-run" ]; then
-  printf '%s\n' $stale_dirs $stale_files | sed '/^$/d'
-  echo "(dry run) $(printf '%s\n' $stale_dirs $stale_files | sed '/^$/d' | wc -l | tr -d ' ') entries, target is $((before / 1024))MB"
-  exit 0
-fi
+  if [ "${1:-}" = "--dry-run" ]; then
+    printf '%s\n' $stale_dirs $stale_files | sed '/^$/d'
+    echo "(dry run) $root: $(printf '%s\n' $stale_dirs $stale_files | sed '/^$/d' | wc -l | tr -d ' ') entries, $((before / 1024))MB"
+    continue
+  fi
 
-[ -n "$stale_dirs" ] && printf '%s\n' $stale_dirs | xargs -I{} rm -rf {}
-[ -n "$stale_files" ] && printf '%s\n' $stale_files | xargs -I{} rm -f {}
+  [ -n "$stale_dirs" ] && printf '%s\n' $stale_dirs | xargs -I{} rm -rf {}
+  [ -n "$stale_files" ] && printf '%s\n' $stale_files | xargs -I{} rm -f {}
 
-after="$(du -sk "$root" | cut -f1)"
-echo "target: $((before / 1024))MB → $((after / 1024))MB (freed $(( (before - after) / 1024 ))MB)"
+  after="$(du -sk "$root" | cut -f1)"
+  echo "$root: $((before / 1024))MB → $((after / 1024))MB (freed $(( (before - after) / 1024 ))MB)"
+done
