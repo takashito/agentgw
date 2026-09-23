@@ -68,8 +68,10 @@ async fn main() {
             // Only when this host is set up to accept machines, follow with the fleet status
             if c == "status" {
                 let dir = agentgw::state_dir::StateDir::resolve();
+                agentgw::setup::migrate_env(&dir);
                 let env = dir.load_env().unwrap_or_default().into_iter().collect();
-                println!("\n{}", agentgw::bridge::machine::role_line(&env));
+                let access = agentgw::bridge::state::Access::load(&dir);
+                println!("\n{}", agentgw::bridge::machine::role_line(&env, &access));
                 agentgw::bridge::gateway::Cli::print_fleet(&dir).await;
             }
             std::process::exit(rc);

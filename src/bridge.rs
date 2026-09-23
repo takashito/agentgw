@@ -513,13 +513,19 @@ impl Bridge {
     /// SIGTERM/SIGINT=graceful shutdown / SIGUSR1=maintenance restart / SIGHUP=reload.
     pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let dir = crate::state_dir::StateDir::resolve();
+        // **Before anything reads it.** An older `.env` is folded into the shape below first
+        crate::setup::migrate_env(&dir);
         for (k, v) in dir.load_env()? {
             // Safe: single-threaded section at start-up, before any spawn
             unsafe { std::env::set_var(k, v) };
         }
         // Upstream (direct or via the gateway) and downstream (accepting machines). **A config with both doesn't start**
         // (silently connecting both makes Slack start load-balancing, bringing split-brain straight back)
-        let wiring = machine::Wiring::resolve(|k| std::env::var(k).ok())?;
+        let wiring = machine::Wiring::resolve(
+            |k| std::env::var(k).ok(),
+            &bridge::Access::load(&dir),
+            machine::address_of,
+        )?;
         let mode = wiring.upstream.clone();
         LogCtx::default().info(
             "bridge",
@@ -532,9 +538,8 @@ impl Bridge {
         // connecting and auth.test look like "posted before start-up" and are silently dropped
         let started_at_ms = Host::now_ms();
 
-        let link_address = match (&wiring.upstream, &wiring.inlet) {
-            (machine::Mode::Relay { url, .. }, _) => url.clone(),
-            (machine::Mode::AwaitParent, Some(listen)) => listen.addr().to_string(),
+        let link_address = match &wiring.upstream {
+            machine::Mode::Relay { url, .. } => url.clone(),
             _ => String::new(),
         };
         let machine_name = match wiring.self_id.clone() {
@@ -584,31 +589,6 @@ impl Bridge {
                         }
                         Some(_) => continue, // anything arriving before acceptance is dropped
                         None => return Err("relay link ended before the handshake".into()),
-                    }
-                };
-                (token, home, gateway, Some(rx))
-            }
-            // The gateway comes to us. **Waiting is the same** — nothing can be written to Slack until the first Ready
-            machine::Mode::AwaitParent => {
-                let Some(listen) = wiring.inlet.clone() else {
-                    return Err("AGENTGW_LINK_LISTEN is not set, so the gateway has nowhere to connect".into());
-                };
-                let (tx, mut rx) = mpsc::channel(64);
-                let addr = listen.addr();
-                let inlet = Arc::new(machine::GatewayInlet {
-                    token: listen.token,
-                    live: link_up.clone(),
-                    tx,
-                    up: uplink.clone(),
-                });
-                tokio::spawn(inlet.serve(addr));
-                let (token, home, gateway) = loop {
-                    match rx.recv().await {
-                        Some(machine::FromRelay::Ready { bot_token, home, gateway }) => {
-                            break (bot_token, home, gateway);
-                        }
-                        Some(_) => continue,
-                        None => return Err("the inlet closed before the parent arrived".into()),
                     }
                 };
                 (token, home, gateway, Some(rx))
@@ -676,7 +656,6 @@ impl Bridge {
                 dir: dir.clone(),
                 cooldown: Default::default(),
                 homes: Default::default(),
-                hosts: Default::default(),
                 presence: Default::default(),
                 pending_selection: Default::default(),
                 bot_user_id: Default::default(),
@@ -684,7 +663,6 @@ impl Bridge {
                 click_tx: click_tx.clone(),
                 reload: reload_tx.clone(),
                 tunnels: Default::default(),
-                entrance: Default::default(),
             });
             // One listener per address: loopback for whatever terminates TLS in front, the LAN address
             // for machines on the same network
@@ -734,20 +712,16 @@ impl Bridge {
                 fleet.dial_children(targets);
             }
         }
-        // For machines a direct connection can't reach, the gateway opens an ssh tunnel (the list `add-child` writes).
-        // **Held as a child process of agentgw** — it only needs to be connected while running
-        if let Some(fleet) = &fleet
-            && let Ok(raw) = std::env::var("AGENTGW_TUNNELS")
-        {
-            // The exit is the gateway's port. **The first address is its own way in** (loopback, written
-            // first) — reading the port off the whole list took the *last* address's instead
-            let port = std::env::var("AGENTGW_LINK_LISTEN")
-                .ok()
-                .and_then(|l| {
-                    gateway::first_addr(&l).rsplit(':').next().map(str::to_string)
-                })
-                .unwrap_or_else(|| gateway::DEFAULT_PORT.to_string());
-            for (child, target) in machine::child_urls(&raw) {
+        // For machines a direct connection can't reach, the gateway opens an ssh tunnel. **Which ones
+        // is in their records** — the same place that says which addresses to open, so the two can't
+        // disagree. **Held as a child process of agentgw**: it only needs to be up while we are
+        if let Some(fleet) = &fleet {
+            // The exit is our loopback, whatever the machine dials at its own end
+            let port = machine::link_port(|k| std::env::var(k).ok());
+            for (child, link) in bridge::Access::load(&dir).machines {
+                let Some(target) = link.ssh_target.filter(|t| !t.trim().is_empty()) else {
+                    continue;
+                };
                 tokio::spawn(gateway::keep_tunnel(
                     fleet.clone(),
                     child,
@@ -782,9 +756,8 @@ impl Bridge {
                     std::process::exit(1);
                 });
             }
-            // Via the gateway (whether we dial or it comes to fetch us). **Fed into the same two
-            // channels**, so not one line downstream changes
-            (machine::Mode::Relay { .. } | machine::Mode::AwaitParent, Some(mut rx)) => {
+            // Via the gateway. **Fed into the same two channels**, so not one line downstream changes
+            (machine::Mode::Relay { .. }, Some(mut rx)) => {
                 let sinks = RelaySinks {
                     msg_tx,
                     click_tx,
@@ -801,7 +774,7 @@ impl Bridge {
                     }
                 });
             }
-            (machine::Mode::Relay { .. } | machine::Mode::AwaitParent, None) => {
+            (machine::Mode::Relay { .. }, None) => {
                 unreachable!("a machine behind a gateway always has a receiver")
             }
         }

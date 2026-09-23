@@ -1867,8 +1867,6 @@ pub struct Fleet {
     /// machine → the folder its agents start in when a channel has no folder of its own. Filled when a
     /// machine connects; **memory only**, since it is only for showing `channels`.
     pub homes: tokio::sync::Mutex<HashMap<String, String>>,
-    /// machine → (host, ip), as the machine itself reported on connecting. **Memory only** for the same reason.
-    pub hosts: tokio::sync::Mutex<HashMap<String, (String, String)>>,
     /// The Slack bot token handed to machines (given out in the `Ready` frame).
     pub bot_token: String,
     pub api: crate::chat::ChatRef,
@@ -1886,17 +1884,23 @@ pub struct Fleet {
     pub reload: Sender<()>,
     /// The ssh tunnels we keep open (to show the route in `status`).
     pub tunnels: std::sync::Mutex<Tunnels>,
-    /// machine → the address of ours it arrived on. **Memory only.** A machine behind a front
-    /// arrives on our loopback, which is the truth: that is the way in being used.
-    ///
-    /// **Never cleared when a machine goes away.** It is read to decide which addresses may be
-    /// closed, and a machine that is merely offline right now must not have its way in taken away.
-    pub entrance: tokio::sync::Mutex<HashMap<String, String>>,
 }
 
 impl Fleet {
     fn access(&self) -> Access {
         Access::load(&self.dir)
+    }
+
+    /// Note that a machine is here right now. **The record is the only place this is kept**, so
+    /// `machines` can still say when an absent machine was last seen.
+    async fn seen_now(&self, id: &str) {
+        let now = crate::clock::iso8601(now_ms());
+        self.edit_access(|a| {
+            if let Some(link) = a.machines.get_mut(id) {
+                link.last_seen = now;
+            }
+        })
+        .await;
     }
 
     /// Rewrite access.json and make the Bridge itself reread it.
@@ -1913,7 +1917,7 @@ impl Fleet {
     /// The `machines` list: the gateway first, then every machine it knows, with where it can be reached
     /// and whether it is connected. Hosts come from the machines themselves — only they can see their tailnet.
     async fn machines_table(self: &Arc<Self>) -> String {
-        let hosts = self.hosts.lock().await.clone();
+        let access = self.access();
         // The gateway dials nobody, so `reachable_at` has no interface to measure — it answers with
         // this host's own name, which is what an address of ours is known by
         let tailscale = crate::setup::ssh::tailscale_json();
@@ -1927,8 +1931,14 @@ impl Fleet {
             crate::setup::add_machine::tailnet_identity(tailscale.as_deref());
         let tunnels = self.tunnels.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let connected = self.links.connected();
-        let mut names: Vec<String> = connected.clone();
-        for id in self.access().routes.values().filter_map(|r| r.bridge.clone()) {
+        // Every machine we have a record of, plus any that a channel names but we have no record for
+        let mut names: Vec<String> = access.machines.keys().cloned().collect();
+        for id in access
+            .routes
+            .values()
+            .filter_map(|r| r.bridge.clone())
+            .chain(connected.iter().cloned())
+        {
             if id != self.self_id && !names.contains(&id) {
                 names.push(id);
             }
@@ -1939,8 +1949,13 @@ impl Fleet {
         // **One row per way in.** The gateway has no route to itself, so what it has to say is where
         // machines arrive — and there can be several (an address it holds, a front that hands it on)
         let mut rows: Vec<MachineRow> = Vec::new();
+        let listen = crate::bridge::machine::listen_addrs(
+            &crate::bridge::machine::link_port(|k| std::env::var(k).ok()),
+            &access,
+            crate::bridge::machine::address_of,
+        );
         for e in entrances(
-            &std::env::var("AGENTGW_LINK_LISTEN").unwrap_or_default(),
+            &listen.join(","),
             crate::setup::ssh::tailscale_serve_json().as_deref(),
         ) {
             let (host, port) = e.at.rsplit_once(':').unwrap_or((e.at.as_str(), ""));
@@ -1980,7 +1995,8 @@ impl Fleet {
             });
         }
         for id in &names {
-            let (host, ip) = hosts.get(id).cloned().unwrap_or_default();
+            let record = access.machines.get(id).cloned().unwrap_or_default();
+            let (host, ip) = (record.host.clone(), record.address.clone());
             // A machine behind an ssh tunnel dials its own loopback, so loopback is the interface it
             // names. What reaches *it* is the gateway's ssh target, which only the gateway knows
             let (host, ip) = match (ip.starts_with("127."), tunnels.get(id)) {
@@ -2481,7 +2497,16 @@ impl Fleet {
                 self.homes.lock().await.insert(bridge_id.to_string(), path);
             }
             link::LinkFrame::MachineHost { host, ip } => {
-                self.hosts.lock().await.insert(bridge_id.to_string(), (host, ip));
+                // **Only the machine can see its own tailnet**, so this is the one place these two
+                // come from. Kept on its record so `machines` can still say where an absent one is
+                let id = bridge_id.to_string();
+                self.edit_access(|a| {
+                    if let Some(link) = a.machines.get_mut(&id) {
+                        link.host = host;
+                        link.address = ip;
+                    }
+                })
+                .await;
             }
             link::LinkFrame::Machines {
                 channel,
@@ -2810,13 +2835,8 @@ pub(super) fn admit_upgrade(
 }
 
 /// Where machines dial in. `/bridge/{id}`.
-/// The address a request came in on, carried from the listener that accepted it.
-#[derive(Clone)]
-struct Entered(String);
-
 async fn on_upgrade(
     State(fleet): State<Arc<Fleet>>,
-    axum::Extension(Entered(at)): axum::Extension<Entered>,
     headers: HeaderMap,
     uri: axum::http::Uri,
     ws: WebSocketUpgrade,
@@ -2835,7 +2855,7 @@ async fn on_upgrade(
     }
     // Returning the subprotocol in the upgrade response is the convention (strict clients hang up otherwise)
     ws.protocols([LINK_SUBPROTOCOL])
-        .on_upgrade(move |socket| on_socket(fleet, bridge_id, at, socket))
+        .on_upgrade(move |socket| on_socket(fleet, bridge_id, socket))
 }
 
 /// The axum-side reader. It only bridges the difference — the watch clock and state machine live only in `link::beat`.
@@ -2853,8 +2873,8 @@ impl LinkRead for WebSocket {
 }
 
 /// The life of one link (**the side a machine dialed**).
-async fn on_socket(fleet: Arc<Fleet>, bridge_id: String, at: String, mut socket: WebSocket) {
-    fleet.entrance.lock().await.insert(bridge_id.clone(), at);
+async fn on_socket(fleet: Arc<Fleet>, bridge_id: String, mut socket: WebSocket) {
+    fleet.seen_now(&bridge_id).await;
     let (conn, mut rx) = fleet.attach(&bridge_id).await;
 
     // Don't split the socket (don't use futures_util's Sink side). **After the handshake the machine sends
@@ -2909,13 +2929,8 @@ async fn on_status(
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
     let tunnels = fleet.tunnels.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let entrance = fleet.entrance.lock().await.clone();
-    axum::Json(serde_json::json!({
-        "connected": fleet.links.connected(),
-        "tunnels": tunnels,
-        "entrances": entrance,
-    }))
-    .into_response()
+    axum::Json(serde_json::json!({ "connected": fleet.links.connected(), "tunnels": tunnels }))
+        .into_response()
 }
 
 /// Open the endpoint that accepts machines. **Never returns.**
@@ -2949,17 +2964,10 @@ pub(super) async fn bind_link_port(addr: std::net::SocketAddr, what: &str) -> Op
 /// **a different port**, guarded by loopback + token. This one is exposed through a front proxy, so putting
 /// them on the same port would let hooks and MCP be hit from outside.
 async fn serve_children_on(fleet: Arc<Fleet>, listener: tokio::net::TcpListener) {
-    // **Which of our addresses this listener is.** There is one listener per address, so a machine
-    // that arrives here arrived on this one — nothing has to be inferred later
-    let at = listener
-        .local_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_default();
     let app = Router::new()
         .route("/status", get(on_status))
         .route(link::PROBE_PATH, get(on_upgrade))
         .route("/bridge/{id}", get(on_upgrade))
-        .layer(axum::Extension(Entered(at)))
         .with_state(fleet);
     if let Err(e) = axum::serve(listener, app).await {
         rlog("error", &format!("the link server stopped: {e}"));
@@ -3208,10 +3216,6 @@ pub(crate) fn first_addr(listen: &str) -> &str {
     listen.split(',').next().unwrap_or(listen).trim()
 }
 
-/// **Loopback**, not `0.0.0.0`: a gateway opens a wider address only when `add-machine` measures that a
-/// machine needs it.
-pub(crate) const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
-
 /// The fleet section of `status`. **The only strings shown to people are here.**
 pub struct Cli;
 
@@ -3307,15 +3311,8 @@ impl Cli {
         Self::ask_status(listen, token).await.map(|r| r.0)
     }
 
-    /// The addresses of ours that machines have actually arrived on. `None` = it didn't answer, which
-    /// is **not** the same as "none" — with no answer, nothing may be closed.
-    pub(crate) async fn ask_entrances(listen: &str, token: &str) -> Option<Vec<String>> {
-        Self::ask_status(listen, token).await.map(|r| r.2)
-    }
-
-    /// The answer from the running gateway's `status` endpoint — connected machines, the tunnels the
-    /// gateway keeps open, and the addresses of ours machines have come in on.
-    async fn ask_status(listen: &str, token: &str) -> Option<(Vec<String>, Tunnels, Vec<String>)> {
+    /// The answer from the running gateway's `status` endpoint — connected machines, and the tunnels the gateway keeps open.
+    async fn ask_status(listen: &str, token: &str) -> Option<(Vec<String>, Tunnels)> {
         for i in 0..3 {
             if i > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(700)).await;
@@ -3327,7 +3324,7 @@ impl Cli {
         None
     }
 
-    async fn ask_status_once(listen: &str, token: &str) -> Option<(Vec<String>, Tunnels, Vec<String>)> {
+    async fn ask_status_once(listen: &str, token: &str) -> Option<(Vec<String>, Tunnels)> {
         let listen = first_addr(listen);
         // Ask curl to avoid a dependency (no HTTP client declared for this one-off job)
         let out = tokio::process::Command::new("curl")
@@ -3354,14 +3351,7 @@ impl Cli {
             .get("tunnels")
             .and_then(|t| serde_json::from_value(t.clone()).ok())
             .unwrap_or_default();
-        let mut entrances: Vec<String> = v
-            .get("entrances")
-            .and_then(|e| e.as_object())
-            .map(|e| e.values().filter_map(|a| a.as_str().map(str::to_string)).collect())
-            .unwrap_or_default();
-        entrances.sort();
-        entrances.dedup();
-        Some((connected, tunnels, entrances))
+        Some((connected, tunnels))
     }
 
     /// id → readable name (best-effort). Anything that can't be looked up is shown as the raw id.
@@ -3703,7 +3693,6 @@ mod tests {
         );
         let fleet = Arc::new(Fleet {
             homes: Default::default(),
-            hosts: Default::default(),
             links: LinkServer::new(),
             token: "s3cret".to_string(),
             self_id: "parent".to_string(),
@@ -3718,7 +3707,6 @@ mod tests {
             click_tx,
             reload,
             tunnels: Default::default(),
-            entrance: Default::default(),
         });
         (fleet, msg_rx)
     }

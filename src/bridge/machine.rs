@@ -24,11 +24,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use axum::Router;
-use axum::extract::State;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::http::HeaderMap;
-use axum::routing::get;
 
 use crate::bridge::gateway;
 
@@ -364,100 +359,134 @@ pub enum Mode {
         api_token: String,
         bridge_id: String,
     },
-    /// Via the gateway (**being picked up**) — don't dial; wait at a listener for the gateway's connection.
-    /// Exists only for setups where the gateway is behind NAT and the machine can't reach it.
-    /// The frame direction doesn't change (gateway → machine).
-    AwaitParent,
 }
 
 impl Mode {
-    /// Decide the mode from env. **Refuse to start if both are set.**
-    ///
-    /// Silently connecting both makes Slack start load-balancing across two consumers of the same app token,
-    /// bringing back exactly the split-brain this design prevents. So rather than defaulting to one,
-    /// **refuse loudly**.
-    pub fn resolve(get: impl Fn(&str) -> Option<String>) -> Result<Mode, String> {
+    /// Which side of a link this Bridge is, from `.env`. **The role is written down, not guessed** —
+    /// it used to be inferred from which keys happened to be present, and a half-finished `.env` then
+    /// read as a different role rather than as an error.
+    pub fn resolve(
+        get: impl Fn(&str) -> Option<String>,
+        access: &crate::bridge::state::Access,
+    ) -> Result<Mode, String> {
         let v = |k: &str| {
             get(k)
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
         };
-        let (app, bot) = (v("SLACK_APP_TOKEN"), v("SLACK_BOT_TOKEN"));
-        let (url, token, id) = (
-            v("AGENTGW_RELAY_URL"),
-            v("AGENTGW_RELAY_TOKEN"),
-            v("AGENTGW_BRIDGE_ID"),
-        );
-        let wants_relay = url.is_some() || token.is_some();
-        let listens = v("AGENTGW_LINK_LISTEN").is_some();
-
-        // **One link per machine.** With both directions, the same event is delivered twice
-        if wants_relay && listens {
-            return Err(crate::t!(
-                "Both AGENTGW_RELAY_URL and AGENTGW_LINK_LISTEN are set in .env. Keep one: \
-                 AGENTGW_RELAY_URL if this machine connects to the gateway, AGENTGW_LINK_LISTEN if \
-                 the gateway connects to this machine. With both, every message arrives twice.",
-                ".env に AGENTGW_RELAY_URL と AGENTGW_LINK_LISTEN の両方があります。どちらか一方にしてください。\
-                 このマシンからゲートウェイにつなぐなら AGENTGW_RELAY_URL、ゲートウェイからこのマシンに\
-                 つなぐなら AGENTGW_LINK_LISTEN です。両方あると、メッセージが2回ずつ届きます。"
-            ));
-        }
-        if app.is_some() && wants_relay {
-            return Err(crate::t!(
-                ".env has both SLACK_APP_TOKEN and AGENTGW_RELAY_URL. This machine can either connect \
-                 to Slack itself (as the gateway) or go through a gateway, not both — Slack would split \
-                 messages between the two, and some would never be answered. To go through a gateway, \
-                 comment out SLACK_APP_TOKEN.",
-                ".env に SLACK_APP_TOKEN と AGENTGW_RELAY_URL の両方があります。このマシンは、自分で Slack に\
-                 つなぐ(ゲートウェイになる)か、ゲートウェイを通すかのどちらかです。両方だと Slack が\
-                 メッセージを振り分けてしまい、返事の来ないものが出ます。ゲートウェイを通すなら、\
-                 SLACK_APP_TOKEN をコメントアウトしてください。"
-            ));
-        }
-        if wants_relay {
-            let (Some(url), Some(api_token)) = (url, token) else {
-                return Err(crate::t!(
-                    "The connection to the gateway is only half set up: .env needs both \
-                     AGENTGW_RELAY_URL and AGENTGW_RELAY_TOKEN. Run `agentgw add-machine` on the \
-                     gateway to set both.",
-                    "ゲートウェイへの接続の設定が途中です。.env に AGENTGW_RELAY_URL と \
-                     AGENTGW_RELAY_TOKEN の両方が必要です。ゲートウェイで `agentgw add-machine` を\
-                     実行すると両方が書かれます。"
-                ));
-            };
-            // **No automatic naming.** Don't fall back to the hostname or `default` —
-            // machines with colliding names steal each other's Slack messages
-            let Some(bridge_id) = id else {
-                return Err(crate::t!(
-                    "This machine has no name. Set AGENTGW_BRIDGE_ID in .env. It isn't chosen \
-                     automatically: two machines with the same name would take each other's messages.",
-                    "このマシンに名前がありません。.env に AGENTGW_BRIDGE_ID を書いてください。\
-                     名前は自動では決めません。同じ名前のマシンが2台あると、互いのメッセージを取り合うためです。"
-                ));
-            };
-            return Ok(Mode::Relay {
-                url,
-                api_token,
-                bridge_id,
-            });
-        }
-        // No Slack token and only a listener = a machine that the gateway comes to pick up
-        if app.is_none() && listens {
-            return Ok(Mode::AwaitParent);
-        }
-        match (app, bot) {
-            (Some(app_token), Some(bot_token)) => Ok(Mode::Direct {
-                app_token,
-                bot_token,
+        // **No automatic naming.** Don't fall back to the hostname or `default` — machines with
+        // colliding names steal each other's Slack messages
+        let id = v("AGENTGW_BRIDGE_ID");
+        let role = v("AGENTGW_BRIDGE_ROLE").unwrap_or_default();
+        match role.to_lowercase().as_str() {
+            "machine" => {
+                let Some(link) = access.gateway.as_ref().filter(|l| !l.link_url.is_empty()) else {
+                    return Err(crate::t!(
+                        "This machine doesn't know its gateway: access.json has no `gateway` record.                          Run `agentgw add-machine` for it on the gateway.",
+                        "このマシンはゲートウェイを知りません(access.json に `gateway` がありません)。                         ゲートウェイで `agentgw add-machine` を実行してください。"
+                    ));
+                };
+                let Some(api_token) = v("AGENTGW_LINK_TOKEN") else {
+                    return Err(crate::t!(
+                        ".env has no AGENTGW_LINK_TOKEN, so this machine has no key to present to the                          gateway. Run `agentgw add-machine` for it on the gateway.",
+                        ".env に AGENTGW_LINK_TOKEN がありません。ゲートウェイに示す鍵が無い状態です。                         ゲートウェイで `agentgw add-machine` を実行してください。"
+                    ));
+                };
+                let Some(bridge_id) = id else {
+                    return Err(crate::t!(
+                        "This machine has no name. Set AGENTGW_BRIDGE_ID in .env. It isn't chosen                          automatically: two machines with the same name would take each other's messages.",
+                        "このマシンに名前がありません。.env に AGENTGW_BRIDGE_ID を書いてください。                         名前は自動では決めません。同じ名前のマシンが2台あると、互いのメッセージを取り合うためです。"
+                    ));
+                };
+                Ok(Mode::Relay {
+                    url: link.link_url.clone(),
+                    api_token,
+                    bridge_id,
+                })
+            }
+            "gateway" => match (v("SLACK_APP_TOKEN"), v("SLACK_BOT_TOKEN")) {
+                (Some(app_token), Some(bot_token)) => Ok(Mode::Direct {
+                    app_token,
+                    bot_token,
+                }),
+                _ => Err(crate::t!(
+                    "This is the gateway, but .env has no Slack tokens. Run `agentgw install` and                      paste them.",
+                    "ここはゲートウェイですが、.env に Slack のトークンがありません。`agentgw install` を                     実行して貼り付けてください。"
+                )),
+            },
+            _ => Err(match role.is_empty() {
+                true => crate::t!(
+                    ".env doesn't say what this Bridge is: set AGENTGW_BRIDGE_ROLE to `gateway` or                      `machine`. `agentgw install` writes it.",
+                    ".env にこの Bridge の役割がありません。AGENTGW_BRIDGE_ROLE に `gateway` か `machine` を                     書いてください(`agentgw install` が書きます)。"
+                ),
+                false => crate::t!(
+                    "AGENTGW_BRIDGE_ROLE in .env is `{role}`, which is neither `gateway` nor `machine`.",
+                    ".env の AGENTGW_BRIDGE_ROLE が `{role}` です。`gateway` か `machine` のどちらかです。"
+                ),
             }),
-            _ => Err(crate::t!(
-                "There are no Slack tokens in .env. For the gateway, run `agentgw install` and paste \
-                 them; for any other machine, run `agentgw add-machine` on the gateway.",
-                ".env に Slack のトークンがありません。ゲートウェイなら `agentgw install` でトークンを\
-                 入れてください。ほかのマシンは、ゲートウェイで `agentgw add-machine` を実行して加えます。"
-            )),
         }
     }
+}
+
+/// The port machines link on. `AGENTGW_BRIDGE_PORT` when someone wanted a different one.
+pub fn link_port(get: impl Fn(&str) -> Option<String>) -> String {
+    get("AGENTGW_BRIDGE_PORT")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| gateway::DEFAULT_PORT.to_string())
+}
+
+/// The address a name has on this machine, asked of the OS. `None` when nothing answers.
+///
+/// Used at startup to turn the names in the links' dial URLs into addresses to open. Those names are
+/// **ours** — the gateway's own LAN or tailnet name — so this resolver is the right one to ask.
+pub fn address_of(name: &str) -> Option<String> {
+    if name.is_empty() || name.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    let ask = |program: &str, args: &[&str]| -> Option<String> {
+        let out = std::process::Command::new(program).args(args).output().ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).to_string())
+    };
+    // No resolver crate for one lookup: `getent` where there is one, `host` elsewhere (macOS has it)
+    let said = match ask("getent", &["hosts", name]) {
+        // `192.0.2.20   build-box.lan` — the address comes first
+        Some(out) => out.lines().next()?.split_whitespace().next().map(str::to_string),
+        // `build-box.lan has address 192.0.2.20`
+        None => ask("host", &["-W", "2", name])?
+            .lines()
+            .find_map(|l| l.rsplit_once("has address "))
+            .map(|(_, ip)| ip.trim().to_string()),
+    };
+    said.filter(|a| !a.is_empty())
+}
+
+/// Every address the gateway accepts machines on: **loopback always**, plus whatever each link asks
+/// for. **Derived, never stored** — a machine that goes away takes its address with it, so nothing
+/// piles up and nothing has to be swept.
+///
+/// Loopback is not optional: it is where a front that terminates TLS forwards to, and where an ssh
+/// tunnel comes out.
+pub fn listen_addrs(
+    port: &str,
+    access: &crate::bridge::state::Access,
+    resolve: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    // **No machines, nothing to accept.** A lone Bridge opens no port at all
+    if access.machines.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![format!("127.0.0.1:{port}")];
+    for link in access.machines.values() {
+        if let Some(addr) = link.required_address(&resolve)
+            && !out.contains(&addr)
+        {
+            out.push(addr);
+        }
+    }
+    out
 }
 
 /// The listener that accepts machines. Default is `0.0.0.0` (accept on any interface).
@@ -499,172 +528,60 @@ pub struct Wiring {
     pub self_id: Option<String>,
     /// Set when accepting machines. **Without it, the usual standalone Bridge**.
     pub children: Option<Listen>,
-    /// The listener of a machine that the gateway picks up. Mutually exclusive with `children` (both read `AGENTGW_LINK_LISTEN`,
-    /// but for different peers — this one is where **upstream** comes in).
-    pub inlet: Option<Listen>,
 }
 
 impl Wiring {
-    pub fn resolve(get: impl Fn(&str) -> Option<String>) -> Result<Wiring, String> {
+    /// `resolve_name` turns a name in a link's dial URL into an address. Those names are **ours**, so
+    /// this machine's resolver is the right one to ask; it is passed in so tests need no DNS.
+    pub fn resolve(
+        get: impl Fn(&str) -> Option<String>,
+        access: &crate::bridge::state::Access,
+        resolve_name: impl Fn(&str) -> Option<String>,
+    ) -> Result<Wiring, String> {
         let v = |k: &str| {
             get(k)
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
         };
-        let upstream = Mode::resolve(&get)?;
+        let upstream = Mode::resolve(&get, access)?;
         let self_id = v("AGENTGW_BRIDGE_ID");
-
-        let Some(listen) = v("AGENTGW_LINK_LISTEN") else {
+        if !matches!(upstream, Mode::Direct { .. }) {
             return Ok(Wiring {
                 upstream,
                 self_id,
                 children: None,
-                inlet: None,
             });
-        };
-        // A machine the gateway picks up opens this listener **for the gateway** (it doesn't take machines).
-        // Three tiers (dialing a gateway while having machines) are already refused by Mode::resolve
-        if matches!(upstream, Mode::AwaitParent) {
+        }
+        let addrs = listen_addrs(&link_port(&get), access, resolve_name);
+        // **Without machines it is the usual standalone Bridge** — nothing to accept, nothing to open
+        if addrs.is_empty() {
             return Ok(Wiring {
                 upstream,
                 self_id,
                 children: None,
-                inlet: Some(Listen {
-                    addrs: parse_listens(&listen)?,
-                    token: v("AGENTGW_LINK_TOKEN").ok_or_else(|| {
-                        crate::t!(
-                            ".env has AGENTGW_LINK_LISTEN but no AGENTGW_LINK_TOKEN. The gateway's \
-                             secret key is required to accept its connection.",
-                            ".env に AGENTGW_LINK_LISTEN はありますが、AGENTGW_LINK_TOKEN がありません。\
-                             ゲートウェイからの接続を受けるには、ゲートウェイの秘密鍵が必要です。"
-                        )
-                    })?,
-                }),
             });
         }
         let Some(token) = v("AGENTGW_LINK_TOKEN") else {
             return Err(crate::t!(
-                ".env has AGENTGW_LINK_LISTEN but no AGENTGW_LINK_TOKEN. Machines can't connect \
-                 without a secret key; `agentgw add-machine` creates one.",
-                ".env に AGENTGW_LINK_LISTEN はありますが、AGENTGW_LINK_TOKEN がありません。秘密鍵が\
-                 無いとマシンはつながれません。`agentgw add-machine` を実行すると作られます。"
+                "This is the gateway, but .env has no AGENTGW_LINK_TOKEN. Machines can't connect                  without a secret key; `agentgw add-machine` creates one.",
+                "ここはゲートウェイですが、.env に AGENTGW_LINK_TOKEN がありません。秘密鍵が無いと                 マシンはつながれません。`agentgw add-machine` を実行すると作られます。"
             ));
         };
         // A gateway with no name can't be the target of `pwd <own id>`. It is not decided automatically
         if self_id.is_none() {
             return Err(crate::t!(
-                "To accept machines, this gateway needs a name: set AGENTGW_BRIDGE_ID in .env. \
-                 `pwd <name>:<path>` uses it, so it isn't chosen automatically.",
-                "マシンを受け入れるには、このゲートウェイに名前が必要です。.env に AGENTGW_BRIDGE_ID を\
-                 書いてください。`pwd <名前>:<パス>` で使う名前なので、自動では決めません。"
+                "To accept machines, this gateway needs a name: set AGENTGW_BRIDGE_ID in .env.                  `pwd <name>:<path>` uses it, so it isn't chosen automatically.",
+                "マシンを受け入れるには、このゲートウェイに名前が必要です。.env に AGENTGW_BRIDGE_ID を                 書いてください。`pwd <名前>:<パス>` で使う名前なので、自動では決めません。"
             ));
         }
         Ok(Wiring {
             upstream,
             self_id,
             children: Some(Listen {
-                addrs: parse_listens(&listen)?,
+                addrs: parse_listens(&addrs.join(","))?,
                 token,
             }),
-            inlet: None,
         })
-    }
-}
-
-// ── waiting for the gateway (machines the gateway dials)  ─────────────────────
-
-/// A machine's kit for waiting for the gateway's connection. It is **where upstream comes in**, so it differs from [`gateway::Fleet`](crate::bridge::gateway::Fleet) (which accepts machines).
-pub struct GatewayInlet {
-    pub token: String,
-    /// Whether the gateway is connected right now (`status` says so).
-    pub live: Arc<AtomicBool>,
-    /// Where received frames go. **The same sink** as when the machine dials.
-    pub tx: tokio::sync::mpsc::Sender<FromRelay>,
-    /// Answers to send back up (the same as when the machine dials).
-    pub up: Uplink,
-}
-
-async fn on_parent_upgrade(
-    State(inlet): State<Arc<GatewayInlet>>,
-    headers: HeaderMap,
-    uri: axum::http::Uri,
-    ws: WebSocketUpgrade,
-) -> axum::response::Response {
-    match gateway::admit_upgrade(&headers, &uri, &inlet.token, "a parent", ws) {
-        Ok((parent_id, ws)) => ws
-            .protocols([link::LINK_SUBPROTOCOL])
-            .on_upgrade(move |socket| on_parent_socket(inlet, parent_id, socket)),
-        Err(response) => response,
-    }
-}
-
-/// Keep reading frames from the gateway. **Agents are not touched** — losing the gateway
-/// only means "no new Slack messages until it comes back".
-async fn on_parent_socket(inlet: Arc<GatewayInlet>, parent_id: String, mut socket: WebSocket) {
-    gateway::rlog("info", &format!("parent \"{parent_id}\" connected"));
-    inlet.live.store(true, Ordering::SeqCst);
-    // If the gateway silently vanishes, we'd stay stuck in receive forever without noticing. Poke to check
-    let mut watch = IdleWatch::default();
-    loop {
-        // **Receive only via `beat`.** Waiting on `recv()` directly hangs forever on half-open
-        let raw = match wake(&mut socket, &mut watch, &inlet.up).await {
-            Wake::Up(frame) => {
-                watch.on_traffic();
-                if socket.send(Message::Text(link::encode(&frame).into())).await.is_err() {
-                    break;
-                }
-                continue;
-            }
-            Wake::Beat(Beat::Text(t)) => t,
-            Wake::Beat(Beat::Alive) => continue,
-            Wake::Beat(Beat::Ping) => {
-                if socket
-                    .send(Message::Ping(Default::default()))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-                continue;
-            }
-            Wake::Beat(Beat::Gone(why)) => {
-                gateway::rlog(
-                    "info",
-                    &format!("parent \"{parent_id}\": link closed ({why})"),
-                );
-                break;
-            }
-        };
-        let Some(frame) = link::decode(&raw).and_then(FromRelay::of) else {
-            gateway::rlog("info", "dropped an unrecognised frame from the parent");
-            continue;
-        };
-        if inlet.tx.send(frame).await.is_err() {
-            break;
-        }
-    }
-    inlet.live.store(false, Ordering::SeqCst);
-    gateway::rlog("info", &format!("parent \"{parent_id}\" disconnected"));
-}
-
-/// Open the listener that accepts the gateway. **Does not return.**
-impl GatewayInlet {
-    /// Open the listener that accepts the gateway. **Does not return.**
-    pub async fn serve(self: Arc<Self>, addr: std::net::SocketAddr) {
-        let app = Router::new()
-            .route(link::PROBE_PATH, get(on_parent_upgrade))
-            .route("/bridge/{id}", get(on_parent_upgrade))
-            .with_state(self);
-        let Some(listener) = gateway::bind_link_port(addr, "parent").await else {
-            return;
-        };
-        gateway::rlog(
-            "info",
-            &format!("waiting for the parent on {addr}/bridge/<id>"),
-        );
-        if let Err(e) = axum::serve(listener, app).await {
-            gateway::rlog("error", &format!("the inlet stopped: {e}"));
-        }
     }
 }
 
@@ -731,8 +648,11 @@ pub fn child_urls(raw: &str) -> Vec<(String, String)> {
 /// it shows even when the Bridge isn't running (which is exactly when you want to read it).
 /// If `Wiring::resolve` rejects the config, its reason is shown as is — the only place to learn why
 /// a Bridge can't start without opening the logs.
-pub fn role_line(env: &std::collections::HashMap<String, String>) -> String {
-    let wiring = match Wiring::resolve(|k| env.get(k).cloned()) {
+pub fn role_line(
+    env: &std::collections::HashMap<String, String>,
+    access: &crate::bridge::state::Access,
+) -> String {
+    let wiring = match Wiring::resolve(|k| env.get(k).cloned(), access, address_of) {
         Ok(w) => w,
         Err(why) => {
             let why = why.lines().next().unwrap_or("");
@@ -744,8 +664,8 @@ pub fn role_line(env: &std::collections::HashMap<String, String>) -> String {
         .as_deref()
         .map(|n| crate::t!(" \"{n}\"", "「{n}」"))
         .unwrap_or_default();
-    match (&wiring.upstream, &wiring.children, &wiring.inlet) {
-        (Mode::Direct { .. }, Some(l), _) => {
+    match (&wiring.upstream, &wiring.children) {
+        (Mode::Direct { .. }, Some(l)) => {
             // Every address, not just the first: a gateway opens one per way in that a machine needs
             let addr = l.addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ");
             crate::t!(
@@ -753,24 +673,13 @@ pub fn role_line(env: &std::collections::HashMap<String, String>) -> String {
                 "役割: ゲートウェイ{name} — Slack に接続、マシンを {addr} で受け付け"
             )
         }
-        (Mode::Direct { .. }, None, _) => crate::t!(
+        (Mode::Direct { .. }, None) => crate::t!(
             "Role: gateway{name} — connected to Slack, no other machines",
             "役割: ゲートウェイ{name} — Slack に接続、ほかのマシンなし"
         ),
-        (Mode::Relay { url, .. }, ..) => crate::t!(
+        (Mode::Relay { url, .. }, _) => crate::t!(
             "Role: machine{name} — connects to the gateway at {url}",
             "役割: マシン{name} — ゲートウェイ {url} につなぐ"
-        ),
-        (Mode::AwaitParent, _, Some(l)) => {
-            let addr = l.addr();
-            crate::t!(
-                "Role: machine{name} — waits for the gateway to connect on {addr}",
-                "役割: マシン{name} — ゲートウェイからの接続を {addr} で待つ"
-            )
-        }
-        (Mode::AwaitParent, _, None) => crate::t!(
-            "Role: machine{name} — waits for the gateway, but has no address to listen on",
-            "役割: マシン{name} — ゲートウェイを待っているが、受け付ける場所が未設定"
         ),
     }
 }
@@ -814,31 +723,93 @@ mod tests {
         move |k: &str| map.get(k).cloned()
     }
 
+    use crate::bridge::state::{Access, Link};
+
+    /// A gateway with these machines recorded.
+    fn with_machines(pairs: &[(&str, Link)]) -> Access {
+        Access {
+            machines: pairs.iter().map(|(k, l)| (k.to_string(), l.clone())).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn a_link(kind: &str, url: &str) -> Link {
+        Link {
+            kind: kind.into(),
+            link_url: url.into(),
+            ..Default::default()
+        }
+    }
+
+    /// `hub.lan` is ours, and it is the only name this test's resolver knows.
+    fn here(name: &str) -> Option<String> {
+        (name == "hub.lan").then(|| "192.0.2.10".to_string())
+    }
+
     #[test]
-    fn direct_mode_needs_both_slack_tokens() {
+    fn the_gateway_is_the_one_holding_the_slack_tokens() {
         assert_eq!(
-            Mode::resolve(env(&[
-                ("SLACK_APP_TOKEN", "xapp-1"),
-                ("SLACK_BOT_TOKEN", "xoxb-1")
-            ]))
+            Mode::resolve(
+                env(&[
+                    ("AGENTGW_BRIDGE_ROLE", "gateway"),
+                    ("SLACK_APP_TOKEN", "xapp-1"),
+                    ("SLACK_BOT_TOKEN", "xoxb-1")
+                ]),
+                &Access::default()
+            )
             .unwrap(),
             Mode::Direct {
                 app_token: "xapp-1".into(),
                 bot_token: "xoxb-1".into()
             }
         );
-        assert!(Mode::resolve(env(&[("SLACK_APP_TOKEN", "xapp-1")])).is_err());
-        assert!(Mode::resolve(env(&[])).is_err());
+        // Half the tokens is not a different role, it is a broken gateway
+        let e = Mode::resolve(
+            env(&[("AGENTGW_BRIDGE_ROLE", "gateway"), ("SLACK_APP_TOKEN", "xapp-1")]),
+            &Access::default(),
+        )
+        .unwrap_err();
+        assert!(e.contains("no Slack tokens"), "{e}");
+    }
+
+    /// **The role is written down, not guessed.** It used to be inferred from which keys happened to be
+    /// present, so a half-finished `.env` read as a different role instead of as an error.
+    #[test]
+    fn a_bridge_that_does_not_say_what_it_is_refuses_to_start() {
+        let e = Mode::resolve(env(&[("SLACK_APP_TOKEN", "xapp-1")]), &Access::default()).unwrap_err();
+        assert!(e.contains("AGENTGW_BRIDGE_ROLE"), "{e}");
+        // **`Gateway` still works** — only a real typo is refused, and it is quoted back as written
+        assert!(
+            Mode::resolve(
+                env(&[
+                    ("AGENTGW_BRIDGE_ROLE", "Gateway"),
+                    ("SLACK_APP_TOKEN", "xapp-1"),
+                    ("SLACK_BOT_TOKEN", "xoxb-1")
+                ]),
+                &Access::default()
+            )
+            .is_ok()
+        );
+        let typo = Mode::resolve(env(&[("AGENTGW_BRIDGE_ROLE", "Gatway")]), &Access::default())
+            .unwrap_err();
+        assert!(typo.contains("`Gatway`"), "{typo}");
     }
 
     #[test]
-    fn relay_mode_needs_the_url_the_token_and_a_name() {
+    fn a_machine_dials_the_gateway_its_record_names() {
+        let access = Access {
+            gateway: Some(a_link(Link::TAILSCALE, "wss://r")),
+            ..Default::default()
+        };
         assert_eq!(
-            Mode::resolve(env(&[
-                ("AGENTGW_RELAY_URL", "wss://r"),
-                ("AGENTGW_RELAY_TOKEN", "s"),
-                ("AGENTGW_BRIDGE_ID", "desktop"),
-            ]))
+            Mode::resolve(
+                env(&[
+                    ("AGENTGW_BRIDGE_ROLE", "machine"),
+                    ("AGENTGW_LINK_TOKEN", "s"),
+                    ("AGENTGW_BRIDGE_ID", "desktop"),
+                ]),
+                &access
+            )
             .unwrap(),
             Mode::Relay {
                 url: "wss://r".into(),
@@ -846,48 +817,52 @@ mod tests {
                 bridge_id: "desktop".into()
             }
         );
-        // Only the URL / only the token = half-finished config. Refuse with a clear message
-        let half = Mode::resolve(env(&[("AGENTGW_RELAY_URL", "wss://r")])).unwrap_err();
-        assert!(half.contains("half set up"), "{half}");
+        // No record = it doesn't know where its gateway is
+        let lost = Mode::resolve(
+            env(&[
+                ("AGENTGW_BRIDGE_ROLE", "machine"),
+                ("AGENTGW_LINK_TOKEN", "s"),
+                ("AGENTGW_BRIDGE_ID", "desktop"),
+            ]),
+            &Access::default(),
+        )
+        .unwrap_err();
+        assert!(lost.contains("doesn't know its gateway"), "{lost}");
     }
 
     /// **No automatic naming.** Falling back to `default` makes multiple machines all collide.
     #[test]
-    fn a_relay_bridge_without_a_name_refuses_to_start() {
-        let e = Mode::resolve(env(&[
-            ("AGENTGW_RELAY_URL", "wss://r"),
-            ("AGENTGW_RELAY_TOKEN", "s"),
-        ]))
+    fn a_machine_without_a_name_refuses_to_start() {
+        let access = Access {
+            gateway: Some(a_link(Link::TAILSCALE, "wss://r")),
+            ..Default::default()
+        };
+        let e = Mode::resolve(
+            env(&[("AGENTGW_BRIDGE_ROLE", "machine"), ("AGENTGW_LINK_TOKEN", "s")]),
+            &access,
+        )
         .unwrap_err();
         assert!(e.contains("AGENTGW_BRIDGE_ID"), "{e}");
         assert!(e.contains("take each other's messages"), "{e}");
     }
 
-    /// A config with both set doesn't start. Silently connecting both brings split-brain back.
-    #[test]
-    fn having_both_modes_configured_refuses_to_start() {
-        let e = Mode::resolve(env(&[
-            ("SLACK_APP_TOKEN", "xapp-1"),
-            ("SLACK_BOT_TOKEN", "xoxb-1"),
-            ("AGENTGW_RELAY_URL", "wss://r"),
-            ("AGENTGW_RELAY_TOKEN", "s"),
-            ("AGENTGW_BRIDGE_ID", "desktop"),
-        ]))
-        .unwrap_err();
-        assert!(e.contains("not both"), "{e}");
-        assert!(e.contains("SLACK_APP_TOKEN"), "{e}");
-    }
-
     /// An empty string is the same as absent. A .env left with just `SLACK_APP_TOKEN=` doesn't block startup.
     #[test]
     fn an_empty_value_counts_as_absent() {
+        let access = Access {
+            gateway: Some(a_link(Link::TAILSCALE, "wss://r")),
+            ..Default::default()
+        };
         assert!(matches!(
-            Mode::resolve(env(&[
-                ("SLACK_APP_TOKEN", "   "),
-                ("AGENTGW_RELAY_URL", "wss://r"),
-                ("AGENTGW_RELAY_TOKEN", "s"),
-                ("AGENTGW_BRIDGE_ID", "desktop"),
-            ])),
+            Mode::resolve(
+                env(&[
+                    ("AGENTGW_BRIDGE_ROLE", "machine"),
+                    ("SLACK_APP_TOKEN", "   "),
+                    ("AGENTGW_LINK_TOKEN", "s"),
+                    ("AGENTGW_BRIDGE_ID", "desktop"),
+                ]),
+                &access
+            ),
             Ok(Mode::Relay { .. })
         ));
     }
@@ -896,6 +871,7 @@ mod tests {
 
     fn parent(extra: &[(&str, &str)]) -> Vec<(String, String)> {
         let mut v: Vec<(String, String)> = [
+            ("AGENTGW_BRIDGE_ROLE", "gateway"),
             ("SLACK_APP_TOKEN", "xapp-1"),
             ("SLACK_BOT_TOKEN", "xoxb-1"),
             ("AGENTGW_BRIDGE_ID", "vps"),
@@ -907,104 +883,84 @@ mod tests {
         v
     }
 
-    fn wire(pairs: &[(String, String)]) -> Result<Wiring, String> {
+    fn wire(pairs: &[(String, String)], access: &Access) -> Result<Wiring, String> {
         let owned: Vec<(String, String)> = pairs.to_vec();
-        Wiring::resolve(move |k| {
-            owned
-                .iter()
-                .find(|(key, _)| key == k)
-                .map(|(_, v)| v.clone())
-        })
+        Wiring::resolve(
+            move |k| {
+                owned
+                    .iter()
+                    .find(|(key, _)| key == k)
+                    .map(|(_, v)| v.clone())
+            },
+            access,
+            here,
+        )
     }
 
-    /// Without a config for accepting machines, it is **the usual standalone Bridge**. This is the main regression guard.
+    /// With no machines recorded there is nothing to accept — **the usual standalone Bridge**, and no
+    /// port opened at all. This is the main regression guard.
     #[test]
-    fn a_bridge_without_a_listen_is_the_lone_bridge_we_already_had() {
-        let w = wire(&parent(&[])).unwrap();
+    fn a_bridge_with_no_machines_opens_nothing() {
+        let w = wire(&parent(&[]), &Access::default()).unwrap();
         assert!(w.children.is_none());
         assert!(matches!(w.upstream, Mode::Direct { .. }));
     }
 
+    /// **Loopback always, plus what each link asks for.** Derived from the records every start-up, so a
+    /// machine that goes away takes its address with it.
     #[test]
-    fn a_parent_listens_on_the_loopback_port_it_was_given() {
-        let w = wire(&parent(&[
-            ("AGENTGW_LINK_LISTEN", "127.0.0.1:8787"),
-            ("AGENTGW_LINK_TOKEN", "s3cret"),
-        ]))
-        .unwrap();
+    fn the_open_addresses_come_from_the_machines() {
+        let access = with_machines(&[
+            // A front terminates this one and hands it to our loopback: nothing extra to open
+            ("fronted", a_link(Link::TAILSCALE, "wss://hub.example.ts.net")),
+            ("lan", a_link(Link::LAN, "ws://hub.lan:8787")),
+            // Its exit is our loopback too
+            ("tunnelled", a_link(Link::TUNNEL, "ws://127.0.0.1:8799")),
+        ]);
+        let w = wire(&parent(&[("AGENTGW_LINK_TOKEN", "s3cret")]), &access).unwrap();
         let l = w.children.unwrap();
-        assert_eq!(l.addr().to_string(), "127.0.0.1:8787");
+        let addrs: Vec<String> = l.addrs.iter().map(|a| a.to_string()).collect();
+        assert_eq!(addrs, vec!["127.0.0.1:8787", "192.0.2.10:8787"]);
         assert_eq!(l.token, "s3cret");
         assert_eq!(w.self_id.as_deref(), Some("vps"));
-    }
-
-    /// **Binds on public interfaces too** (2026-08-02, user decision). Nothing is refused, but
-    /// being exposed beyond loopback sets `is_exposed`, which logs one warning line at startup.
-    #[test]
-    fn a_listen_outside_the_loopback_is_allowed_but_marked_exposed() {
-        let w = wire(&parent(&[
-            ("AGENTGW_LINK_LISTEN", "0.0.0.0:8787"),
-            ("AGENTGW_LINK_TOKEN", "s3cret"),
-        ]))
-        .unwrap();
-        let l = w.children.unwrap();
-        assert_eq!(l.addr().to_string(), "0.0.0.0:8787");
         assert!(l.is_exposed());
 
-        let loop_back = wire(&parent(&[
-            ("AGENTGW_LINK_LISTEN", "127.0.0.1:8787"),
-            ("AGENTGW_LINK_TOKEN", "s3cret"),
-        ]))
+        // Take the LAN machine away and its address goes with it
+        let alone = with_machines(&[("fronted", a_link(Link::TAILSCALE, "wss://hub.example.ts.net"))]);
+        let w = wire(&parent(&[("AGENTGW_LINK_TOKEN", "s3cret")]), &alone).unwrap();
+        let l = w.children.unwrap();
+        assert_eq!(l.addr().to_string(), "127.0.0.1:8787");
+        assert!(!l.is_exposed());
+    }
+
+    /// A different port is asked for in one place, not spelled into every address.
+    #[test]
+    fn the_port_is_asked_for_once() {
+        let access = with_machines(&[("lan", a_link(Link::LAN, "ws://hub.lan:8788"))]);
+        let w = wire(
+            &parent(&[("AGENTGW_LINK_TOKEN", "s3cret"), ("AGENTGW_BRIDGE_PORT", "8788")]),
+            &access,
+        )
         .unwrap();
-        assert!(!loop_back.children.unwrap().is_exposed());
+        let addrs: Vec<String> = w.children.unwrap().addrs.iter().map(|a| a.to_string()).collect();
+        assert_eq!(addrs, vec!["127.0.0.1:8788", "192.0.2.10:8788"]);
     }
 
     #[test]
-    fn a_listen_without_a_key_refuses_to_start() {
-        let e = wire(&parent(&[("AGENTGW_LINK_LISTEN", "127.0.0.1:8787")])).unwrap_err();
+    fn a_gateway_with_machines_but_no_key_refuses_to_start() {
+        let access = with_machines(&[("lan", a_link(Link::LAN, "ws://hub.lan:8787"))]);
+        let e = wire(&parent(&[]), &access).unwrap_err();
         assert!(e.contains("AGENTGW_LINK_TOKEN"), "{e}");
     }
 
     /// A gateway with no name can't be the target of `pwd <own id>`. **Not decided automatically.**
     #[test]
     fn a_parent_without_a_name_refuses_to_start() {
-        let mut pairs = parent(&[
-            ("AGENTGW_LINK_LISTEN", "127.0.0.1:8787"),
-            ("AGENTGW_LINK_TOKEN", "s3cret"),
-        ]);
+        let mut pairs = parent(&[("AGENTGW_LINK_TOKEN", "s3cret")]);
         pairs.retain(|(k, _)| k != "AGENTGW_BRIDGE_ID");
-        let e = wire(&pairs).unwrap_err();
+        let access = with_machines(&[("lan", a_link(Link::LAN, "ws://hub.lan:8787"))]);
+        let e = wire(&pairs, &access).unwrap_err();
         assert!(e.contains("AGENTGW_BRIDGE_ID"), "{e}");
-    }
-
-    /// **One link per machine.** A config that dials out while also being picked up
-    /// gets every event twice (= a config trying to build three tiers is stopped here too).
-    #[test]
-    fn a_child_cannot_face_both_ways() {
-        let e = wire(&[
-            ("AGENTGW_RELAY_URL".into(), "wss://r".into()),
-            ("AGENTGW_RELAY_TOKEN".into(), "s".into()),
-            ("AGENTGW_BRIDGE_ID".into(), "desktop".into()),
-            ("AGENTGW_LINK_LISTEN".into(), "127.0.0.1:8787".into()),
-            ("AGENTGW_LINK_TOKEN".into(), "k".into()),
-        ])
-        .unwrap_err();
-        assert!(e.contains("Keep one"), "{e}");
-    }
-
-    /// No Slack token and only a listener = **a machine that the gateway picks up**.
-    #[test]
-    fn a_bridge_with_only_an_inlet_waits_for_its_parent() {
-        let w = wire(&[
-            ("AGENTGW_BRIDGE_ID".into(), "desktop".into()),
-            ("AGENTGW_LINK_LISTEN".into(), "127.0.0.1:8787".into()),
-            ("AGENTGW_LINK_TOKEN".into(), "k".into()),
-        ])
-        .unwrap();
-        assert!(matches!(w.upstream, Mode::AwaitParent));
-        // The opened listener is **for upstream**; it doesn't take machines
-        assert!(w.children.is_none());
-        assert_eq!(w.inlet.unwrap().addr().to_string(), "127.0.0.1:8787");
     }
 
     /// The table of machines to pick up. **Whitespace and a trailing / are stripped. Broken pairs are silently dropped**
@@ -1093,8 +1049,8 @@ mod tests {
         );
     }
 
-    /// The first line of `status`. **Staying silent with the role misread is the worst**, so the four shapes and
-    /// "can't tell" are pinned.
+    /// The first line of `status`. **Staying silent with the role misread is the worst**, so every shape
+    /// and "can't tell" are pinned.
     #[test]
     fn role_line_names_the_role() {
         let env = |pairs: &[(&str, &str)]| -> std::collections::HashMap<String, String> {
@@ -1103,38 +1059,49 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect()
         };
-        let line = |pairs: &[(&str, &str)]| role_line(&env(pairs));
+        let line = |pairs: &[(&str, &str)], access: &Access| role_line(&env(pairs), access);
 
-        let solo = line(&[("SLACK_APP_TOKEN", "xapp-1"), ("SLACK_BOT_TOKEN", "xoxb-1")]);
+        let solo = line(
+            &[
+                ("AGENTGW_BRIDGE_ROLE", "gateway"),
+                ("SLACK_APP_TOKEN", "xapp-1"),
+                ("SLACK_BOT_TOKEN", "xoxb-1"),
+            ],
+            &Access::default(),
+        );
         assert!(solo.starts_with("Role: gateway — connected to Slack, no other machines"), "{solo}");
 
-        let parent = line(&[
-            ("SLACK_APP_TOKEN", "xapp-1"),
-            ("SLACK_BOT_TOKEN", "xoxb-1"),
-            ("AGENTGW_BRIDGE_ID", "mac"),
-            ("AGENTGW_LINK_LISTEN", "127.0.0.1:8787"),
-            ("AGENTGW_LINK_TOKEN", "k"),
-        ]);
+        let parent = line(
+            &[
+                ("AGENTGW_BRIDGE_ROLE", "gateway"),
+                ("SLACK_APP_TOKEN", "xapp-1"),
+                ("SLACK_BOT_TOKEN", "xoxb-1"),
+                ("AGENTGW_BRIDGE_ID", "mac"),
+                ("AGENTGW_LINK_TOKEN", "k"),
+            ],
+            &with_machines(&[("lan", a_link(Link::LAN, "ws://hub.lan:8787"))]),
+        );
         assert!(parent.contains("Role: gateway \"mac\""), "{parent}");
-        assert!(parent.contains("127.0.0.1:8787"), "{parent}");
+        // `role_line` asks the real resolver, which knows nothing of this test's names — loopback is
+        // what is certain, and that it says every address rather than one is what matters here
+        assert!(parent.contains("accepts machines on 127.0.0.1:8787"), "{parent}");
 
-        let dialing = line(&[
-            ("AGENTGW_RELAY_URL", "wss://p.example"),
-            ("AGENTGW_RELAY_TOKEN", "k"),
-            ("AGENTGW_BRIDGE_ID", "laptop"),
-        ]);
+        let dialing = line(
+            &[
+                ("AGENTGW_BRIDGE_ROLE", "machine"),
+                ("AGENTGW_LINK_TOKEN", "k"),
+                ("AGENTGW_BRIDGE_ID", "laptop"),
+            ],
+            &Access {
+                gateway: Some(a_link(Link::TAILSCALE, "wss://p.example")),
+                ..Default::default()
+            },
+        );
         assert!(dialing.contains("Role: machine \"laptop\""), "{dialing}");
         assert!(dialing.contains("wss://p.example"), "{dialing}");
 
-        let awaiting = line(&[
-            ("AGENTGW_LINK_LISTEN", "127.0.0.1:8788"),
-            ("AGENTGW_LINK_TOKEN", "k"),
-            ("AGENTGW_BRIDGE_ID", "laptop"),
-        ]);
-        assert!(awaiting.contains("waits for the gateway"), "{awaiting}");
-
         // A config that can't start is exactly when status needs to give the reason (without opening the logs)
-        let broken = line(&[]);
+        let broken = line(&[], &Access::default());
         assert!(broken.starts_with("Role: can't tell"), "{broken}");
     }
 }

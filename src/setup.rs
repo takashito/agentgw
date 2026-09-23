@@ -204,6 +204,7 @@ fn ask_child(state_dir: &StateDir) -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", state_dir.path().display()))?;
     crate::state_dir::write_atomic_mode(&env_file, &after, Some(0o600))
         .map_err(|e| format!("{}: {e}", env_file.display()))?;
+    remember_gateway(state_dir, &conn);
     println!(
         "{}",
         crate::t!(
@@ -276,63 +277,22 @@ fn ask_parent(state_dir: &StateDir) -> Result<(), String> {
             env_file.display()
         )
     );
-    default_listen(state_dir);
+    write_role(state_dir, "gateway");
     Ok(())
 }
 
-/// Where the gateway accepts machines. Loopback to start with, and **loopback stays** whatever else
-/// is added: it is where `tailscale serve` (or any front that terminates TLS) forwards to, and where
-/// an ssh tunnel comes out. Nothing wider is opened until `add-machine` measures that a machine
-/// needs it.
-fn default_listen(state_dir: &StateDir) {
-    let set = state_dir
-        .load_env()
-        .unwrap_or_default()
-        .iter()
-        .any(|(k, v)| k == "AGENTGW_LINK_LISTEN" && !v.trim().is_empty());
-    if !set {
-        write_listen(state_dir, &format!("127.0.0.1:{}", crate::bridge::gateway::DEFAULT_PORT));
-    }
-}
-
-/// Add one address to what the gateway listens on, keeping what is there. `false` = it already had it.
-///
-/// **Called before each route is tried**, not at install time: a route can only be tried once the
-/// address it needs is open. So this opens the address of **every route attempted**, not just the one
-/// that wins. What the losers opened is taken back out once the route is settled
-/// (`add_machine::close_unused_addresses`).
-pub(crate) fn add_listen(state_dir: &StateDir, addr: &str) -> bool {
-    let current = state_dir
-        .load_env()
-        .unwrap_or_default()
-        .into_iter()
-        .find(|(k, _)| k == "AGENTGW_LINK_LISTEN")
-        .map(|(_, v)| v)
-        .unwrap_or_default();
-    if current.split(',').any(|a| a.trim() == addr) {
-        return false;
-    }
-    let mut addrs: Vec<&str> = current.split(',').map(str::trim).filter(|a| !a.is_empty()).collect();
-    addrs.push(addr);
-    write_listen(state_dir, &addrs.join(","));
-    true
-}
-
-fn write_listen(state_dir: &StateDir, value: &str) {
+/// Write down what this Bridge is. **The role is written, not guessed**: which keys happen to be
+/// present used to decide it, so a half-finished `.env` read as a different role instead of as an
+/// error. Where machines are accepted isn't written at all — that follows from their records.
+fn write_role(state_dir: &StateDir, role: &str) {
     let path = state_dir.join(".env");
     let before = std::fs::read_to_string(&path).unwrap_or_default();
-    let after = crate::state_dir::set_env_keys(&before, &[("AGENTGW_LINK_LISTEN", value.to_string())]);
-    match crate::state_dir::write_atomic_mode(&path, &after, Some(0o600)) {
-        Ok(()) => println!(
-            "{}",
-            crate::t!(
-                "Machines connect to: {value}",
-                "マシンからの接続を受ける場所: {value}"
-            )
-        ),
-        Err(e) => eprintln!("{}: {e}", path.display()),
+    let after = crate::state_dir::set_env_keys(&before, &[("AGENTGW_BRIDGE_ROLE", role.to_string())]);
+    if let Err(e) = crate::state_dir::write_atomic_mode(&path, &after, Some(0o600)) {
+        eprintln!("{}: {e}", path.display());
     }
 }
+
 
 pub fn uninstall(mac: bool, job: &Path) -> i32 {
     // Stop first, then remove the definition. bootout on a stopped service returns non-zero, but
@@ -437,28 +397,165 @@ pub fn install(mac: bool, job: &Path, rest: &[String]) -> i32 {
     0
 }
 
-/// Writes the gateway connection settings into `.env` and **retires the direct-connection token**.
+/// Writes what `.env` keeps of a connection string: **the role, the name and the key**. Where the
+/// gateway is goes to access.json instead — `.env` keeps what has to be there before anything is
+/// read, and the secrets, because it is the file with the tight mode.
 ///
 /// Having someone write three values by hand is three chances to get one wrong, so everything comes
-/// from one connection string. Commenting out `SLACK_APP_TOKEN` is the key — if it stays,
-/// [`Mode::resolve`](crate::bridge::machine::Mode::resolve) refuses to start (rightly).
+/// from one connection string. Commenting out `SLACK_APP_TOKEN` is part of it — this machine goes
+/// through the gateway now, and two consumers of one Slack app split the messages between them.
 pub fn apply_connection(env_text: &str, conn: &link::Invite, bridge_id: &str) -> String {
     // Close the direct connection. **Comment it out rather than delete it** — for the day you want it back
     let folded: Vec<String> = env_text
         .lines()
         .map(|line| match line.split_once('=').map(|(k, _)| k.trim()) {
-            Some("SLACK_APP_TOKEN") => format!("# (relay mode) {line}"),
+            Some("SLACK_APP_TOKEN") => format!("# (machine mode) {line}"),
             _ => line.to_string(),
         })
         .collect();
     set_env_keys(
         &folded.join("\n"),
         &[
-            ("AGENTGW_RELAY_URL", conn.url.clone()),
-            ("AGENTGW_RELAY_TOKEN", conn.api_token.clone()),
+            ("AGENTGW_BRIDGE_ROLE", "machine".to_string()),
+            ("AGENTGW_LINK_TOKEN", conn.api_token.clone()),
             ("AGENTGW_BRIDGE_ID", bridge_id.to_string()),
         ],
     )
+}
+
+/// The other half of a connection string: **where the gateway is**, written to access.json.
+pub fn remember_gateway(dir: &StateDir, conn: &link::Invite) {
+    let mut access = crate::bridge::state::Access::load(dir);
+    let was = access.gateway.take().unwrap_or_default();
+    access.gateway = Some(crate::bridge::state::Link {
+        kind: link_kind(&conn.url).to_string(),
+        link_url: conn.url.clone(),
+        ..was
+    });
+    if let Err(e) = access.save(dir) {
+        eprintln!("{}", crate::t!("Couldn't write access.json: {e}", "access.json が書けません: {e}"));
+    }
+}
+
+/// Which kind of route a dial URL describes. **Loopback means the ssh tunnel** — nothing else asks a
+/// machine to dial itself.
+pub fn link_kind(url: &str) -> &'static str {
+    use crate::bridge::state::Link;
+    let host = url
+        .split_once("://")
+        .map(|(_, rest)| rest.split('/').next().unwrap_or(rest))
+        .map(|hp| hp.rsplit_once(':').map(|(h, _)| h).unwrap_or(hp))
+        .unwrap_or_default();
+    if host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()) || host == "localhost" {
+        return Link::TUNNEL;
+    }
+    const TAILNET: &str = ".ts.net"; // Tailscale's own domain, as in hub.example.ts.net
+    match host.ends_with(TAILNET) {
+        true => Link::TAILSCALE,
+        false => Link::LAN,
+    }
+}
+
+/// Fold an older `.env` into the shape this version reads. **Runs once, before anything is read**,
+/// and does nothing when it has already run.
+///
+/// How a machine connects used to live in three keys — `AGENTGW_TUNNELS`, `AGENTGW_ROUTES` and the
+/// addresses in `AGENTGW_LINK_LISTEN` — and one fact in three places is a fact that can disagree with
+/// itself. It is one record per machine in access.json now, and `.env` keeps only what has to be read
+/// before that file can be: the role, the name, the port and the secrets.
+pub fn migrate_env(dir: &StateDir) {
+    use crate::bridge::state::{Access, Link};
+    let env: std::collections::HashMap<String, String> =
+        dir.load_env().unwrap_or_default().into_iter().collect();
+    let v = |k: &str| env.get(k).map(|s| s.trim()).filter(|s| !s.is_empty());
+    // Already in the new shape
+    if v("AGENTGW_BRIDGE_ROLE").is_some() {
+        return;
+    }
+    let (listen, relay_url) = (v("AGENTGW_LINK_LISTEN"), v("AGENTGW_RELAY_URL"));
+    let role = match (listen, relay_url) {
+        (Some(_), _) => "gateway",
+        (None, Some(_)) => "machine",
+        // Nothing to fold: a standalone Bridge, which is a gateway with no machines
+        (None, None) => "gateway",
+    };
+    let port = listen
+        .and_then(|l| crate::bridge::gateway::first_addr(l).rsplit(':').next())
+        .unwrap_or(crate::bridge::gateway::DEFAULT_PORT)
+        .to_string();
+
+    let mut access = Access::load(dir);
+    if role == "machine" {
+        if let Some(url) = relay_url {
+            access.gateway = Some(Link {
+                kind: link_kind(url).to_string(),
+                link_url: url.to_string(),
+                ..Default::default()
+            });
+        }
+    } else {
+        // A tunnel is named by its ssh target; the machine at its end dials its own loopback
+        for (id, target) in crate::bridge::machine::child_urls(v("AGENTGW_TUNNELS").unwrap_or("")) {
+            access.machines.insert(
+                id,
+                Link {
+                    kind: Link::TUNNEL.to_string(),
+                    link_url: format!("ws://127.0.0.1:{}", crate::bridge::gateway::TUNNEL_PORT),
+                    ssh_target: Some(target),
+                    ..Default::default()
+                },
+            );
+        }
+        for (id, url) in crate::bridge::machine::child_urls(v("AGENTGW_ROUTES").unwrap_or("")) {
+            let kind = match Some(url.as_str()) == v("AGENTGW_LINK_PUBLIC_URL") {
+                true => Link::PUBLIC,
+                false => link_kind(&url),
+            };
+            access.machines.insert(
+                id,
+                Link {
+                    kind: kind.to_string(),
+                    link_url: url,
+                    ..Default::default()
+                },
+            );
+        }
+    }
+    if let Err(e) = access.save(dir) {
+        eprintln!("{}", crate::t!("Couldn't write access.json: {e}", "access.json が書けません: {e}"));
+        return;
+    }
+
+    // The machine's key had its own name; there is one key now, whichever side you are
+    let mut set: Vec<(&str, String)> = vec![("AGENTGW_BRIDGE_ROLE", role.to_string())];
+    if port != crate::bridge::gateway::DEFAULT_PORT {
+        set.push(("AGENTGW_BRIDGE_PORT", port));
+    }
+    if v("AGENTGW_LINK_TOKEN").is_none()
+        && let Some(tok) = v("AGENTGW_RELAY_TOKEN")
+    {
+        set.push(("AGENTGW_LINK_TOKEN", tok.to_string()));
+    }
+    let path = dir.join(".env");
+    let before = std::fs::read_to_string(&path).unwrap_or_default();
+    let kept: String = before
+        .lines()
+        .filter(|l| {
+            !matches!(
+                l.split_once('=').map(|(k, _)| k.trim()),
+                Some("AGENTGW_LINK_LISTEN")
+                    | Some("AGENTGW_TUNNELS")
+                    | Some("AGENTGW_ROUTES")
+                    | Some("AGENTGW_RELAY_URL")
+                    | Some("AGENTGW_RELAY_TOKEN")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let after = crate::state_dir::set_env_keys(&kept, &set);
+    if let Err(e) = crate::state_dir::write_atomic_mode(&path, &after, Some(0o600)) {
+        eprintln!("{}: {e}", path.display());
+    }
 }
 
 /// `agentgw install` / `agentgw uninstall` — returns the process exit code.
@@ -555,8 +652,9 @@ pub fn cli(args: &[String], dir: &StateDir) -> i32 {
         eprintln!("link: {}", crate::t!("couldn't write {}: {e}", "{} に書けません: {e}", env_path.display()));
         return 1;
     }
+    remember_gateway(dir, &conn);
     println!("{}", crate::t!("Saved: {}", "保存しました: {}", env_path.display()));
-    println!("  AGENTGW_RELAY_URL={}", conn.url);
+    println!("  gateway={}", conn.url);
     println!("  AGENTGW_BRIDGE_ID={bridge_id}");
     if before.lines().any(|l| l.starts_with("SLACK_APP_TOKEN=")) {
         println!(
@@ -742,18 +840,111 @@ mod tests {
         let before = "SLACK_BOT_TOKEN=xoxb-1\nSLACK_APP_TOKEN=xapp-1\nOTHER=keep me\n";
         let after = apply_connection(before, &conn(), "desktop");
         assert!(
-            after.contains("# (relay mode) SLACK_APP_TOKEN=xapp-1"),
+            after.contains("# (machine mode) SLACK_APP_TOKEN=xapp-1"),
             "{after}"
         );
         assert!(!after.contains("\nSLACK_APP_TOKEN="), "{after}");
         assert!(after.contains("SLACK_BOT_TOKEN=xoxb-1"), "{after}");
         assert!(after.contains("OTHER=keep me"), "{after}");
-        assert!(
-            after.contains("AGENTGW_RELAY_URL=wss://relay.example"),
-            "{after}"
-        );
-        assert!(after.contains("AGENTGW_RELAY_TOKEN=s3cret"), "{after}");
+        assert!(after.contains("AGENTGW_BRIDGE_ROLE=machine"), "{after}");
+        assert!(after.contains("AGENTGW_LINK_TOKEN=s3cret"), "{after}");
         assert!(after.contains("AGENTGW_BRIDGE_ID=desktop"), "{after}");
+        // **Where the gateway is doesn't go in .env** — that is access.json's
+        assert!(!after.contains("relay.example"), "{after}");
+    }
+
+    /// The fold from the three old keys. **The one thing that must not be wrong** — get it wrong and
+    /// the gateway opens different addresses than the machines dial.
+    #[test]
+    fn an_older_env_folds_into_one_record_per_machine() {
+        use crate::bridge::state::{Access, Link};
+        let dir = StateDir::at(std::env::temp_dir().join(format!(
+            "agentgw-migrate-{}-{}",
+            std::process::id(),
+            line!()
+        )));
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(
+            dir.join(".env"),
+            "SLACK_APP_TOKEN=xapp-1\n             AGENTGW_BRIDGE_ID=hub\n             AGENTGW_LINK_TOKEN=k\n             AGENTGW_LINK_LISTEN=127.0.0.1:8787,192.0.2.10:8787\n             AGENTGW_TUNNELS=mac=me@mac\n             AGENTGW_ROUTES=pve=ws://hub.lan:8787,vps=wss://hub.example.ts.net\n             OTHER=keep me\n",
+        )
+        .unwrap();
+
+        migrate_env(&dir);
+        let access = Access::load(&dir);
+        assert_eq!(access.machines["pve"].kind, Link::LAN);
+        assert_eq!(access.machines["pve"].link_url, "ws://hub.lan:8787");
+        assert_eq!(access.machines["vps"].kind, Link::TAILSCALE);
+        assert_eq!(access.machines["mac"].kind, Link::TUNNEL);
+        assert_eq!(access.machines["mac"].ssh_target.as_deref(), Some("me@mac"));
+        // The machine at the far end of a tunnel dials its own loopback
+        assert_eq!(access.machines["mac"].link_url, "ws://127.0.0.1:8799");
+
+        let env: std::collections::HashMap<String, String> =
+            dir.load_env().unwrap().into_iter().collect();
+        assert_eq!(env.get("AGENTGW_BRIDGE_ROLE").map(String::as_str), Some("gateway"));
+        // 8787 is the default, so it isn't written out
+        assert!(!env.contains_key("AGENTGW_BRIDGE_PORT"));
+        assert!(!env.contains_key("AGENTGW_LINK_LISTEN"));
+        assert!(!env.contains_key("AGENTGW_TUNNELS"));
+        assert!(!env.contains_key("AGENTGW_ROUTES"));
+        // Secrets and anything else stay exactly where they were
+        assert_eq!(env.get("AGENTGW_LINK_TOKEN").map(String::as_str), Some("k"));
+        assert_eq!(env.get("SLACK_APP_TOKEN").map(String::as_str), Some("xapp-1"));
+        assert_eq!(env.get("OTHER").map(String::as_str), Some("keep me"));
+
+        // **Running again changes nothing** — it is the role being written that says it is done
+        migrate_env(&dir);
+        assert_eq!(Access::load(&dir).machines.len(), 3);
+
+        // The addresses this opens are the ones the machines dial
+        let addrs = crate::bridge::machine::listen_addrs("8787", &access, |n| {
+            (n == "hub.lan").then(|| "192.0.2.10".to_string())
+        });
+        assert_eq!(addrs, vec!["127.0.0.1:8787", "192.0.2.10:8787"]);
+        std::fs::remove_dir_all(dir.path()).ok();
+    }
+
+    /// A machine's side: where its gateway is moves out of `.env`, and its key loses the separate name.
+    #[test]
+    fn an_older_machine_env_folds_the_same_way() {
+        use crate::bridge::state::{Access, Link};
+        let dir = StateDir::at(std::env::temp_dir().join(format!(
+            "agentgw-migrate-{}-{}",
+            std::process::id(),
+            line!()
+        )));
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(
+            dir.join(".env"),
+            "AGENTGW_BRIDGE_ID=pve\n             AGENTGW_RELAY_URL=wss://hub.example.ts.net\n             AGENTGW_RELAY_TOKEN=k\n",
+        )
+        .unwrap();
+
+        migrate_env(&dir);
+        let access = Access::load(&dir);
+        let gw = access.gateway.unwrap();
+        assert_eq!(gw.link_url, "wss://hub.example.ts.net");
+        assert_eq!(gw.kind, Link::TAILSCALE);
+        let env: std::collections::HashMap<String, String> =
+            dir.load_env().unwrap().into_iter().collect();
+        assert_eq!(env.get("AGENTGW_BRIDGE_ROLE").map(String::as_str), Some("machine"));
+        assert_eq!(env.get("AGENTGW_LINK_TOKEN").map(String::as_str), Some("k"));
+        assert!(!env.contains_key("AGENTGW_RELAY_URL"));
+        assert!(!env.contains_key("AGENTGW_RELAY_TOKEN"));
+        std::fs::remove_dir_all(dir.path()).ok();
+    }
+
+    /// The kind of route is read off the dial URL. **Loopback means the tunnel** — nothing else asks a
+    /// machine to dial itself.
+    #[test]
+    fn the_kind_of_route_is_read_off_the_url() {
+        use crate::bridge::state::Link;
+        assert_eq!(link_kind("ws://127.0.0.1:8799"), Link::TUNNEL);
+        assert_eq!(link_kind("ws://localhost:8799"), Link::TUNNEL);
+        assert_eq!(link_kind("wss://hub.example.ts.net"), Link::TAILSCALE);
+        assert_eq!(link_kind("ws://hub.example.ts.net:8787"), Link::TAILSCALE);
+        assert_eq!(link_kind("ws://hub.lan:8787"), Link::LAN);
     }
 
     /// Pasting again **overwrites**; it doesn't add lines.
@@ -768,8 +959,8 @@ mod tests {
             },
             "laptop",
         );
-        assert_eq!(twice.matches("AGENTGW_RELAY_URL=").count(), 1, "{twice}");
-        assert!(twice.contains("AGENTGW_RELAY_URL=wss://new"), "{twice}");
+        assert_eq!(twice.matches("AGENTGW_LINK_TOKEN=").count(), 1, "{twice}");
+        assert!(twice.contains("AGENTGW_LINK_TOKEN=new"), "{twice}");
         assert!(twice.contains("AGENTGW_BRIDGE_ID=laptop"), "{twice}");
     }
 
@@ -785,9 +976,17 @@ mod tests {
                     .map(|(k, v)| (k.to_string(), v.to_string()))
             })
             .collect();
-        let got = Mode::resolve(move |k: &str| {
-            pairs.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone())
-        })
+        let access = crate::bridge::state::Access {
+            gateway: Some(crate::bridge::state::Link {
+                link_url: "wss://relay.example".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let got = Mode::resolve(
+            move |k: &str| pairs.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone()),
+            &access,
+        )
         .unwrap();
         assert_eq!(
             got,
