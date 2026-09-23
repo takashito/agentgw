@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Add a git worktree whose target/ starts out with this checkout's dependency cache, for free.
 #
-#   scripts/worktree.sh <name> [path] [base-ref]
+#   scripts/worktree.sh <name> [path] [base-ref]   # default path: worktrees/<name>
 #
 # **Why not share one target/ between checkouts.** Cargo takes one lock on the whole build
 # directory, so a second build anywhere in the repo waits for the first to finish (seen here:
@@ -28,7 +28,9 @@ if [ -z "$name" ]; then
 fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
-dest="${2:-$(dirname "$repo_root")/$(basename "$repo_root")-$name}"
+# **Inside the repository** (`worktrees/`, git-ignored), not beside it: a checkout of this project
+# belongs under this project, and keeping them here means one folder to find, move or delete.
+dest="${2:-$repo_root/worktrees/$name}"
 base="${3:-origin/main}"
 crate="$(sed -n 's/^name *= *"\(.*\)"/\1/p' "$repo_root/Cargo.toml" | head -1)"
 
