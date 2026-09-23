@@ -527,6 +527,26 @@ impl Api {
             .map_err(|e| e.to_string())
     }
 
+    /// Rename a session that already exists. **Only a rename** — if no session has been created for
+    /// the thread yet this answers `not_authorized`, which is why naming a new thread goes through
+    /// `start_session` (setStatus creates it) instead.
+    pub async fn rename_session(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        title: &str,
+    ) -> Result<(), String> {
+        let req = SlackApiAgentsSessionsRenameRequest::new(title.to_string())
+            .with_channel_id(channel.into())
+            .with_thread_ts(thread_ts.into());
+        self.client
+            .open_session(&self.token)
+            .agents_sessions_rename(&req)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
     /// GET read as raw JSON. For reading fields that slack-morphism's typed models **drop**
     /// (a DM's `channel.user`, `user.profile.bot_id` — neither is in the 2.24.0 models).
     /// `ok:false` is already turned into Err by the connector before it gets here.
@@ -1045,6 +1065,14 @@ impl crate::chat::Chat for Api {
     ) -> Result<(), String> {
         Api::start_session(self, channel, thread_ts, title).await
     }
+    async fn rename_session(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        title: &str,
+    ) -> Result<(), String> {
+        Api::rename_session(self, channel, thread_ts, title).await
+    }
 }
 
 // ── reading what Slack sends (Socket Mode events, button clicks) ────────────
@@ -1075,6 +1103,9 @@ fn fleet_event_of(ev: &SlackEventCallbackBody) -> Option<FleetEvent> {
         }
         SlackEventCallbackBody::AgentSessionStopped(e) => {
             ("agent_session_stopped", serde_json::to_value(e))
+        }
+        SlackEventCallbackBody::AgentSessionTitleChanged(e) => {
+            ("agent_session_title_changed", serde_json::to_value(e))
         }
         _ => return None,
     };
@@ -1300,6 +1331,7 @@ fn message_of(ev: &SlackMessageEvent) -> Option<InboundMsg> {
         reaction: None,
         deleted_ts: None,
         edited: None,
+        session_title: None,
     })
 }
 
@@ -1345,6 +1377,7 @@ fn deletion_of(ev: &SlackMessageEvent) -> Option<InboundMsg> {
         reaction: None,
         deleted_ts: Some(deleted_ts),
         edited: None,
+        session_title: None,
     })
 }
 
@@ -1411,6 +1444,7 @@ fn edit_of(ev: &SlackMessageEvent) -> Option<InboundMsg> {
                 }),
             ts: edited_ts,
         }),
+        session_title: None,
     })
 }
 
@@ -1419,6 +1453,29 @@ fn edit_of(ev: &SlackMessageEvent) -> Option<InboundMsg> {
 /// Emoji on exchanges between people are not passed to the agent.
 ///
 /// The thread root is the reacted-to message's `thread_ts`, or the message itself if absent. `ts` is
+/// A person renamed the thread's session in Slack. **Nothing reaches the agent** — the Bridge
+/// only notes whose name the thread carries now, and stops renaming it.
+fn session_renamed_of(ev: &SlackAgentSessionTitleChangedEvent) -> Option<InboundMsg> {
+    let thread_ts = ev.thread_ts.as_ref()?.to_string();
+    Some(InboundMsg {
+        channel: ev.channel.to_string(),
+        channel_kind: ChannelKind::Channel,
+        ts: thread_ts.clone(),
+        thread_ts: Some(thread_ts),
+        user: None,
+        is_bot: false,
+        bot_id: None,
+        text: String::new(),
+        files: Vec::new(),
+        file_paths: Vec::new(),
+        file_errors: Vec::new(),
+        reaction: None,
+        deleted_ts: None,
+        edited: None,
+        session_title: Some(ev.title.clone()),
+    })
+}
+
 /// Slack's own stop button on an agent session. **It is a `stop`, just not typed** — the Bridge
 /// already knows what to do with that word, so this hands it the same message instead of growing a
 /// second stop path. One debug line keeps the origin traceable.
@@ -1451,6 +1508,7 @@ fn session_stopped_of(ev: &SlackAgentSessionStoppedEvent) -> Option<InboundMsg> 
         reaction: None,
         deleted_ts: None,
         edited: None,
+        session_title: None,
     })
 }
 
@@ -1495,6 +1553,7 @@ fn reaction_of(
         reaction: Some(reaction),
         deleted_ts: None,
         edited: None,
+        session_title: None,
     })
 }
 
@@ -1503,6 +1562,10 @@ fn reaction_of(
 fn inbound_of(event: SlackEventCallbackBody) -> Option<InboundMsg> {
     let msg = match event {
         SlackEventCallbackBody::AgentSessionStopped(ev) => match session_stopped_of(&ev) {
+            Some(msg) => msg,
+            None => return None,
+        },
+        SlackEventCallbackBody::AgentSessionTitleChanged(ev) => match session_renamed_of(&ev) {
             Some(msg) => msg,
             None => return None,
         },
@@ -1604,6 +1667,8 @@ pub fn inbound_from_relay(name: &str, event: &serde_json::Value) -> Option<Inbou
         "agent_session_stopped" => {
             serde_json::from_value(event.clone()).map(SlackEventCallbackBody::AgentSessionStopped)
         }
+        "agent_session_title_changed" => serde_json::from_value(event.clone())
+            .map(SlackEventCallbackBody::AgentSessionTitleChanged),
         other => {
             LogCtx::default().debug(
                 "slack",
@@ -1905,6 +1970,20 @@ mod tests {
         // A session channel carries no thread. There is no turn to stop, so nothing is invented
         let channel_session = serde_json::json!({"channel": "C1", "event_ts": "2.2"});
         assert!(inbound_from_relay("agent_session_stopped", &channel_session).is_none());
+    }
+
+    /// A person renaming the thread in Slack's sidebar. It is not a message: nothing goes to the
+    /// agent, the Bridge only learns whose name the thread carries.
+    #[test]
+    fn a_rename_by_hand_arrives_as_a_title_and_no_text() {
+        let ev = serde_json::json!({
+            "channel": "C1", "thread_ts": "1.1", "title": "the cache rewrite", "previous_title": "fix the tests"
+        });
+        let msg = inbound_from_relay("agent_session_title_changed", &ev).expect("a rename");
+        assert_eq!(msg.session_title.as_deref(), Some("the cache rewrite"));
+        assert_eq!(msg.thread_ts.as_deref(), Some("1.1"));
+        assert!(msg.text.is_empty(), "nothing for the agent to read");
+        assert!(inbound_from_relay("agent_session_title_changed", &serde_json::json!({"channel":"C1","title":"x"})).is_none());
     }
 
     /// Slack checks a session title like a channel name — measured against the live API.

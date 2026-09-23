@@ -332,6 +332,12 @@ impl Bridge {
     }
 
     pub(super) async fn on_inbound(&mut self, msg: &InboundMsg) {
+        // **A person renamed the thread.** Their name wins from here on: note it and stop, the
+        // agent is told nothing (it is not a message, and there is nothing for it to do)
+        if let Some(title) = &msg.session_title {
+            self.lock_thread_title(msg, title);
+            return;
+        }
         // Our own marks come back to us. Drop them **before dedup** so our emoji don't fill the memory
         if is_own_reaction(msg, self.bot_user_id.as_deref()) {
             LogCtx::default().debug(
@@ -1226,6 +1232,31 @@ impl Bridge {
         }
     }
 
+    /// Remember that the thread's name is a person's doing, so nothing overwrites it later.
+    /// A thread nobody has an entry for is left alone — there is nothing yet to protect.
+    fn lock_thread_title(&mut self, msg: &InboundMsg, title: &str) {
+        let Some(root) = msg.thread_ts.clone() else {
+            return;
+        };
+        let ctx = LogCtx {
+            session_id: None,
+            thread_key: Some(ThreadKey::new(&msg.channel, &root)),
+        };
+        let Some(mut e) = self.threads.get(&root).cloned() else {
+            ctx.debug("bridge", &format!("session renamed by hand to \"{title}\" — no thread of ours"));
+            return;
+        };
+        if e.title_locked == Some(true) {
+            return; // already theirs; renaming again changes nothing here
+        }
+        e.title_locked = Some(true);
+        self.threads.upsert(&root, e);
+        if let Err(err) = self.threads.save() {
+            ctx.error("bridge", &format!("threads.json save failed: {err}"));
+        }
+        ctx.info("bridge", &format!("session renamed by hand to \"{title}\" — ours to rename no more"));
+    }
+
     /// Log the received ids as a milestone and swap 👀 for 🤖 (fire-and-forget).
     pub(super) fn received(&mut self, key: &ThreadKey, ids: Vec<String>, ctx: &LogCtx) {
         if ids.is_empty() {
@@ -1569,6 +1600,7 @@ mod tests {
             reaction: None,
             deleted_ts: None,
             edited: None,
+            session_title: None,
         }
     }
 

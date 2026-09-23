@@ -1407,6 +1407,7 @@ mod tests {
             reaction: None,
             deleted_ts: None,
             edited: None,
+            session_title: None,
         };
         let deleted = InboundMsg {
             deleted_ts: Some("1.1".into()),
@@ -1682,6 +1683,7 @@ mod tests {
             reaction: None,
             deleted_ts: None,
             edited: None,
+            session_title: None,
         }
     }
 
@@ -1736,6 +1738,15 @@ mod tests {
     async fn settle() {
         for _ in 0..20 {
             tokio::task::yield_now().await;
+        }
+    }
+
+    /// What Slack sends when a person renames the thread's session in the sidebar.
+    fn renamed_by_hand(root: &str, title: &str) -> InboundMsg {
+        InboundMsg {
+            session_title: Some(title.into()),
+            thread_ts: Some(root.into()),
+            ..in_thread(root, "")
         }
     }
 
@@ -1931,6 +1942,38 @@ mod tests {
             "{:?}",
             slack.calls()
         );
+    }
+
+    #[tokio::test]
+    async fn the_agent_renames_the_thread_unless_a_person_named_it() {
+        // Observed: the agent calls set_thread_title when the topic moves on, and the rename goes
+        // out as a session rename. Once a person has named the thread in Slack, theirs stands.
+        let (d, slack, agent, _clock) = flow_deps("rename");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let sid = running_thread(&mut b, &agent).await;
+        let asked = |title: &str| bridge::Disposition {
+            kind: "title",
+            channel_id: "C1".into(),
+            thread_ts: Some(ROOT.to_string()),
+            message_ids: Vec::new(),
+            session_id: sid.clone(),
+            title: Some(title.to_string()),
+        };
+        b.on_disposition(asked("the cache rewrite: <@U1>")).await;
+        settle().await;
+        // The mention and the `:` are gone — a name is read by a person, and Slack refuses both
+        assert!(
+            slack.calls().contains(&format!("rename C1 {ROOT} the cache rewrite")),
+            "{:?}",
+            slack.calls()
+        );
+
+        // A person renames it in Slack — from then on the agent's asking changes nothing
+        b.on_inbound(&renamed_by_hand(ROOT, "mine now")).await;
+        let before = slack.calls().len();
+        b.on_disposition(asked("something else")).await;
+        settle().await;
+        assert_eq!(slack.calls().len(), before, "{:?}", slack.calls());
     }
 
     #[tokio::test]

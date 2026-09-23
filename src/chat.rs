@@ -58,6 +58,9 @@ pub struct InboundMsg {
     /// When set, `text` is **the new body itself** — the Bridge builds the instruction
     /// (the wording depends on "is this the one being worked on now", which only the Bridge knows).
     pub edited: Option<Edited>,
+    /// Set when **a person renamed this thread's session** in Slack. Nothing is delivered to the
+    /// agent — the Bridge notes that the name is theirs now and stops renaming it.
+    pub session_title: Option<String>,
 }
 
 /// One edit. `revision` is Slack's `edited.ts` (marks the same edit being redelivered).
@@ -306,6 +309,13 @@ pub trait Chat: Send + Sync + 'static {
         thread_ts: &str,
         title: &str,
     ) -> Result<(), String>;
+    /// Rename a session that already exists (the agent noticed the topic moved on).
+    async fn rename_session(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        title: &str,
+    ) -> Result<(), String>;
 }
 
 pub type ChatRef = Arc<dyn Chat>;
@@ -541,6 +551,9 @@ pub mod fake {
         }
         async fn start_session(&self, c: &str, th: &str, title: &str) -> Result<(), String> {
             self.record(format!("session {c} {th} {title}"))
+        }
+        async fn rename_session(&self, c: &str, th: &str, title: &str) -> Result<(), String> {
+            self.record(format!("rename {c} {th} {title}"))
         }
     }
 

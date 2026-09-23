@@ -1203,6 +1203,12 @@ impl Bridge {
             session_id: Some(d.session_id.clone()),
             thread_key: Some(key.clone()),
         };
+        // **A rename is not an answer.** It clears no ledger entry and ends no turn, so it is
+        // handled here and never reaches the code below
+        if d.kind == "title" {
+            self.rename_thread(&key, d.title.unwrap_or_default(), &ctx).await;
+            return;
+        }
         // An answer came = the shimmer's job is done (any of reply / no_reply / edit_message).
         // Just drop it — slack::Thinking's Drop sends the clear from the tail of the queue, so
         // it always clears after, never overtaking, the `is thinking…` the watch just sent
@@ -1235,6 +1241,32 @@ impl Bridge {
                 }
             });
         }
+    }
+
+    /// Rename the thread's session, **unless a person already named it by hand**.
+    ///
+    /// Fire-and-forget like the first naming: a name is a convenience, and the turn does not
+    /// depend on it. The characters Slack rejects are dropped by the same `session_title` the
+    /// opening message goes through.
+    async fn rename_thread(&mut self, key: &ThreadKey, asked: String, ctx: &LogCtx) {
+        let (channel, Some(root)) = key.split() else {
+            return;
+        };
+        if self.threads.get(&root).and_then(|e| e.title_locked) == Some(true) {
+            ctx.info("bridge", "rename skipped — a person named this thread");
+            return;
+        }
+        let Some(title) = slack::session_title(&asked) else {
+            ctx.info("bridge", &format!("rename skipped — nothing usable in \"{asked}\""));
+            return;
+        };
+        let (api, ctx) = (self.deps.slack.clone(), ctx.clone());
+        tokio::spawn(async move {
+            match api.rename_session(&channel, &root, &title).await {
+                Ok(()) => ctx.info("bridge", &format!("session renamed \"{title}\"")),
+                Err(e) => ctx.info("bridge", &format!("session rename \"{title}\" failed: {e}")),
+            }
+        });
     }
 
     pub(super) async fn flush_stickies(&mut self) {
@@ -1633,6 +1665,7 @@ pub async fn execute_tool(
                         thread_ts: thread.clone(),
                         message_ids: ids,
                         session_id: session_id.to_string(),
+                        title: None,
                     },
                     &c,
                 )
@@ -1686,6 +1719,7 @@ pub async fn execute_tool(
                     thread_ts: thread.clone(),
                     message_ids: ids,
                     session_id: session_id.to_string(),
+                    title: None,
                 };
                 notify(dispo, d, &c).await;
                 Ok(format!("posted ts={ts}"))
@@ -1728,6 +1762,7 @@ pub async fn execute_tool(
                                 thread_ts: Some(t),
                                 message_ids: vec![message_ts],
                                 session_id: session_id.to_string(),
+                                title: None,
                             };
                             notify(dispo, d, &c).await;
                         }
@@ -1777,6 +1812,7 @@ pub async fn execute_tool(
                             thread_ts: thread,
                             message_ids: ids,
                             session_id: session_id.to_string(),
+                            title: None,
                         };
                         notify(dispo, d, &c).await;
                     }
@@ -1816,9 +1852,28 @@ pub async fn execute_tool(
                 thread_ts: thread,
                 message_ids: ids,
                 session_id: session_id.to_string(),
+                title: None,
             };
             notify(dispo, d, &c).await;
             Ok("recorded — nothing posted".to_string())
+        }
+        "set_thread_title" => {
+            // The rename happens on the main side (it holds Threads, so it knows whether a person
+            // already named this thread). Nothing is posted to Slack from here
+            let thread = opt("thread_ts");
+            let c = dctx(thread.as_deref());
+            let title = s("title");
+            c.info("bridge", &format!("disposition=title thread={} title=\"{title}\"", thread.as_deref().unwrap_or("-")));
+            let d = Disposition {
+                kind: "title",
+                channel_id: s("channel_id"),
+                thread_ts: thread,
+                message_ids: Vec::new(),
+                session_id: session_id.to_string(),
+                title: Some(title),
+            };
+            notify(dispo, d, &c).await;
+            Ok("asked the bridge to rename this thread".to_string())
         }
         other => Err(format!("unknown tool: {other}")),
     };

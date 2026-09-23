@@ -141,6 +141,10 @@ pub struct ThreadEntry {
     /// Written in the same shape as before — so production values are read as-is on switchover day
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
+    /// A person named this thread's session by hand (Slack's `agent_session_title_changed`).
+    /// **Their name wins from then on** — neither the opening message nor the agent overwrites it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title_locked: Option<bool>,
     /// The newest message this Bridge saw in the thread: its ts, and the first 60 characters.
     ///
     /// **`status` links to this, not to the root.** A permalink to the root opens the thread at its
@@ -355,6 +359,7 @@ impl Threads {
                     reaction: None,
                     deleted_ts: None,
                     edited: None,
+                    session_title: None,
                 })
             })
             .collect()
@@ -1301,6 +1306,9 @@ pub struct Disposition {
     pub thread_ts: Option<String>,
     pub message_ids: Vec<String>,
     pub session_id: String,
+    /// Only for `kind: "title"` — the name the agent asked for. The rename itself happens on the
+    /// main side, which holds Threads and therefore knows whether a person already named this one.
+    pub title: Option<String>,
 }
 
 /// Whether the agent may end its turn. true means block Stop and push for a disposition.
@@ -1391,6 +1399,7 @@ mod tests {
             reaction: None,
             deleted_ts: None,
             edited: None,
+            session_title: None,
         };
         assert!(t.threads_with_pending().is_empty());
         t.enqueue_pending("1.0", "C1", &msg("1.1", "ひとつ目"));

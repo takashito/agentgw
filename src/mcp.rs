@@ -136,6 +136,19 @@ impl Mcp {
                     "required": ["channel"],
                 },
             }),
+            serde_json::json!({
+                "name": "set_thread_title",
+                "description": "Rename this thread's session so it can be found again by what it is about. Call it when the topic has clearly moved on from the name the thread carries — not for every message. Keep it short, a few words, in the language of the conversation. A name a person set by hand wins: the bridge keeps theirs and tells you so. Do NOT narrate this tool: never write \"I should use set_thread_title\" / \"I will rename this thread\" or any similar preamble.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "channel_id": { "type": "string", "description": "Channel or DM ID (C.../D.../G...) of the thread." },
+                        "thread_ts": { "type": "string", "description": "Thread root timestamp — the thread being renamed." },
+                        "title": { "type": "string", "description": "The new name. A few words; the bridge trims it to what Slack accepts." },
+                    },
+                    "required": ["channel_id", "thread_ts", "title"],
+                },
+            }),
         ]
     }
 
@@ -437,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn all_six_tools_are_defined() {
+    fn every_tool_is_defined() {
         let tools = Mcp::tool_definitions();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(
@@ -448,7 +461,8 @@ mod tests {
                 "no_reply",
                 "edit_message",
                 "download_attachment",
-                "fetch_messages"
+                "fetch_messages",
+                "set_thread_title"
             ]
         );
         for t in &tools {
@@ -519,5 +533,6 @@ mod tests {
         assert_eq!(req("edit_message"), ["channel_id", "message_ts", "text"]);
         assert_eq!(req("download_attachment"), ["file_id"]);
         assert_eq!(req("fetch_messages"), ["channel"]);
+        assert_eq!(req("set_thread_title"), ["channel_id", "thread_ts", "title"]);
     }
 }

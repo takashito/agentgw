@@ -49,6 +49,7 @@
     "event_subscriptions": {
       "bot_events": [
         "agent_session_stopped",
+        "agent_session_title_changed",
         "app_mention",
         "app_home_opened",
         "member_joined_channel",
