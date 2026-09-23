@@ -253,45 +253,19 @@ pub fn dial_url(t: &Transport) -> String {
     }
 }
 
-/// Add or remove one machine in `.env`'s `AGENTGW_TUNNELS` (`laptop=me@laptop,desktop=me@desktop`).
-///
-/// **The gateway's agentgw opens the tunnels itself** (not a separate service — they only need to be
-/// up while agentgw runs). It reads this list at startup and watches one ssh per machine.
-pub fn tunnels_with(raw: &str, child: &str, target: Option<&str>) -> String {
-    let mut list: Vec<(String, String)> = crate::bridge::machine::child_urls(raw)
-        .into_iter()
-        .filter(|(id, _)| id != child)
-        .collect();
-    if let Some(t) = target {
-        list.push((child.to_string(), t.to_string()));
-    }
-    list.iter()
-        .map(|(id, t)| format!("{id}={t}"))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
 /// The route this gateway settled on for a machine last time. **A tunnel is already written down**
 /// (`AGENTGW_TUNNELS`, the gateway keeps it open); a direct one is remembered here so the next
 /// `add-machine` starts where the last one ended instead of measuring everything again.
-pub fn remembered_route(tunnels: &str, routes: &str, child: &str) -> Option<Transport> {
-    if crate::bridge::machine::child_urls(tunnels)
-        .iter()
-        .any(|(id, _)| id == child)
-    {
+pub fn remembered_route(access: &crate::bridge::state::Access, child: &str) -> Option<Transport> {
+    let link = access.machines.get(child)?;
+    if link.ssh_target.as_ref().is_some_and(|t| !t.trim().is_empty()) {
         return Some(Transport::Tunnel {
             remote_port: TUNNEL_PORT,
         });
     }
-    crate::bridge::machine::child_urls(routes)
-        .into_iter()
-        .find(|(id, _)| id == child)
-        .map(|(_, url)| Transport::Direct { url })
-}
-
-/// `AGENTGW_ROUTES` with this machine's direct URL written in (or taken out, when it moved to a tunnel).
-pub fn routes_with(raw: &str, child: &str, url: Option<&str>) -> String {
-    tunnels_with(raw, child, url)
+    (!link.link_url.is_empty()).then(|| Transport::Direct {
+        url: link.link_url.clone(),
+    })
 }
 
 // ── Execution ────────────────────────────────────────────────────────────────
@@ -502,11 +476,7 @@ async fn add_child(
     let by_hand = env.get("AGENTGW_LINK_PUBLIC_URL").cloned();
     let known = (!fresh)
         .then(|| {
-            remembered_route(
-                env.get("AGENTGW_TUNNELS").map(String::as_str).unwrap_or_default(),
-                env.get("AGENTGW_ROUTES").map(String::as_str).unwrap_or_default(),
-                &child,
-            )
+            remembered_route(&crate::bridge::state::Access::load(&dir), &child)
         })
         .flatten();
     let plan: Vec<RouteChoice> = match &known {
@@ -1238,24 +1208,34 @@ mod tests {
     /// instead of measuring everything again. `-n` is what asks for a fresh look.
     #[test]
     fn the_route_that_worked_is_remembered() {
+        use crate::bridge::state::{Access, Link};
+        let with_link = |id: &str, url: &str, ssh: Option<&str>| Access {
+            machines: [(
+                id.to_string(),
+                Link {
+                    link_url: url.into(),
+                    ssh_target: ssh.map(str::to_string),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
         assert_eq!(
-            remembered_route("", "build-box=ws://hub.lan:8787", "build-box"),
+            remembered_route(&with_link("build-box", "ws://hub.lan:8787", None), "build-box"),
             Some(Transport::Direct { url: "ws://hub.lan:8787".into() })
         );
         assert_eq!(
-            remembered_route("build-box=user@build-box.lan", "", "build-box"),
+            remembered_route(&with_link("build-box", "ws://127.0.0.1:8799", Some("user@build-box.lan")), "build-box"),
             Some(Transport::Tunnel { remote_port: TUNNEL_PORT })
         );
-        // A tunnel is the gateway's own doing, so it wins over a stale direct URL
+        // The ssh target is the gateway's own doing, so it wins over whatever URL sits beside it
         assert_eq!(
-            remembered_route("build-box=user@build-box.lan", "build-box=ws://hub.lan:8787", "build-box"),
+            remembered_route(&with_link("build-box", "ws://hub.lan:8787", Some("user@build-box.lan")), "build-box"),
             Some(Transport::Tunnel { remote_port: TUNNEL_PORT })
         );
-        assert_eq!(remembered_route("", "", "build-box"), None);
-        assert_eq!(remembered_route("", "mac=ws://x:1", "build-box"), None);
-
-        assert_eq!(routes_with("", "build-box", Some("ws://hub.lan:8787")), "build-box=ws://hub.lan:8787");
-        assert_eq!(routes_with("build-box=ws://a:1,mac=ws://b:2", "build-box", None), "mac=ws://b:2");
+        assert_eq!(remembered_route(&Access::default(), "build-box"), None);
+        assert_eq!(remembered_route(&with_link("mac", "ws://x:1", None), "build-box"), None);
     }
 
     fn choice(label: &str, url: Option<&str>) -> RouteChoice {
@@ -1361,29 +1341,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_tunnel_is_added_replaced_and_removed_by_child_name() {
-        assert_eq!(
-            tunnels_with("", "laptop", Some("me@laptop")),
-            "laptop=me@laptop"
-        );
-        assert_eq!(
-            tunnels_with("desktop=me@desktop", "laptop", Some("me@laptop")),
-            "desktop=me@desktop,laptop=me@laptop"
-        );
-        assert_eq!(
-            tunnels_with(
-                "laptop=old@laptop,desktop=me@desktop",
-                "laptop",
-                Some("me@laptop")
-            ),
-            "desktop=me@desktop,laptop=me@laptop",
-            "同じ子は1本だけ(差し替え)"
-        );
-        assert_eq!(
-            tunnels_with("laptop=me@laptop,desktop=me@desktop", "laptop", None),
-            "desktop=me@desktop",
-            "直結で繋がったら外す"
-        );
-    }
 }
