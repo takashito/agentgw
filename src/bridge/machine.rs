@@ -100,7 +100,26 @@ pub enum FromRelay {
         thread_only: bool,
     },
     /// This thread is another machine's now — drop it, so two agents never answer one conversation.
-    ThreadLeft { channel: String, thread_ts: String },
+    /// `to`/`path` say where it went, so the conversation can be sent after it.
+    ThreadLeft {
+        channel: String,
+        thread_ts: String,
+        to: String,
+        path: String,
+    },
+    /// One slice of a conversation arriving from the machine that had this thread.
+    ThreadChunk {
+        channel: String,
+        thread_ts: String,
+        session_id: String,
+        path: String,
+        from_machine: String,
+        from_path: String,
+        entry: Option<serde_json::Value>,
+        seq: u32,
+        last: bool,
+        data: String,
+    },
     /// A refusal that talking won't fix. **No retry.**
     Fatal(Fatal),
 }
@@ -130,7 +149,7 @@ async fn wake<S: crate::bridge::gateway::LinkRead + Send>(
 /// accepted side use the same sink** (`Fatal` is a local matter, so it never comes from a frame).
 /// `None` for [`LinkFrame::ProjectSet`] — that one only ever goes the other way.
 impl FromRelay {
-    fn of(frame: LinkFrame) -> Option<Self> {
+    pub(crate) fn of(frame: LinkFrame) -> Option<Self> {
         use LinkFrame as F;
         Some(match frame {
             F::Ready {
@@ -167,9 +186,37 @@ impl FromRelay {
             F::ThreadLeft {
                 channel,
                 thread_ts,
+                to,
+                path,
             } => FromRelay::ThreadLeft {
                 channel,
                 thread_ts,
+                to,
+                path,
+            },
+            F::ThreadChunk {
+                channel,
+                thread_ts,
+                session_id,
+                path,
+                from_machine,
+                from_path,
+                entry,
+                seq,
+                last,
+                data,
+                ..
+            } => FromRelay::ThreadChunk {
+                channel,
+                thread_ts,
+                session_id,
+                path,
+                from_machine,
+                from_path,
+                entry,
+                seq,
+                last,
+                data,
             },
             F::Home { channel } => FromRelay::Home { channel },
             // Answers and asks only ever go the other way

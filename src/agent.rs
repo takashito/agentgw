@@ -500,6 +500,8 @@ pub trait Agent: Send + Sync + 'static {
     /// destroy. The message is git's own. **The refusal is the safety check** — there is no second
     /// one here, and nothing forces past it.
     fn remove_worktree(&self, path: &str) -> Option<Result<(), String>>;
+    /// A conversation's whole record, to carry to another machine. `None` if there is none to read.
+    fn read_session(&self, session_id: &str) -> Option<String>;
     fn last_activity_ms(&self, remembered: Option<&str>, session_id: &str) -> Option<u64>;
     fn current_model(
         &self,
@@ -580,6 +582,8 @@ pub mod fake {
         pub fail_spawn: std::sync::atomic::AtomicBool,
         /// Folders `workdir_exists` says are missing (every other folder exists).
         pub missing_dirs: Mutex<Vec<String>>,
+        /// Conversations this agent can hand over, by session id.
+        pub sessions: Mutex<std::collections::HashMap<String, String>>,
         /// What `session_cwd` answers for every session. Unset means the agent's whereabouts
         /// cannot be read, as they cannot be before it has written anything.
         pub cwd: Mutex<Option<String>>,
@@ -705,6 +709,9 @@ pub mod fake {
         }
         fn workdir_exists(&self, path: &str) -> bool {
             !self.missing_dirs.lock().unwrap().iter().any(|d| d == path)
+        }
+        fn read_session(&self, session_id: &str) -> Option<String> {
+            self.sessions.lock().unwrap().get(session_id).cloned()
         }
         fn remove_worktree(&self, path: &str) -> Option<Result<(), String>> {
             if !self.worktrees.lock().unwrap().iter().any(|w| w == path) {

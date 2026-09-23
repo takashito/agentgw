@@ -129,7 +129,40 @@ pub mod link {
         ///
         /// **Sent to the machine that had it**, so it stops treating the thread as live — one that
         /// still had the row would keep answering and two agents would talk over each other.
-        ThreadLeft { channel: String, thread_ts: String },
+        ///
+        /// `to` and `path` say where it went, so the conversation can be sent after it.
+        ThreadLeft {
+            channel: String,
+            thread_ts: String,
+            #[serde(default, skip_serializing_if = "String::is_empty")]
+            to: String,
+            #[serde(default, skip_serializing_if = "String::is_empty")]
+            path: String,
+        },
+        /// One slice of a conversation on its way to the machine that now has its thread.
+        ///
+        /// **Split because it is big** — a transcript measured on a real machine was 5MB, and one
+        /// frame that size has to start over from nothing if the link drops mid-way. The receiver
+        /// keeps the pieces aside and only puts the conversation in place when the last one lands,
+        /// so a broken move leaves no half a conversation behind.
+        ThreadChunk {
+            /// Which machine it is for. The gateway passes it along; it reads nothing else.
+            to: String,
+            channel: String,
+            thread_ts: String,
+            session_id: String,
+            /// Where the conversation is going to live, and where it used to.
+            path: String,
+            from_machine: String,
+            from_path: String,
+            /// The thread's row, on the first slice only.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            entry: Option<serde_json::Value>,
+            seq: u32,
+            last: bool,
+            /// A slice of the transcript, as the JSONL text it already is.
+            data: String,
+        },
         /// The notice channel changed. Sent to every machine so they all write to the same place.
         Home { channel: String },
         /// `set-home`, asked from a machine — same reason as [`LinkFrame::Channels`].
@@ -367,6 +400,21 @@ pub mod link {
                 LinkFrame::ThreadLeft {
                     channel: "C1".into(),
                     thread_ts: "1700000000.000100".into(),
+                    to: "dock".into(),
+                    path: "/srv/app".into(),
+                },
+                LinkFrame::ThreadChunk {
+                    to: "dock".into(),
+                    channel: "C1".into(),
+                    thread_ts: "1700000000.000100".into(),
+                    session_id: "sid-1".into(),
+                    path: "/srv/app".into(),
+                    from_machine: "desk".into(),
+                    from_path: "/home/me/app".into(),
+                    entry: None,
+                    seq: 1,
+                    last: true,
+                    data: "{}\n".into(),
                 },
                 LinkFrame::ProjectSet {
                     channel: "C1".into(),
@@ -1997,6 +2045,10 @@ pub struct Fleet {
     pub thread_routes: AsyncMutex<Routes>,
     /// Asks the Bridge to write a thread's machine into threads.json. `(thread_ts, machine)`.
     pub remember: Sender<(String, String)>,
+    /// Frames for **this machine's own Bridge**. The gateway is a machine too — it serves its own
+    /// channels — and without this a frame addressed to itself would be sent down a link that does
+    /// not exist and silently vanish.
+    pub to_self: Sender<crate::bridge::machine::FromRelay>,
     /// The ssh tunnels we keep open (to show the route in `status`).
     pub tunnels: std::sync::Mutex<Tunnels>,
 }
@@ -2004,6 +2056,21 @@ pub struct Fleet {
 impl Fleet {
     fn access(&self) -> Access {
         Access::load(&self.dir)
+    }
+
+    /// Send a frame to one machine, **this one included**.
+    ///
+    /// The gateway serves its own channels, so "the machine handling this" is sometimes itself.
+    /// `links` only knows the ones that dialled in, so addressing yourself through it drops the
+    /// frame without a word.
+    async fn send_frame(&self, to: &str, frame: &link::LinkFrame) -> bool {
+        if to != self.self_id {
+            return self.links.send_to(to, frame);
+        }
+        match crate::bridge::machine::FromRelay::of(frame.clone()) {
+            Some(f) => self.to_self.send(f).await.is_ok(),
+            None => false,
+        }
     }
 
     /// Note that a machine is here right now. **The record is the only place this is kept**, so
@@ -2667,14 +2734,18 @@ impl Fleet {
             .await;
         // The machine that had it drops its record, or it would answer a thread that is no longer its
         // own the next time one of its own messages arrives
-        if let Some(old) = was.as_deref().filter(|o| *o != self.self_id) {
-            self.links.send_to(
+        if let Some(old) = was.as_deref() {
+            self.send_frame(
                 old,
                 &link::LinkFrame::ThreadLeft {
                     channel: channel.to_string(),
                     thread_ts: thread_ts.to_string(),
+                    // Where to send the conversation after it
+                    to: bridge_id.to_string(),
+                    path: abs.to_string(),
                 },
-            );
+            )
+            .await;
         }
         rlog(
             "info",
@@ -2758,6 +2829,25 @@ impl Fleet {
                 channel,
                 thread_ts,
             } => self.set_home(&channel, &thread_ts).await,
+            // A conversation on its way to the machine that now has its thread. **Passed along
+            // unread** — the gateway is the only road between two machines, not a party to the move
+            ref chunk @ link::LinkFrame::ThreadChunk {
+                ref to,
+                ref thread_ts,
+                seq,
+                last,
+                ..
+            } => {
+                let to = to.clone();
+                if !self.send_frame(&to, chunk).await {
+                    rlog(
+                        "info",
+                        &format!("thread {thread_ts} slice {seq} could not reach {to} — the move is incomplete"),
+                    );
+                } else if last {
+                    rlog("info", &format!("thread {thread_ts} fully handed to {to}"));
+                }
+            }
             link::LinkFrame::PwdOn {
                 channel,
                 thread_ts,
@@ -4068,6 +4158,7 @@ mod tests {
             reload,
             thread_routes: Default::default(),
             remember: tokio::sync::mpsc::channel(4).0,
+            to_self: tokio::sync::mpsc::channel(4).0,
             tunnels: Default::default(),
         });
         (fleet, msg_rx)

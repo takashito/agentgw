@@ -498,12 +498,149 @@ impl Bridge {
 
     /// SIGHUP. access.json / threads.json are **authoritative in memory**, so
     /// this is the only way to take in hand edits.
+    /// How much of a conversation goes in one frame. 256KB: twenty-odd frames for the largest
+    /// transcript measured on a real machine (5MB), and small enough that a dropped link costs
+    /// one of them rather than the lot.
+    const CHUNK: usize = 256 * 1024;
+
+    /// Send the conversation after a thread that has moved to `to`.
+    ///
+    /// **The agent is already down** when this runs, so nothing is writing to the file. Reading it
+    /// while a turn was still going would carry half a sentence.
+    ///
+    /// The copy here is left alone. It is no longer anyone's conversation — the row is gone, so
+    /// nothing will resume it — but deleting it would make a failed move unrecoverable, and it costs
+    /// only disk.
+    async fn send_thread_after(&self, channel: &str, thread_ts: &str, to: &str, path: &str) {
+        let ctx = LogCtx::default();
+        let Some(up) = self.ask_gateway.clone() else {
+            return;
+        };
+        let Some(entry) = self.threads.get(thread_ts).cloned() else {
+            return;
+        };
+        let Some(sid) = entry.agent_id.clone() else {
+            return; // never had an agent, so there is no conversation to send
+        };
+        let here = self.deps.agent.session_cwd(None, &sid).unwrap_or_default();
+        let text = self
+            .deps
+            .agent
+            .read_session(&sid)
+            .unwrap_or_else(|| String::new());
+        let row = serde_json::to_value(&entry).ok();
+        // An empty conversation still sends one frame: the row has to travel even when the agent
+        // never wrote anything
+        let slices: Vec<&str> = if text.is_empty() {
+            vec![""]
+        } else {
+            split_on_lines(&text, Self::CHUNK)
+        };
+        let total = slices.len();
+        for (i, data) in slices.into_iter().enumerate() {
+            let _ = up.send(crate::bridge::gateway::link::LinkFrame::ThreadChunk {
+                to: to.to_string(),
+                channel: channel.to_string(),
+                thread_ts: thread_ts.to_string(),
+                session_id: sid.clone(),
+                path: path.to_string(),
+                from_machine: self.machine_name.clone(),
+                from_path: here.clone(),
+                entry: (i == 0).then(|| row.clone()).flatten(),
+                seq: i as u32,
+                last: i + 1 == total,
+                data: data.to_string(),
+            });
+        }
+        ctx.info(
+            "bridge",
+            &format!(
+                "thread {thread_ts} sent to {to}: session={sid} {}B in {total} frame(s)",
+                text.len()
+            ),
+        );
+    }
+
+    /// Take one slice of a conversation being moved here, and put it in place on the last.
+    ///
+    /// **Nothing is visible until the last slice lands.** The pieces go to a file beside the one
+    /// they are becoming, so a move cut off half-way leaves a leftover rather than a conversation
+    /// that stops mid-sentence and would be resumed as if it were whole.
+    async fn take_thread_chunk(&mut self, part: ArrivingThread) {
+        let ctx = LogCtx::default();
+        let Some(dir) = crate::agent::claude::Transcript::project_dir(&part.path) else {
+            ctx.error("bridge", "no home directory — cannot take a moved conversation");
+            return;
+        };
+        let (whole, partial) = (
+            dir.join(format!("{}.jsonl", part.session_id)),
+            dir.join(format!("{}.jsonl.arriving", part.session_id)),
+        );
+        // **A conversation already here under that name is not ours to overwrite.** Session ids are
+        // single-use, so one that exists means something has gone wrong upstream, not a retry
+        if part.seq == 0 && whole.exists() {
+            ctx.error(
+                "bridge",
+                &format!("a conversation named {} is already here — the move is refused", part.session_id),
+            );
+            return;
+        }
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            ctx.error("bridge", &format!("could not make {}: {e}", dir.display()));
+            return;
+        }
+        let opened = std::fs::OpenOptions::new()
+            .create(true)
+            .append(part.seq > 0)
+            .truncate(part.seq == 0)
+            .write(true)
+            .open(&partial);
+        match opened.and_then(|mut f| std::io::Write::write_all(&mut f, part.data.as_bytes())) {
+            Ok(()) => {}
+            Err(e) => {
+                ctx.error("bridge", &format!("could not write {}: {e}", partial.display()));
+                return;
+            }
+        }
+        if !part.last {
+            return;
+        }
+        if let Err(e) = std::fs::rename(&partial, &whole) {
+            ctx.error("bridge", &format!("could not put {} in place: {e}", whole.display()));
+            return;
+        }
+        // The row last: until it exists this machine does not answer the thread, and by the time it
+        // does the conversation is whole
+        let mut entry: crate::bridge::state::ThreadEntry = part
+            .entry
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+        entry.agent_id = Some(part.session_id.clone());
+        entry.channel_id = Some(part.channel.clone());
+        entry.repo_path = Some(part.path.clone());
+        entry.moved_from = Some(crate::bridge::state::MovedFrom {
+            machine: part.from_machine.clone(),
+            path: part.from_path.clone(),
+        });
+        self.threads.upsert(&part.thread_ts, entry);
+        if let Err(e) = self.threads.save() {
+            ctx.error("bridge", &format!("threads.json save failed: {e}"));
+        }
+        ctx.info(
+            "bridge",
+            &format!(
+                "thread {} arrived from {} ({} → {}): session={}",
+                part.thread_ts, part.from_machine, part.from_path, part.path, part.session_id
+            ),
+        );
+    }
+
     /// Let go of a thread the gateway has given to another machine.
     ///
     /// **The agent goes and the row goes**, the same ending a deleted thread gets: nothing will
     /// arrive for it here again, and a row left behind would make this machine answer a conversation
     /// that is being answered somewhere else. The conversation is not lost — it carries on there.
-    async fn give_up_thread(&mut self, channel: &str, thread_ts: &str) {
+    async fn give_up_thread(&mut self, channel: &str, thread_ts: &str, to: &str, path: &str) {
         let key = ThreadKey::new(channel, thread_ts);
         let ctx = LogCtx {
             thread_key: Some(key.clone()),
@@ -513,15 +650,20 @@ impl Bridge {
         ctx.info(
             "bridge",
             &format!(
-                "thread {thread_ts} handed to another machine — ending session={}",
+                "thread {thread_ts} handed to {to} — ending session={}",
                 sid.as_deref().unwrap_or("none")
             ),
         );
+        // **Down first, then read.** A turn still running would be writing to the very file about to
+        // be sent, and half a sentence would arrive
+        self.terminate(&key, sid.as_deref(), None).await;
+        if !to.is_empty() {
+            self.send_thread_after(channel, thread_ts, to, path).await;
+        }
         self.threads.entries.remove(thread_ts);
         if let Err(e) = self.threads.save() {
             ctx.error("bridge", &format!("threads.json save failed: {e}"));
         }
-        self.terminate(&key, sid.as_deref(), None).await;
         self.awaiting_receipt.retain(|_, (k, _)| k != &key);
     }
 
@@ -667,7 +809,12 @@ impl Bridge {
         // threads.json**, so the gateway hands the pair over instead of saving the file itself.
         let (remember_tx, mut remember_rx) = mpsc::channel::<(String, String)>(64);
         // Threads this machine has been relieved of (the gateway gave them to someone else).
-        let (left_tx, mut left_rx) = mpsc::channel::<(String, String)>(16);
+        let (left_tx, mut left_rx) = mpsc::channel::<(String, String, String, String)>(16);
+        // Conversations on their way here. One slice per message; the last one puts it in place
+        let (arriving_tx, mut arriving_rx) = mpsc::channel::<ArrivingThread>(64);
+        // The gateway addressing **its own** Bridge. It serves channels like any machine, so a frame
+        // meant for it has to arrive the same way one sent down a link does.
+        let (down_tx, down_rx) = mpsc::channel::<machine::FromRelay>(64);
         // The signal that the link to the gateway was re-established (only machines use it)
         let (relink_tx, mut relink_rx) = mpsc::channel(4);
         consume_restart_marker(&dir, api.as_ref()).await;
@@ -714,6 +861,7 @@ impl Bridge {
                     crate::bridge::state::Threads::load(&dir).bridges(),
                 ),
                 remember: remember_tx.clone(),
+                to_self: down_tx.clone(),
                 tunnels: Default::default(),
             });
             // One listener per address: loopback for whatever terminates TLS in front, the LAN address
@@ -722,6 +870,28 @@ impl Bridge {
                 tokio::spawn(crate::bridge::gateway::serve_children(fleet.clone(), addr));
             }
             tokio::spawn(fleet.clone().watch_presence());
+            {
+                // Frames the gateway addresses to itself, handled exactly as a machine handles the
+                // ones that come down its link
+                let sinks = RelaySinks {
+                    msg_tx: msg_tx.clone(),
+                    click_tx: click_tx.clone(),
+                    dir: dir.clone(),
+                    reload: reload_tx.clone(),
+                    relink: relink_tx.clone(),
+                    up: up_tx.clone(),
+                    machine: wiring.self_id.clone().unwrap_or_default(),
+                    gateway_url: String::new(),
+                    left: left_tx.clone(),
+                    arriving: arriving_tx.clone(),
+                };
+                let mut down_rx = down_rx;
+                tokio::spawn(async move {
+                    while let Some(item) = down_rx.recv().await {
+                        pump_relay(item, &sinks).await;
+                    }
+                });
+            }
             {
                 // The gateway's own channels: its Bridge asks through the same channel a machine uses
                 let (fleet, up) = (fleet.clone(), uplink.clone());
@@ -820,6 +990,7 @@ impl Bridge {
                     machine: machine_name.clone(),
                     gateway_url: link_address.clone(),
                     left: left_tx.clone(),
+                    arriving: arriving_tx.clone(),
                 };
                 tokio::spawn(async move {
                     while let Some(item) = rx.recv().await {
@@ -955,7 +1126,9 @@ impl Bridge {
                 // job alone — see `Threads::set_bridge`
                 Some((thread_ts, machine)) = remember_rx.recv() => b.remember_thread_route(&thread_ts, &machine),
                 // This thread is another machine's now: let go of it before it answers twice
-                Some((channel, thread_ts)) = left_rx.recv() => b.give_up_thread(&channel, &thread_ts).await,
+                Some((channel, thread_ts, to, path)) = left_rx.recv() => b.give_up_thread(&channel, &thread_ts, &to, &path).await,
+                // A slice of a conversation being moved here
+                Some(part) = arriving_rx.recv() => b.take_thread_chunk(part).await,
                 // The link to the gateway was re-established. **Post online again** — for a machine
                 // this one line is the only way to tell a person "connected" (the gateway's presence
                 // only reports 🔴. Don't say the same thing in two places)
@@ -1057,6 +1230,45 @@ impl Host {
 /// into `InboundMsg` — the point is **not duplicating the conversion logic**: a second copy would sooner or later
 /// make the gates decide differently for direct and Relay.
 ///
+/// One slice of a conversation being moved onto this machine.
+pub struct ArrivingThread {
+    pub channel: String,
+    pub thread_ts: String,
+    pub session_id: String,
+    /// Where it will live here.
+    pub path: String,
+    pub from_machine: String,
+    pub from_path: String,
+    /// The thread's row, on the first slice only.
+    pub entry: Option<serde_json::Value>,
+    pub seq: u32,
+    pub last: bool,
+    pub data: String,
+}
+
+/// Cut `text` into pieces of at most `max` bytes, **never mid-line**.
+///
+/// A transcript is one JSON object per line. Splitting inside one would leave the receiver holding
+/// two halves that only mean anything joined in the right order — true here, but it stops being true
+/// the moment a slice is ever retried or reordered, and the cost of not allowing it is this function.
+fn split_on_lines(text: &str, max: usize) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while rest.len() > max {
+        // Back off to the last line break inside the budget; a single line longer than the budget
+        // has to go whole, since cutting it would corrupt it
+        let cut = match rest[..max].rfind('\n') {
+            Some(at) => at + 1,
+            None => rest.find('\n').map(|at| at + 1).unwrap_or(rest.len()),
+        };
+        let (head, tail) = rest.split_at(cut);
+        out.push(head);
+        rest = tail;
+    }
+    out.push(rest);
+    out
+}
+
 /// `reload` is the "access.json was written, reread it" signal. **Writing without it leaves a running
 /// Bridge looking at the old value (no Owner), dropping everything that arrives as `no-owner`** — since it's dropped
 /// at the door, even the command that fixes the Owner can't get in, and only a restart gets out (happened on a real machine 2026-08-02).
@@ -1099,8 +1311,11 @@ struct RelaySinks {
     machine: String,
     /// Where this machine dials the gateway — which says which of its interfaces the link goes out of.
     gateway_url: String,
-    /// Threads the gateway handed to someone else. The main loop tears each one down here.
-    left: mpsc::Sender<(String, String)>,
+    /// Threads the gateway handed to someone else: `(channel, thread_ts, to, path)`.
+    /// The main loop sends the conversation after them and tears each one down.
+    left: mpsc::Sender<(String, String, String, String)>,
+    /// Slices of a conversation arriving from the machine that had the thread.
+    arriving: mpsc::Sender<ArrivingThread>,
 }
 
 /// Tell the gateway where this machine works for each of its channels. The folders are **this machine's
@@ -1187,6 +1402,7 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
         machine,
         gateway_url,
         left,
+        arriving,
     } = sinks;
     match item {
         machine::FromRelay::Event { name, event } => {
@@ -1247,8 +1463,39 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
         machine::FromRelay::ThreadLeft {
             channel,
             thread_ts,
+            to,
+            path,
         } => {
-            let _ = left.send((channel, thread_ts)).await;
+            let _ = left.send((channel, thread_ts, to, path)).await;
+        }
+        // A conversation arriving from the machine that had this thread. Kept aside until the last
+        // slice lands — see `Bridge::take_thread_chunk`
+        machine::FromRelay::ThreadChunk {
+            channel,
+            thread_ts,
+            session_id,
+            path,
+            from_machine,
+            from_path,
+            entry,
+            seq,
+            last,
+            data,
+        } => {
+            let _ = arriving
+                .send(ArrivingThread {
+                    channel,
+                    thread_ts,
+                    session_id,
+                    path,
+                    from_machine,
+                    from_path,
+                    entry,
+                    seq,
+                    last,
+                    data,
+                })
+                .await;
         }
         // `pwd <this machine>:<path>`. Only this machine can see its folders, so the gateway waits for this
         // answer before handing the channel over — a folder that isn't there changes nothing
@@ -1579,7 +1826,7 @@ mod tests {
         let (reload, mut reload_rx) = mpsc::channel(4);
         let (relink, _relink_rx) = mpsc::channel(4);
         let (up, mut up_rx) = mpsc::unbounded_channel();
-        let sinks = RelaySinks { msg_tx, click_tx, dir: dir.clone(), reload, relink, up, machine: "desk".into(), gateway_url: String::new(), left: mpsc::channel(4).0 };
+        let sinks = RelaySinks { msg_tx, click_tx, dir: dir.clone(), reload, relink, up, machine: "desk".into(), gateway_url: String::new(), left: mpsc::channel(4).0, arriving: mpsc::channel(4).0 };
         let ask = |path: &str| machine::FromRelay::SetProject {
             channel: "C1".into(),
             thread_ts: "1.1".into(),
@@ -1628,6 +1875,7 @@ mod tests {
             machine: "test-machine".into(),
             gateway_url: String::new(),
             left: mpsc::channel(4).0,
+            arriving: mpsc::channel(4).0,
         };
         pump_relay(
             machine::FromRelay::Linked {
@@ -2216,6 +2464,91 @@ mod tests {
         assert!(b.threads.get(ROOT).is_none(), "the thread stayed on the books");
     }
 
+    /// **A transcript is one JSON object per line, so a slice never ends mid-line.** Joining is the
+    /// only thing the receiver does, and a half line would leave it holding something unreadable.
+    #[test]
+    fn a_conversation_is_sliced_between_lines() {
+        let text = "aaaa\nbbbb\ncccc\n";
+        // Budget smaller than the whole: cut back to the last break inside it
+        let parts = split_on_lines(text, 7);
+        assert_eq!(parts, vec!["aaaa\n", "bbbb\n", "cccc\n"]);
+        assert_eq!(parts.concat(), text, "joining gives back exactly what was sent");
+
+        // Fits in one
+        assert_eq!(split_on_lines(text, 999), vec![text]);
+
+        // **A single line longer than the budget goes whole**, since cutting it would corrupt it
+        let long = "xxxxxxxxxxxxxxxxxxxx\nyy\n";
+        let parts = split_on_lines(long, 4);
+        assert_eq!(parts, vec!["xxxxxxxxxxxxxxxxxxxx\n", "yy\n"]);
+        assert_eq!(parts.concat(), long);
+    }
+
+    /// The conversation lands under **the new folder's** name. `--resume` looks only where it is
+    /// started, so under the old name it would find nothing and quietly begin a blank conversation.
+    #[test]
+    fn a_moved_conversation_is_filed_under_the_new_folder() {
+        use crate::agent::claude::Transcript;
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(
+            Transcript::project_dir("/mnt/dev/agentgw").unwrap(),
+            std::path::Path::new(&home).join(".claude/projects/-mnt-dev-agentgw")
+        );
+        // Dots go the same way as slashes — measured against real directories
+        assert_eq!(
+            Transcript::project_dir("/Users/t/.config").unwrap(),
+            std::path::Path::new(&home).join(".claude/projects/-Users-t--config")
+        );
+    }
+
+    /// **Nothing is visible until the last slice lands, and the row comes after the conversation.**
+    /// A move cut off half-way must not leave something that would be resumed as if it were whole:
+    /// the thread only becomes this machine's once the file is complete.
+    #[tokio::test]
+    async fn a_conversation_appears_only_once_all_of_it_has_arrived() {
+        let (d, _slack, _agent, _clock) = flow_deps("thread-arriving");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let home = std::env::var("HOME").unwrap();
+        let work = format!("{home}/.agentgw-arrive-test-{}", std::process::id());
+        std::fs::create_dir_all(&work).unwrap();
+        let dir = crate::agent::claude::Transcript::project_dir(&work).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let sid = "18d7aaaa-0000-4000-8000-000000000001";
+        let part = |seq: u32, last: bool, data: &str| ArrivingThread {
+            channel: "C1".into(),
+            thread_ts: ROOT.into(),
+            session_id: sid.into(),
+            path: work.clone(),
+            from_machine: "desk".into(),
+            from_path: "/home/me/app".into(),
+            entry: (seq == 0).then(|| serde_json::json!({"session_id": sid})),
+            seq,
+            last,
+            data: data.into(),
+        };
+
+        b.take_thread_chunk(part(0, false, "{\"a\":1}\n")).await;
+        assert!(b.threads.get(ROOT).is_none(), "claimed the thread before it was whole");
+        assert!(!dir.join(format!("{sid}.jsonl")).exists(), "a partial conversation was left in place");
+
+        b.take_thread_chunk(part(1, true, "{\"b\":2}\n")).await;
+        let whole = dir.join(format!("{sid}.jsonl"));
+        assert_eq!(
+            std::fs::read_to_string(&whole).unwrap(),
+            "{\"a\":1}\n{\"b\":2}\n",
+            "the slices were not joined in order"
+        );
+        let entry = b.threads.get(ROOT).expect("the thread is ours now");
+        assert_eq!(entry.agent_id.as_deref(), Some(sid));
+        assert_eq!(entry.repo_path.as_deref(), Some(work.as_str()));
+        // Where it came from, to tell the agent when it wakes
+        let from = entry.moved_from.clone().expect("where it came from was dropped");
+        assert_eq!((from.machine.as_str(), from.path.as_str()), ("desk", "/home/me/app"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
     /// **A thread handed to another machine is let go of here.** Keeping the row would leave two
     /// machines answering one conversation, which is worse than losing the agent: the person sees
     /// two replies and neither side knows about the other.
@@ -2226,7 +2559,7 @@ mod tests {
         let sid = running_thread(&mut b, &agent).await;
         assert!(b.threads.get(ROOT).is_some(), "the thread is on the books");
 
-        b.give_up_thread("C1", ROOT).await;
+        b.give_up_thread("C1", ROOT, "", "").await;
 
         let name = crate::agent::SessionId::from(sid).window_name();
         assert!(

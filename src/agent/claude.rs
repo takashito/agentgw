@@ -1211,6 +1211,10 @@ impl crate::agent::Agent for Claude {
     fn session_history_exists(&self, remembered: Option<&str>, session_id: &str) -> bool {
         Transcript::locate(remembered, session_id).is_some()
     }
+    fn read_session(&self, session_id: &str) -> Option<String> {
+        let t = Transcript::locate(None, session_id)?;
+        std::fs::read_to_string(&t.path).ok()
+    }
 
     fn last_activity_ms(&self, remembered: Option<&str>, session_id: &str) -> Option<u64> {
         let t = Transcript::locate(remembered, session_id)?;
@@ -1359,6 +1363,27 @@ impl Transcript {
 
     fn at(path: String) -> Self {
         Self { path, offset: 0 }
+    }
+
+    /// Where a conversation started in `cwd` is kept: `~/.claude/projects/<cwd with / and . as ->`.
+    ///
+    /// **`--resume` only looks under the folder it was started in**, so a conversation carried to
+    /// another machine has to land under the new folder's name, not the old one's.
+    ///
+    /// ponytail: the encoding is read off real directories on a real machine (`/Users/taito` →
+    /// `-Users-taito`, `/Users/taito/.config` → `-Users-taito--config`), not from any documentation.
+    /// Claude Code could change it. If resuming a moved conversation ever starts a blank one, compare
+    /// this against the directory names under `~/.claude/projects` again.
+    pub fn project_dir(cwd: &str) -> Option<std::path::PathBuf> {
+        let name: String = cwd
+            .chars()
+            .map(|c| if c == '/' || c == '.' { '-' } else { c })
+            .collect();
+        Some(
+            std::path::Path::new(&std::env::var("HOME").ok()?)
+                .join(".claude/projects")
+                .join(name),
+        )
     }
 
     /// Exhaustive search of `~/.claude/projects/<project>/<sid>.jsonl`.

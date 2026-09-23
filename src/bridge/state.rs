@@ -170,6 +170,12 @@ pub struct ThreadEntry {
     /// lets the next start say so instead of leaving it there.
     #[serde(rename = "permPrompts", default, skip_serializing_if = "Vec::is_empty")]
     pub perm_prompts: Vec<String>,
+    /// Where this conversation was before it was moved here.
+    ///
+    /// **Told to the agent when it is woken**, because every path in its own record is from the old
+    /// place and the same files are not promised to be here.
+    #[serde(rename = "movedFrom", skip_serializing_if = "Option::is_none")]
+    pub moved_from: Option<MovedFrom>,
     /// The machine this thread is being handled by. **Written and read by the gateway only** — a
     /// machine has no use for it, since everything reaching a machine is already its own.
     ///
@@ -184,6 +190,13 @@ pub struct ThreadEntry {
     pub bridge: Option<String>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Where a moved conversation used to live.
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq, Eq)]
+pub struct MovedFrom {
+    pub machine: String,
+    pub path: String,
 }
 
 impl ThreadEntry {
