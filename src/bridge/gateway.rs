@@ -1895,12 +1895,12 @@ impl Fleet {
     /// `machines` can still say when an absent machine was last seen.
     async fn seen_now(&self, id: &str) {
         let now = crate::clock::iso8601(now_ms());
-        self.edit_access(|a| {
-            if let Some(link) = a.machines.get_mut(id) {
-                link.last_seen = now;
-            }
-        })
-        .await;
+        let id = id.to_string();
+        // **A machine that got in is one we know**, even with nothing written down for it — one
+        // linked before the records existed arrives on loopback, which is open regardless. An empty
+        // record asks for no address, so writing it opens nothing
+        self.edit_access(|a| a.machines.entry(id).or_default().last_seen = now)
+            .await;
     }
 
     /// Rewrite access.json and make the Bridge itself reread it.
@@ -2501,10 +2501,9 @@ impl Fleet {
                 // come from. Kept on its record so `machines` can still say where an absent one is
                 let id = bridge_id.to_string();
                 self.edit_access(|a| {
-                    if let Some(link) = a.machines.get_mut(&id) {
-                        link.host = host;
-                        link.address = ip;
-                    }
+                    let link = a.machines.entry(id).or_default();
+                    link.host = host;
+                    link.address = ip;
                 })
                 .await;
             }
