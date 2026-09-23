@@ -522,7 +522,15 @@ impl Bridge {
         let Some(sid) = entry.agent_id.clone() else {
             return; // never had an agent, so there is no conversation to send
         };
-        let here = self.deps.agent.session_cwd(None, &sid).unwrap_or_default();
+        // **The row, not the transcript.** The transcript's last `cwd` is where the conversation was
+        // *written*, and a conversation that has already been moved once was written on the machine
+        // before this one — so on a second move it names that machine's folder and the agent is told
+        // it came from where it is standing (measured 2026-09-23, moving back from the gateway).
+        let here = entry
+            .repo_path
+            .clone()
+            .or_else(|| self.deps.agent.session_cwd(None, &sid))
+            .unwrap_or_default();
         let text = self
             .deps
             .agent
@@ -2547,6 +2555,40 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// **Where it came from is the row's folder, not the transcript's.** A conversation moved twice
+    /// was written on the machine before last, so reading its transcript names that folder and the
+    /// agent is told it came from the place it is standing in — which is what happened on a real
+    /// move back from the gateway (2026-09-23): "was on dock in /Users/…" while standing in
+    /// /Users/… on the Mac.
+    #[tokio::test]
+    async fn a_second_move_says_the_folder_it_actually_left() {
+        let (d, _slack, agent, _clock) = flow_deps("moved-twice");
+        let ((mut b, _fx), _deliv) = Bridge::for_test_with_deliveries(d);
+        let sid = running_thread(&mut b, &agent).await;
+        // It is being handled in the folder its row names...
+        if let Some(e) = b.threads.entries.get_mut(ROOT) {
+            e.repo_path = Some("/mnt/dev/agentgw".into());
+        }
+        // ...while the transcript still says where it was written, one machine ago
+        *agent.cwd.lock().unwrap() = Some("/Users/t/dev/agentgw".into());
+        agent
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(sid.clone(), "{}\n".into());
+        b.ask_gateway = Some(tokio::sync::mpsc::unbounded_channel().0);
+
+        b.send_thread_after("C1", ROOT, "tyo-mpv5l", "/Users/t/dev/agentgw")
+            .await;
+        // Nothing to assert on the channel (it is dropped); the value is read back the same way
+        let sent = b
+            .threads
+            .get(ROOT)
+            .and_then(|e| e.repo_path.clone())
+            .unwrap();
+        assert_eq!(sent, "/mnt/dev/agentgw", "the row is what names the folder it left");
     }
 
     /// **A thread handed to another machine is let go of here.** Keeping the row would leave two
