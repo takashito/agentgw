@@ -855,6 +855,8 @@ impl Bridge {
                             thread_ts: root_ts.to_string(),
                             machine: machine.clone(),
                             path: path.clone(),
+                            // Typed inside a thread = move this conversation, not the channel
+                            thread_only: msg.thread_ts.is_some(),
                         },
                         &ctx,
                     )

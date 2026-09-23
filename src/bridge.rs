@@ -498,6 +498,33 @@ impl Bridge {
 
     /// SIGHUP. access.json / threads.json are **authoritative in memory**, so
     /// this is the only way to take in hand edits.
+    /// Let go of a thread the gateway has given to another machine.
+    ///
+    /// **The agent goes and the row goes**, the same ending a deleted thread gets: nothing will
+    /// arrive for it here again, and a row left behind would make this machine answer a conversation
+    /// that is being answered somewhere else. The conversation is not lost — it carries on there.
+    async fn give_up_thread(&mut self, channel: &str, thread_ts: &str) {
+        let key = ThreadKey::new(channel, thread_ts);
+        let ctx = LogCtx {
+            thread_key: Some(key.clone()),
+            ..Default::default()
+        };
+        let sid = self.threads.get(thread_ts).and_then(|e| e.agent_id.clone());
+        ctx.info(
+            "bridge",
+            &format!(
+                "thread {thread_ts} handed to another machine — ending session={}",
+                sid.as_deref().unwrap_or("none")
+            ),
+        );
+        self.threads.entries.remove(thread_ts);
+        if let Err(e) = self.threads.save() {
+            ctx.error("bridge", &format!("threads.json save failed: {e}"));
+        }
+        self.terminate(&key, sid.as_deref(), None).await;
+        self.awaiting_receipt.retain(|_, (k, _)| k != &key);
+    }
+
     /// Write down which machine a thread belongs to, for the gateway to read back after a restart.
     ///
     /// Nothing else about the row is touched, and a row that says something else already is left
@@ -639,6 +666,8 @@ impl Bridge {
         // The gateway asking for a thread's machine to be written down. **Only this loop writes
         // threads.json**, so the gateway hands the pair over instead of saving the file itself.
         let (remember_tx, mut remember_rx) = mpsc::channel::<(String, String)>(64);
+        // Threads this machine has been relieved of (the gateway gave them to someone else).
+        let (left_tx, mut left_rx) = mpsc::channel::<(String, String)>(16);
         // The signal that the link to the gateway was re-established (only machines use it)
         let (relink_tx, mut relink_rx) = mpsc::channel(4);
         consume_restart_marker(&dir, api.as_ref()).await;
@@ -790,6 +819,7 @@ impl Bridge {
                     up: up_tx.clone(),
                     machine: machine_name.clone(),
                     gateway_url: link_address.clone(),
+                    left: left_tx.clone(),
                 };
                 tokio::spawn(async move {
                     while let Some(item) = rx.recv().await {
@@ -924,6 +954,8 @@ impl Bridge {
                 // The gateway decided which machine a thread belongs to. Writing it is this loop's
                 // job alone — see `Threads::set_bridge`
                 Some((thread_ts, machine)) = remember_rx.recv() => b.remember_thread_route(&thread_ts, &machine),
+                // This thread is another machine's now: let go of it before it answers twice
+                Some((channel, thread_ts)) = left_rx.recv() => b.give_up_thread(&channel, &thread_ts).await,
                 // The link to the gateway was re-established. **Post online again** — for a machine
                 // this one line is the only way to tell a person "connected" (the gateway's presence
                 // only reports 🔴. Don't say the same thing in two places)
@@ -1067,6 +1099,8 @@ struct RelaySinks {
     machine: String,
     /// Where this machine dials the gateway — which says which of its interfaces the link goes out of.
     gateway_url: String,
+    /// Threads the gateway handed to someone else. The main loop tears each one down here.
+    left: mpsc::Sender<(String, String)>,
 }
 
 /// Tell the gateway where this machine works for each of its channels. The folders are **this machine's
@@ -1108,6 +1142,7 @@ fn report_folders(
             channel,
             thread_ts: String::new(),
             result: Ok(path),
+            thread_only: false,
         });
     }
 }
@@ -1151,6 +1186,7 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
         up,
         machine,
         gateway_url,
+        left,
     } = sinks;
     match item {
         machine::FromRelay::Event { name, event } => {
@@ -1206,16 +1242,29 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
                 let _ = reload.send(()).await;
             }
         }
+        // This thread belongs to another machine now. **Tear the agent down and drop the row** —
+        // left alone it would answer the thread from here as well, two agents over one conversation
+        machine::FromRelay::ThreadLeft {
+            channel,
+            thread_ts,
+        } => {
+            let _ = left.send((channel, thread_ts)).await;
+        }
         // `pwd <this machine>:<path>`. Only this machine can see its folders, so the gateway waits for this
         // answer before handing the channel over — a folder that isn't there changes nothing
         machine::FromRelay::SetProject {
             channel,
             thread_ts,
             path,
+            thread_only,
         } => {
             let abs = bridge::absolute_project_path(&path, &Host::home());
             let result = if !std::path::Path::new(&abs).is_dir() {
                 Err(bridge::no_such_folder(&abs, machine))
+            } else if thread_only {
+                // One thread is moving here, not the channel. **Leave the channel's folder alone** —
+                // it decides where this channel's *other* threads start, and they are not moving
+                Ok(abs)
             } else {
                 let op = bridge::AccessOp::SetRepo {
                     channel: channel.clone(),
@@ -1240,6 +1289,7 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
                 channel,
                 thread_ts,
                 result,
+                thread_only,
             });
         }
         // Getting here means the link has been given up. **Don't touch the agents** — running ones
@@ -1529,10 +1579,11 @@ mod tests {
         let (reload, mut reload_rx) = mpsc::channel(4);
         let (relink, _relink_rx) = mpsc::channel(4);
         let (up, mut up_rx) = mpsc::unbounded_channel();
-        let sinks = RelaySinks { msg_tx, click_tx, dir: dir.clone(), reload, relink, up, machine: "desk".into(), gateway_url: String::new() };
+        let sinks = RelaySinks { msg_tx, click_tx, dir: dir.clone(), reload, relink, up, machine: "desk".into(), gateway_url: String::new(), left: mpsc::channel(4).0 };
         let ask = |path: &str| machine::FromRelay::SetProject {
             channel: "C1".into(),
             thread_ts: "1.1".into(),
+            thread_only: false,
             path: path.into(),
         };
         let proj = base.join("proj").to_string_lossy().to_string();
@@ -1576,6 +1627,7 @@ mod tests {
             up,
             machine: "test-machine".into(),
             gateway_url: String::new(),
+            left: mpsc::channel(4).0,
         };
         pump_relay(
             machine::FromRelay::Linked {
@@ -2164,6 +2216,26 @@ mod tests {
         assert!(b.threads.get(ROOT).is_none(), "the thread stayed on the books");
     }
 
+    /// **A thread handed to another machine is let go of here.** Keeping the row would leave two
+    /// machines answering one conversation, which is worse than losing the agent: the person sees
+    /// two replies and neither side knows about the other.
+    #[tokio::test]
+    async fn a_thread_given_to_another_machine_is_let_go_of() {
+        let (d, _slack, agent, _clock) = flow_deps("thread-left");
+        let ((mut b, _fx), _deliv) = Bridge::for_test_with_deliveries(d);
+        let sid = running_thread(&mut b, &agent).await;
+        assert!(b.threads.get(ROOT).is_some(), "the thread is on the books");
+
+        b.give_up_thread("C1", ROOT).await;
+
+        let name = crate::agent::SessionId::from(sid).window_name();
+        assert!(
+            crate::agent::Agent::pid_of(&*agent, None, &name).is_none(),
+            "the agent was left running, so both machines would answer"
+        );
+        assert!(b.threads.get(ROOT).is_none(), "the row stayed behind");
+    }
+
     /// **The worktree goes with the conversation that was using it.** Deleting the thread is a person
     /// saying the work is over, and nothing ever comes back for that checkout.
     #[tokio::test]
@@ -2542,6 +2614,8 @@ mod tests {
                 thread_ts: "1782000001.000200".into(),
                 machine: "hub".into(),
                 path: Some("~/x".into()),
+                // Typed straight into the channel, so the channel is what moves
+                thread_only: false,
             })
         );
         assert_eq!(
@@ -2596,6 +2670,7 @@ mod tests {
                 channel: "C_WORK".into(),
                 thread_ts: String::new(),
                 result: Ok("/srv/app".into()),
+                thread_only: false,
             })
         );
         assert_eq!(up_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty), "nothing to say for a channel with no folder");
@@ -2618,6 +2693,7 @@ mod tests {
                 channel: "C1".into(),
                 thread_ts: String::new(),
                 result: Ok("/work/app".into()),
+                thread_only: false,
             })
         );
     }

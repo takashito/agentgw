@@ -96,7 +96,11 @@ pub enum FromRelay {
         channel: String,
         thread_ts: String,
         path: String,
+        /// Asked inside a thread: only that conversation moves, not the channel.
+        thread_only: bool,
     },
+    /// This thread is another machine's now — drop it, so two agents never answer one conversation.
+    ThreadLeft { channel: String, thread_ts: String },
     /// A refusal that talking won't fix. **No retry.**
     Fatal(Fatal),
 }
@@ -153,10 +157,19 @@ impl FromRelay {
                 channel,
                 thread_ts,
                 path,
+                thread_only,
             } => FromRelay::SetProject {
                 channel,
                 thread_ts,
                 path,
+                thread_only,
+            },
+            F::ThreadLeft {
+                channel,
+                thread_ts,
+            } => FromRelay::ThreadLeft {
+                channel,
+                thread_ts,
             },
             F::Home { channel } => FromRelay::Home { channel },
             // Answers and asks only ever go the other way

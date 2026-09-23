@@ -321,6 +321,7 @@ impl Bridge {
                                 channel: msg.channel.clone(),
                                 thread_ts: String::new(),
                                 result: Ok(path.clone()),
+                                thread_only: false,
                             },
                             ctx,
                         );

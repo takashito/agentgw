@@ -120,7 +120,16 @@ pub mod link {
             channel: String,
             thread_ts: String,
             path: String,
+            /// Typed **inside a thread**: move that one conversation and leave the channel alone.
+            /// Default false so a machine too old to send it still means what it used to.
+            #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+            thread_only: bool,
         },
+        /// This thread belongs to another machine now: let go of it.
+        ///
+        /// **Sent to the machine that had it**, so it stops treating the thread as live — one that
+        /// still had the row would keep answering and two agents would talk over each other.
+        ThreadLeft { channel: String, thread_ts: String },
         /// The notice channel changed. Sent to every machine so they all write to the same place.
         Home { channel: String },
         /// `set-home`, asked from a machine — same reason as [`LinkFrame::Channels`].
@@ -149,6 +158,9 @@ pub mod link {
             thread_ts: String,
             machine: String,
             path: Option<String>,
+            /// Typed inside a thread — see [`LinkFrame::SetProject`].
+            #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+            thread_only: bool,
         },
         /// The machine's answer to `SetProject`: the absolute path it stored, or why it didn't (said to the
         /// person as is). Carries the channel and thread back, so the gateway keeps no table of what it asked.
@@ -156,6 +168,10 @@ pub mod link {
             channel: String,
             thread_ts: String,
             result: Result<String, String>,
+            /// Echoed back from the [`LinkFrame::SetProject`] that asked, so the gateway still keeps
+            /// no table of what it asked for.
+            #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+            thread_only: bool,
         },
     }
 
@@ -340,16 +356,29 @@ pub mod link {
                     channel: "C1".into(),
                     thread_ts: "1700000000.000100".into(),
                     path: "~/dev/x".into(),
+                    thread_only: false,
+                },
+                LinkFrame::SetProject {
+                    channel: "C1".into(),
+                    thread_ts: "1700000000.000100".into(),
+                    path: "~/dev/x".into(),
+                    thread_only: true,
+                },
+                LinkFrame::ThreadLeft {
+                    channel: "C1".into(),
+                    thread_ts: "1700000000.000100".into(),
                 },
                 LinkFrame::ProjectSet {
                     channel: "C1".into(),
                     thread_ts: "1700000000.000100".into(),
                     result: Ok("/home/me/dev/x".into()),
+                    thread_only: false,
                 },
                 LinkFrame::ProjectSet {
                     channel: "C1".into(),
                     thread_ts: "1700000000.000100".into(),
                     result: Err("no folder".into()),
+                    thread_only: true,
                 },
             ]
         }
@@ -854,6 +883,15 @@ impl<'a> Event<'a> {
     /// why the post has to be read before this can say anything about a thread.
     pub fn reacted_ts(&self) -> Option<&'a str> {
         self.raw.get("item")?.get("ts")?.as_str()
+    }
+
+    /// Written **inside** a thread rather than straight into the channel. That is what tells a
+    /// `pwd` meant for one conversation from one meant for the channel.
+    ///
+    /// Not the same as [`Self::thread`] having a value — that one answers "which thread is this
+    /// about", and a post straight into the channel is the start of its own.
+    pub fn in_a_thread(&self) -> bool {
+        self.str_at("thread_ts").is_some()
     }
 
     /// Written by the bot itself — **including these very refusals**. Without this, a channel with no
@@ -2474,7 +2512,8 @@ impl Fleet {
             RouteOutcome::NotACommand => {}
             // The folder can only be checked where it is. Here: now. Elsewhere: ask, and bind on the answer
             RouteOutcome::SetProject { bridge_id, path } => {
-                self.assign_project(channel, &thread, &bridge_id, Some(path)).await;
+                self.assign_project(channel, &thread, &bridge_id, Some(path), ev.in_a_thread())
+                    .await;
                 return true;
             }
             RouteOutcome::Refused(reply) => {
@@ -2515,10 +2554,19 @@ impl Fleet {
     /// Assign a place to a machine and hand that machine "you're in charge".
     /// **Send nothing when assigning ourselves** — we don't phone ourselves.
     /// `pwd <this gateway>:<path>` — the folder is here, so check and store it without asking anyone.
-    async fn set_project_here(self: &Arc<Self>, channel: &str, thread_ts: &str, path: &str) {
+    async fn set_project_here(
+        self: &Arc<Self>,
+        channel: &str,
+        thread_ts: &str,
+        path: &str,
+        thread_only: bool,
+    ) {
         let abs = crate::bridge::state::absolute_project_path(path, &StateDir::home());
         let result = if !std::path::Path::new(&abs).is_dir() {
             Err(crate::bridge::state::no_such_folder(&abs, &self.self_id))
+        } else if thread_only {
+            // Only one thread is coming here; the channel's folder is not ours to change
+            Ok(abs)
         } else {
             let op = crate::bridge::state::AccessOp::SetRepo {
                 channel: channel.to_string(),
@@ -2533,7 +2581,8 @@ impl Fleet {
             }
         };
         let me = self.self_id.clone();
-        self.on_project_set(&me, channel, thread_ts, result).await;
+        self.on_project_set(&me, channel, thread_ts, result, thread_only)
+            .await;
     }
 
     /// A machine's answer to `pwd <machine>:<path>`. Yes → hand the channel over and say where it works;
@@ -2544,6 +2593,7 @@ impl Fleet {
         channel: &str,
         thread_ts: &str,
         result: Result<String, String>,
+        thread_only: bool,
     ) {
         if thread_ts.is_empty() {
             // A folder set on the machine itself: record it so `channels` shows where the work happens
@@ -2559,6 +2609,11 @@ impl Fleet {
             return;
         }
         match result {
+            // **Asked inside a thread: move that conversation and nothing else.** The channel keeps
+            // whatever it had, so the threads already on it, and the next one it starts, stay put
+            Ok(abs) if thread_only => {
+                self.move_thread(bridge_id, channel, thread_ts, &abs).await;
+            }
             Ok(abs) => {
                 let mut reply = handover_reply(channel, &self.access().bridges(), bridge_id);
                 let (ch, id, folder) = (channel.to_string(), bridge_id.to_string(), abs.clone());
@@ -2582,6 +2637,58 @@ impl Fleet {
         }
     }
 
+    /// Hand one thread to another machine, leaving its channel untouched.
+    ///
+    /// **The folder has already been checked**, on the machine that will take it — nothing moves on a
+    /// path that isn't there. From here it is only bookkeeping: the thread's row says where its
+    /// messages go from now on, and the machine that had it is told to let go.
+    ///
+    /// The conversation itself does not travel yet, so the new machine starts a fresh agent in the
+    /// folder. Saying so is the point of the reply.
+    async fn move_thread(self: &Arc<Self>, bridge_id: &str, channel: &str, thread_ts: &str, abs: &str) {
+        let was = self.thread_routes.lock().await.get(thread_ts).cloned();
+        if was.as_deref() == Some(bridge_id) {
+            let already = crate::t!(
+                "This thread is already on `{}`, in `{}`.",
+                "このスレッドはすでに `{}` の `{}` にいます。",
+                bridge_id,
+                abs,
+            );
+            self.post(channel, Some(thread_ts), &already).await;
+            return;
+        }
+        self.thread_routes
+            .lock()
+            .await
+            .insert(thread_ts.to_string(), bridge_id.to_string());
+        let _ = self
+            .remember
+            .send((thread_ts.to_string(), bridge_id.to_string()))
+            .await;
+        // The machine that had it drops its record, or it would answer a thread that is no longer its
+        // own the next time one of its own messages arrives
+        if let Some(old) = was.as_deref().filter(|o| *o != self.self_id) {
+            self.links.send_to(
+                old,
+                &link::LinkFrame::ThreadLeft {
+                    channel: channel.to_string(),
+                    thread_ts: thread_ts.to_string(),
+                },
+            );
+        }
+        rlog(
+            "info",
+            &format!("thread {thread_ts} moved {} → {bridge_id} ({abs})", was.as_deref().unwrap_or("-")),
+        );
+        let reply = crate::t!(
+            "This thread now runs on `{}`, in `{}`.\nIts history stays behind, so the next message starts a fresh agent there.",
+            "このスレッドは `{}` の `{}` で動くようになりました。\n会話の記録は移らないので、次のメッセージから新しいエージェントが始まります。",
+            bridge_id,
+            abs,
+        );
+        self.post(channel, Some(thread_ts), &reply).await;
+    }
+
     /// Text a machine sent up its link: its answer to `SetProject`, or a command it was given in one of
     /// its threads (the gateway never saw it — a follow-up in a running thread carries no mention).
     async fn on_machine_text(self: &Arc<Self>, bridge_id: &str, raw: &str) {
@@ -2597,7 +2704,11 @@ impl Fleet {
                 channel,
                 thread_ts,
                 result,
-            } => self.on_project_set(bridge_id, &channel, &thread_ts, result).await,
+                thread_only,
+            } => {
+                self.on_project_set(bridge_id, &channel, &thread_ts, result, thread_only)
+                    .await
+            }
             link::LinkFrame::Channels {
                 channel,
                 thread_ts,
@@ -2652,7 +2763,11 @@ impl Fleet {
                 thread_ts,
                 machine,
                 path,
-            } => self.assign_project(&channel, &thread_ts, &machine, path).await,
+                thread_only,
+            } => {
+                self.assign_project(&channel, &thread_ts, &machine, path, thread_only)
+                    .await
+            }
             _ => rlog("info", &format!("{bridge_id}: dropped an unexpected frame from a machine")),
         }
     }
@@ -2687,6 +2802,7 @@ impl Fleet {
         thread_ts: &str,
         machine: &str,
         path: Option<String>,
+        thread_only: bool,
     ) {
         let connected = self.machines();
         if !connected.iter().any(|m| m == machine) {
@@ -2696,13 +2812,14 @@ impl Fleet {
         }
         let path = path.unwrap_or_else(|| "~".to_string());
         if machine == self.self_id {
-            self.set_project_here(channel, thread_ts, &path).await;
+            self.set_project_here(channel, thread_ts, &path, thread_only).await;
         } else if !self.links.send_to(
             machine,
             &link::LinkFrame::SetProject {
                 channel: channel.to_string(),
                 thread_ts: thread_ts.to_string(),
                 path,
+                thread_only,
             },
         ) {
             let notice = Delivery::offline_notice(machine, &self.links.connected());
@@ -3895,6 +4012,23 @@ mod tests {
         let r = serde_json::json!({"item": {"channel": "C1", "ts": "222.2"}});
         assert_eq!(Event::new("reaction_added", &r).reacted_ts(), Some("222.2"));
         assert_eq!(Event::new("message", &serde_json::json!({})).reacted_ts(), None);
+    }
+
+    /// **Where `pwd` was typed decides what it moves.** Inside a thread it moves that conversation;
+    /// straight into the channel it sets where the channel's next one starts. Without this split,
+    /// changing a channel took every live thread with it (2026-09-23).
+    #[test]
+    fn where_pwd_was_typed_decides_what_moves() {
+        let in_thread = serde_json::json!({
+            "channel": "C1", "ts": "222.2", "thread_ts": "111.1", "text": "pwd dock:/x"
+        });
+        assert!(Event::new("message", &in_thread).in_a_thread());
+
+        // Straight into the channel: it opens its own thread, so there is no conversation to move
+        let at_channel = serde_json::json!({"channel": "C1", "ts": "111.1", "text": "pwd dock:/x"});
+        let ev = Event::new("message", &at_channel);
+        assert!(!ev.in_a_thread());
+        assert_eq!(ev.thread(), Some("111.1"), "still names a thread to reply in");
     }
 
     /// A press has to follow the thread its prompt is in, not the channel's current machine.
