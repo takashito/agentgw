@@ -1,0 +1,27 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -c \"import json,sys,subprocess;c=json.load(sys.stdin).get('tool_input',{}).get('command','');subprocess.run(['${CLAUDE_PROJECT_DIR}/scripts/prune-old-builds.sh'],capture_output=True) if 'cargo' in c else None\"",
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "WorktreeCreate": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -c \"import json,sys,subprocess;n=json.load(sys.stdin).get('name') or '';sys.exit(subprocess.run(['${CLAUDE_PROJECT_DIR}/scripts/worktree.sh', n]).returncode)\"",
+            "timeout": 120
+          }
+        ]
+      }
+    ]
+  }
+}

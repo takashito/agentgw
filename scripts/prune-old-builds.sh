@@ -3,7 +3,7 @@
 # artifacts are the expensive ones (a cold build of the Linux target is ~9 minutes) and they
 # are never stale: cargo rebuilds a dependency only when its version or features change.
 #
-#   scripts/gc.sh [--dry-run]
+#   scripts/prune-old-builds.sh [--dry-run]
 #
 # What piles up is *our own* crate. Every build writes a new `libagentgw-<hash>.rlib` (plus
 # the test binaries) and a new incremental session, and cargo never deletes the old ones —
