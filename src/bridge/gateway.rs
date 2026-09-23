@@ -1599,6 +1599,18 @@ struct MachineRow {
     down: Option<String>,
 }
 
+/// The address machines actually reach the gateway at, out of everything it accepts.
+/// The gateway dials nobody, so it has no interface of its own to name — where it takes machines is
+/// the next best thing. **Loopback and `0.0.0.0` reach nobody**, so they are skipped.
+fn listen_ip(listen: &str) -> String {
+    listen
+        .split(',')
+        .filter_map(|a| a.trim().rsplit_once(':').map(|(host, _)| host))
+        .find(|h| !h.starts_with("127.") && *h != "localhost" && *h != "0.0.0.0")
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// The `machines` answer as a standard-Markdown table (so it must go out with `post_markdown`).
 /// **Pure function** — the caller does the I/O.
 fn machines_md(rows: &[MachineRow]) -> String {
@@ -1818,7 +1830,10 @@ impl Fleet {
         let mut rows = vec![MachineRow {
             id: self.self_id.clone(),
             host: me_host,
-            ip: me_ip,
+            ip: match me_ip.is_empty() {
+                false => me_ip,
+                true => listen_ip(&std::env::var("AGENTGW_LINK_LISTEN").unwrap_or_default()),
+            },
             link: crate::t!("gateway", "ゲートウェイ"),
             online: true,
             down: None,
@@ -4278,6 +4293,16 @@ mod tests {
         assert!(out.contains("● Machines connected — 1"), "{out}");
         assert!(out.contains("#dev (C1) → desktop  ● online"), "{out}");
         assert!(out.contains("C2 → laptop  ○ offline"), "{out}"); // the raw id if the name can't be looked up
+    }
+
+    #[test]
+    fn the_gateway_shows_the_address_machines_reach_it_at() {
+        // Loopback is written first and reaches nobody — the address after it is the answer
+        assert_eq!(listen_ip("127.0.0.1:8787,192.168.10.11:8787"), "192.168.10.11");
+        // Nothing but loopback: nothing to show, rather than an address nobody can use
+        assert_eq!(listen_ip("127.0.0.1:8787"), "");
+        assert_eq!(listen_ip(""), "");
+        assert_eq!(listen_ip("0.0.0.0:8787"), "");
     }
 
     #[test]
