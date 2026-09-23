@@ -614,6 +614,7 @@ async fn add_child(
                 machine_on_tailnet,
                 lan,
                 listen,
+                ssh::tailscale_serve_json().as_deref(),
             );
             if let Some(i) = pick_route(&options, ask_which_route(&options)) {
                 chosen_first(&mut options, i);
@@ -987,6 +988,7 @@ pub fn probe_base(url: &str) -> String {
 /// An address the gateway does not hold yet is opened for the length of the question (`Doorbell`) —
 /// otherwise it could never answer and could never be chosen. What the chosen one needs is opened for
 /// good afterwards.
+#[allow(clippy::too_many_arguments)]
 fn routes_that_work(
     target: &str,
     child: &str,
@@ -995,6 +997,7 @@ fn routes_that_work(
     machine_on_tailnet: bool,
     lan: Option<(String, String)>,
     listen: Option<&str>,
+    serve_json: Option<&str>,
 ) -> Vec<RouteChoice> {
     let held = |addr: &str| listen.unwrap_or_default().split(',').any(|a| a.trim() == addr);
     let port = link_port(listen);
@@ -1008,23 +1011,32 @@ fn routes_that_work(
             listen: None,
         });
     }
-    if machine_on_tailnet
-        && let Some((name, ip)) = tailnet.filter(|(n, _)| !n.is_empty())
-    {
-        // Two ways over the tailnet: through whatever terminates TLS on 443 (`tailscale serve`, which
-        // forwards to loopback — nothing to open here), or straight to the link port
-        cands.push(Candidate {
-            label: crate::t!("tailnet · wss://{name}", "tailnet · wss://{name}"),
-            url: format!("wss://{name}"),
-            listen: None,
-        });
-        if !ip.is_empty() {
+    // Through whatever terminates TLS in front of us. **Asked of the front, not assumed from being on
+    // a tailnet**: served or not is a local fact, and an unserved name is a candidate that can only
+    // ever answer "no" — one wasted ssh round trip per machine added. The name comes from the front
+    // too, since what is served needn't be the tailnet's own name.
+    // Only tailnet fronts are read, so the machine still has to be on the tailnet to use one
+    if machine_on_tailnet {
+        for e in crate::bridge::gateway::entrances(listen.unwrap_or_default(), serve_json) {
+            let Some(front) = e.front else { continue };
+            let name = e.at.rsplit_once(':').map(|(h, _)| h).unwrap_or(e.at.as_str()).to_string();
             cands.push(Candidate {
-                label: crate::t!("tailnet · ws://{name}:{port}", "tailnet · ws://{name}:{port}"),
-                url: format!("ws://{name}:{port}"),
-                listen: Some(format!("{ip}:{port}")),
+                label: crate::t!("{front} · wss://{name}", "{front} · wss://{name}"),
+                url: format!("wss://{name}"),
+                listen: None,
             });
         }
+    }
+    // Or straight to the link port, which we must hold ourselves
+    if machine_on_tailnet
+        && let Some((name, ip)) = tailnet.filter(|(n, _)| !n.is_empty())
+        && !ip.is_empty()
+    {
+        cands.push(Candidate {
+            label: crate::t!("tailnet · ws://{name}:{port}", "tailnet · ws://{name}:{port}"),
+            url: format!("ws://{name}:{port}"),
+            listen: Some(format!("{ip}:{port}")),
+        });
     }
     if let Some((url, addr)) = lan {
         cands.push(Candidate {
