@@ -1550,6 +1550,51 @@ async fn name_here(ip: &str) -> Option<String> {
     said.filter(|n| !n.is_empty() && n != ip)
 }
 
+/// The address a name has **here**, asked of the OS. `None` when nothing answers.
+///
+/// The mirror of [`name_here`]: a machine behind an ssh tunnel dials its own loopback, so the address
+/// it reports says nothing about where it is. What reaches it is the gateway's ssh target — a name,
+/// which only this resolver can turn back into an address.
+async fn address_here(name: &str) -> Option<String> {
+    if name.is_empty() || name.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    let ask = async |program: &str, args: Vec<&str>| -> Option<String> {
+        let out = tokio::process::Command::new(program)
+            .args(args)
+            .output()
+            .await
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).to_string())
+    };
+    let said = match tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        match ask("getent", vec!["hosts", name]).await {
+            Some(out) => Some(address_from_getent(&out)),
+            None => ask("host", vec!["-W", "2", name]).await.map(|o| address_from_host(&o)),
+        }
+    })
+    .await
+    {
+        Ok(said) => said?,
+        Err(_) => None,
+    };
+    said.filter(|a| !a.is_empty())
+}
+
+/// `192.0.2.20   build-box.lan` → `192.0.2.20`. The address comes first.
+fn address_from_getent(out: &str) -> Option<String> {
+    out.lines().next()?.split_whitespace().next().map(str::to_string)
+}
+
+/// `build-box.lan has address 192.0.2.20` → `192.0.2.20`.
+fn address_from_host(out: &str) -> Option<String> {
+    out.lines()
+        .find_map(|l| l.rsplit_once("has address "))
+        .map(|(_, ip)| ip.trim().to_string())
+}
+
 /// `192.0.2.20   build-box.lan build-box` → `build-box.lan`. The first name is the canonical one.
 fn name_from_getent(out: &str) -> Option<String> {
     out.lines()
@@ -1930,15 +1975,20 @@ impl Fleet {
             // A machine behind an ssh tunnel dials its own loopback, so loopback is the interface it
             // names. What reaches *it* is the gateway's ssh target, which only the gateway knows
             let (host, ip) = match (ip.starts_with("127."), tunnels.get(id)) {
-                (true, Some(t)) => (ssh_host_of(&t.target).to_string(), String::new()),
+                (true, Some(t)) => {
+                    let named = ssh_host_of(&t.target).to_string();
+                    let at = address_here(&named).await.unwrap_or_default();
+                    (named, at)
+                }
                 // What this resolver calls the address wins over what the machine calls itself
                 _ => (name_here(&ip).await.unwrap_or(host), ip),
             };
             // How the gateway gets to it: a tunnel it opened itself (and knows), or straight there
             let (link, down) = match tunnels.get(id) {
                 None => (crate::t!("direct", "直結"), None),
+                // **Backticks, or Slack reads `user@host` as an email** and draws a mailto link
                 Some(Tunnel { target, error }) => (
-                    crate::t!("ssh tunnel ({target})", "ssh トンネル({target})"),
+                    crate::t!("ssh tunnel (`{target}`)", "ssh トンネル(`{target}`)"),
                     error.clone(),
                 ),
             };

@@ -67,6 +67,16 @@ fn opts_of(access: &Access) -> Vec<String> {
         ));
         out.push("-o".into());
         out.push("ControlPersist=120".into());
+    } else {
+        // **Don't ride on a shared connection we are about to pull out from under ourselves.**
+        // The gateway holds an ssh to the same machine for the tunnel, and with `ControlMaster auto`
+        // in ssh_config that one is the master. Setting a tunnel up restarts the gateway, which kills
+        // it — and an ssh started in the next couple of seconds attaches to the dying master and comes
+        // back "Permission denied (publickey,password)" although the key is fine (measured on a real
+        // machine: failed twice, then worked). Our own connection costs a handshake and can't be
+        // yanked away. With `-p` the sharing is the point, so it stays.
+        out.push("-o".into());
+        out.push("ControlPath=none".into());
     }
     out
 }
@@ -359,12 +369,15 @@ mod tests {
             let joined = opts_of(&a).join(" ");
             joined
         };
-        // Nothing asked for, so nothing but the quiet: ssh's own chatter is not part of our output
-        assert_eq!(args(Access::default()), "-o LogLevel=ERROR");
+        // Nothing asked for: the quiet, and a connection of our own. Sharing the gateway's would
+        // break the moment setting up a tunnel restarts it
+        assert_eq!(args(Access::default()), "-o LogLevel=ERROR -o ControlPath=none");
         let with_key = args(Access { identity: Some("/k/id".into()), ask_password: false });
         assert!(with_key.contains("-i /k/id") && with_key.contains("IdentitiesOnly=yes"), "{with_key}");
         let with_pw = args(Access { identity: None, ask_password: true });
         assert!(with_pw.contains("ControlMaster=auto") && with_pw.contains("ControlPersist=120"), "{with_pw}");
+        // With `-p` the sharing is the point — one prompt for the whole run
+        assert!(!with_pw.contains("ControlPath=none"), "{with_pw}");
         assert!(!with_pw.contains("password"), "{with_pw}");
         assert_eq!(batch_mode_of(false)[1], "BatchMode=yes");
         assert_eq!(batch_mode_of(true)[1], "BatchMode=no");
