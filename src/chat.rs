@@ -296,12 +296,9 @@ pub trait Chat: Send + Sync + 'static {
         thread_ts: Option<&str>,
         path: &Path,
     ) -> Result<(), String>;
-    async fn set_thinking_status(
-        &self,
-        channel: &str,
-        thread_ts: &str,
-        status: &str,
-    ) -> Result<(), String>;
+    /// Busy while a turn is in flight, idle when it is over. Slack draws it — a working line and,
+    /// with `agent_session_stopped` subscribed, a stop button.
+    async fn set_busy(&self, channel: &str, thread_ts: &str, busy: bool) -> Result<(), String>;
     /// Register a thread as an agent session named `title` — what the `Agents & tools` sidebar lists.
     async fn start_session(
         &self,
@@ -539,8 +536,8 @@ pub mod fake {
             std::fs::metadata(p).map_err(|e| format!("read {}: {e}", p.display()))?;
             self.record(format!("upload {c} {} {}", th.unwrap_or("-"), p.display()))
         }
-        async fn set_thinking_status(&self, c: &str, th: &str, s: &str) -> Result<(), String> {
-            self.record(format!("status {c} {th} {s}"))
+        async fn set_busy(&self, c: &str, th: &str, busy: bool) -> Result<(), String> {
+            self.record(format!("status {c} {th} {}", if busy { "busy" } else { "idle" }))
         }
         async fn start_session(&self, c: &str, th: &str, title: &str) -> Result<(), String> {
             self.record(format!("session {c} {th} {title}"))

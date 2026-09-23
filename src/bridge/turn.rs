@@ -87,7 +87,7 @@ impl Bridge {
         // A hook arrived = the agent is alive and working. Re-arm the silence watch (turn start
         // and progress re-arm it — all hooks are a superset of those, and each is "evidence of activity")
         if let Some(k) = key.clone() {
-            self.touch_thread(&k, ""); // activity = lift the stall display. Unlike delivery, there's nothing new to show
+            self.touch_thread(&k, false); // activity, but no new turn: only re-arm the silence watch
         }
         // Every hook carries the transcript location — the first one sets up the receipt-check tail
         if let Some(path) = ev.payload["transcript_path"].as_str() {
@@ -373,7 +373,7 @@ impl Bridge {
                 ids.join(",")
             ),
         );
-        self.touch_thread(key, slack::TYPING_STATUS);
+        self.touch_thread(key, true);
         true
     }
 
@@ -594,7 +594,7 @@ impl Bridge {
                         continue;
                     };
                     e.shown = true;
-                    e.thinking.set(slack::THINKING_STATUS);
+                    e.thinking.set(true);
                     LogCtx {
                         session_id: None,
                         thread_key: Some(key.clone()),
@@ -817,16 +817,17 @@ impl Bridge {
         );
     }
 
-    /// A permission prompt went up = the agent goes silent **on purpose**. Stop the watch and
-    /// clear any `is thinking…` already shown (the prompt itself shows that it's waiting).
+    /// A permission prompt went up = the agent goes silent **on purpose**. Stop the watch.
+    ///
+    /// **The session stays busy.** The turn is not over — it is held at a prompt — and busy is
+    /// what keeps Slack's stop button there, which is exactly what someone wants when a prompt is
+    /// in the way. Only the silence watch stands down; the prompt itself says what it waits for.
     fn suspend_stall_for_perm(&mut self, key: &ThreadKey) {
         let Some(e) = self.stall.get_mut(key) else {
             return; // no watch for this round yet (first turn) — nothing to stop
         };
         e.awaiting_perm = true;
-        if std::mem::replace(&mut e.shown, false) {
-            e.thinking.set("");
-        }
+        e.shown = false;
     }
 
     /// A permission was settled. `rearm` = a person clicked (restart measuring silence).
@@ -837,9 +838,7 @@ impl Bridge {
             return;
         };
         e.awaiting_perm = false;
-        if std::mem::replace(&mut e.shown, false) {
-            e.thinking.set("");
-        }
+        e.shown = false;
         if rearm {
             e.last_activity_ms = self.deps.clock.now_ms();
         }

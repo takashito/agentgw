@@ -345,7 +345,7 @@ impl Bridge {
             slack::Api::brief_call(
                 "restart: thinking status set failed",
                 self.deps.slack
-                    .set_thinking_status(channel, root_ts, &slack::Status::Restart.text()),
+                    .set_busy(channel, root_ts, true),
                 ctx,
             )
             .await;
@@ -421,7 +421,7 @@ impl Bridge {
         if let Some((channel, root_ts)) = req {
             slack::Api::brief_call(
                 "restart: thinking status clear failed",
-                self.deps.slack.set_thinking_status(channel, root_ts, ""),
+                self.deps.slack.set_busy(channel, root_ts, false),
                 ctx,
             )
             .await;
@@ -1961,7 +1961,7 @@ mod tests {
         b.stall_tick();
         b.stall_tick();
         settle().await;
-        let thinking = format!("status C1 {ROOT} {}", slack::THINKING_STATUS);
+        let thinking = format!("status C1 {ROOT} busy");
         let shown = slack.calls().iter().filter(|c| **c == thinking).count();
         assert_eq!(shown, 1, "{:?}", slack.calls());
     }
@@ -2269,13 +2269,13 @@ mod tests {
         clock.advance(slack::SILENCE_MS + 1);
         b.stall_tick();
         settle().await;
-        let thinking = format!("status C1 {ROOT} {}", slack::THINKING_STATUS);
+        let thinking = format!("status C1 {ROOT} busy");
         assert!(!slack.calls().contains(&thinking), "{:?}", slack.calls());
         // …and the thread is not left looking busy. Either nothing was ever shown (a status that
         // never went up needs no clear — the guard only sends changes), or the last word was the clear
         let last_status = slack.calls().into_iter().rev().find(|c| c.starts_with("status C1"));
         assert!(
-            last_status.is_none() || last_status == Some(format!("status C1 {ROOT} ")),
+            last_status.is_none() || last_status == Some(format!("status C1 {ROOT} idle")),
             "{:?}",
             slack.calls()
         );
@@ -2631,7 +2631,7 @@ mod tests {
         settle().await;
         let calls = slack.calls();
         // The sign-in started here (the link follows after the first poll of the sign-in screen)
-        assert!(calls.iter().any(|c| c.starts_with("status C1") && c.contains("Signing in")), "{calls:?}");
+        assert!(calls.iter().any(|c| c.starts_with("status C1") && c.ends_with("busy")), "{calls:?}");
         assert!(!calls.iter().any(|c| c.contains("Already signed in")), "{calls:?}");
     }
 

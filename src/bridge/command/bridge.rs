@@ -179,7 +179,7 @@ impl Bridge {
         };
         // The report hits Slack once per thread to resolve permalinks and channel names — show a shimmer while waiting
         let thinking =
-            slack::Thinking::new(self.deps.slack.clone(), &msg.channel, root_ts, &slack::Status::Gathering.text());
+            slack::Thinking::new(self.deps.slack.clone(), &msg.channel, root_ts, true);
         let (slack, clock) = (self.deps.slack.clone(), self.deps.clock.clone());
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = clear. It goes away whichever path exits

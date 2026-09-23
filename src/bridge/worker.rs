@@ -13,7 +13,6 @@ use crate::bridge::worker;
 use crate::bridge::state as bridge;
 use crate::log::LogCtx;
 use crate::bridge::{Bridge, CmdFx, Host};
-use crate::chat::slack;
 use crate::mcp;
 use crate::agent::Agent;
 use crate::agent::WorkerState;
@@ -1266,7 +1265,7 @@ impl Bridge {
             ),
         );
         // Same as Dispatch::Deliver — show the shimmer the moment it is handed over
-        self.touch_thread(key, slack::TYPING_STATUS);
+        self.touch_thread(key, true);
         let delivered: Result<(), String> = Ok(());
 
         // The refill starts a different session — do not let it carry the assigned session_id

@@ -807,7 +807,7 @@ impl Bridge {
             && crate::bridge::command::Message::new(&msg.text, self.bot_user_id.as_deref())
                 .mentions_someone_else();
         if handed_off && msg.reaction.is_none() && !for_someone_else {
-            self.touch_thread(&key, slack::TYPING_STATUS);
+            self.touch_thread(&key, true);
         }
     }
 
@@ -890,7 +890,7 @@ impl Bridge {
         // resend after a failed turn would send the old wording again
         self.ledger.track(key, edited_ts);
         self.ledger.remember_envelope(key, edited_ts, &envelope);
-        self.touch_thread(key, slack::TYPING_STATUS);
+        self.touch_thread(key, true);
     }
 
     /// Before exiting, **save messages not yet handed over to threads.json**.
@@ -1171,7 +1171,7 @@ impl Bridge {
             ),
         );
         for key in alive {
-            self.touch_thread(&key, "");
+            self.touch_thread(&key, false);
         }
     }
 
@@ -1190,11 +1190,9 @@ impl Bridge {
     /// There was activity: re-arm the silence timer and replace the status with `status`.
     /// Idempotent.
     ///
-    /// `status` is what to show now as a result of the activity: delivery gives `is typing…`,
-    /// a hook gives `""` (clear). **The replacement is one send**: sending "show" and "clear"
-    /// separately has no ordering and they cancel each other (it really happens with a follow-up
-    /// delivery to a thread already showing `is thinking…`).
-    pub(super) fn touch_thread(&mut self, key: &ThreadKey, status: &str) {
+    /// `busy` is what the activity means for the session: a delivery hands over a turn (busy), a
+    /// hook is only evidence the agent is alive (not busy by itself).
+    pub(super) fn touch_thread(&mut self, key: &ThreadKey, busy: bool) {
         // A thread with nothing pending needs no watch: it would never fire, and the next tick
         // would just fold it as settled (wasteful for every hook that keeps coming after the answer)
         if !self.stall.contains_key(key) && self.ledger.pending(key).is_empty() {
@@ -1212,7 +1210,7 @@ impl Bridge {
                     last_activity_ms: 0,
                     shown: false,
                     awaiting_perm: false,
-                    thinking: slack::Thinking::new(self.deps.slack.clone(), &channel, &ts, ""),
+                    thinking: slack::Thinking::new(self.deps.slack.clone(), &channel, &ts, false),
                 })
             }
         };
@@ -1223,8 +1221,8 @@ impl Bridge {
         // blinked through the whole turn). A turn ends where it always ended — the entry is
         // dropped, and its guard sends the clear from the tail of the queue
         e.shown = false;
-        if !status.is_empty() {
-            e.thinking.set(status);
+        if busy {
+            e.thinking.set(true);
         }
     }
 
@@ -1425,7 +1423,7 @@ impl Bridge {
                         done.msg_ts, channel
                     ),
                 );
-                self.touch_thread(&done.key, slack::TYPING_STATUS);
+                self.touch_thread(&done.key, true);
                 // Next in line for this window
                 self.start_delivery(&done.window.clone(), &done.key.clone(), &root_ts, &ctx);
             }

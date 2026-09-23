@@ -2262,6 +2262,12 @@ mod tests {
     }
 
     /// A `Claude` whose screen can be swapped per call, and a record of the keys sent.
+    /// The watch has no early exit — it polls until its budget runs out, so the budget **is** how
+    /// long these tests take. It used to be 30ms, which is not a budget but a coin flip: on a busy
+    /// machine the runtime got through one poll of three and the test failed (four times in one
+    /// afternoon). A tenth of a second is still cheap and leaves room for a loaded machine.
+    const WATCH_MS: u64 = 300;
+
     fn claude_showing(
         panes: Vec<&'static str>,
     ) -> (std::sync::Arc<std::sync::Mutex<Vec<String>>>, Claude) {
@@ -2337,7 +2343,7 @@ mod tests {
         use crate::agent::screen::tests::{TRUST_PANE_NO_FIRST, TRUST_PANE_YES_SECOND};
         let (keys, c) = claude_showing(vec![TRUST_PANE_NO_FIRST, TRUST_PANE_YES_SECOND, ""]);
         let out = c
-            .watch_spawn_screens(&Window::of("1-1"), 30, 1, &LogCtx::default())
+            .watch_spawn_screens(&Window::of("1-1"), WATCH_MS, 1, &LogCtx::default())
             .await;
         assert_eq!(out, SpawnOutcome::Answered);
         let keys = keys.lock().unwrap();
@@ -2350,7 +2356,7 @@ mod tests {
         // Even if the same screen shows twice, Enter only once
         let (keys, c) = claude_showing(vec![TRUST_PANE, TRUST_PANE, ""]);
         let out = c
-            .watch_spawn_screens(&Window::of("1-1"), 30, 1, &LogCtx::default())
+            .watch_spawn_screens(&Window::of("1-1"), WATCH_MS, 1, &LogCtx::default())
             .await;
         assert_eq!(out, SpawnOutcome::Answered);
         let keys = keys.lock().unwrap();
@@ -2365,7 +2371,7 @@ mod tests {
     async fn the_login_screen_aborts_the_watch_without_pressing_anything() {
         let (keys, c) = claude_showing(vec![LOGIN_PANE]);
         let out = c
-            .watch_spawn_screens(&Window::of("1-1"), 30, 1, &LogCtx::default())
+            .watch_spawn_screens(&Window::of("1-1"), WATCH_MS, 1, &LogCtx::default())
             .await;
         assert_eq!(out, SpawnOutcome::LoginRequired);
         // A screen Enter does not clear — firing would send the input box's contents, so do not fire
@@ -2398,7 +2404,7 @@ mod tests {
     async fn a_quiet_pane_runs_out_the_budget_and_says_so() {
         let (keys, c) = claude_showing(vec!["still booting\u{2026}"]);
         let out = c
-            .watch_spawn_screens(&Window::of("1-1"), 20, 1, &LogCtx::default())
+            .watch_spawn_screens(&Window::of("1-1"), WATCH_MS, 1, &LogCtx::default())
             .await;
         assert_eq!(out, SpawnOutcome::NoScreen);
         assert!(keys.lock().unwrap().is_empty());
@@ -2409,7 +2415,7 @@ mod tests {
         // Answering confirm does not mean "started". The latch is cleared by user_prompt
         let (keys, c) = claude_showing(vec!["Yes, proceed with local development", TRUST_PANE, ""]);
         let out = c
-            .watch_spawn_screens(&Window::of("1-1"), 30, 1, &LogCtx::default())
+            .watch_spawn_screens(&Window::of("1-1"), WATCH_MS, 1, &LogCtx::default())
             .await;
         assert_eq!(out, SpawnOutcome::Answered);
         let keys = keys.lock().unwrap();

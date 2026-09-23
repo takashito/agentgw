@@ -478,7 +478,7 @@ impl Api {
         Ok(res.permalink.to_string())
     }
 
-    /// Mark the thread's session busy or idle. **An empty string means idle.**
+    /// Mark the thread's session busy or idle.
     ///
     /// Slack draws this one itself: while a session is `processing` it shows its own "working"
     /// indicator and, because the app subscribes to `agent_session_stopped`, a stop button next to
@@ -486,15 +486,13 @@ impl Api {
     /// status of "is checking the plumbing…" came out as "Claude is working…"), so the text that
     /// callers pass only decides busy from idle.
     ///
-    /// ponytail: that leaves [`Status`]'s wordings as prose nobody reads. Delete them once it is
-    /// clear Slack will not take a status line again — keeping them costs one `&str` per call.
-    pub async fn set_thinking_status(
-        &self,
-        channel: &str,
-        thread_ts: &str,
-        status: &str,
-    ) -> Result<(), String> {
-        let req = SlackApiAgentsSessionsSetStatusRequest::new(session_status(status))
+    pub async fn set_busy(&self, channel: &str, thread_ts: &str, busy: bool) -> Result<(), String> {
+        let status = if busy {
+            SlackAgentSessionStatus::Processing
+        } else {
+            SlackAgentSessionStatus::Active
+        };
+        let req = SlackApiAgentsSessionsSetStatusRequest::new(status)
             .with_channel_id(channel.into())
             .with_thread_ts(thread_ts.into());
         self.client
@@ -822,16 +820,6 @@ impl Api {
     }
 }
 
-/// Busy or idle, from the status line a caller wanted to show. Empty is the caller's way of
-/// saying "nothing in flight", which is what closes Slack's working indicator and its stop button.
-fn session_status(status: &str) -> SlackAgentSessionStatus {
-    if status.is_empty() {
-        SlackAgentSessionStatus::Active
-    } else {
-        SlackAgentSessionStatus::Processing
-    }
-}
-
 /// The name for a thread's agent session, or `None` when nothing usable is left.
 ///
 /// **Slack checks a session title the way it checks a channel name** (measured 2026-09-22:
@@ -878,19 +866,15 @@ fn without_markup(text: &str) -> String {
 impl dyn Chat {
     /// Send one assistant status call and log it. **best-effort, but never silent** —
     /// both success and failure are logged. Not blocking the caller is the caller's responsibility.
-    pub async fn thinking(&self, channel: &str, thread_ts: &str, status: &str) {
+    pub async fn busy(&self, channel: &str, thread_ts: &str, busy: bool) {
         let ctx = LogCtx {
             session_id: None,
             thread_key: Some(ThreadKey::new(channel, thread_ts)),
         };
-        let what = if status.is_empty() {
-            "cleared".to_string()
-        } else {
-            format!("set \"{status}\"")
-        };
-        match self.set_thinking_status(channel, thread_ts, status).await {
-            Ok(()) => ctx.debug("bridge", &format!("thinking status {what}")),
-            Err(e) => ctx.debug("bridge", &format!("thinking status {what} failed: {e}")),
+        let what = if busy { "busy" } else { "idle" };
+        match self.set_busy(channel, thread_ts, busy).await {
+            Ok(()) => ctx.debug("bridge", &format!("session {what}")),
+            Err(e) => ctx.debug("bridge", &format!("session {what} failed: {e}")),
         }
     }
 
@@ -1050,13 +1034,8 @@ impl crate::chat::Chat for Api {
     ) -> Result<(), String> {
         Api::upload_file(self, channel, thread_ts, path).await
     }
-    async fn set_thinking_status(
-        &self,
-        channel: &str,
-        thread_ts: &str,
-        status: &str,
-    ) -> Result<(), String> {
-        Api::set_thinking_status(self, channel, thread_ts, status).await
+    async fn set_busy(&self, channel: &str, thread_ts: &str, busy: bool) -> Result<(), String> {
+        Api::set_busy(self, channel, thread_ts, busy).await
     }
     async fn start_session(
         &self,
@@ -1669,63 +1648,9 @@ pub fn perm_click_from_relay(
     })
 }
 
-// ── Wording of the assistant status (pinned in `tests`).
-// Any empty string clears it, so there is no "clear" constant here.
-
-/// Right after delivery / on returning to a thread.
-pub const TYPING_STATUS: &str = "is typing…";
-/// When a turn has been silent past [`SILENCE_MS`] (`THINKING_STATUS`).
-pub const THINKING_STATUS: &str = "is thinking…";
 /// How long before we treat it as silent. The Bun version defaulted to 5s,
 /// but **the Rust version uses 3s** (user decision 2026-07-31 — thinking took too long to come back after a tool ran).
 pub const SILENCE_MS: u64 = 3_000;
-/// Slack's "…ing" status line. Use as `thinking.set(&Status::Login.text())`.
-///
-/// There is **deliberately no** dedicated status for `compact` (a user decision).
-/// The earlier implementation showed a "compacting context…" status during compact and re-set it with `… {n}s` on every
-/// tick. The Rust version drops this — compact posts a progress checklist (sticky) and keeps
-/// editing it, so a shimmer on top would be redundant (**not a porting omission**).
-/// Delivery's `is typing…` and silence's `is thinking…` still show during compact as before.
-#[derive(Clone, Copy, Debug)]
-pub enum Status {
-    /// `status`.
-    Gathering,
-    /// `context`.
-    Context,
-    /// `usage`.
-    Usage,
-    /// `model`.
-    Model,
-    /// `effort <level>`.
-    Effort,
-    /// Shimmer shown only while in `mode <name>`.
-    Mode,
-    /// `login` — newly worded to match the tone above.
-    Login,
-    /// `logout` — same (new).
-    Logout,
-    /// `resume` — same (new).
-    Resume,
-    /// `restart` — same (new).
-    Restart,
-}
-
-impl Status {
-    pub fn text(self) -> String {
-        match self {
-            Status::Gathering => crate::t!("Gathering…", "集計中…"),
-            Status::Context => crate::t!("Checking the context…", "コンテキストを確認中…"),
-            Status::Usage => crate::t!("Checking usage…", "使用状況を確認中…"),
-            Status::Model => crate::t!("Switching the model…", "モデルを切り替え中…"),
-            Status::Effort => crate::t!("Setting the effort level…", "effort を設定中…"),
-            Status::Mode => crate::t!("Switching the permission mode…", "権限モードを切り替え中…"),
-            Status::Login => crate::t!("Signing in…", "サインイン中…"),
-            Status::Logout => crate::t!("Signing out…", "サインアウト中…"),
-            Status::Resume => crate::t!("Resuming the thread…", "スレッドを再開中…"),
-            Status::Restart => crate::t!("Restarting…", "再起動中…"),
-        }
-    }
-}
 
 // ── In-progress status (shimmer) — where the Bridge shows "thinking" ────────────
 
@@ -1745,11 +1670,11 @@ impl Status {
 /// catches the rest, so **it never gets stuck** — at worst "the agent's shimmer disappears
 /// during the command". Fix it once a shared per-thread-key registry (Arc/Weak + cleanup)
 /// is worth threading through the 10 places that create a guard
-pub struct Thinking(tokio::sync::mpsc::UnboundedSender<String>);
+pub struct Thinking(tokio::sync::mpsc::UnboundedSender<bool>);
 
 impl Thinking {
-    pub fn new(api: crate::chat::ChatRef, channel: &str, thread_ts: &str, status: &str) -> Self {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    pub fn new(api: crate::chat::ChatRef, channel: &str, thread_ts: &str, busy: bool) -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<bool>();
         let (channel, thread_ts) = (channel.to_string(), thread_ts.to_string());
         tokio::spawn(async move {
             // **Only changes go out.** Slack draws the busy state itself now, so two "is typing…"
@@ -1757,34 +1682,33 @@ impl Thinking {
             // 800ms. A thread starts idle, so a guard that never showed anything sends nothing on
             // Drop either
             let mut sent = false;
-            while let Some(s) = rx.recv().await {
-                let busy = !s.is_empty();
+            while let Some(busy) = rx.recv().await {
                 if busy == sent {
                     continue;
                 }
                 sent = busy;
-                api.thinking(&channel, &thread_ts, &s).await;
+                api.busy(&channel, &thread_ts, busy).await;
             }
         });
         let t = Self(tx);
-        // Created with an empty string, it **sends nothing** (for cases like the `Stall` send path, "set up the channel first,
-        // the caller decides what to show"). Nothing has been shown yet, so no wasted clear
-        // either. The clear on Drop always goes out regardless of status
-        if !status.is_empty() {
-            t.set(status);
+        // Created idle, it **sends nothing** (for cases like the `Stall` send path, "set up the
+        // channel first, the caller decides when it goes busy"). Nothing has been shown yet, so
+        // Drop has nothing to take down either
+        if busy {
+            t.set(true);
         }
         t
     }
 
-    /// Re-set (Slack expires the status after a short time — used by the compact tick).
-    pub fn set(&self, status: &str) {
-        let _ = self.0.send(status.to_string());
+    /// Busy while a turn is in flight, idle when it is over.
+    pub fn set(&self, busy: bool) {
+        let _ = self.0.send(busy);
     }
 }
 
 impl Drop for Thinking {
     fn drop(&mut self) {
-        self.set(""); // empty string = clear. Just send it — the serial task sends in order
+        self.set(false); // idle. Just send it — the serial task sends in order
     }
 }
 
@@ -1964,15 +1888,6 @@ impl SlackId {
 
 #[cfg(test)]
 mod tests {
-
-    /// The empty status is what ends a turn on screen: it closes the working indicator and takes
-    /// the stop button with it. Anything else means a turn is in flight.
-    #[test]
-    fn an_empty_status_is_the_idle_one() {
-        assert_eq!(session_status(""), SlackAgentSessionStatus::Active);
-        assert_eq!(session_status(THINKING_STATUS), SlackAgentSessionStatus::Processing);
-        assert_eq!(session_status(TYPING_STATUS), SlackAgentSessionStatus::Processing);
-    }
 
     /// Slack's native stop button on a session. Measured shape: `channel`, `thread_ts`, `user`, `event_ts`.
     #[test]
