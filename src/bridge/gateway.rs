@@ -1587,6 +1587,71 @@ pub fn route_of(id: &str, tunnels: &Tunnels) -> String {
     }
 }
 
+/// One line of the `machines` table.
+struct MachineRow {
+    id: String,
+    host: String,
+    ip: String,
+    /// How the gateway reaches it: `direct`, `ssh tunnel (…)`, or `gateway` for ourselves
+    link: String,
+    online: bool,
+    /// Why the tunnel is down. Kept out of the table — a long reason pulls the columns apart
+    down: Option<String>,
+}
+
+/// The `machines` answer as a standard-Markdown table (so it must go out with `post_markdown`).
+/// **Pure function** — the caller does the I/O.
+fn machines_md(rows: &[MachineRow]) -> String {
+    let cell = |s: &str| match s.is_empty() {
+        true => String::new(),
+        false => format!("`{s}`"),
+    };
+    let mut out = vec![
+        crate::t!("**Machines**", "**マシン**"),
+        String::new(),
+        crate::t!(
+            "| machine | host | address | link | status |",
+            "| マシン | ホスト | アドレス | つなぎ方 | 状態 |"
+        ),
+        "|---|---|---|---|---|".to_string(),
+    ];
+    for r in rows {
+        // Nothing at all to say about where it is — the one case that isn't a code span
+        let host = match (r.host.is_empty(), r.ip.is_empty()) {
+            (true, true) => crate::t!("(not known here)", "(こちらでは分かりません)"),
+            _ => cell(&r.host),
+        };
+        let (id, ip, link) = (cell(&r.id), cell(&r.ip), &r.link);
+        let state = match r.online {
+            true => "🟢",
+            false => "🔴",
+        };
+        out.push(format!("| {id} | {host} | {ip} | {link} | {state} |"));
+    }
+    // Only ourselves in the table
+    if rows.len() == 1 {
+        out.push(String::new());
+        out.push(crate::t!(
+            "(no machines yet — run `agentgw add-machine user@host` here)",
+            "(マシンはまだありません。ここで `agentgw add-machine user@host` を実行してください)"
+        ));
+    }
+    let mut down: Vec<String> = Vec::new();
+    for r in rows {
+        let Some(why) = &r.down else { continue };
+        let id = cell(&r.id);
+        down.push(crate::t!(
+            "{id} — the ssh tunnel is down: {why}",
+            "{id} — ssh トンネルがつながっていません: {why}"
+        ));
+    }
+    if !down.is_empty() {
+        out.push(String::new());
+        out.extend(down);
+    }
+    out.join("\n")
+}
+
 /// Plain-text rendering of the fleet section of `status`. **Pure function** — the caller does the I/O.
 ///
 /// `connected` is `None` = the running Bridge didn't answer (= it's not running). Even then the route table
@@ -1749,52 +1814,42 @@ impl Fleet {
         names.sort();
         names.dedup();
 
-        let where_ = |host: &str, ip: &str| match (host.is_empty(), ip.is_empty()) {
-            (true, true) => crate::t!("(not known here)", "(こちらでは分かりません)"),
-            (false, true) => format!("`{host}`"),
-            (true, false) => format!("`{ip}`"),
-            (false, false) => format!("`{host}` (`{ip}`)"),
-        };
-        let me = &self.self_id;
-        let me_where = where_(&me_host, &me_ip);
-        let mut lines = vec![
-            crate::t!("*Gateway*", "*ゲートウェイ*"),
-            crate::t!("machine id: `{me}`", "マシン: `{me}`"),
-            crate::t!("host: {me_where}", "ホスト: {me_where}"),
-            String::new(),
-            crate::t!("*Machines*", "*マシン*"),
-        ];
-        if names.is_empty() {
-            lines.push(crate::t!(
-                "(none yet — run `agentgw add-machine user@host` here)",
-                "(まだありません。ここで `agentgw add-machine user@host` を実行してください)"
-            ));
-        }
-        for (i, id) in names.iter().enumerate() {
-            if i > 0 {
-                lines.push(String::new());
-            }
+        // The gateway is a row like any other — it just has no route to itself
+        let mut rows = vec![MachineRow {
+            id: self.self_id.clone(),
+            host: me_host,
+            ip: me_ip,
+            link: crate::t!("gateway", "ゲートウェイ"),
+            online: true,
+            down: None,
+        }];
+        for id in &names {
             let (host, ip) = hosts.get(id).cloned().unwrap_or_default();
-            let online = connected.iter().any(|c| c == id);
-            let state = match online {
-                true => crate::t!("🟢 online", "🟢 オンライン"),
-                false => crate::t!("🔴 offline", "🔴 オフライン"),
-            };
             // A machine behind an ssh tunnel dials its own loopback, so loopback is the interface it
             // names. What reaches *it* is the gateway's ssh target, which only the gateway knows
-            let reachable = match (ip.starts_with("127."), tunnels.get(id)) {
-                (true, Some(t)) => where_(ssh_host_of(&t.target), ""),
+            let (host, ip) = match (ip.starts_with("127."), tunnels.get(id)) {
+                (true, Some(t)) => (ssh_host_of(&t.target).to_string(), String::new()),
                 // What this resolver calls the address wins over what the machine calls itself
-                _ => where_(&name_here(&ip).await.unwrap_or(host), &ip),
+                _ => (name_here(&ip).await.unwrap_or(host), ip),
             };
             // How the gateway gets to it: a tunnel it opened itself (and knows), or straight there
-            let route = route_of(id, &tunnels);
-            lines.push(crate::t!("machine id: `{id}`", "マシン: `{id}`"));
-            lines.push(crate::t!("host: {reachable}", "ホスト: {reachable}"));
-            lines.push(crate::t!("link: {route}", "つなぎ方: {route}"));
-            lines.push(crate::t!("status: {state}", "状態: {state}"));
+            let (link, down) = match tunnels.get(id) {
+                None => (crate::t!("direct", "直結"), None),
+                Some(Tunnel { target, error }) => (
+                    crate::t!("ssh tunnel ({target})", "ssh トンネル({target})"),
+                    error.clone(),
+                ),
+            };
+            rows.push(MachineRow {
+                id: id.clone(),
+                host,
+                ip,
+                link,
+                online: connected.iter().any(|c| c == id),
+                down,
+            });
         }
-        lines.join("\n")
+        machines_md(&rows)
     }
 
     /// The `channels` table. **`machines()` and not `links.connected()`**: the gateway is a machine too,
@@ -2271,7 +2326,14 @@ impl Fleet {
                 thread_ts,
             } => {
                 let table = self.machines_table().await;
-                self.post(&channel, Some(&thread_ts), &table).await;
+                // A table only renders in a `markdown` block — mrkdwn has no table syntax
+                if let Err(e) = self
+                    .api
+                    .post_markdown(&channel, &table, Some(&thread_ts))
+                    .await
+                {
+                    rlog("error", &format!("could not post to {channel}: {e}"));
+                }
             }
             link::LinkFrame::SetHome {
                 channel,
@@ -4216,6 +4278,43 @@ mod tests {
         assert!(out.contains("● Machines connected — 1"), "{out}");
         assert!(out.contains("#dev (C1) → desktop  ● online"), "{out}");
         assert!(out.contains("C2 → laptop  ○ offline"), "{out}"); // the raw id if the name can't be looked up
+    }
+
+    #[test]
+    fn the_machines_table_keeps_a_broken_tunnel_out_of_the_columns() {
+        let row = |id: &str, host: &str, ip: &str, link: &str, online, down: Option<&str>| {
+            MachineRow {
+                    id: id.into(),
+                host: host.into(),
+                ip: ip.into(),
+                link: link.into(),
+                online,
+                down: down.map(str::to_string),
+            }
+        };
+        let out = machines_md(&[
+            row("dock", "dock.lan", "", "gateway", true, None),
+            row("pve", "pve.ts.net", "100.89.207.102", "direct", true, None),
+            row("mac", "", "", "ssh tunnel (me@mac)", false, Some("connection refused")),
+        ]);
+        assert!(out.contains("| `dock` | `dock.lan` |  | gateway | 🟢 |"), "{out}");
+        assert!(
+            out.contains("| `pve` | `pve.ts.net` | `100.89.207.102` | direct | 🟢 |"),
+            "{out}"
+        );
+        // Nothing known about where it is, and the reason it is down stays below the table
+        assert!(
+            out.contains("| `mac` | (not known here) |  | ssh tunnel (me@mac) | 🔴 |"),
+            "{out}"
+        );
+        assert!(!out.contains("| ssh tunnel (me@mac) — "), "{out}");
+        assert!(
+            out.ends_with("`mac` — the ssh tunnel is down: connection refused"),
+            "{out}"
+        );
+        // A lone gateway says how to add one
+        let alone = machines_md(&[row("dock", "dock.lan", "", "gateway", true, None)]);
+        assert!(alone.contains("agentgw add-machine user@host"), "{alone}");
     }
 
     /// Don't mix up **not running** with **not configured** — the route table is shown either way.
