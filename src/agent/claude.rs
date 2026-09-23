@@ -1162,6 +1162,52 @@ impl crate::agent::Agent for Claude {
     fn workdir_exists(&self, path: &str) -> bool {
         std::path::Path::new(path).is_dir()
     }
+    fn remove_worktree(&self, path: &str) -> Option<Result<(), String>> {
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-C", path])
+                .args(args)
+                .output()
+                .ok()?;
+            out.status
+                .success()
+                .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        };
+        // **Resolve both before comparing.** `--git-common-dir` answers relative to the directory
+        // asked (a plain `.git` inside a checkout) while `--absolute-git-dir` never does, so comparing
+        // the two strings calls every checkout a worktree — and would hand the project itself to
+        // `worktree remove`. Canonicalising settles the symlinks on the way (`/tmp` is one on macOS).
+        let resolve = |p: &str| {
+            let named = std::path::Path::new(p);
+            let abs = if named.is_absolute() {
+                named.to_path_buf()
+            } else {
+                std::path::Path::new(path).join(named)
+            };
+            std::fs::canonicalize(abs).ok()
+        };
+        let own = resolve(&git(&["rev-parse", "--absolute-git-dir"])?)?;
+        let shared = resolve(&git(&["rev-parse", "--git-common-dir"])?)?;
+        if own == shared {
+            return None; // the checkout itself — never ours to remove
+        }
+        // Run it from the checkout the worktree belongs to: git refuses to remove the worktree it is
+        // standing in. `--force` is deliberately absent, so one with work in it comes back as Err.
+        let main = shared.parent()?.to_path_buf();
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&main)
+            .args(["worktree", "remove", path])
+            .output()
+            .map_err(|e| e.to_string());
+        Some(out.and_then(|o| {
+            if o.status.success() {
+                Ok(())
+            } else {
+                Err(String::from_utf8_lossy(&o.stderr).trim().to_string())
+            }
+        }))
+    }
     fn session_history_exists(&self, remembered: Option<&str>, session_id: &str) -> bool {
         Transcript::locate(remembered, session_id).is_some()
     }
@@ -1355,17 +1401,27 @@ impl Transcript {
         Some(String::from_utf8_lossy(&buf[..end]).into_owned())
     }
 
-    /// The `cwd` in the **first line** = where the agent actually ran. Only the first line is read because
-    /// this JSONL grows to several MB (do not stall the main loop).
+    /// Where the agent is working **now**: the `cwd` of the last entry that carries one.
+    ///
+    /// **Read from the end, not the start.** Every entry carries the directory the agent was in when
+    /// it was written, and one that enters a worktree keeps writing to the same file from its new
+    /// place — so the last is where it is, and the first is only where it began.
+    ///
+    /// Reading the first line alone used to be the whole of this function, on the grounds that the
+    /// file grows to several MB. It stopped working: a transcript now opens with bookkeeping entries
+    /// (`last-prompt`, `queue-operation`, `mode`) carrying no `cwd` at all, so it returned `None` for
+    /// every transcript measured on a real machine (20 of 20, 2026-09-23), and `resume` had been
+    /// quietly falling back to the recorded repo path ever since.
+    ///
+    /// The tail keeps the original promise — a fixed read, never the whole file.
     pub fn cwd(&self) -> Option<String> {
-        use std::io::BufRead;
-        let mut line = String::new();
-        std::io::BufReader::new(std::fs::File::open(&self.path).ok()?)
-            .read_line(&mut line)
-            .ok()?;
-        serde_json::from_str::<serde_json::Value>(&line).ok()?["cwd"]
-            .as_str()
-            .map(str::to_string)
+        let tail = self.tail(ACTIVITY_TAIL).ok()?;
+        // Backwards, whole entries only: a tail's first line is usually cut in half, and a
+        // half-parsed one is simply skipped
+        tail.lines().rev().find_map(|l| {
+            let entry: serde_json::Value = serde_json::from_str(l).ok()?;
+            entry.get("cwd")?.as_str().map(str::to_string)
+        })
     }
 
     /// Modification time (epoch ms). None if unreadable.
@@ -1706,6 +1762,7 @@ impl HookIntake {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::Agent;
     use crate::agent::SessionId;
     use crate::agent::screen::tests::{LOGIN_PANE, TRUST_PANE};
 
@@ -2494,5 +2551,68 @@ mod tests {
             Some(at + 3_600_000)
         );
         assert!(Transcript::limit_hit(&no_time, at + 2 * 3_600_000).is_none());
+    }
+
+    /// **Against real git, because git's own answer is the thing being relied on.** A fake would only
+    /// repeat the belief under test: that a worktree and the checkout it belongs to can be told apart,
+    /// and that removal refuses when work would be lost.
+    ///
+    /// The checkout case is the one that matters. Getting it wrong deletes the project. It was already
+    /// wrong once — the two git answers are not both absolute, and comparing them as strings made
+    /// every checkout look like a worktree.
+    #[test]
+    fn a_worktree_comes_down_but_the_checkout_it_belongs_to_never_does() {
+        let base = std::env::temp_dir().join(format!("agentgw-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.email", "t@example.com"]);
+        git(&repo, &["config", "user.name", "T"]);
+        std::fs::write(repo.join("a.txt"), "a").unwrap();
+        git(&repo, &["add", "a.txt"]);
+        git(&repo, &["commit", "-qm", "first"]);
+
+        // Nothing here goes near tmux — it only shells out to git
+        let claude = quiet();
+        let at = |p: &std::path::Path| p.to_str().unwrap().to_string();
+
+        // The checkout itself: not a worktree, and nothing is touched
+        assert!(
+            claude.remove_worktree(&at(&repo)).is_none(),
+            "called the checkout a worktree"
+        );
+        assert!(repo.join("a.txt").exists(), "the checkout was disturbed");
+        // Somewhere that is no repository at all
+        assert!(claude.remove_worktree(&at(&base)).is_none());
+
+        // A clean worktree comes down
+        let clean = base.join("clean");
+        git(&repo, &["worktree", "add", "-q", "-b", "clean", clean.to_str().unwrap()]);
+        assert!(matches!(claude.remove_worktree(&at(&clean)), Some(Ok(()))));
+        assert!(!clean.exists(), "it said it removed the worktree and did not");
+
+        // One with work in it is refused, and left where it is
+        let dirty = base.join("dirty");
+        git(&repo, &["worktree", "add", "-q", "-b", "dirty", dirty.to_str().unwrap()]);
+        std::fs::write(dirty.join("unsaved.txt"), "work").unwrap();
+        assert!(matches!(claude.remove_worktree(&at(&dirty)), Some(Err(_))));
+        assert!(dirty.join("unsaved.txt").exists(), "unsaved work was destroyed");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

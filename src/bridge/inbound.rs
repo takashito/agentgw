@@ -986,6 +986,12 @@ impl Bridge {
                     sid.as_deref().unwrap_or("none")
                 ),
             );
+            // Where it was working, read **before** the record goes: if that was a worktree it goes
+            // with the conversation, and afterwards there is nothing left to ask
+            let workdir = sid.as_deref().and_then(|s| {
+                let remembered = self.workers.warm(s).and_then(|h| h.transcript_path.clone());
+                self.deps.agent.session_cwd(remembered.as_deref(), s)
+            });
             // **The thread itself goes first**, unlike every other teardown: `terminate` keeps the
             // entry so the next message can `--resume`, and here there will never be a next message.
             // Dropping it before the teardown also lets that log line say which ending it was
@@ -994,6 +1000,10 @@ impl Bridge {
                 ctx.error("bridge", &format!("threads.json save failed: {e}"));
             }
             self.terminate(key, sid.as_deref(), None).await;
+            // After the teardown, never before: until then the agent still holds that directory open
+            if let Some(dir) = workdir {
+                self.remove_thread_worktree(&dir, ctx).await;
+            }
             // Nothing may be posted into it later either
             self.awaiting_receipt.retain(|_, (k, _)| k != key);
             return;
@@ -1040,6 +1050,34 @@ impl Bridge {
         }
         // A cancelled request is not pending (take it off the watch)
         self.ledger.disposed(key, &[deleted.to_string()]);
+    }
+
+    /// Take the worktree down with the conversation that was using it.
+    ///
+    /// **Deleting a thread is a person saying the work is over**, so the checkout it was done in can
+    /// go too. Only a worktree, though: an agent usually works in the repository itself, and the
+    /// agent answers `None` for that — which is why nothing here decides it.
+    ///
+    /// A refusal means work still lives there. The thread that would have been told is the very one
+    /// that was deleted, so it goes to the home notice instead; left silent, the folder would sit on
+    /// disk with nobody aware of it.
+    async fn remove_thread_worktree(&self, dir: &str, ctx: &LogCtx) {
+        match self.deps.agent.remove_worktree(dir) {
+            None => {}
+            Some(Ok(())) => ctx.info("bridge", &format!("worktree removed with its thread: {dir}")),
+            Some(Err(why)) => {
+                ctx.info("bridge", &format!("worktree kept at {dir}: {why}"));
+                let text = crate::t!(
+                    "A deleted thread left work behind in its worktree, so I kept it:\n`{}`\n\
+                     Remove it with `git worktree remove --force {}` when you are done with it.",
+                    "消えたスレッドの作業場に作業が残っていたので、残しました:\n`{}`\n\
+                     要らなくなったら `git worktree remove --force {}` で消せます。",
+                    dir,
+                    dir,
+                );
+                self.post_notice(&text, ctx).await;
+            }
+        }
     }
 
     /// Queue a termination. No second one for the same thread: it would try to kill the same

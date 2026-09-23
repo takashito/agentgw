@@ -2138,6 +2138,80 @@ mod tests {
         assert!(b.threads.get(ROOT).is_none(), "the thread stayed on the books");
     }
 
+    /// **The worktree goes with the conversation that was using it.** Deleting the thread is a person
+    /// saying the work is over, and nothing ever comes back for that checkout.
+    #[tokio::test]
+    async fn deleting_the_thread_root_takes_its_worktree() {
+        let (d, _slack, agent, _clock) = flow_deps("root-deleted-worktree");
+        let ((mut b, _fx), _deliv) = Bridge::for_test_with_deliveries(d);
+        running_thread(&mut b, &agent).await;
+        let wt = "/repo/.claude/worktrees/feat/thing";
+        *agent.cwd.lock().unwrap() = Some(wt.into());
+        agent.worktrees.lock().unwrap().push(wt.into());
+
+        let mut gone = in_thread(ROOT, "");
+        gone.ts = ROOT.into();
+        gone.deleted_ts = Some(ROOT.into());
+        b.on_inbound(&gone).await;
+
+        assert_eq!(
+            *agent.removed_worktrees.lock().unwrap(),
+            vec![wt.to_string()],
+            "the worktree outlived the thread"
+        );
+    }
+
+    /// **Never the checkout the work was done in.** An agent usually works in the repository itself,
+    /// and that is the one directory removal must never reach — the agent answers `None` for it.
+    #[tokio::test]
+    async fn deleting_the_thread_root_leaves_a_plain_checkout_alone() {
+        let (d, _slack, agent, _clock) = flow_deps("root-deleted-checkout");
+        let ((mut b, _fx), _deliv) = Bridge::for_test_with_deliveries(d);
+        running_thread(&mut b, &agent).await;
+        // The repository itself: never registered as a worktree, so `remove_worktree` says None
+        *agent.cwd.lock().unwrap() = Some("/repo".into());
+
+        let mut gone = in_thread(ROOT, "");
+        gone.ts = ROOT.into();
+        gone.deleted_ts = Some(ROOT.into());
+        b.on_inbound(&gone).await;
+
+        assert!(
+            agent.removed_worktrees.lock().unwrap().is_empty(),
+            "the checkout itself was removed"
+        );
+    }
+
+    /// **Work left in the worktree keeps it, and someone is told.** git's refusal is the whole safety
+    /// check. The thread that would have carried the news is the one that was deleted, so it goes to
+    /// the home notice — otherwise the folder sits there with nobody aware of it.
+    #[tokio::test]
+    async fn a_worktree_with_work_in_it_is_kept_and_reported() {
+        let (d, slack, agent, _clock) = flow_deps("root-deleted-dirty");
+        let ((mut b, _fx), _deliv) = Bridge::for_test_with_deliveries(d);
+        running_thread(&mut b, &agent).await;
+        let wt = "/repo/.claude/worktrees/feat/unfinished";
+        *agent.cwd.lock().unwrap() = Some(wt.into());
+        agent.worktrees.lock().unwrap().push(wt.into());
+        agent.dirty_worktrees.lock().unwrap().push(wt.into());
+
+        let mut gone = in_thread(ROOT, "");
+        gone.ts = ROOT.into();
+        gone.deleted_ts = Some(ROOT.into());
+        b.on_inbound(&gone).await;
+        settle().await;
+
+        assert!(
+            agent.removed_worktrees.lock().unwrap().is_empty(),
+            "removed a worktree git had refused"
+        );
+        assert!(
+            slack.calls().iter().any(|c| c.contains(wt)),
+            "kept it and told nobody: {:?}",
+            slack.calls()
+        );
+    }
+
     /// **A body that turns up nowhere is told once, and never typed in again.** Delivery stopped
     /// judging submission by the screen (a busy TUI is only slow, not stuck), so the ledger is what
     /// stands between a body that never got in and silence. Retyping is the other half of the lesson:

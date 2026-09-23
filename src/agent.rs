@@ -490,6 +490,16 @@ pub trait Agent: Send + Sync + 'static {
     /// Whether `path` is a folder an agent can start in on this machine. tmux doesn't say when it
     /// isn't — it quietly starts in the home directory instead.
     fn workdir_exists(&self, path: &str) -> bool;
+    /// Take down the worktree an agent was working in, once its conversation is gone for good.
+    ///
+    /// **`None` means `path` is not a worktree** — the checkout itself, or no checkout at all — and
+    /// nothing was touched. That is the case this call exists to tell apart: an agent usually works
+    /// in the repository itself, and removing *that* would take the project with it.
+    ///
+    /// `Some(Err)` means it is one and git refused, because work lives there that removal would
+    /// destroy. The message is git's own. **The refusal is the safety check** — there is no second
+    /// one here, and nothing forces past it.
+    fn remove_worktree(&self, path: &str) -> Option<Result<(), String>>;
     fn last_activity_ms(&self, remembered: Option<&str>, session_id: &str) -> Option<u64>;
     fn current_model(
         &self,
@@ -570,6 +580,16 @@ pub mod fake {
         pub fail_spawn: std::sync::atomic::AtomicBool,
         /// Folders `workdir_exists` says are missing (every other folder exists).
         pub missing_dirs: Mutex<Vec<String>>,
+        /// What `session_cwd` answers for every session. Unset means the agent's whereabouts
+        /// cannot be read, as they cannot be before it has written anything.
+        pub cwd: Mutex<Option<String>>,
+        /// Folders `remove_worktree` treats as worktrees. Anything else answers `None` (= the
+        /// checkout itself), which is what an agent working in the repository looks like.
+        pub worktrees: Mutex<Vec<String>>,
+        /// Worktrees that refuse removal, as git does when work would be lost.
+        pub dirty_worktrees: Mutex<Vec<String>>,
+        /// Folders `remove_worktree` was asked to take down and did.
+        pub removed_worktrees: Mutex<Vec<String>>,
         windows: Mutex<Vec<WindowRow>>,
         next: AtomicU64,
     }
@@ -678,13 +698,23 @@ pub mod fake {
             Some(true)
         }
         fn session_cwd(&self, _r: Option<&str>, _s: &str) -> Option<String> {
-            None
+            self.cwd.lock().unwrap().clone()
         }
         fn session_history_exists(&self, _r: Option<&str>, s: &str) -> bool {
             self.histories.lock().unwrap().iter().any(|h| h == s)
         }
         fn workdir_exists(&self, path: &str) -> bool {
             !self.missing_dirs.lock().unwrap().iter().any(|d| d == path)
+        }
+        fn remove_worktree(&self, path: &str) -> Option<Result<(), String>> {
+            if !self.worktrees.lock().unwrap().iter().any(|w| w == path) {
+                return None;
+            }
+            if self.dirty_worktrees.lock().unwrap().iter().any(|w| w == path) {
+                return Some(Err(format!("contains modified or untracked files: {path}")));
+            }
+            self.removed_worktrees.lock().unwrap().push(path.to_string());
+            Some(Ok(()))
         }
         fn last_activity_ms(&self, _r: Option<&str>, _s: &str) -> Option<u64> {
             None
