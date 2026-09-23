@@ -805,9 +805,10 @@ impl<'a> Event<'a> {
     /// "this has expired", which would be a lie).
     pub fn channel(&self) -> Option<&'a str> {
         match self.name {
-            "message" | "member_joined_channel" | "agent_session_stopped" => {
-                self.str_at("channel")
-            }
+            "message"
+            | "member_joined_channel"
+            | "agent_session_stopped"
+            | "agent_session_title_changed" => self.str_at("channel"),
             "reaction_added" | "reaction_removed" => self.raw.get("item")?.get("channel")?.as_str(),
             _ => None,
         }
@@ -4298,7 +4299,7 @@ mod tests {
     #[test]
     fn the_gateway_shows_the_address_machines_reach_it_at() {
         // Loopback is written first and reaches nobody — the address after it is the answer
-        assert_eq!(listen_ip("127.0.0.1:8787,192.168.10.11:8787"), "192.168.10.11");
+        assert_eq!(listen_ip("127.0.0.1:8787,203.0.113.10:8787"), "203.0.113.10");
         // Nothing but loopback: nothing to show, rather than an address nobody can use
         assert_eq!(listen_ip("127.0.0.1:8787"), "");
         assert_eq!(listen_ip(""), "");
@@ -4319,12 +4320,12 @@ mod tests {
         };
         let out = machines_md(&[
             row("dock", "dock.lan", "", "gateway", true, None),
-            row("pve", "pve.ts.net", "100.89.207.102", "direct", true, None),
+            row("pve", "pve.example.ts.net", "100.64.0.9", "direct", true, None),
             row("mac", "", "", "ssh tunnel (me@mac)", false, Some("connection refused")),
         ]);
         assert!(out.contains("| `dock` | `dock.lan` |  | gateway | 🟢 |"), "{out}");
         assert!(
-            out.contains("| `pve` | `pve.ts.net` | `100.89.207.102` | direct | 🟢 |"),
+            out.contains("| `pve` | `pve.example.ts.net` | `100.64.0.9` | direct | 🟢 |"),
             "{out}"
         );
         // Nothing known about where it is, and the reason it is down stays below the table
