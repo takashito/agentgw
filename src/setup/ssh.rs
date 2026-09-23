@@ -41,10 +41,15 @@ static KEY_NOW: OnceLock<String> = OnceLock::new();
 
 /// The options every ssh / scp call starts with.
 fn opts() -> Vec<String> {
-    opts_of(&ACCESS.get().cloned().unwrap_or_default())
+    let key = gateway_key();
+    opts_of(
+        &ACCESS.get().cloned().unwrap_or_default(),
+        key.exists().then(|| key.to_string_lossy().to_string()).as_deref(),
+    )
 }
 
-fn opts_of(access: &Access) -> Vec<String> {
+/// `gateway_key` = this gateway has an ssh key of its own, left on machines by `add-machine -p`.
+fn opts_of(access: &Access, gateway_key: Option<&str>) -> Vec<String> {
     // ssh's own chatter ("Shared connection to host closed.") is not part of what we are reporting.
     // Errors and the password prompt still come through
     let mut out: Vec<String> = vec!["-o".into(), "LogLevel=ERROR".into()];
@@ -55,6 +60,13 @@ fn opts_of(access: &Access) -> Vec<String> {
         // An explicit key is the one to use — don't let the agent's keys go first
         out.push("-o".into());
         out.push("IdentitiesOnly=yes".into());
+    } else if let Some(key) = gateway_key {
+        // **Offer the gateway's own key too**, the way the tunnel does. A machine set up with `-p`
+        // authorizes that key and nothing else of ours, so without it the only way in is a shared
+        // connection someone else authenticated — which is no way in at all. Offered, not forced:
+        // a machine that authorizes one of the usual keys instead still gets in on that
+        out.push("-i".into());
+        out.push(key.to_string());
     }
     if access.ask_password {
         // Ask once: the first connection prompts, the rest share it
@@ -365,13 +377,18 @@ mod tests {
     /// ask, and multiplexes so it asks once. **No password ever reaches argv.**
     #[test]
     fn access_shapes_the_ssh_options() {
-        let args = |a: Access| {
-            let joined = opts_of(&a).join(" ");
-            joined
-        };
+        let args = |a: Access| opts_of(&a, None).join(" ");
         // Nothing asked for: the quiet, and a connection of our own. Sharing the gateway's would
         // break the moment setting up a tunnel restarts it
         assert_eq!(args(Access::default()), "-o LogLevel=ERROR -o ControlPath=none");
+        // The gateway's own key is offered beside the usual ones — a machine set up with `-p`
+        // authorizes that one and nothing else of ours
+        let with_own = opts_of(&Access::default(), Some("/k/agentgw")).join(" ");
+        assert!(with_own.contains("-i /k/agentgw"), "{with_own}");
+        assert!(!with_own.contains("IdentitiesOnly"), "{with_own}");
+        // An identity that was asked for wins over it, and then it is the only one tried
+        let both = opts_of(&Access { identity: Some("/k/id".into()), ask_password: false }, Some("/k/agentgw")).join(" ");
+        assert!(both.contains("-i /k/id") && !both.contains("/k/agentgw"), "{both}");
         let with_key = args(Access { identity: Some("/k/id".into()), ask_password: false });
         assert!(with_key.contains("-i /k/id") && with_key.contains("IdentitiesOnly=yes"), "{with_key}");
         let with_pw = args(Access { identity: None, ask_password: true });
