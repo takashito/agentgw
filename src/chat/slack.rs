@@ -1254,6 +1254,11 @@ async fn on_push_event(
     _client: Arc<SlackHyperClient>,
     state: SlackClientEventsUserState,
 ) -> UserCallbackResult<()> {
+    // An event slack-morphism has no model for. Both paths below drop it, so **record that we did** —
+    // otherwise "Slack did not send it" and "we could not read it" look the same in the log.
+    if let SlackEventCallbackBody::Unknown(raw) = &event.event {
+        LogCtx::default().info("slack", &format!("unhandled event: {}", unknown_event_line(raw)));
+    }
     let guard = state.read().await;
     // A gateway (a Bridge with machines) does not fold before deciding who handles it
     if let Some(fleet) = guard.get_user_state::<tokio::sync::mpsc::Sender<FleetEvent>>() {
@@ -1275,6 +1280,18 @@ async fn on_push_event(
         LogCtx::default().error("slack", &format!("inbound queue closed: {e}"));
     }
     Ok(())
+}
+
+/// One log line for an event we have no model for: its `type`, then the raw body cut to a readable length.
+fn unknown_event_line(raw: &serde_json::Value) -> String {
+    const MAX: usize = 800;
+    let kind = raw.get("type").and_then(|t| t.as_str()).unwrap_or("?");
+    let body = raw.to_string();
+    let body = match body.char_indices().nth(MAX) {
+        Some((cut, _)) => format!("{}…", &body[..cut]),
+        None => body,
+    };
+    format!("{kind} {body}")
 }
 
 /// Slack message event → the Bridge's vocabulary. None for shapes we cannot reply to (no content and no attachment, no channel).
@@ -1953,6 +1970,17 @@ impl SlackId {
 
 #[cfg(test)]
 mod tests {
+
+    /// An event we have no model for is logged by its `type`, and a long body is cut.
+    #[test]
+    fn an_unknown_event_is_named_by_its_type() {
+        let raw = serde_json::json!({ "type": "agent_session_deleted", "channel": "C1" });
+        assert!(super::unknown_event_line(&raw).starts_with("agent_session_deleted {"));
+        let long = serde_json::json!({ "type": "x", "blob": "あ".repeat(2000) });
+        let line = super::unknown_event_line(&long);
+        assert!(line.ends_with('…'));
+        assert!(line.chars().count() < 900);
+    }
 
     /// Slack's native stop button on a session. Measured shape: `channel`, `thread_ts`, `user`, `event_ts`.
     #[test]
