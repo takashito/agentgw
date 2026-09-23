@@ -601,8 +601,8 @@ fn parse_listens(listen: &str) -> Result<Vec<std::net::SocketAddr>, String> {
         .collect::<Result<Vec<_>, String>>()?;
     if addrs.is_empty() {
         return Err(crate::t!(
-            "AGENTGW_LINK_LISTEN is empty",
-            "AGENTGW_LINK_LISTEN が空です"
+            "there is no address to accept machines on",
+            "マシンを受け付けるアドレスがありません"
         ));
     }
     Ok(addrs)
@@ -611,8 +611,8 @@ fn parse_listens(listen: &str) -> Result<Vec<std::net::SocketAddr>, String> {
 fn parse_listen(listen: &str) -> Result<std::net::SocketAddr, String> {
     let (host, port) = listen.rsplit_once(':').ok_or_else(|| {
         crate::t!(
-            "AGENTGW_LINK_LISTEN must be host:port (e.g. 0.0.0.0:8787), not {listen}",
-            "AGENTGW_LINK_LISTEN は host:port の形で書いてください(例: 0.0.0.0:8787)。今の値: {listen}"
+            "an address to accept machines on must be host:port, not {listen}",
+            "マシンを受け付けるアドレスは host:port の形です。今の値: {listen}"
         )
     })?;
     let host = host.trim_matches(['[', ']']);

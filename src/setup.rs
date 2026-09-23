@@ -137,10 +137,10 @@ fn ensure_config(state_dir: &StateDir) -> Result<(), String> {
         );
         return Ok(());
     }
-    // A machine connects one of two ways (dials out itself / the gateway comes to fetch it). Neither holds Slack tokens
-    if (has("AGENTGW_RELAY_URL") && has("AGENTGW_RELAY_TOKEN"))
-        || (has("AGENTGW_LINK_LISTEN") && has("AGENTGW_LINK_TOKEN"))
-    {
+    // A machine goes through a gateway and holds no Slack tokens of its own
+    if parsed.iter().any(|(k, v): &(String, String)| {
+        k == "AGENTGW_BRIDGE_ROLE" && v.trim().eq_ignore_ascii_case("machine")
+    }) {
         println!(
             "{}",
             crate::t!(

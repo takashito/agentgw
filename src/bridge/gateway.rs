@@ -3278,13 +3278,16 @@ impl Cli {
     pub async fn print_fleet(dir: &StateDir) {
         let env = Self::env_of(dir);
         println!("{}", Self::ports_line(dir));
-        let (Some(listen), Some(token)) = (
-            env.get("AGENTGW_LINK_LISTEN"),
-            env.get("AGENTGW_LINK_TOKEN"),
-        ) else {
+        let access = Access::load(dir);
+        // Nothing to say about a fleet with no machines in it
+        let (Some(token), false) = (env.get("AGENTGW_LINK_TOKEN"), access.machines.is_empty()) else {
             return;
         };
-        let access = Access::load(dir);
+        // **Ask on our own way in.** The addresses machines use are opened for them, not for us
+        let listen = &format!(
+            "127.0.0.1:{}",
+            crate::bridge::machine::link_port(|k| env.get(k).cloned())
+        );
         let view = FleetView {
             listen: listen.clone(),
             owner: (!access.owner.is_empty()).then(|| access.owner.clone()),
