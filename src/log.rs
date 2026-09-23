@@ -54,12 +54,13 @@ impl LogCtx {
     }
 
     fn write(&self, level: &str, component: &str, message: &str) {
-        // **A test must not write into the live logs.** The state directory is resolved from the
-        // environment, so a test that logs anything lands in the production `plugin-debug.log` and
-        // `logs/by-thread/` unless it was told where to go (lines from the suite were found there:
-        // `C1-1-0`, and a delivery watchdog firing on a fake clock)
-        #[cfg(test)]
-        if std::env::var_os("AGENTGW_STATE_DIR").is_none() {
+        // **A test writes no log line at all.** The state directory comes from the environment, and
+        // asking only whether it is set is not a guard: an agent runs with `AGENTGW_STATE_DIR`
+        // pointing at the live one, so `cargo test` in that shell wrote the suite's own lines into
+        // production — `logs/by-thread/C1-1782000000-000100/bridge.log` holding
+        // `thinking status set "Signing in…"`, 13 such folders, next to the real threads.
+        // Nothing reads a log file in a test, so there is nothing to keep by writing one.
+        if cfg!(test) {
             return;
         }
         // Logging must never break the hot path — failures are swallowed
