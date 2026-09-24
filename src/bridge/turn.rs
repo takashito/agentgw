@@ -2,7 +2,7 @@
 //! failure of a turn, the usage-limit watch, the silence watch, tool permission prompts,
 //! and writing the progress message.
 
-use super::{Bridge, Host};
+use super::{Bridge, DialogPending, Host};
 use crate::agent::Window;
 use crate::agent::{HookEvent, ProbeErr, SessionId};
 use crate::bridge::state as bridge;
@@ -844,9 +844,121 @@ impl Bridge {
         }
     }
 
+    /// Offers the modal holding `window` to the thread as buttons. False when the screen is
+    /// holding no modal (the delivery was refused for some other reason) or the prompt could
+    /// not be posted -- the caller then says what it would have said anyway.
+    ///
+    /// **The message stays queued.** Nothing here waits for the click: once the dialog is
+    /// answered the retry tick carries the message in by itself.
+    pub(super) async fn offer_dialog(
+        &mut self,
+        window: &str,
+        channel: &str,
+        thread_ts: &str,
+        ctx: &LogCtx,
+    ) -> bool {
+        let Some(d) = self.deps.agent.dialog(&Window::of(window)) else {
+            return false;
+        };
+        // One live prompt per window. An older one would answer a modal that has moved on
+        self.dialog_pending.retain(|_, p| p.window != window);
+        static NEXT_REQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT_REQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let req_id = format!("d{:x}-{n}", self.deps.clock.now_ms());
+        let prompt_ts = match self
+            .deps
+            .slack
+            .post_dialog_prompt(channel, thread_ts, &req_id, &d)
+            .await
+        {
+            Ok(ts) => ts,
+            Err(e) => {
+                ctx.error("bridge", &format!("dialog prompt post failed: {e}"));
+                return false;
+            }
+        };
+        ctx.info(
+            "bridge",
+            &format!(
+                "dialog reqId={req_id} window={window} rows={} -> posted Slack prompt, awaiting click",
+                d.options.len()
+            ),
+        );
+        self.dialog_pending.insert(
+            req_id,
+            DialogPending {
+                channel: channel.to_string(),
+                thread_ts: thread_ts.to_string(),
+                window: window.to_string(),
+                prompt_ts,
+            },
+        );
+        true
+    }
+
+    /// A dialog button was clicked: type the answer on the agent's screen and say what happened.
+    ///
+    /// **The queued message is let go at once** (`delivery_trouble` cleared): the whole point of
+    /// answering was to unblock it, and the retry wait would otherwise hold it back a while longer.
+    async fn on_dialog_click(&mut self, click: &slack::PermClick, p: DialogPending) {
+        let ctx = LogCtx {
+            session_id: None,
+            thread_key: Some(ThreadKey::new(&p.channel, &p.thread_ts)),
+        };
+        let choice = click
+            .action
+            .strip_prefix("dlg-")
+            .and_then(|a| a.parse::<usize>().ok());
+        let picked = self
+            .deps
+            .agent
+            .dialog(&Window::of(&p.window))
+            .and_then(|d| choice.and_then(|i| d.options.get(i).cloned()));
+        let answered = self
+            .deps
+            .agent
+            .answer_dialog(&Window::of(&p.window), choice, &ctx)
+            .await;
+        let done = match &answered {
+            Ok(()) => {
+                self.delivery_trouble.remove(&p.window);
+                ctx.info(
+                    "bridge",
+                    &format!(
+                        "dialog reqId={} window={} -> {} (by {})",
+                        click.req_id, p.window, click.action, click.by
+                    ),
+                );
+                let what = picked.unwrap_or_else(|| crate::t!("Cancelled", "取り消し"));
+                format!("✅ {what} — <@{}>", click.by)
+            }
+            Err(e) => {
+                ctx.error(
+                    "bridge",
+                    &format!("dialog reqId={} window={}: {e}", click.req_id, p.window),
+                );
+                format!("⚠️ {e}")
+            }
+        };
+        if let Err(e) = self
+            .deps
+            .slack
+            .update_message(&p.channel, &p.prompt_ts, &done)
+            .await
+        {
+            ctx.debug("bridge", &format!("dialog prompt update failed: {e}"));
+        }
+    }
+
     /// An approval button was clicked. **Answer the agent the moment it's clicked** — then redraw the prompt
     /// to show the result (the agent doesn't wait even if rewriting the post is slow).
     pub(super) async fn on_perm_click(&mut self, click: slack::PermClick) {
+        // Dialog buttons ride the same wiring as the permission ones -- same action id shape, same
+        // relay hop, same channel -- and are told apart here by which table holds the id
+        if let Some(p) = self.dialog_pending.remove(&click.req_id) {
+            self.on_dialog_click(&click, p).await;
+            return;
+        }
         let answered = self.perm_pending.remove(&click.req_id);
         if let Some(p) = &answered {
             let (thread_ts, prompt_ts) = (p.thread_ts.clone(), p.prompt_ts.clone());

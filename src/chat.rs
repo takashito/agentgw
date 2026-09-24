@@ -269,6 +269,15 @@ pub trait Chat: Send + Sync + 'static {
         tool_name: &str,
         tool_input: &serde_json::Value,
     ) -> Result<String, String>;
+    /// Block Kit prompt offering a modal's rows as buttons, so the dialog holding the agent can
+    /// be answered from the thread. Returns the post's ts.
+    async fn post_dialog_prompt(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        req_id: &str,
+        dialog: &crate::agent::Dialog,
+    ) -> Result<String, String>;
     async fn open_dm(&self, user_id: &str) -> Result<String, String>;
     async fn history(&self, channel: &str, limit: u16) -> Result<Vec<FetchedMsg>, String>;
     async fn replies(
@@ -483,6 +492,16 @@ pub mod fake {
             _i: &serde_json::Value,
         ) -> Result<String, String> {
             self.record(format!("perm {c} {th} {id} {tool}"))?;
+            Ok(self.ts())
+        }
+        async fn post_dialog_prompt(
+            &self,
+            c: &str,
+            th: &str,
+            id: &str,
+            d: &crate::agent::Dialog,
+        ) -> Result<String, String> {
+            self.record(format!("dialog {c} {th} {id} {} [{}]", d.title, d.options.join(" | ")))?;
             Ok(self.ts())
         }
         async fn open_dm(&self, u: &str) -> Result<String, String> {

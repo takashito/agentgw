@@ -428,6 +428,23 @@ pub enum ProbeErr {
 }
 
 
+/// A modal the agent's screen is holding, read off the screen itself.
+///
+/// The rows are what a person picks between; `selected` is where the cursor already is, so the
+/// answer is a run of Up/Down and one Enter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Dialog {
+    /// The question, or the line above the rows when the modal does not ask one.
+    pub title: String,
+    /// The hint line itself. It says what confirming means, which is not always the same:
+    /// `/model`'s offers three keys where the plain ones offer Enter and Esc.
+    pub footer: String,
+    /// The rows, cleaned of their cursor, numbering and indent.
+    pub options: Vec<String>,
+    /// Index into `options` the cursor is on.
+    pub selected: usize,
+}
+
 // ── the agent as the core sees it ──
 
 /// Starting and driving the coding agent. Implemented by [`claude::Claude`].
@@ -457,6 +474,17 @@ pub trait Agent: Send + Sync + 'static {
     fn terminate(&self, w: &Window) -> Result<(), String>;
     /// Cancels what the worker is doing (Escape).
     fn interrupt(&self, w: &Window) -> Result<(), String>;
+    /// The modal the window is holding, if any. Reads the screen and presses nothing.
+    fn dialog(&self, w: &Window) -> Option<Dialog>;
+    /// Answers that modal: moves the cursor onto `choice` and confirms it, or cancels (`None`).
+    /// Errs if the modal went away or the cursor would not move -- the caller must not report
+    /// an answer that did not land.
+    async fn answer_dialog(
+        &self,
+        w: &Window,
+        choice: Option<usize>,
+        ctx: &LogCtx,
+    ) -> Result<(), String>;
     fn login_kill(&self);
 
     /// Compacts the conversation. Progress goes to `progress` one reading at a time;
@@ -578,6 +606,10 @@ pub mod fake {
         pub delivered: Mutex<Vec<(String, String)>>,
         /// Window ids that got an interrupt (Escape).
         pub interrupted: Mutex<Vec<String>>,
+        /// The modal `dialog` reports for every window. Unset means the screen is clear.
+        pub dialog: Mutex<Option<Dialog>>,
+        /// Every answer `answer_dialog` was asked to give, `None` meaning cancel.
+        pub answered: Mutex<Vec<Option<usize>>>,
         /// When set, `deliver` fails the way a window with an open dialog does.
         pub fail_deliver: std::sync::atomic::AtomicBool,
         /// Sessions whose conversation history exists (others can't be resumed).
@@ -688,6 +720,24 @@ pub mod fake {
         }
         fn interrupt(&self, w: &Window) -> Result<(), String> {
             self.interrupted.lock().unwrap().push(w.as_str().to_string());
+            Ok(())
+        }
+        fn dialog(&self, _w: &Window) -> Option<Dialog> {
+            self.dialog.lock().unwrap().clone()
+        }
+        async fn answer_dialog(
+            &self,
+            _w: &Window,
+            choice: Option<usize>,
+            _ctx: &LogCtx,
+        ) -> Result<(), String> {
+            let Some(d) = self.dialog.lock().unwrap().take() else {
+                return Err("the dialog is no longer on screen".into());
+            };
+            if choice.is_some_and(|i| i >= d.options.len()) {
+                return Err("that choice is not on the dialog".into());
+            }
+            self.answered.lock().unwrap().push(choice);
             Ok(())
         }
         fn login_kill(&self) {}

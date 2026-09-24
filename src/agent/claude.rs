@@ -8,7 +8,7 @@
 //! **It holds no Slack-facing text at all** — rendering is the Bridge's job (`command.rs`).
 
 use super::SpawnOutcome;
-use super::screen::{Pane, SpawnScreen, strip_modal_decoration};
+use super::screen::{Pane, SpawnScreen};
 use super::tmux::Tmux;
 use super::{Pid, Window, WindowRow};
 use super::{CompactOutcome, CompactProgress, LimitHit, LoginOutcome, ProbeErr, SpawnReq};
@@ -68,6 +68,14 @@ const WORKER_STARTUP_PROMPT: &str = "You are a Slack thread worker. There is no 
 /// (one thread received the same request four times).
 const DELIVER_SUBMIT_RETRIES: u32 = 9;
 const DELIVER_SUBMIT_POLL: Duration = Duration::from_millis(200);
+
+/// How many cursor moves an answer to a dialog may take, and the pause after each press.
+///
+/// One press per read: the cursor is the only proof the key landed. The cap is a few more than
+/// any list seen so far -- if the cursor is not where it was aimed by then the screen is not
+/// what we think it is, and the answer is refused rather than confirmed blind.
+const DIALOG_MOVE_CAP: usize = 12;
+const DIALOG_MOVE_POLL: Duration = Duration::from_millis(80);
 
 /// How much of a transcript's end to read when asking when it last moved. One entry is a few hundred
 /// bytes at most, so 64KB always spans several.
@@ -357,8 +365,11 @@ impl Claude {
         let p = Pane::new(pane);
         if let Some(footer) = p.modal_footer() {
             // **Written for the person waiting in the thread**, not for the log: they can act on
-            // "answer the dialog", not on a window id or a footer string
-            let title = Self::dialog_title(pane, footer);
+            // "answer the dialog", not on a window id or a footer string. The wording is the
+            // screen's own — modals we don't know by name are exactly the ones that get stuck
+            let title = p
+                .dialog()
+                .map_or_else(|| footer.trim().to_string(), |d| d.title);
             return Some(crate::t!(
                 "the agent is waiting on a dialog ({title}) — answer it on its screen and this goes through",
                 "エージェントの画面で確認待ちになっています（{title}）。画面で答えると、これはそのまま渡ります"
@@ -372,20 +383,55 @@ impl Claude {
         })
     }
 
-    /// The one line shown with ⚠️. The known-text table ([`Pane::spawn_screen`]) is not used — unknown modals
-    /// are exactly what gets stuck, so borrow the heading the screen wrote itself. Walk back only **before** the
-    /// hint line looking for a question line (`?`); if none, use the hint line itself (it still says "this is a dialog").
-    /// Picking a `?` from the whole pane would grab something a human said that is still in the scrollback.
-    fn dialog_title<'a>(pane: &'a str, footer: &'a str) -> &'a str {
-        const LOOK_BACK: usize = 30;
-        let lines: Vec<&str> = pane.split('\n').collect();
-        let at = lines.iter().position(|l| *l == footer).unwrap_or(0);
-        lines[at.saturating_sub(LOOK_BACK)..at]
-            .iter()
-            .rev()
-            .map(|l| strip_modal_decoration(l).trim_end())
-            .find(|l| l.ends_with('?'))
-            .unwrap_or_else(|| footer.trim())
+    /// The modal on this window's screen, if any. Reads it; presses nothing.
+    pub fn dialog(&self, w: &Window) -> Option<crate::agent::Dialog> {
+        Pane::new(&self.tmux.capture(w).ok()?).dialog()
+    }
+
+    /// Walks the cursor onto `choice` and confirms it, or cancels with Escape (`None`).
+    ///
+    /// **One press, then look.** The screen is read again after every key, so a modal that has
+    /// gone away — someone answered it on the machine — stops this instead of leaking an Enter
+    /// into the input box underneath. Up and Down are both used rather than running off the end
+    /// of the list, which not every list wraps around.
+    pub async fn answer_dialog(
+        &self,
+        w: &Window,
+        choice: Option<usize>,
+        ctx: &LogCtx,
+    ) -> Result<(), String> {
+        let Some(want) = choice else {
+            ctx.info("worker", &format!("{w}: dialog cancelled (Escape)"));
+            return self.tmux.send_escape(w);
+        };
+        for _ in 0..DIALOG_MOVE_CAP {
+            let Some(d) = self.dialog(w) else {
+                return Err(crate::t!(
+                    "the dialog is no longer on the agent's screen",
+                    "エージェントの画面にその確認はもうありません"
+                ));
+            };
+            if want >= d.options.len() {
+                return Err(crate::t!(
+                    "that choice is not on the dialog any more",
+                    "その選択肢はもう画面にありません"
+                ));
+            }
+            if d.selected == want {
+                ctx.info(
+                    "worker",
+                    &format!("{w}: dialog answered with {:?}", d.options[want]),
+                );
+                return self.tmux.send_enter(w);
+            }
+            let key = if want > d.selected { "Down" } else { "Up" };
+            self.tmux.send_key(w, key)?;
+            tokio::time::sleep(DIALOG_MOVE_POLL).await;
+        }
+        Err(crate::t!(
+            "the dialog's cursor would not move onto that choice",
+            "画面の選択位置をそこまで動かせませんでした"
+        ))
     }
 
     pub fn terminate(&self, w: &Window) -> Result<(), String> {
@@ -1155,6 +1201,19 @@ impl crate::agent::Agent for Claude {
 
     fn interrupt(&self, w: &Window) -> Result<(), String> {
         self.tmux.send_escape(w)
+    }
+
+    fn dialog(&self, w: &Window) -> Option<crate::agent::Dialog> {
+        Claude::dialog(self, w)
+    }
+
+    async fn answer_dialog(
+        &self,
+        w: &Window,
+        choice: Option<usize>,
+        ctx: &LogCtx,
+    ) -> Result<(), String> {
+        Claude::answer_dialog(self, w, choice, ctx).await
     }
 
     fn login_kill(&self) {
@@ -2078,7 +2137,7 @@ mod tests {
              \u{a0} \u{25cf} High effort (default) \u{2190}/\u{2192} to adjust\n\
              \n\
              Enter to set as default \u{b7} s to use this session only \u{b7} Esc to cancel\n",
-            "Esc to cancel",
+            "Select model",
         ),
     ];
 
@@ -2473,6 +2532,39 @@ mod tests {
         assert_eq!(Claude::with_auto_mode_dismissed(&updated), None, "already dismissed: no write");
         let fresh = Claude::with_auto_mode_dismissed(&serde_json::json!({})).unwrap();
         assert_eq!(fresh["autoModeEnvSetup"]["dismissed"], true);
+    }
+
+    /// Answering a dialog from the thread: walk the cursor a row at a time, reading the screen
+    /// after each press, and only then confirm. **The screen is the proof the key landed** —
+    /// counting presses instead would confirm whatever row the cursor happened to be on.
+    #[tokio::test]
+    async fn a_dialog_is_answered_by_moving_the_cursor_then_confirming() {
+        use crate::agent::screen::tests::{TRUST_PANE_NO_FIRST, TRUST_PANE_YES_SECOND};
+        // First read: "No, exit" selected. After one Down the second read shows Yes selected
+        let (calls, c) = deliver_probe(vec![TRUST_PANE_NO_FIRST, TRUST_PANE_YES_SECOND]);
+        c.answer_dialog(&Window::of("@42"), Some(1), &LogCtx::default())
+            .await
+            .unwrap();
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.iter().filter(|c| c.ends_with(" Down")).count(), 1);
+        assert_eq!(enters(&calls), 1);
+        assert!(
+            calls.iter().all(|c| !c.contains("send-keys -l")),
+            "not one character is typed at a dialog: {calls:?}"
+        );
+    }
+
+    /// Someone answered it on the machine while the buttons sat in the thread. Pressing Enter
+    /// now would land in the input box underneath, so the answer is refused instead.
+    #[tokio::test]
+    async fn answering_a_dialog_that_has_gone_is_refused_rather_than_pressed() {
+        let (calls, c) = deliver_probe(vec!["\u{276f} \u{a0}"]);
+        let err = c
+            .answer_dialog(&Window::of("@42"), Some(1), &LogCtx::default())
+            .await
+            .unwrap_err();
+        assert!(err.contains("no longer on"), "{err}");
+        assert_eq!(enters(&calls.lock().unwrap()), 0);
     }
 
     #[tokio::test]

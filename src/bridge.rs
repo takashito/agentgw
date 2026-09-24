@@ -90,6 +90,10 @@ pub struct Bridge {
     sticky: slack::StickyBoard,
     /// Tool permissions waiting for a person's click. reqId → the waiting agent and the prompt to delete.
     perm_pending: HashMap<String, PermPending>,
+    /// Dialogs on an agent's screen offered to the thread as buttons. reqId -> which window.
+    /// One entry per window: a newer prompt for the same window replaces the older one, so a
+    /// stale prompt cannot answer a modal that has since changed.
+    dialog_pending: HashMap<String, DialogPending>,
     /// `thread_key\0message_id` → narration fragments whose final hasn't arrived yet.
     narration: HashMap<String, String>,
     hooks_file: String,
@@ -174,6 +178,19 @@ pub struct DeliveryDone {
     pub result: Result<(), String>,
 }
 
+/// A dialog offered to a thread as buttons, waiting for someone to press one.
+///
+/// **Nothing is blocked on it.** The message that ran into the dialog stays queued and the tick
+/// keeps trying, so answering the dialog is all that is needed -- the retry carries it in.
+pub(crate) struct DialogPending {
+    pub channel: String,
+    pub thread_ts: String,
+    /// The window holding the modal; the answer is typed there.
+    pub window: String,
+    /// ts of the posted prompt, for rewriting it once it is answered.
+    pub prompt_ts: String,
+}
+
 /// A window that would not take a delivery.
 pub(crate) struct DeliveryTrouble {
     /// Nothing is tried again before this.
@@ -224,6 +241,7 @@ impl Bridge {
             lifecycle: bridge::Lifecycle::new(),
             sticky: slack::StickyBoard::default(),
             perm_pending: HashMap::new(),
+            dialog_pending: HashMap::new(),
             narration: HashMap::new(),
             hooks_file: config.hooks_file,
             mcp_port: config.mcp_port,
@@ -2388,6 +2406,63 @@ mod tests {
         assert!(
             delivered.iter().any(|(_, t)| t.contains("and this")),
             "the message was never handed over after the wait: {delivered:?}"
+        );
+    }
+
+    /// The shape that stopped a thread on 2026-09-24: a modal held the screen, the delivery was
+    /// refused, and all the thread got was a warning naming a screen nobody there can reach.
+    ///
+    /// Now the modal's own rows come to the thread as buttons. Pressing one types the answer on
+    /// the agent's screen and **lets the queued message go at once** — the whole point of the
+    /// answer was to unblock it, so it must not sit out the refusal wait as well.
+    #[tokio::test]
+    async fn a_delivery_stopped_by_a_dialog_offers_its_rows_to_the_thread() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (d, slack, agent, _clock) = flow_deps("dialog");
+        let ((mut b, _fx), mut deliv) = Bridge::for_test_with_deliveries(d);
+        running_thread(&mut b, &agent).await;
+        agent.fail_deliver.store(true, SeqCst);
+        *agent.dialog.lock().unwrap() = Some(crate::agent::Dialog {
+            title: "Grant the missing permissions in System Settings.".into(),
+            footer: "Enter to confirm \u{b7} Esc to cancel".into(),
+            options: vec!["Open System Settings".into(), "Try again".into()],
+            selected: 0,
+        });
+
+        b.on_inbound(&in_thread("1782000000.000200", "and this")).await;
+        settle_deliveries(&mut b, &mut deliv).await;
+        assert!(
+            slack.calls().iter().any(|c| c.starts_with("dialog C1") && c.contains("Try again")),
+            "the rows never reached the thread: {:?}",
+            slack.calls()
+        );
+        assert!(
+            !slack.calls().iter().any(|c| c.contains("Couldn't hand this to the agent")),
+            "warned as well as asked: {:?}",
+            slack.calls()
+        );
+
+        let req_id = b.dialog_pending.keys().next().expect("a prompt is waiting").clone();
+        b.on_perm_click(slack::PermClick {
+            req_id,
+            action: "dlg-1".into(),
+            by: "U_OWNER".into(),
+        })
+        .await;
+        assert_eq!(*agent.answered.lock().unwrap(), vec![Some(1)]);
+        assert!(
+            slack.calls().iter().any(|c| c.contains("\u{2705} Try again")),
+            "the prompt never said what was picked: {:?}",
+            slack.calls()
+        );
+
+        agent.fail_deliver.store(false, SeqCst);
+        b.retry_pending(&LogCtx::default());
+        settle_deliveries(&mut b, &mut deliv).await;
+        let delivered = agent.delivered.lock().unwrap().clone();
+        assert!(
+            delivered.iter().any(|(_, t)| t.contains("and this")),
+            "the queued message never went in after the dialog was answered: {delivered:?}"
         );
     }
 

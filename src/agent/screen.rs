@@ -243,6 +243,58 @@ impl<'a> Pane<'a> {
             .find(|l| l.to_ascii_lowercase().contains("esc to cancel"))
     }
 
+    /// The rows a modal is offering and which one the cursor sits on. `None` when no modal
+    /// holds the screen, or when the `❯` above the hint is the input box rather than a
+    /// choice list (nothing to pick from).
+    ///
+    /// Shape taken from real screens: the rows are one unbroken block just above the cancel
+    /// hint, exactly one of them carrying the `❯` cursor. They may be numbered
+    /// (`❯ 1. Set it up`) or not (`❯ Try again`), and the rows that are not selected
+    /// are indented with NBSP or spaces.
+    ///
+    /// **The dialog is not looked up by name.** Modals we do not know are exactly the ones
+    /// that get stuck, so everything shown comes off the screen itself.
+    pub fn dialog(&self) -> Option<crate::agent::Dialog> {
+        let footer = self.modal_footer()?;
+        let lines: Vec<&str> = self.0.split('\n').collect();
+        let at = lines.iter().position(|l| *l == footer)?;
+        let from = at.saturating_sub(DIALOG_LOOK_BACK);
+        // The cursor row, and only one near the hint: a `❯` further up is the echo of a
+        // line that was already sent, which would drag scrollback in as options
+        let cursor = from
+            + lines[from..at]
+                .iter()
+                .rposition(|l| l.trim_start().starts_with('❯'))?;
+        // Leading whitespace in bytes - enough to tell a row of the block from the paragraph
+        // above it, which is written further left
+        let indent = |l: &str| l.len() - l.trim_start().len();
+        let cursor_indent = indent(lines[cursor]);
+        let is_row = |l: &str| !l.trim().is_empty() && indent(l) >= cursor_indent;
+        let top = lines[from..cursor]
+            .iter()
+            .rposition(|l| !is_row(l))
+            .map_or(from, |i| from + i + 1);
+        let bottom = cursor
+            + lines[cursor..at]
+                .iter()
+                .position(|l| !is_row(l))
+                .unwrap_or(at - cursor);
+        let options: Vec<String> = lines[top..bottom]
+            .iter()
+            .map(|l| strip_modal_decoration(l.trim()).trim_end().to_string())
+            .collect();
+        // An empty row means that `❯` was the input box under the modal, not a choice
+        if options.iter().any(|o| o.is_empty()) {
+            return None;
+        }
+        Some(crate::agent::Dialog {
+            title: dialog_title(&lines[from..top], footer),
+            footer: footer.trim().to_string(),
+            selected: cursor - top,
+            options,
+        })
+    }
+
     /// The TUI's live input box = the **last** `❯` line of the pane. A command **already sent**
     /// stays on screen as the echoed `❯ /effort high`, shaped exactly like a line being typed;
     /// only its position tells them apart.
@@ -768,7 +820,46 @@ fn parse_percent_line(line: &str) -> Option<u32> {
 }
 
 /// Strip leading decoration, in order: decoration → option number → whitespace.
-pub(super) fn strip_modal_decoration(line: &str) -> &str {
+/// How far above the cancel hint a modal's own text can be. Past that is scrollback.
+const DIALOG_LOOK_BACK: usize = 30;
+
+/// Characters of the modal's question kept for the thread. A paragraph, not an essay.
+const DIALOG_TITLE_CAP: usize = 300;
+
+/// The line shown above the rows: the modal's question, or, when it does not ask one, the
+/// paragraph sitting just above them. The hint line stands in when there is neither, which at
+/// least says "this is a dialog".
+///
+/// **Whole paragraphs, not single lines.** The screen wraps a question over several lines, so
+/// the `?` is rarely at the end of one — looking line by line missed the workspace-trust
+/// question entirely and fell back to the hint. Only the lines above the rows are searched:
+/// a `?` taken from the whole pane would pick up something a person said that is still in the
+/// scrollback.
+fn dialog_title(head: &[&str], footer: &str) -> String {
+    let paragraphs: Vec<String> = head
+        .split(|l| l.trim().is_empty())
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            p.iter()
+                .map(|l| strip_modal_decoration(l.trim()).trim_end())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|p| !p.is_empty())
+        .collect();
+    let title = paragraphs
+        .iter()
+        .rev()
+        .find(|p| p.contains('?'))
+        .or_else(|| paragraphs.last())
+        .map_or_else(|| footer.trim().to_string(), |p| p.clone());
+    if title.chars().count() <= DIALOG_TITLE_CAP {
+        return title;
+    }
+    title.chars().take(DIALOG_TITLE_CAP - 1).collect::<String>() + "\u{2026}"
+}
+
+fn strip_modal_decoration(line: &str) -> &str {
     let t = line.trim_start_matches(MODAL_DECORATION);
     let digits = t.len() - t.trim_start_matches(|c: char| c.is_ascii_digit()).len();
     if digits == 0 {
@@ -1140,6 +1231,76 @@ the full history gets re-read on your next message.
  \u{276f} Yes, I trust this folder
 
  Enter to confirm \u{b7} Esc to cancel";
+
+    /// A real modal that stopped a thread on 2026-09-24, read back from a screenshot of the
+    /// pane. Two things the numbered dialogs do not have: **the rows carry no numbers**, and
+    /// the modal's heading is not the paragraph nearest them.
+    ///
+    /// Transcribed from an image, so the exact decoration (space or NBSP) cannot be sworn to.
+    /// What the reading leans on — one block of rows above the hint, exactly one of them
+    /// carrying the cursor — is plain in the picture.
+    const PERMISSION_MODAL: &str = "\
+\u{25cf} Calling a tool, running 2 shell commands \u{b7} 5m 47s\u{2026}\n\
+ \u{2514} $ grep -rn 'something' docs/notes.md | head -20\n\
+\n\
+ Computer Use needs macOS permissions\n\
+\n\
+ Accessibility: \u{2718} not granted\n\
+ Screen Recording: \u{2718} not granted\n\
+\n\
+ Grant the missing permissions in System Settings, then select \"Try again\".\n\
+\n\
+ \u{276f} Open System Settings \u{2192} Accessibility\n\
+   Open System Settings \u{2192} Screen Recording\n\
+   Try again\n\
+\n\
+ Enter to confirm \u{b7} Esc to cancel";
+
+    #[test]
+    fn dialog_reads_rows_that_carry_no_numbers() {
+        let d = Pane::new(PERMISSION_MODAL).dialog().expect("a modal is up");
+        assert_eq!(
+            d.options,
+            [
+                "Open System Settings \u{2192} Accessibility",
+                "Open System Settings \u{2192} Screen Recording",
+                "Try again",
+            ]
+        );
+        assert_eq!(d.selected, 0);
+        assert_eq!(d.footer, "Enter to confirm \u{b7} Esc to cancel");
+        // No question on this screen, so the paragraph just above the rows stands in. The
+        // heading two paragraphs up would read better, but nothing on the screen marks it as
+        // the heading, and guessing is what put the hint line in the notice before this
+        assert_eq!(
+            d.title,
+            "Grant the missing permissions in System Settings, then select \"Try again\"."
+        );
+    }
+
+    #[test]
+    fn dialog_reads_numbered_rows_and_where_the_cursor_is() {
+        let d = Pane::new(TRUST_PANE).dialog().expect("a modal is up");
+        assert_eq!(d.options, ["Yes, I trust this folder", "No, exit"]);
+        assert_eq!(d.selected, 0);
+        // The question wins over the paragraph nearest the rows ("Security guide")
+        assert!(d.title.starts_with("Quick safety check"), "{}", d.title);
+
+        let moved = Pane::new(TRUST_PANE_YES_SECOND)
+            .dialog()
+            .expect("a modal is up");
+        assert_eq!(moved.options, ["No, exit", "Yes, I trust this folder"]);
+        assert_eq!(moved.selected, 1);
+    }
+
+    /// Why the reading refuses an empty row: under a modal the input box keeps its own
+    /// `\u{276f}`, and taking that for a choice would send Enter into the box.
+    #[test]
+    fn dialog_does_not_take_a_bare_input_box_for_a_choice() {
+        let pane = " \u{276f} \u{a0}\n\n Enter to confirm \u{b7} Esc to cancel";
+        assert_eq!(Pane::new(pane).dialog(), None);
+        assert_eq!(Pane::new("nothing is up here").dialog(), None);
+    }
 
     #[test]
     fn the_trust_dialog_says_which_answer_is_selected() {

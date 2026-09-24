@@ -188,6 +188,82 @@ impl Api {
         Ok(res.ts.to_string())
     }
 
+    /// Block Kit prompt offering a modal's rows as buttons. The rows are read off the agent's
+    /// screen, so the wording is the screen's, not ours.
+    ///
+    /// The hint line goes in as well: what confirming does is not always the same
+    /// (`/model`'s reads "Enter to set as default"), and only the screen says so.
+    pub async fn post_dialog_prompt(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        req_id: &str,
+        dialog: &crate::agent::Dialog,
+    ) -> Result<String, String> {
+        let rows: Vec<String> = dialog
+            .options
+            .iter()
+            .enumerate()
+            .map(|(i, o)| format!("{}. {o}", i + 1))
+            .collect();
+        let body = format!(
+            "{}\n*{}*\n```{}```\n_{}_",
+            crate::t!(
+                ":keyboard: The agent is waiting on a dialog \u{2014} answer it here and the queued messages go through.",
+                ":keyboard: エージェントが画面の確認待ちで止まっています。ここで答えると、溜まっているメッセージがそのまま渡ります。"
+            ),
+            dialog.title,
+            rows.join("\n"),
+            dialog.footer,
+        );
+        let button = |label: &str, action: &str| {
+            SlackBlockButtonElement::new(
+                format!("perm:{action}:{req_id}").into(),
+                SlackBlockPlainTextOnly::from(label),
+            )
+        };
+        // Slack takes 25 elements in one actions block and 75 characters in a button
+        let mut buttons: Vec<SlackActionBlockElement> = dialog
+            .options
+            .iter()
+            .take(DIALOG_BUTTON_CAP)
+            .enumerate()
+            .map(|(i, o)| {
+                let mut b = button(&button_label(o), &format!("dlg-{i}"));
+                if i == dialog.selected {
+                    b = b.with_style(SlackBlockButtonStyle::Primary);
+                }
+                b.into()
+            })
+            .collect();
+        buttons.push(
+            button(&crate::t!("Cancel (Esc)", "取り消す (Esc)"), "dlg-cancel")
+                .with_style(SlackBlockButtonStyle::Danger)
+                .into(),
+        );
+        let blocks: Vec<SlackBlock> = vec![
+            SlackSectionBlock::new()
+                .with_text(SlackBlockText::MarkDown(body.into()))
+                .into(),
+            SlackActionsBlock::new(buttons).into(),
+        ];
+        let req = SlackApiChatPostMessageRequest::new(
+            channel.into(),
+            SlackMessageContent::new()
+                .with_text(format!("Dialog: {}", dialog.title))
+                .with_blocks(blocks),
+        )
+        .with_thread_ts(thread_ts.into())
+        .with_unfurl_links(false);
+        let res = self
+            .client
+            .open_session(&self.token)
+            .chat_post_message(&req)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(res.ts.to_string())
+    }
+
     pub async fn add_reaction(&self, channel: &str, ts: &str, emoji: &str) -> Result<(), String> {
         let req = SlackApiReactionsAddRequest::new(channel.into(), emoji.into(), ts.into());
         self.client
@@ -992,6 +1068,16 @@ impl crate::chat::Chat for Api {
     ) -> Result<String, String> {
         Api::post_perm_prompt(self, channel, thread_ts, req_id, tool_name, tool_input).await
     }
+
+    async fn post_dialog_prompt(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        req_id: &str,
+        dialog: &crate::agent::Dialog,
+    ) -> Result<String, String> {
+        Api::post_dialog_prompt(self, channel, thread_ts, req_id, dialog).await
+    }
     async fn open_dm(&self, user_id: &str) -> Result<String, String> {
         Api::open_dm(self, user_id).await
     }
@@ -1704,6 +1790,17 @@ pub fn inbound_from_relay(name: &str, event: &serde_json::Value) -> Option<Inbou
             None
         }
     }
+}
+
+/// Buttons in one actions block, leaving room for Cancel under Slack's 25.
+const DIALOG_BUTTON_CAP: usize = 20;
+
+/// A row as a button label. Slack takes 75 characters and rejects an empty one.
+fn button_label(option: &str) -> String {
+    if option.chars().count() <= 75 {
+        return option.to_string();
+    }
+    option.chars().take(74).collect::<String>() + "\u{2026}"
 }
 
 /// Turn a button press forwarded by the Relay into a [`PermClick`]. No decision here — only the fact it was pressed.

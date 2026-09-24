@@ -1552,11 +1552,18 @@ impl Bridge {
                     },
                 );
                 if !told {
-                    self.post_error_frame(
-                        channel,
-                        root_ts,
-                        crate::t!("Couldn't hand this to the agent: {e}", "エージェントに渡せませんでした: {e}"),
-                    );
+                    // A modal is the one refusal a person can lift from here: offer its rows as
+                    // buttons instead of a warning nobody can act on without the machine
+                    if !self
+                        .offer_dialog(&done.window, &channel, &root_ts, &ctx)
+                        .await
+                    {
+                        self.post_error_frame(
+                            channel,
+                            root_ts,
+                            crate::t!("Couldn't hand this to the agent: {e}", "エージェントに渡せませんでした: {e}"),
+                        );
+                    }
                 }
             }
         }
