@@ -903,31 +903,34 @@ pub(super) fn help(machines: bool, agent: &dyn crate::agent::Agent) -> String {
 
     let mut lines: Vec<String> = vec![crate::t!("*agentgw commands*", "*agentgw のコマンド*"), String::new()];
 
-    for (title, rows) in super::agent::help_sections(agent) {
+    let mut sections = super::agent::help_sections(agent);
+    // `pwd` and `cd` are per-thread too, so they go with the rest rather than in a section of their own
+    if let Some((_, rows)) = sections.first_mut() {
+        rows.push(("pwd".into(), crate::t!("show where this thread works", "このスレッドの作業ディレクトリを見る")));
+        rows.push(("cd <path>".into(), crate::t!("move this thread to that folder", "このスレッドをそのフォルダへ移す")));
+        if machines {
+            rows.push((
+                "cd <machine>[:<path>]".into(),
+                crate::t!("move this thread to that machine, conversation and all", "このスレッドをそのマシンへ移す(会話ごと)"),
+            ));
+        }
+    }
+    for (title, rows) in sections {
         section(&mut lines, title, rows);
     }
     let mut channels: Vec<(&str, String)> = Vec::new();
     if machines {
         channels.push(("channels", crate::t!("show which machine handles this channel and the others", "このチャンネルとほかのチャンネルを受け持つマシンを見る")));
     }
-    channels.push(("route <path>", crate::t!("set this channel's project directory (`/…`, `~/…`)", "このチャンネルの作業ディレクトリを決める(`/…`・`~/…`)")));
+    channels.push(("route <path>", crate::t!("set this channel's default project directory (`/…`, `~/…`)", "このチャンネルの既定の作業ディレクトリを決める(`/…`・`~/…`)")));
     if machines {
-        channels.push(("route <machine>[:<path>]", crate::t!("map this channel to a machine (its home folder or specific path)", "このチャンネルをマシンに割り当てる(そのマシンの家、またはパスを指定)")));
+        channels.push(("route <machine>[:<path>]", crate::t!("map this channel's default machine (its home folder or specific path)", "このチャンネルの既定のマシンを割り当てる(そのマシンの家、またはパスを指定)")));
     }
     channels.push(("warm on|off [<#channel>]", crate::t!("keep an agent started ahead of time for a channel", "チャンネルのエージェントを先に起動しておくか")));
     channels.push(("allow-bot <@bot>", crate::t!("let a bot's messages start work", "そのボットの投稿で作業を始められるようにする")));
     channels.push(("remove-bot <@bot>", crate::t!("stop letting that bot's messages through", "そのボットの投稿を通さないようにする")));
     channels.push(("set-home", crate::t!("send notices to this channel", "通知をこのチャンネルに出す")));
     section(&mut lines, crate::t!("Channels", "チャンネル"), channels);
-    let mut threads: Vec<(&str, String)> = vec![(
-        "pwd",
-        crate::t!("show where this thread works", "このスレッドの作業ディレクトリを見る"),
-    )];
-    threads.push(("cd <path>", crate::t!("move this thread to that folder", "このスレッドをそのフォルダへ移す")));
-    if machines {
-        threads.push(("cd <machine>[:<path>]", crate::t!("move this thread to that machine, conversation and all", "このスレッドをそのマシンへ移す(会話ごと)")));
-    }
-    section(&mut lines, crate::t!("Threads", "スレッド"), threads);
     section(
         &mut lines,
         crate::t!("Agent Gateway", "Agent Gateway"),
@@ -1254,10 +1257,18 @@ mod tests {
     fn a_bridge_that_takes_children_lists_the_machine_commands() {
         let h = help(true, &crate::agent::fake::FakeAgent::default());
         assert!(h.contains("route <machine>[:<path>]") && h.contains("channels"));
-        assert!(h.contains("map this channel to a machine"));
-        // The thread's own verb shows up beside it, so the two scopes are visible at once
+        // **Default**, because that is the whole difference from `cd`: it decides where the threads
+        // this channel starts next begin, and moves none of the ones already running
+        assert!(h.contains("map this channel's default machine"));
         assert!(h.contains("cd <machine>[:<path>]"));
         assert!(h.contains("move this thread"));
+        // `pwd` and `cd` sit in the thread section, not one of their own: the reader looking for
+        // "what can I do to this thread" finds them where `stop` and `exit` already are
+        let threads = h.split("*In the threads*").nth(1).expect("no thread section");
+        let threads = threads.split("\n\n").next().unwrap();
+        for row in ["`stop`", "`pwd`", "`cd <path>`", "`cd <machine>[:<path>]`"] {
+            assert!(threads.contains(row), "{row} is outside the thread section: {threads}");
+        }
         // Having machines doesn't change the other sections
         assert!(h.contains("status") && h.contains("help / ?"));
     }

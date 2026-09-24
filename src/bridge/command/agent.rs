@@ -1546,7 +1546,7 @@ pub(super) fn help_sections(agent: &dyn Agent) -> Vec<(String, Vec<(String, Stri
     let choice = |verb: &str, values: &[&str]| format!("{verb} [{}]", values.join("|"));
     vec![
         (
-            crate::t!("In this thread", "このスレッドで"),
+            crate::t!("In the threads", "スレッドで"),
             vec![
                 ("stop".to_string(), crate::t!("stop the current turn (a 🛑 reaction works too)", "実行中のターンを止める(🛑 のリアクションでも可)")),
                 ("exit / bye / done".to_string(), crate::t!("end this thread's agent; your next message resumes it", "このスレッドのエージェントを終える。次に書けば再開する")),
