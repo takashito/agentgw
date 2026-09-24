@@ -881,6 +881,14 @@ impl Bridge {
                         msg.ts, msg.channel
                     ),
                 );
+                // **A message under the channel is not in a thread**, so there is nothing for `cd` to
+                // move. What that person is after is this channel's machine or its default folder,
+                // and that is `route`'s job — say so rather than writing a row for a thread that
+                // does not exist yet
+                if for_thread && msg.thread_ts.is_none() {
+                    self.post(&msg.channel, root_ts, bridge::cd_outside_a_thread(), key);
+                    return true;
+                }
                 // Which machines exist is the gateway's knowledge — ask it, and it answers in this thread
                 if let Target::Machine { machine, path } = &target
                     && self.ask_the_gateway(

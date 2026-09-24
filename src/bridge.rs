@@ -3309,6 +3309,32 @@ mod tests {
         );
     }
 
+    /// **`cd` under the channel names `route` instead of doing anything.** There is no thread there
+    /// to move, and the person who typed it wants this channel pointed somewhere — which is the
+    /// other verb. Writing a row for a thread that does not exist yet would be the silent version.
+    #[tokio::test]
+    async fn cd_outside_a_thread_points_at_route() {
+        let (d, slack, agent, _clock) = flow_deps("cd-no-thread");
+        let ((mut b, _fx), _deliv) = Bridge::for_test_with_deliveries(d);
+        running_thread(&mut b, &agent).await;
+        let before = b.threads.get(ROOT).and_then(|e| e.repo_path.clone());
+
+        b.on_inbound(&channel_msg("1782000009.000400", "U_OWNER", "<@U_BOT> cd /work/app")).await;
+        settle().await;
+
+        assert!(agent.cd_to.lock().unwrap().is_empty(), "an agent was asked to move");
+        assert_eq!(
+            b.threads.get(ROOT).and_then(|e| e.repo_path.clone()),
+            before,
+            "a row moved although nothing was in a thread"
+        );
+        assert!(
+            slack.calls().iter().any(|c| c.contains("`route`")),
+            "the reply did not name the verb that does this: {:?}",
+            slack.calls()
+        );
+    }
+
     /// `route` sets the channel's default and **leaves running threads alone** — that separation is
     /// the whole reason the two verbs exist.
     #[tokio::test]

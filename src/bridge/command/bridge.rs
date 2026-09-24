@@ -972,6 +972,21 @@ pub(super) fn pwd_usage() -> String {
 }
 
 /// What `cd` accepts.
+/// `cd` typed under the channel rather than inside a thread. It names `route`, because wanting to
+/// point the channel somewhere is the reason someone types this there.
+pub(super) fn cd_outside_a_thread() -> String {
+    crate::t!(
+        "`cd` moves **a thread**, so type it inside one.\n\
+         To point **this channel** at a machine or a default project folder, use `route`:\n\
+         • `route <machine>[:<path>]` — this channel's default machine\n\
+         • `route ~/dev/app` — this channel's default project folder",
+        "`cd` は**スレッド**を移すので、スレッドの中で打ってください。\n\
+         **このチャンネル**のマシンや既定の作業ディレクトリを決めるのは `route` です:\n\
+         • `route <マシン>[:<パス>]` — このチャンネルの既定のマシン\n\
+         • `route ~/dev/app` — このチャンネルの既定の作業ディレクトリ"
+    )
+}
+
 fn cd_usage() -> String {
     crate::t!(
         "`cd` moves **this thread**. It takes one of these:\n\
