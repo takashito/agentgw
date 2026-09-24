@@ -2752,8 +2752,8 @@ impl Fleet {
             &format!("thread {thread_ts} moved {} → {bridge_id} ({abs})", was.as_deref().unwrap_or("-")),
         );
         let reply = crate::t!(
-            "This thread now runs on `{}`, in `{}`.\nIts history stays behind, so the next message starts a fresh agent there.",
-            "このスレッドは `{}` の `{}` で動くようになりました。\n会話の記録は移らないので、次のメッセージから新しいエージェントが始まります。",
+            "This thread now runs on `{}`, in `{}`.\nIts conversation goes with it, so it carries on there from the next message.",
+            "このスレッドは `{}` の `{}` で動くようになりました。\n会話の記録も移るので、次のメッセージから続きが始まります。",
             bridge_id,
             abs,
         );
