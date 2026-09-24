@@ -269,22 +269,17 @@ impl Bridge {
                 "No machine named `{machine}` is connected. This machine works on its own.",
                 "`{machine}` という名前のマシンはつながっていません。このマシンは単独で動いています。"
             ),
-            // **This thread's folder, not its channel's.** A moved thread has one of its own, and
-            // answering with the channel's said the move had not happened (measured 2026-09-24)
+            // **This thread's own machine and folder, not its channel's.**
+            //
+            // The machine is simply this one: a bare `pwd` is not answered by the gateway, it is
+            // delivered to whichever machine handles the thread, so the one running this *is* the
+            // answer. Reading it from the channel named the machine the thread used to be on, and
+            // reading it from the thread's row named nobody — that field is the gateway's copy and
+            // is never written on a machine (measured 2026-09-24: 0 of 32 rows).
             PwdMode::Current => {
                 let (repo_path, _) = self.thread_cwd(root_ts, &msg.channel);
                 PwdEntry {
-                    machine: self
-                        .threads
-                        .get(root_ts)
-                        .and_then(|e| e.bridge.clone())
-                        .or_else(|| {
-                            self.access
-                                .routes
-                                .get(&msg.channel)
-                                .and_then(|r| r.bridge.clone())
-                        })
-                        .unwrap_or_else(|| me.clone()),
+                    machine: me.clone(),
                     repo_path,
                 }
                 .render()

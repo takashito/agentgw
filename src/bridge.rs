@@ -3160,6 +3160,44 @@ mod tests {
         );
     }
 
+    /// **After a move, `pwd` answers for where the thread is now** — this machine and this thread's
+    /// folder. It named the channel's machine instead, so a thread moved to the gateway still
+    /// reported the machine it had left (measured 2026-09-24: `tyo-mpv5l:/mnt/dev/agentgw`, a folder
+    /// that only exists on the other one).
+    #[tokio::test]
+    async fn pwd_answers_for_the_thread_after_it_has_moved() {
+        let (d, slack, _agent, _clock) = flow_deps("pwd-after-move");
+        let (mut b, _fx) = Bridge::for_test(d);
+        // The channel still points at the machine this thread came from...
+        b.access
+            .routes
+            .entry("C1".into())
+            .or_default()
+            .bridge = Some("somewhere-else".into());
+        // ...while the thread itself was moved here, into its own folder
+        b.threads.upsert(
+            "1782000001.000100",
+            crate::bridge::state::ThreadEntry {
+                repo_path: Some("/mnt/dev/agentgw".into()),
+                ..Default::default()
+            },
+        );
+
+        b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "<@U_BOT> pwd")).await;
+        settle().await;
+
+        assert!(
+            slack.calls().iter().any(|c| c.contains("`test-machine:/mnt/dev/agentgw`")),
+            "answered for the channel, not the thread: {:?}",
+            slack.calls()
+        );
+        assert!(
+            !slack.calls().iter().any(|c| c.contains("somewhere-else")),
+            "named the machine the thread had left: {:?}",
+            slack.calls()
+        );
+    }
+
     /// A message that starts with `pwd` but isn't one of the forms gets the usage — it used to go to the
     /// agent as a sentence, so a mistyped path just vanished into the conversation.
     #[tokio::test]
