@@ -45,8 +45,11 @@ impl ToolStatus {
     fn glyph(self) -> &'static str {
         match self {
             ToolStatus::Pending => "◌",
-            ToolStatus::Done => "•",
-            // A plain × , not an emoji: it lines up with ◌ / • / ● at the same width
+            // **Not `•`**: Slack rewrites U+2022 as `-` inside a markdown block, wherever it sits —
+            // leading whitespace, a zero-width space before it and even a code span make no difference
+            // (measured on screen 2026-09-24). U+00B7 comes through as itself, at the same width.
+            ToolStatus::Done => "·",
+            // A plain × , not an emoji: it lines up with ◌ / · / ● at the same width
             ToolStatus::Error => "×",
             ToolStatus::Deny => "🚫",
         }
@@ -273,8 +276,7 @@ pub enum RenderItem {
 
 /// Prefix of a narration line. Slack turns ⏺ (U+23FA) into an emoji, so we use ●.
 const NARR_GLYPH: &str = "●";
-/// Indent of a tool row. **NBSP, not a plain space** — Slack collapses leading whitespace
-/// and reformats lines starting with `• ` as a bulleted list.
+/// Indent of a tool row. **NBSP, not a plain space** — Slack collapses leading whitespace.
 const TOOL_INDENT: &str = "\u{A0}\u{A0}\u{A0}";
 /// Slack strips the leading whitespace of a message's **first line** — NBSP included — so the top
 /// tool row came out flush left while every row under it kept its indent. A zero-width space is not
@@ -390,8 +392,8 @@ impl StickyBoard {
                         _ => None,
                     })
                     .collect();
-                // The **two spaces** after `•` line up with unfolded `•` rows
-                lines.push(format!("{TOOL_INDENT}•  {}", Self::tool_breakdown(&pairs)));
+                // The **two spaces** after the glyph line up with unfolded rows
+                lines.push(format!("{TOOL_INDENT}·  {}", Self::tool_breakdown(&pairs)));
             }
         }
         run.clear();
@@ -969,7 +971,7 @@ impl StickyBoard {
                 if let Some(key) = key {
                     rendered_agents.push(key.clone());
                     if let Some((_, ty, rows)) = groups.iter().find(|(gid, _, _)| *gid == key) {
-                        // Replace the leading • with ▾ so it looks like a standalone section heading
+                        // Replace the leading glyph with ▾ so it looks like a standalone section heading
                         let head = Self::render_item_line(it, false, false);
                         let head = match head.strip_prefix(TOOL_INDENT) {
                             Some(rest) => {
@@ -1384,7 +1386,7 @@ mod tests {
             "窓は2件: {body}"
         );
         assert!(
-            !body.contains("•  Read 2 files"),
+            !body.contains("·  Read 2 files"),
             "run 畳みは適用しない: {body}"
         );
     }
@@ -1435,7 +1437,7 @@ mod tests {
         let body = b.take_dirty(10_000).pop().unwrap().2;
         assert_eq!(
             body,
-            format!("{INDENT_GUARD}{TOOL_INDENT}•  Read 2 files, Searched for 1 pattern"),
+            format!("{INDENT_GUARD}{TOOL_INDENT}·  Read 2 files, Searched for 1 pattern"),
             "{body}"
         );
     }
@@ -1446,7 +1448,7 @@ mod tests {
         let mut b = StickyBoard::default();
         b.tool("t1", "Read", "/a.rs", ToolStatus::Done);
         let body = b.take_dirty(10_000).pop().unwrap().2;
-        assert_eq!(body, format!("{INDENT_GUARD}{TOOL_INDENT}• Read `/a.rs`"), "{body}");
+        assert_eq!(body, format!("{INDENT_GUARD}{TOOL_INDENT}· Read `/a.rs`"), "{body}");
     }
 
     #[test]
@@ -1551,7 +1553,7 @@ mod tests {
         b.push_narration(&ThreadKey::parse("k"), "ビルドを確認します");
         let dirty = b.take_dirty(10_000);
         assert_eq!(dirty.len(), 1);
-        assert!(dirty[0].2.contains("• Bash `cargo test`") && dirty[0].2.contains("● ビルド"));
+        assert!(dirty[0].2.contains("· Bash `cargo test`") && dirty[0].2.contains("● ビルド"));
         // A re-flush within 1 second is held back by the rate guard
         b.push_narration(&ThreadKey::parse("k"), "続き");
         assert!(b.take_dirty(10_500).is_empty());
@@ -1815,7 +1817,7 @@ mod tests {
         );
         let (ts, body) = b.take_final(&ThreadKey::parse("k")).expect("final draw");
         assert_eq!(ts, None);
-        assert!(body.contains("• Bash `cargo test`"), "{body}");
+        assert!(body.contains("· Bash `cargo test`"), "{body}");
         assert!(
             b.take_final(&ThreadKey::parse("k")).is_none(),
             "2回目は返さない"

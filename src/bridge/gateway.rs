@@ -168,7 +168,7 @@ pub mod link {
         /// `set-home`, asked from a machine — same reason as [`LinkFrame::Channels`].
         SetHome { channel: String, thread_ts: String },
         /// Where this machine's agents start when a channel has no folder of its own. Sent on connecting,
-        /// so `channels` can show a real path for every channel instead of just the machine's name.
+        /// so `route` can show a real path for every channel instead of just the machine's name.
         MachineHome { path: String },
         /// Where this machine can be reached: its tailnet name and IP (empty when there is no tailnet),
         /// and **the URL it dialled to get here**. Only the machine knows the last one for certain, and
@@ -182,7 +182,7 @@ pub mod link {
         },
         /// `machines`, asked from a machine — same reason as [`LinkFrame::Channels`].
         Machines { channel: String, thread_ts: String },
-        /// `channels`, asked from a machine. **The gateway only sees messages that mention the bot**, and a
+        /// `route`, asked from a machine. **The gateway only sees messages that mention the bot**, and a
         /// follow-up in a running thread doesn't; the machine that owns the thread asks on its behalf.
         Channels { channel: String, thread_ts: String },
         /// `pwd <machine>[:<path>]`, asked from a machine — same reason as [`LinkFrame::Channels`].
@@ -222,7 +222,7 @@ pub mod link {
     /// Read the machine's name from the dial path. `/bridge/desktop` → `desktop`.
     ///
     /// Only one segment passes, with a narrow alphabet (`[A-Za-z0-9][A-Za-z0-9_.-]*`). The name shows up
-    /// in logs and in the `channels` table, and nothing is gained by accepting something like `..` as a name.
+    /// in logs and in the `route` table, and nothing is gained by accepting something like `..` as a name.
     pub fn bridge_id_of_path(path: &str) -> Option<&str> {
         let id = path.strip_prefix(BRIDGE_PATH)?;
         crate::bridge::state::is_machine_name(id).then_some(id)
@@ -1151,7 +1151,7 @@ impl NoticeCooldown {
 }
 
 // ── Section 5: commands the gateway answers itself ───────────────────────────────
-// Only "things no machine can be asked" live here: `pwd <machine>` / `channels` (the machine you'd ask is the thing being changed),
+// Only "things no machine can be asked" live here: `pwd <machine>` / `route` (the machine you'd ask is the thing being changed),
 // `set-home` (a broadcast to the whole fleet), and the DM name-claim (the moment the Owner is born).
 // Decisions are pure functions; the caller does the execution (saving, posting, forwarding).
 
@@ -1177,7 +1177,7 @@ impl CommandCtx<'_> {
 
     /// Whether this command is addressed to the bot. DMs need no mention.
     ///
-    /// An unaddressed `pwd` / `channels` **isn't even refused** — cutting into people's conversation over one word
+    /// An unaddressed `pwd` / `route` **isn't even refused** — cutting into people's conversation over one word
     /// with "that's Owner-only" is barging into a conversation the bot isn't part of.
     fn addressed(&self) -> bool {
         self.is_dm() || self.msg().mentions_bot()
@@ -1208,16 +1208,15 @@ impl CommandCtx<'_> {
 /// hijack the channel, sending every later message to their machine (with their permissions).
 /// This check is not decoration.
     /// `self_id` is the gateway's name — **channels with no machine assigned go to the gateway**, so the list says so.
-    /// `channels` (the table) and `pwd <machine>[:<path>]` (handing this channel to a machine). Both are
+    /// `route` (the table) and `pwd <machine>[:<path>]` (handing this channel to a machine). Both are
     /// answered here — the gateway is the one that knows the machines. `pwd <path>` is not: it goes to the
     /// machine running this channel, which is where the folder is.
     pub fn route(&self, connected: &[String]) -> RouteOutcome {
         let ctx = self;
-        let listing = ["channels", "channel"]
-            .iter()
-            .any(|verb| ctx.verb_args(verb).is_some_and(|args| args.is_empty()));
+        // Bare `route` is the table; `route <something>` sets this channel's line and is read below
+        let listing = ctx.verb_args("route").is_some_and(|args| args.is_empty());
         if listing {
-            if let Some(reply) = ctx.refuse_if_not_owner("channels") {
+            if let Some(reply) = ctx.refuse_if_not_owner("route") {
                 return RouteOutcome::Refused(reply);
             }
             return RouteOutcome::List;
@@ -1329,7 +1328,7 @@ fn handover_reply(channel: &str, routes: &Routes, bridge_id: &str) -> String {
 pub enum RouteOutcome {
     NotACommand,
     Refused(String),
-    /// `channels` — the caller builds the table (it needs Slack, and this decision runs on every message).
+    /// `route` — the caller builds the table (it needs Slack, and this decision runs on every message).
     List,
     /// `cd`/`route` naming a machine: ask it to check `path`; bind only on its yes.
     SetProject {
@@ -1341,7 +1340,7 @@ pub enum RouteOutcome {
     UnknownBridge(String),
 }
 
-/// The answer to `channels`. Says **what's going on in the channel it was typed in** first,
+/// The answer to `route`. Says **what's going on in the channel it was typed in** first,
 /// then lists the other channels and machines. Each one is marked online or not.
 ///
 /// Channels with no machine assigned go to the gateway — writing only "unassigned" in the list
@@ -2035,7 +2034,7 @@ pub struct Fleet {
     /// This machine's name. What `pwd <own id>` points at.
     pub self_id: String,
     /// machine → the folder its agents start in when a channel has no folder of its own. Filled when a
-    /// machine connects; **memory only**, since it is only for showing `channels`.
+    /// machine connects; **memory only**, since it is only for showing `route`.
     pub homes: tokio::sync::Mutex<HashMap<String, String>>,
     /// The Slack bot token handed to machines (given out in the `Ready` frame).
     pub bot_token: String,
@@ -2228,7 +2227,7 @@ impl Fleet {
         machines_md(&rows)
     }
 
-    /// The `channels` table. **`machines()` and not `links.connected()`**: the gateway is a machine too,
+    /// The `route` table. **`machines()` and not `links.connected()`**: the gateway is a machine too,
     /// and leaving itself out drew it as offline.
     async fn channels_table(self: &Arc<Self>, here: &str) -> String {
         let in_slack = match self.api.bot_channels().await {
@@ -2526,7 +2525,7 @@ impl Fleet {
         let owner = self.owner();
         let machines = self.machines();
 
-        // ── DM name-claim. Before `pwd <machine>` / `channels` (they assume there's already an Owner)
+        // ── DM name-claim. Before `pwd <machine>` / `route` (they assume there's already an Owner)
         if crate::chat::slack::SlackId::is_dm(channel) {
             let awaiting = self.pending_selection.lock().await.is_some();
             let outcome = DmOnboardingCtx {
@@ -2679,7 +2678,7 @@ impl Fleet {
         thread_only: bool,
     ) {
         if thread_ts.is_empty() {
-            // A folder set on the machine itself: record it so `channels` shows where the work happens
+            // A folder set on the machine itself: record it so `route` shows where the work happens
             if let Ok(abs) = result {
                 let (ch, id) = (channel.to_string(), bridge_id.to_string());
                 self.edit_access(move |a| {
@@ -2700,7 +2699,7 @@ impl Fleet {
             Ok(abs) => {
                 let mut reply = handover_reply(channel, &self.access().bridges(), bridge_id);
                 let (ch, id, folder) = (channel.to_string(), bridge_id.to_string(), abs.clone());
-                // Keep the folder here too: `channels` says where each channel's work happens, and only
+                // Keep the folder here too: `route` says where each channel's work happens, and only
                 // the machine knows the absolute path
                 self.edit_access(move |a| {
                     let r = a.routes.entry(ch).or_default();
@@ -4517,7 +4516,7 @@ mod tests {
     fn a_bare_route_says_who_handles_this_channel_first() {
         // here() = ["desktop", "vps"] (connected). laptop is named only in routes
         assert_eq!(
-            CommandCtx::route(&ctx("C1", "<@U_BOT> channels", Some(OWNER)), &here()),
+            CommandCtx::route(&ctx("C1", "<@U_BOT> route", Some(OWNER)), &here()),
             RouteOutcome::List
         );
         let reply = route_table(
@@ -4695,16 +4694,14 @@ mod tests {
         }
     }
 
-    /// `channels` and `channel` list. **The gateway only takes the forms that name a machine** —
+    /// Bare `route` lists. **Otherwise the gateway only takes the forms that name a machine** —
     /// it is the one that knows them; everything else is the machine's own business and goes on down.
     #[test]
-    fn channels_lists_and_only_a_named_machine_stops_here() {
-        for text in ["<@U_BOT> channels", "<@U_BOT> channel"] {
-            let got = CommandCtx::route(&ctx("C1", text, Some(OWNER)), &here());
-            assert_eq!(got, RouteOutcome::List, "{text}");
-        }
-        // Bare, or a plain folder: the machine handling it answers, not the gateway
-        for text in ["<@U_BOT> route", "<@U_BOT> cd", "<@U_BOT> cd ~/dev/x"] {
+    fn a_bare_route_lists_and_only_a_named_machine_stops_here() {
+        let got = CommandCtx::route(&ctx("C1", "<@U_BOT> route", Some(OWNER)), &here());
+        assert_eq!(got, RouteOutcome::List);
+        // The old word is gone: it reads as an ordinary message now
+        for text in ["<@U_BOT> channels", "<@U_BOT> channel", "<@U_BOT> cd", "<@U_BOT> cd ~/dev/x"] {
             let got = CommandCtx::route(&ctx("C1", text, Some(OWNER)), &here());
             assert_eq!(got, RouteOutcome::NotACommand, "{text}");
         }

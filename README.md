@@ -256,7 +256,7 @@ Mention the bot (`@agentgw <command>`), or type in a thread it's working in.
 | `resume` | The command to continue this session in your own terminal |
 | `usage` | Your Claude subscription usage |
 | `status` | Version, active threads and warm agents |
-| `channels` | Which machine handles this channel and the others |
+| `route` | Which machine handles this channel and the others |
 | `machines` | The gateway and every machine: how each one links, and the address it links from |
 | `pwd` | Show where this thread works |
 | `cd <path>` · `cd <machine>[:<path>]` | Move **this thread** to that folder, or to that machine — conversation and all |

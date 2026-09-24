@@ -937,7 +937,7 @@ impl Access {
     ///   but pools are per repo, so if even one channel pointing at the repo opts in (`warm != Some(false)`,
     ///   unset counts as opt-in) it gets stocked (OR). Opted-out channels still claim that pool if it exists.
     /// `me` is this machine's name: **a folder on another machine is not ours to warm**. The gateway keeps
-    /// a copy of every channel's folder (for `channels`), and without this check it started warming
+    /// a copy of every channel's folder (for `route`), and without this check it started warming
     /// agents in folders that only exist on the machines it hands those channels to.
     /// `serves_home` = this Bridge answers places that have no folder of their own — DMs and unassigned
     /// channels. True on the gateway and on a lone Bridge; false on a machine behind a gateway, which only
@@ -1057,7 +1057,7 @@ impl PoolRestore {
 // ─── machine names and project paths ────────────────────────────────────────────
 
 /// A machine's name: `[A-Za-z0-9][A-Za-z0-9_.-]*`. Narrow on purpose — names show up in logs, in
-/// the `channels` table and in dial paths, and nothing is gained by accepting `..`.
+/// the `route` table and in dial paths, and nothing is gained by accepting `..`.
 pub fn is_machine_name(s: &str) -> bool {
     let mut cs = s.chars();
     cs.next().is_some_and(|c| c.is_ascii_alphanumeric())
@@ -1915,7 +1915,7 @@ mod tests {
         assert!(!pools.iter().any(|p| p == "/repo/c"));
     }
 
-    /// The gateway keeps a copy of every channel's folder so `channels` can show it. Those folders live
+    /// The gateway keeps a copy of every channel's folder so `route` can show it. Those folders live
     /// on the machines that handle them, and warming an agent in one here would start it in the wrong place
     /// (seen on a real gateway: it tried to warm the Mac's repos).
     #[test]

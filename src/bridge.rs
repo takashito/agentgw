@@ -102,7 +102,7 @@ pub struct Bridge {
     started_at_ms: u64,
     /// Where spawned sign-in / sign-out tasks send back their state changes.
     cmd_tx: mpsc::Sender<CmdFx>,
-    /// Where to ask the gateway the things only it knows (`channels`, `pwd <machine>`). `None` = this
+    /// Where to ask the gateway the things only it knows (`route`, `pwd <machine>`). `None` = this
     /// Bridge works on its own, with no gateway anywhere.
     ask_gateway: Option<mpsc::UnboundedSender<crate::bridge::gateway::link::LinkFrame>>,
     /// Set on a machine: the gateway it is linked to.
@@ -282,7 +282,7 @@ impl Bridge {
     /// (for a machine this one line is the only way to tell a person "connected" — the gateway's presence only reports 🔴).
     async fn announce_online(&mut self) {
         let pools: Vec<String> = self.access.pool_targets(&Host::home(), &self.machine_name, self.link.is_none());
-        // The machine's own name — the one `channels`, `status` and `pwd <machine>` all use
+        // The machine's own name — the one `route`, `status` and `pwd <machine>` all use
         let text = online_notice(&self.machine_name, env!("CARGO_PKG_VERSION"), &pools, 0);
         self.post_notice(&text, &LogCtx::default()).await;
     }
@@ -739,7 +739,7 @@ impl Bridge {
             _ => Host::name().await,
         };
         // What this Bridge sends up to the gateway: answers (`ProjectSet`) and the commands only the
-        // gateway can run (`channels`, `pwd <machine>`). On the gateway itself it loops back into its own
+        // gateway can run (`route`, `pwd <machine>`). On the gateway itself it loops back into its own
         // fleet, so both sides go through the same handler
         let (up_tx, up_rx) = mpsc::unbounded_channel();
         let up_is_linked = !matches!(wiring.upstream, machine::Mode::Direct { .. });
@@ -1327,7 +1327,7 @@ struct RelaySinks {
 }
 
 /// Tell the gateway where this machine works for each of its channels. The folders are **this machine's
-/// record** (it reads them when it starts an agent); the gateway keeps a copy only so `channels` can show
+/// record** (it reads them when it starts an agent); the gateway keeps a copy only so `route` can show
 /// them. Sent at start-up and on every reconnect, so the copy is right even for folders set before it
 /// started keeping one.
 fn report_folders(
@@ -2996,7 +2996,7 @@ mod tests {
         assert!(b.ledger.pending(&ThreadKey::new("C1", ROOT)).is_empty());
     }
 
-    /// `channels` and `pwd <machine>` are the gateway's to answer, and a follow-up in a running thread
+    /// `route` and `pwd <machine>` are the gateway's to answer, and a follow-up in a running thread
     /// never reaches it (no mention). The machine that owns the thread passes them up.
     #[tokio::test]
     async fn the_machine_passes_gateway_commands_up() {
@@ -3006,7 +3006,7 @@ mod tests {
         let (up, mut up_rx) = mpsc::unbounded_channel();
         b.ask_gateway = Some(up);
 
-        b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "<@U_BOT> channels")).await;
+        b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "<@U_BOT> route")).await;
         b.on_inbound(&channel_msg("1782000001.000200", "U_OWNER", "<@U_BOT> route hub:~/x")).await;
         b.on_inbound(&channel_msg("1782000001.000300", "U_OWNER", "<@U_BOT> set-home")).await;
         b.on_inbound(&channel_msg("1782000001.000400", "U_OWNER", "<@U_BOT> machines")).await;
@@ -3042,7 +3042,7 @@ mod tests {
     }
 
     /// On connecting, a machine says where it works for each of its channels — the gateway may have
-    /// started with no copy at all, and `channels` would then show machines with no folders.
+    /// started with no copy at all, and `route` would then show machines with no folders.
     #[test]
     fn a_machine_reports_its_folders_when_it_connects() {
         use crate::bridge::gateway::link::LinkFrame;
@@ -3086,7 +3086,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir.path());
     }
 
-    /// A folder set on the machine itself is reported up, so the gateway's `channels` doesn't go stale.
+    /// A folder set on the machine itself is reported up, so the gateway's `route` doesn't go stale.
     #[tokio::test]
     async fn a_folder_set_here_is_reported_to_the_gateway() {
         use crate::bridge::gateway::link::LinkFrame;

@@ -374,7 +374,7 @@ impl Bridge {
         match self.access.apply(op) {
             Ok((access, message, warnings)) => {
                 self.adopt_access(access, ctx);
-                // No thread = nothing to say, just keep the gateway's copy current (`channels`)
+                // No thread = nothing to say, just keep the gateway's copy current (`route`)
                 self.ask_the_gateway(
                     crate::bridge::gateway::link::LinkFrame::ProjectSet {
                         channel: msg.channel.clone(),
@@ -889,7 +889,7 @@ fn with_warnings(message: &str, warnings: &[String]) -> String {
 /// help as Slack mrkdwn. Grouped by purpose; each line is a monospace trigger (with aliases) + a one-line description.
 /// Kept in sync **by hand** with `COMMAND_WORDS` and the argument parser — this is their human-facing index.
 ///
-/// `machines` decides whether the machine commands (`pwd <machine>`, `channels`) are listed: true on the
+/// `machines` decides whether the machine commands (`pwd <machine>`, `route`) are listed: true on the
 /// gateway and on any machine linked to one (it passes those commands up). A Bridge on its own has
 /// nobody to hand a channel to, so it doesn't offer.
 pub(super) fn help(machines: bool, agent: &dyn crate::agent::Agent) -> String {
@@ -920,7 +920,7 @@ pub(super) fn help(machines: bool, agent: &dyn crate::agent::Agent) -> String {
     }
     let mut channels: Vec<(&str, String)> = Vec::new();
     if machines {
-        channels.push(("channels", crate::t!("show which machine handles this channel and the others", "このチャンネルとほかのチャンネルを受け持つマシンを見る")));
+        channels.push(("route", crate::t!("show which machine handles this channel and the others", "このチャンネルとほかのチャンネルを受け持つマシンを見る")));
     }
     channels.push(("route <path>", crate::t!("set this channel's default project directory (`/…`, `~/…`)", "このチャンネルの既定の作業ディレクトリを決める(`/…`・`~/…`)")));
     if machines {

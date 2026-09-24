@@ -170,7 +170,7 @@ pub enum Cmd {
     /// `route …` — set **this channel's** machine and folder, which decides where its *next* thread
     /// starts. Live threads keep what they have.
     Route(Target),
-    /// `channels` / `channel` — which machine handles this channel and the others. **The gateway answers it**;
+    /// Bare `route` — which machine handles this channel and the others. **The gateway answers it**;
     /// a machine passes it up (the gateway never sees a follow-up in a running thread — it carries no mention).
     Channels,
     /// `machines` / `machine` — the gateway and every machine it knows, with where each can be reached.
@@ -214,7 +214,9 @@ impl Cmd {
         ("restart", &["restart"], Cmd::Restart),
         ("login", &["login"], Cmd::Login),
         ("logout", &["logout"], Cmd::Logout),
-        ("channels", &["channels", "channel"], Cmd::Channels),
+        // Bare `route` shows the table. With an argument it sets this channel's own line, which is
+        // parsed by shape further down — the words here only match a message that is the word alone
+        ("route", &["route"], Cmd::Channels),
         ("machines", &["machines", "machine"], Cmd::Machines),
     ];
 
@@ -273,7 +275,7 @@ impl Cmd {
             Cmd::Pwd(_) => "pwd",
             Cmd::Cd(_) => "cd",
             Cmd::Route(_) => "route",
-            Cmd::Channels => "channels",
+            Cmd::Channels => "route",
             Cmd::Machines => "machines",
             Cmd::Owner(oc) => return format!("owner-command '{}'", oc.verb),
         };
