@@ -2591,6 +2591,39 @@ mod tests {
         assert_eq!(sent, "/mnt/dev/agentgw", "the row is what names the folder it left");
     }
 
+    /// **A thread's own folder outranks its channel's** — the same rule as which machine handles it.
+    /// A moved thread carries the folder it was moved into; starting it in the channel's folder is a
+    /// path on the machine it just left, and the agent refuses to start at all.
+    #[tokio::test]
+    async fn a_thread_works_in_its_own_folder_not_its_channels() {
+        let (d, _slack, _agent, _clock) = flow_deps("thread-cwd");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let home = Host::home();
+
+        // No row yet: the channel decides, as it always did
+        assert_eq!(b.thread_cwd(ROOT, "C1").0, b.access.repo_path("C1", &home).0);
+
+        // Once the thread has a folder of its own, that is where its agent works
+        b.threads.upsert(
+            ROOT,
+            crate::bridge::state::ThreadEntry {
+                repo_path: Some("/mnt/dev/agentgw".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            b.thread_cwd(ROOT, "C1"),
+            ("/mnt/dev/agentgw".to_string(), false),
+            "the channel's folder was used for a thread that has its own"
+        );
+
+        // An empty folder on the row is not a folder
+        if let Some(e) = b.threads.entries.get_mut(ROOT) {
+            e.repo_path = Some(String::new());
+        }
+        assert_eq!(b.thread_cwd(ROOT, "C1").0, b.access.repo_path("C1", &home).0);
+    }
+
     /// **A thread handed to another machine is let go of here.** Keeping the row would leave two
     /// machines answering one conversation, which is worse than losing the agent: the person sees
     /// two replies and neither side knows about the other.

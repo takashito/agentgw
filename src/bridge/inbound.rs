@@ -664,8 +664,8 @@ impl Bridge {
         // Needed to resend after a failed turn. `track` runs right after the ack (before the
         // envelope exists), so store it in the ledger **here**, once built; every delivery path below comes after this
         self.ledger.remember_envelope(&key, &msg.ts, &envelope);
-        // Resolve the same way as pwd (no route → fall back to Home)
-        let (cwd, home_fallback) = self.access.repo_path(&msg.channel, &Host::home());
+        // Resolve the same way as pwd
+        let (cwd, home_fallback) = self.thread_cwd(&root_ts, &msg.channel);
         // About to start an agent in a registered folder that has gone away: tmux would quietly start it
         // in the home directory instead, working somewhere nobody asked for. Say so and stop
         if !home_fallback
@@ -679,8 +679,8 @@ impl Bridge {
                 msg.channel.clone(),
                 root_ts.clone(),
                 crate::t!(
-                    "This channel's project folder `{cwd}` doesn't exist on *{machine}*, so no agent was started. Set it again with `pwd <path>`.",
-                    "このチャンネルのプロジェクトのフォルダ `{cwd}` が *{machine}* にありません。エージェントは起動していません。`pwd <パス>` で設定し直してください。"
+                    "The project folder `{cwd}` doesn't exist on *{machine}*, so no agent was started. Set it again with `pwd <path>`.",
+                    "プロジェクトのフォルダ `{cwd}` が *{machine}* にありません。エージェントは起動していません。`pwd <パス>` で設定し直してください。"
                 ),
             );
             return;
@@ -1063,6 +1063,27 @@ impl Bridge {
         }
         // A cancelled request is not pending (take it off the watch)
         self.ledger.disposed(key, &[deleted.to_string()]);
+    }
+
+    /// Where this thread's agent works: **its own folder if it has one, otherwise its channel's.**
+    ///
+    /// The same rule as which machine handles it — a channel says where its *next* conversation
+    /// starts, and must not move one already under way. Without this a thread moved to another
+    /// machine was started in the folder its channel names, which is a path on the machine it just
+    /// left: the agent refused to start at all ("the project folder doesn't exist here",
+    /// measured 2026-09-24).
+    ///
+    /// The second value is "this is only the home directory, nobody chose it".
+    pub(super) fn thread_cwd(&self, thread_ts: &str, channel: &str) -> (String, bool) {
+        match self
+            .threads
+            .get(thread_ts)
+            .and_then(|e| e.repo_path.clone())
+            .filter(|p| !p.is_empty())
+        {
+            Some(its_own) => (its_own, false),
+            None => self.access.repo_path(channel, &Host::home()),
+        }
     }
 
     /// Take the worktree down with the conversation that was using it.

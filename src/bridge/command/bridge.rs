@@ -260,20 +260,7 @@ impl Bridge {
         root_ts: &str,
         ctx: &LogCtx,
     ) -> String {
-        let home = Host::home();
         let me = self.machine_name.clone();
-        let entry = |access: &bridge::Access, ch: &str| {
-            let (repo_path, _) = access.repo_path(ch, &home);
-            PwdEntry {
-                // Unset = this machine handles the channel itself
-                machine: access
-                    .routes
-                    .get(ch)
-                    .and_then(|r| r.bridge.clone())
-                    .unwrap_or_else(|| me.clone()),
-                repo_path,
-            }
-        };
         match mode {
             PwdMode::Usage => pwd_usage(),
             // Only the gateway knows the machines and answers these. Reaching a Bridge means there is
@@ -282,8 +269,25 @@ impl Bridge {
                 "No machine named `{machine}` is connected. This machine works on its own.",
                 "`{machine}` という名前のマシンはつながっていません。このマシンは単独で動いています。"
             ),
+            // **This thread's folder, not its channel's.** A moved thread has one of its own, and
+            // answering with the channel's said the move had not happened (measured 2026-09-24)
             PwdMode::Current => {
-                entry(&self.access, &msg.channel).render()
+                let (repo_path, _) = self.thread_cwd(root_ts, &msg.channel);
+                PwdEntry {
+                    machine: self
+                        .threads
+                        .get(root_ts)
+                        .and_then(|e| e.bridge.clone())
+                        .or_else(|| {
+                            self.access
+                                .routes
+                                .get(&msg.channel)
+                                .and_then(|r| r.bridge.clone())
+                        })
+                        .unwrap_or_else(|| me.clone()),
+                    repo_path,
+                }
+                .render()
             }
             // A DM has no route (its agent always starts at Home), so say so
             // instead of silently recording it
