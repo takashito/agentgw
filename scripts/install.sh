@@ -337,7 +337,7 @@ case "${role}" in
     ;;
   machine*|マシン*)
     echo
-    say "This machine works for a gateway. To hand it a Slack channel, type \`pwd <name>:<path>\` in that channel." \
-        "このマシンはゲートウェイの下で動きます。Slack のチャンネルを任せるには、そのチャンネルで \`pwd <名前>:<パス>\` と打ってください。"
+    say "This machine works for a gateway. To hand it a Slack channel, type \`route <name>:<path>\` in that channel." \
+        "このマシンはゲートウェイの下で動きます。Slack のチャンネルを任せるには、そのチャンネルで \`route <名前>:<パス>\` と打ってください。"
     ;;
 esac

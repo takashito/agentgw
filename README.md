@@ -56,7 +56,7 @@ Each thread gets its own agent — a real Claude Code session in `tmux`. Reply t
 <td width="50%" valign="top">
 
 **🖧 A fleet, one Slack app**<br>
-One **gateway** holds the Slack connection. Your other **machines** dial out to it, so they need no open ports. `pwd <machine>:<path>` hands a channel to a machine and picks the folder it works in.
+One **gateway** holds the Slack connection. Your other **machines** dial out to it, so they need no open ports. `route <machine>:<path>` hands a channel to a machine and picks the folder it works in.
 
 </td>
 </tr>
@@ -258,7 +258,9 @@ Mention the bot (`@agentgw <command>`), or type in a thread it's working in.
 | `status` | Version, active threads and warm agents |
 | `channels` | Which machine handles this channel and the others |
 | `machines` | The gateway and every machine: how each one links, and the address it links from |
-| `pwd [<machine>[:<path>]]` · `pwd [path]` | Show this channel's project directory, or set it (`/…`, `~/…`, `./…`). Naming a machine hands the channel to it — its home folder, or the one you name |
+| `pwd` | Show where this thread works |
+| `cd <path>` · `cd <machine>[:<path>]` | Move **this thread** to that folder, or to that machine — conversation and all |
+| `route <path>` · `route <machine>[:<path>]` | Set **this channel's** folder and machine, which decides where the threads it starts next begin |
 | `warm on\|off` | Keep an agent started ahead of time for this channel |
 | `set-home` | Send notices (online, offline, errors) to this channel |
 | `allow-bot @bot` · `remove-bot @bot` | Let another bot's messages start work |
