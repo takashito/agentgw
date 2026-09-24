@@ -1222,14 +1222,24 @@ impl CommandCtx<'_> {
             }
             return RouteOutcome::List;
         }
-        let pwd = ctx
+        // **`cd` and `route` are the same request with a different scope.** Which one was typed says
+        // whether one thread moves or the channel's default changes — not where it was typed
+        let (verb, for_thread) = ["cd", "route"]
+            .into_iter()
+            .map(|v| (v, v == "cd"))
+            .find(|(v, _)| {
+                ctx.addressed() && ctx.msg().verb_args(v).is_some()
+            })
+            .unwrap_or(("", false));
+        let target = ctx
             .addressed()
-            .then(|| crate::bridge::command::Cmd::pwd(&ctx.msg()))
+            .then(|| crate::bridge::command::Cmd::target(&ctx.msg(), verb))
             .flatten();
-        let Some(crate::bridge::command::PwdMode::On { machine: bridge_id, path }) = pwd else {
+        let Some(crate::bridge::command::Target::Machine { machine: bridge_id, path }) = target
+        else {
             return RouteOutcome::NotACommand;
         };
-        if let Some(reply) = ctx.refuse_if_not_owner("pwd") {
+        if let Some(reply) = ctx.refuse_if_not_owner(verb) {
             return RouteOutcome::Refused(reply);
         }
         let bridge_id = &bridge_id;
@@ -1238,11 +1248,12 @@ impl CommandCtx<'_> {
         // are treated the same — the only test is "is it here now". Never silently create an assignment with nowhere to go.
         if !connected.iter().any(|c| c == bridge_id) {
             return RouteOutcome::UnknownBridge(unknown_machine(bridge_id, connected));
-        }        // The machine checks the folder first; the channel moves only if it's there. With no folder named,
-        // that machine's home — so `pwd <machine>` records `<machine>:~` instead of leaving it unset
+        }        // The machine checks the folder first; nothing moves unless it's there. With no folder named,
+        // that machine's home — so `route <machine>` records `<machine>:~` instead of leaving it unset
         RouteOutcome::SetProject {
             bridge_id: bridge_id.clone(),
             path: path.unwrap_or_else(|| "~".to_string()),
+            for_thread,
         }
     }
 
@@ -1320,8 +1331,13 @@ pub enum RouteOutcome {
     Refused(String),
     /// `channels` — the caller builds the table (it needs Slack, and this decision runs on every message).
     List,
-    /// `pwd <machine>:<path>`: ask the machine to set `path` up; bind only on its yes.
-    SetProject { bridge_id: String, path: String },
+    /// `cd`/`route` naming a machine: ask it to check `path`; bind only on its yes.
+    SetProject {
+        bridge_id: String,
+        path: String,
+        /// `cd` (move this thread) rather than `route` (set this channel's default).
+        for_thread: bool,
+    },
     UnknownBridge(String),
 }
 
@@ -2578,8 +2594,8 @@ impl Fleet {
         match ctx.route(&machines) {
             RouteOutcome::NotACommand => {}
             // The folder can only be checked where it is. Here: now. Elsewhere: ask, and bind on the answer
-            RouteOutcome::SetProject { bridge_id, path } => {
-                self.assign_project(channel, &thread, &bridge_id, Some(path), ev.in_a_thread())
+            RouteOutcome::SetProject { bridge_id, path, for_thread } => {
+                self.assign_project(channel, &thread, &bridge_id, Some(path), for_thread)
                     .await;
                 return true;
             }
@@ -4449,11 +4465,15 @@ mod tests {
 
     #[test]
     fn route_sets_this_channel_to_a_connected_machine() {
-        let got = CommandCtx::route(&ctx("C1", "<@U_BOT> pwd desktop", Some(OWNER)), &here());
+        let got = CommandCtx::route(&ctx("C1", "<@U_BOT> route desktop", Some(OWNER)), &here());
         // With no folder named, that machine's home — so `pwd` shows `desktop:/home/…`, not "not set"
         assert_eq!(
             got,
-            RouteOutcome::SetProject { bridge_id: "desktop".into(), path: "~".into() }
+            RouteOutcome::SetProject {
+                bridge_id: "desktop".into(),
+                path: "~".into(),
+                for_thread: false
+            }
         );
         let reply = handover_reply("C1", &routes(&[]), "desktop");
         assert!(reply.contains("This channel is now handled by *desktop*."));
@@ -4472,7 +4492,7 @@ mod tests {
     #[test]
     fn only_the_owner_may_route() {
         for user in [Some("U_STRANGER"), None] {
-            let got = CommandCtx::route(&ctx("C1", "<@U_BOT> pwd desktop", user), &here());
+            let got = CommandCtx::route(&ctx("C1", "<@U_BOT> route desktop", user), &here());
             assert!(
                 matches!(got, RouteOutcome::Refused(_)),
                 "{user:?} → {got:?}"
@@ -4483,7 +4503,7 @@ mod tests {
     /// Can't point at a machine that isn't connected — a typo and one not started are treated the same.
     #[test]
     fn a_route_to_a_machine_that_is_not_here_is_refused() {
-        let got = CommandCtx::route(&ctx("C1", "<@U_BOT> pwd laptop", Some(OWNER)), &here());
+        let got = CommandCtx::route(&ctx("C1", "<@U_BOT> route laptop", Some(OWNER)), &here());
         match got {
             RouteOutcome::UnknownBridge(reply) => {
                 assert!(reply.contains("No machine named `laptop` is connected."), "{reply}");
@@ -4557,7 +4577,7 @@ mod tests {
     /// **A `pwd <machine>` without a mention isn't even refused.** That would be barging into a conversation the bot isn't part of.
     #[test]
     fn an_unaddressed_route_falls_through_without_a_refusal() {
-        let got = CommandCtx::route(&ctx("C1", "pwd desktop", Some(OWNER)), &here());
+        let got = CommandCtx::route(&ctx("C1", "route desktop", Some(OWNER)), &here());
         assert_eq!(got, RouteOutcome::NotACommand);
     }
 
@@ -4565,7 +4585,7 @@ mod tests {
     fn a_route_inside_a_sentence_is_a_sentence() {
         for text in [
             "<@U_BOT> please pwd desktop",
-            "<@U_BOT> pwd desktop and also vps",
+            "<@U_BOT> route desktop and also vps",
         ] {
             let got = CommandCtx::route(&ctx("C1", text, Some(OWNER)), &here());
             assert_eq!(got, RouteOutcome::NotACommand, "{text}");
@@ -4575,7 +4595,7 @@ mod tests {
     /// In a DM no mention is needed.
     #[test]
     fn in_a_dm_route_needs_no_mention() {
-        let got = CommandCtx::route(&ctx("D1", "pwd desktop", Some(OWNER)), &here());
+        let got = CommandCtx::route(&ctx("D1", "route desktop", Some(OWNER)), &here());
         assert!(matches!(got, RouteOutcome::SetProject { .. }), "{got:?}");
     }
 
@@ -4632,13 +4652,37 @@ mod tests {
         assert!(table.contains("- <#C2> → *laptop* 🔴 offline"), "{table}");
     }
 
-    /// `pwd <machine>:<path>` asks the machine first — only it can see its folders.
+    /// Naming a machine asks that machine first — only it can see its folders.
     #[test]
-    fn pwd_with_a_machine_and_a_path_asks_that_machine() {
-        let got = CommandCtx::route(&ctx("C1", "<@U_BOT> pwd desktop:~/dev/x", Some(OWNER)), &here());
+    fn a_machine_and_a_path_asks_that_machine() {
+        let got =
+            CommandCtx::route(&ctx("C1", "<@U_BOT> route desktop:~/dev/x", Some(OWNER)), &here());
         assert_eq!(
             got,
-            RouteOutcome::SetProject { bridge_id: "desktop".into(), path: "~/dev/x".into() }
+            RouteOutcome::SetProject {
+                bridge_id: "desktop".into(),
+                path: "~/dev/x".into(),
+                for_thread: false
+            }
+        );
+    }
+
+    /// **The verb carries the scope, not the place it was typed.** `cd` is one thread, `route` is
+    /// the channel — the same message shape and the same road to the machine, one flag apart.
+    #[test]
+    fn cd_is_for_the_thread_and_route_is_for_the_channel() {
+        assert_eq!(
+            CommandCtx::route(&ctx("C1", "<@U_BOT> cd desktop:~/dev/x", Some(OWNER)), &here()),
+            RouteOutcome::SetProject {
+                bridge_id: "desktop".into(),
+                path: "~/dev/x".into(),
+                for_thread: true
+            }
+        );
+        // `pwd` no longer sets anything, so it is not this command at all
+        assert_eq!(
+            CommandCtx::route(&ctx("C1", "<@U_BOT> pwd desktop:~/dev/x", Some(OWNER)), &here()),
+            RouteOutcome::NotACommand
         );
     }
 
@@ -4651,14 +4695,16 @@ mod tests {
         }
     }
 
-    /// `channels` and `channel` list; `route` is no command any more (a sentence for the agent).
+    /// `channels` and `channel` list. **The gateway only takes the forms that name a machine** —
+    /// it is the one that knows them; everything else is the machine's own business and goes on down.
     #[test]
-    fn channels_lists_and_route_is_gone() {
+    fn channels_lists_and_only_a_named_machine_stops_here() {
         for text in ["<@U_BOT> channels", "<@U_BOT> channel"] {
             let got = CommandCtx::route(&ctx("C1", text, Some(OWNER)), &here());
             assert_eq!(got, RouteOutcome::List, "{text}");
         }
-        for text in ["<@U_BOT> route", "<@U_BOT> route desktop"] {
+        // Bare, or a plain folder: the machine handling it answers, not the gateway
+        for text in ["<@U_BOT> route", "<@U_BOT> cd", "<@U_BOT> cd ~/dev/x"] {
             let got = CommandCtx::route(&ctx("C1", text, Some(OWNER)), &here());
             assert_eq!(got, RouteOutcome::NotACommand, "{text}");
         }
@@ -4704,7 +4750,7 @@ mod tests {
         let c = CommandCtx {
             channel_id: "C1",
             user_id: Some(OWNER),
-            text: "<@U_BOT> pwd desktop",
+            text: "<@U_BOT> route desktop",
             owner_user_id: Some(OWNER),
             bot_user_id: None,
         };

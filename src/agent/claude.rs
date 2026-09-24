@@ -660,6 +660,29 @@ impl Claude {
     }
 
     /// Types `/model <name>`. Returns whether the screen said it is on the requested model.
+    /// Move a running agent to another folder **on this machine**, with Claude Code's own `/cd`.
+    ///
+    /// It keeps the conversation, loads the new folder's `CLAUDE.md` and settings, and files the
+    /// session where `--resume` finds it — all the work a hand-rolled move would have to redo, badly
+    /// (the record would have to be copied to a directory whose name we can only guess at).
+    ///
+    /// Confirmed by the folder appearing on screen. A `/cd` that is refused — an untrusted folder
+    /// the person declines, or one a `Cd` permission rule forbids — leaves the agent where it is,
+    /// and so leaves this `false`.
+    pub async fn cd(&self, target: &Window, path: &str, key: &ThreadKey, ctx: &LogCtx) -> bool {
+        // The tail is enough and survives the TUI shortening a long path from the left
+        let tail: String = path.chars().rev().take(40).collect::<Vec<_>>().into_iter().rev().collect();
+        self.drive(
+            target,
+            &format!("/cd {path}"),
+            |pane| pane.contains(&tail),
+            "cd",
+            key,
+            ctx,
+        )
+        .await
+    }
+
     pub async fn set_model(
         &self,
         target: &Window,
@@ -1168,6 +1191,12 @@ impl crate::agent::Agent for Claude {
 
     async fn set_mode(&self, w: &Window, name: &str, key: &ThreadKey, ctx: &LogCtx) -> Option<bool> {
         Some(Claude::set_mode(self, w, name, key, ctx).await)
+    }
+    async fn cd(&self, w: &Window, path: &str, key: &ThreadKey, ctx: &LogCtx) -> Option<bool> {
+        Some(Claude::cd(self, w, path, key, ctx).await)
+    }
+    fn pre_answer_dialogs(&self, cwd: &str) -> Result<Vec<String>, String> {
+        Self::pre_answer_dialogs(cwd)
     }
 
     async fn set_model(

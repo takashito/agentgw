@@ -480,6 +480,11 @@ pub trait Agent: Send + Sync + 'static {
     fn mode(&self, w: &Window, ctx: &LogCtx) -> Option<&'static str>;
     async fn set_mode(&self, w: &Window, name: &str, key: &ThreadKey, ctx: &LogCtx)
     -> Option<bool>;
+    /// Move a running agent to another folder on this machine, keeping its conversation.
+    /// `None` = this agent has no such notion; `Some(false)` = it was asked and did not move.
+    async fn cd(&self, w: &Window, path: &str, key: &ThreadKey, ctx: &LogCtx) -> Option<bool>;
+    /// Record the answers to the dialogs that would otherwise stop a move or a start on screen.
+    fn pre_answer_dialogs(&self, cwd: &str) -> Result<Vec<String>, String>;
     async fn set_model(
         &self,
         w: &Window,
@@ -587,6 +592,10 @@ pub mod fake {
         pub fail_spawn: std::sync::atomic::AtomicBool,
         /// Folders `workdir_exists` says are missing (every other folder exists).
         pub missing_dirs: Mutex<Vec<String>>,
+        /// Folders `cd` was asked to move to.
+        pub cd_to: Mutex<Vec<String>>,
+        /// When set, `cd` answers that it did not move (an untrusted or forbidden folder).
+        pub refuse_cd: std::sync::atomic::AtomicBool,
         /// Conversations this agent can hand over, by session id.
         pub sessions: Mutex<std::collections::HashMap<String, String>>,
         /// What `session_cwd` answers for every session. Unset means the agent's whereabouts
@@ -702,6 +711,16 @@ pub mod fake {
         }
         async fn set_mode(&self, _w: &Window, _m: &str, _k: &ThreadKey, _c: &LogCtx) -> Option<bool> {
             Some(true)
+        }
+        async fn cd(&self, _w: &Window, path: &str, _k: &ThreadKey, _c: &LogCtx) -> Option<bool> {
+            if self.refuse_cd.load(std::sync::atomic::Ordering::SeqCst) {
+                return Some(false);
+            }
+            self.cd_to.lock().unwrap().push(path.to_string());
+            Some(true)
+        }
+        fn pre_answer_dialogs(&self, _cwd: &str) -> Result<Vec<String>, String> {
+            Ok(Vec::new())
         }
         async fn set_model(&self, _w: &Window, _m: &str, _k: &ThreadKey, _c: &LogCtx) -> Option<bool> {
             Some(true)

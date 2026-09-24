@@ -163,7 +163,13 @@ pub enum Cmd {
     Effort(Option<String>),
     /// `None` = bare `mode` (show the current value) / `Some(name)` = switch
     Mode(Option<String>),
-    Pwd(PwdMode),
+    /// `pwd` — show where this thread works. `true` when it was bare; anything after it gets the usage.
+    Pwd(bool),
+    /// `cd …` — move **this thread**. Always the thread, wherever it was typed.
+    Cd(Target),
+    /// `route …` — set **this channel's** machine and folder, which decides where its *next* thread
+    /// starts. Live threads keep what they have.
+    Route(Target),
     /// `channels` / `channel` — which machine handles this channel and the others. **The gateway answers it**;
     /// a machine passes it up (the gateway never sees a follow-up in a running thread — it carries no mention).
     Channels,
@@ -233,8 +239,16 @@ impl Cmd {
         if let Some(m) = Self::value_of(msg, "mode", Self::listed(agent.modes())) {
             return Some(Cmd::Mode(m));
         }
-        if let Some(mode) = Self::pwd(msg) {
-            return Some(Cmd::Pwd(mode));
+        // `cd` and `route` before `pwd`: each owns its own word, so the order only fixes which usage
+        // a mistyped argument gets
+        if let Some(t) = Self::target(msg, "cd") {
+            return Some(Cmd::Cd(t));
+        }
+        if let Some(t) = Self::target(msg, "route") {
+            return Some(Cmd::Route(t));
+        }
+        if let Some(bare) = Self::pwd(msg) {
+            return Some(Cmd::Pwd(bare));
         }
         Self::owner(msg).map(Cmd::Owner)
     }
@@ -257,6 +271,8 @@ impl Cmd {
             Cmd::Effort(_) => "effort",
             Cmd::Mode(_) => "mode",
             Cmd::Pwd(_) => "pwd",
+            Cmd::Cd(_) => "cd",
+            Cmd::Route(_) => "route",
             Cmd::Channels => "channels",
             Cmd::Machines => "machines",
             Cmd::Owner(oc) => return format!("owner-command '{}'", oc.verb),
@@ -295,28 +311,35 @@ impl Cmd {
     /// A path starts with `/`, `~` or `.`. Any other first word names a machine — `pwd dev` means the
     /// machine *dev*, never a folder called dev (write `./dev` or `~/dev` for that). A machine form is
     /// one word (`pwd dev`) or a word with a colon (`pwd dev:~/a b`); anything else is a sentence.
-    pub(crate) fn pwd(msg: &Message<'_>) -> Option<PwdMode> {
-        let args = msg.verb_args("pwd")?;
+    /// Where a `cd` or a `route` points. **Both take the same shapes** — only the scope differs, and
+    /// that scope is in the verb, not in where the message happened to be typed.
+    pub(crate) fn target(msg: &Message<'_>, verb: &str) -> Option<Target> {
+        let args = msg.verb_args(verb)?;
+        // The bare verb says nothing about where to go
         let Some(first) = args.first() else {
-            return Some(PwdMode::Current);
+            return Some(Target::Usage);
         };
-        // `pwd all` is gone — `channels` shows every channel with its machine and folder
-        if args.len() == 1 && first.to_lowercase() == "all" {
-            return Some(PwdMode::Usage);
-        }
         if first.starts_with(['/', '~', '.']) {
-            return Some(PwdMode::Set(args.join(" ")));
+            return Some(Target::Path(args.join(" ")));
         }
         let joined = args.join(" ");
         let (machine, path) = match joined.split_once(':') {
             Some((m, p)) => (m.to_string(), Some(p.trim().to_string()).filter(|p| !p.is_empty())),
             None if args.len() == 1 => (joined, None),
-            None => return Some(PwdMode::Usage),
+            None => return Some(Target::Usage),
         };
         Some(match crate::bridge::state::is_machine_name(&machine) {
-            true => PwdMode::On { machine, path },
-            false => PwdMode::Usage,
+            true => Target::Machine { machine, path },
+            false => Target::Usage,
         })
+    }
+
+    /// `pwd` **shows, and nothing else** — anything after it is a mistake to point out rather than a
+    /// sentence for the agent. Setting moved to `cd` (this thread) and `route` (this channel), so one
+    /// word no longer means three things and the heavier of them is no longer chosen by where the
+    /// message was typed. `true` = a bare `pwd`.
+    pub(crate) fn pwd(msg: &Message<'_>) -> Option<bool> {
+        Some(msg.verb_args("pwd")?.is_empty())
     }
 
     /// Whether this is an **attempt** at the verb or just a sentence that starts with that word. Decided only by
@@ -374,18 +397,15 @@ impl Cmd {
     }
 }
 
-/// The three forms a parsed `pwd` can take.
-///
-/// There is no "invalid argument" form — an unreadable argument means it was never a command.
-#[derive(Debug, PartialEq, Eq)]
-pub enum PwdMode {
-    Current,
-    Set(String),
-    /// `pwd <machine>` / `pwd <machine>:` / `pwd <machine>:<path>` — hand this channel to a machine, and
-    /// with a path, set its project folder there. **The gateway answers these** (it's the one that knows
+/// Where a parsed `cd` or `route` points. **The same shapes for both** — the scope is the verb.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Target {
+    /// A folder on the machine already in charge (`/…`, `~/…`, `./…`).
+    Path(String),
+    /// A machine, and with it a folder there. **The gateway answers these** (it's the one that knows
     /// the machines); a Bridge that sees one has no machine by that name.
-    On { machine: String, path: Option<String> },
-    /// The message starts with `pwd` but what follows is none of the forms. **Answer with the usage**
+    Machine { machine: String, path: Option<String> },
+    /// The message starts with the verb but what follows is none of the forms. **Answer with the usage**
     /// rather than handing it to the agent: a mistyped path used to vanish into the conversation.
     Usage,
 }
@@ -833,37 +853,50 @@ impl Bridge {
                 );
                 self.user_mode(msg, name, key, root_ts, &ctx);
             }
-            Cmd::Pwd(mode) => {
-                let kind = match mode {
-                    PwdMode::Current => "current",
-                    PwdMode::Set(_) => "set",
-                    PwdMode::On { .. } => "on",
-                    PwdMode::Usage => "usage",
-                };
+            Cmd::Pwd(bare) => {
                 ctx.info(
                     "bridge",
                     &format!(
-                        "slack-events: pwd command mode={kind} msg={} channel={} dm={dm}",
+                        "slack-events: pwd command bare={bare} msg={} channel={} dm={dm}",
+                        msg.ts, msg.channel
+                    ),
+                );
+                let out = match bare {
+                    true => self.pwd_answer(msg, root_ts),
+                    false => super::command::bridge::pwd_usage(),
+                };
+                self.post(&msg.channel, root_ts, out, key);
+            }
+            // `cd` moves this thread, `route` sets this channel's default. **Same shapes, and the same
+            // road** — only the scope differs, and it rides along as `for_thread`
+            ref c @ (Cmd::Cd(ref target) | Cmd::Route(ref target)) => {
+                let (target, for_thread) = (target.clone(), matches!(c, Cmd::Cd(_)));
+                let verb = if for_thread { "cd" } else { "route" };
+                ctx.info(
+                    "bridge",
+                    &format!(
+                        "slack-events: {verb} command msg={} channel={} dm={dm}",
                         msg.ts, msg.channel
                     ),
                 );
                 // Which machines exist is the gateway's knowledge — ask it, and it answers in this thread
-                if let PwdMode::On { machine, path } = &mode
+                if let Target::Machine { machine, path } = &target
                     && self.ask_the_gateway(
                         crate::bridge::gateway::link::LinkFrame::PwdOn {
                             channel: msg.channel.clone(),
                             thread_ts: root_ts.to_string(),
                             machine: machine.clone(),
                             path: path.clone(),
-                            // Typed inside a thread = move this conversation, not the channel
-                            thread_only: msg.thread_ts.is_some(),
+                            thread_only: for_thread,
                         },
                         &ctx,
                     )
                 {
                     return true;
                 }
-                let out = self.pwd_answer(msg, mode, dm, root_ts, &ctx);
+                let out = self
+                    .set_target(msg, target, for_thread, dm, key, root_ts, &ctx)
+                    .await;
                 self.post(&msg.channel, root_ts, out, key);
             }
             // Same: only the gateway knows the machines
@@ -1122,24 +1155,31 @@ mod tests {
             Cmd::value_of(&Message::new("mode を実装して", None), "mode", &modes),
             None
         );
-        assert!(
-            matches!(Cmd::pwd(&Message::new("pwd /a b/c", None)), Some(PwdMode::Set(p)) if p == "/a b/c")
-        );
-        assert_eq!(Cmd::pwd(&Message::new("pwd all", None)), Some(PwdMode::Usage));
-        // Starts with pwd but isn't one of the forms → the usage, not a sentence for the agent
-        assert_eq!(Cmd::pwd(&Message::new("pwd の使い方", None)), Some(PwdMode::Usage));
-        // A path starts with / ~ or . — any other first word is a machine
-        let on = |m: &str, p: Option<&str>| {
-            Some(PwdMode::On { machine: m.into(), path: p.map(str::to_string) })
-        };
-        assert_eq!(Cmd::pwd(&Message::new("pwd laptop", None)), on("laptop", None));
-        assert_eq!(Cmd::pwd(&Message::new("pwd laptop:", None)), on("laptop", None));
-        assert_eq!(Cmd::pwd(&Message::new("pwd hub:~/a b", None)), on("hub", Some("~/a b")));
-        assert_eq!(Cmd::pwd(&Message::new("pwd ./dev", None)), Some(PwdMode::Set("./dev".into())));
-        assert_eq!(Cmd::pwd(&Message::new("pwd /a:b", None)), Some(PwdMode::Set("/a:b".into())));
-        assert_eq!(Cmd::pwd(&Message::new("pwd is handy", None)), Some(PwdMode::Usage));
-        assert_eq!(Cmd::pwd(&Message::new("pwd 何か変な値", None)), Some(PwdMode::Usage));
-        assert_eq!(Cmd::pwd(&Message::new("please pwd /x", None)), None); // not the first word = a sentence
+        // `pwd` shows and takes nothing. An argument is a mistake to point out (false), not a setting
+        assert_eq!(Cmd::pwd(&Message::new("pwd", None)), Some(true));
+        assert_eq!(Cmd::pwd(&Message::new("pwd /srv/app", None)), Some(false));
+        assert_eq!(Cmd::pwd(&Message::new("pwd の使い方", None)), Some(false));
+        assert_eq!(Cmd::pwd(&Message::new("please pwd", None)), None); // not the first word = a sentence
+
+        // `cd` and `route` read the same shapes — the scope is the verb, not where it was typed
+        for verb in ["cd", "route"] {
+            let t = |body: &str| Cmd::target(&Message::new(body, None), verb);
+            let on = |m: &str, p: Option<&str>| {
+                Some(Target::Machine { machine: m.into(), path: p.map(str::to_string) })
+            };
+            assert!(matches!(t(&format!("{verb} /a b/c")), Some(Target::Path(p)) if p == "/a b/c"));
+            assert_eq!(t(&format!("{verb} ./dev")), Some(Target::Path("./dev".into())));
+            // A path starts with / ~ or . — any other first word is a machine
+            assert_eq!(t(&format!("{verb} /a:b")), Some(Target::Path("/a:b".into())));
+            assert_eq!(t(&format!("{verb} laptop")), on("laptop", None));
+            assert_eq!(t(&format!("{verb} laptop:")), on("laptop", None));
+            assert_eq!(t(&format!("{verb} hub:~/a b")), on("hub", Some("~/a b")));
+            // Starts with the verb but isn't one of the forms → the usage, not a sentence
+            assert_eq!(t(&format!("{verb} is handy")), Some(Target::Usage));
+            assert_eq!(t(&format!("{verb} 何か変な値")), Some(Target::Usage));
+            assert_eq!(t(verb), Some(Target::Usage)); // bare: says nothing about where
+            assert_eq!(t(&format!("please {verb} /x")), None);
+        }
         let oc = Cmd::owner(&Message::new("warm on <#C1|general>", None)).unwrap();
         assert_eq!((oc.verb, oc.args.len()), ("warm", 2));
         assert!(Cmd::owner(&Message::new("warm の話をしよう", None)).is_none()); // no on/off = a sentence

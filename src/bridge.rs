@@ -3007,7 +3007,7 @@ mod tests {
         b.ask_gateway = Some(up);
 
         b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "<@U_BOT> channels")).await;
-        b.on_inbound(&channel_msg("1782000001.000200", "U_OWNER", "<@U_BOT> pwd hub:~/x")).await;
+        b.on_inbound(&channel_msg("1782000001.000200", "U_OWNER", "<@U_BOT> route hub:~/x")).await;
         b.on_inbound(&channel_msg("1782000001.000300", "U_OWNER", "<@U_BOT> set-home")).await;
         b.on_inbound(&channel_msg("1782000001.000400", "U_OWNER", "<@U_BOT> machines")).await;
         settle().await;
@@ -3094,7 +3094,7 @@ mod tests {
         let (mut b, _fx) = Bridge::for_test(d);
         let (up, mut up_rx) = mpsc::unbounded_channel();
         b.ask_gateway = Some(up);
-        b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "<@U_BOT> pwd /work/app")).await;
+        b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "<@U_BOT> route /work/app")).await;
         settle().await;
         assert_eq!(
             up_rx.try_recv(),
@@ -3207,8 +3207,9 @@ mod tests {
         b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "<@U_BOT> pwd 何か変な値")).await;
         settle().await;
         assert!(agent.spawned.lock().unwrap().is_empty(), "not handed to an agent");
+        // The usage names the two verbs that do change something — that is the question being asked
         assert!(
-            slack.calls().iter().any(|c| c.contains("`pwd <machine>:~/dev/app`")),
+            slack.calls().iter().any(|c| c.contains("`cd …`") && c.contains("`route …`")),
             "{:?}",
             slack.calls()
         );
@@ -3219,7 +3220,7 @@ mod tests {
     async fn pwd_expands_the_home_directory() {
         let (d, slack, _agent, _clock) = flow_deps("pwd-home");
         let (mut b, _fx) = Bridge::for_test(d);
-        b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "<@U_BOT> pwd ~/dev/proj")).await;
+        b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "<@U_BOT> route ~/dev/proj")).await;
         settle().await;
         let want = format!("{}/dev/proj", Host::home());
         assert_eq!(b.access.repo_path("C1", "/home").0, want, "{:?}", slack.calls());
@@ -3232,7 +3233,7 @@ mod tests {
         let (d, slack, agent, _clock) = flow_deps("pwd-missing");
         agent.missing_dirs.lock().unwrap().push("/nope/proj".into());
         let (mut b, _fx) = Bridge::for_test(d);
-        b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "<@U_BOT> pwd /nope/proj")).await;
+        b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "<@U_BOT> route /nope/proj")).await;
         settle().await;
         assert!(b.access.repo_path("C1", "/home").1, "nothing registered");
         assert!(
@@ -3252,12 +3253,93 @@ mod tests {
         assert!(agent.spawned.lock().unwrap().is_empty());
     }
 
+    /// **`cd` within one machine asks the agent to move itself.** Claude Code's `/cd` keeps the
+    /// conversation and files the session where `--resume` finds it; copying the record by hand
+    /// would mean guessing the directory name it lives under, and tearing the agent down to do it.
+    #[tokio::test]
+    async fn cd_on_this_machine_moves_the_running_agent() {
+        let (d, slack, agent, _clock) = flow_deps("cd-here");
+        let ((mut b, _fx), _deliv) = Bridge::for_test_with_deliveries(d);
+        running_thread(&mut b, &agent).await;
+        // The opening turn has been answered — `cd` waits for a busy agent, like every TUI command
+        let key = ThreadKey::new("C1", ROOT);
+        b.ledger.disposed(&key, &[ROOT.to_string()]);
+
+        b.on_inbound(&in_thread("1782000009.000100", "<@U_BOT> cd /work/app")).await;
+        settle().await;
+
+        assert_eq!(
+            *agent.cd_to.lock().unwrap(),
+            vec!["/work/app".to_string()],
+            "the agent was not asked to move"
+        );
+        assert_eq!(
+            b.threads.get(ROOT).and_then(|e| e.repo_path.clone()).as_deref(),
+            Some("/work/app"),
+            "the row did not follow the agent"
+        );
+    }
+
+    /// **A refused `/cd` changes nothing.** An untrusted folder, or one a `Cd` rule forbids, leaves
+    /// the agent where it is — so the record has to stay too, or it would point at a folder the
+    /// agent is not in and the next start would go somewhere nobody chose.
+    #[tokio::test]
+    async fn a_refused_cd_leaves_the_record_alone() {
+        let (d, slack, agent, _clock) = flow_deps("cd-refused");
+        let ((mut b, _fx), _deliv) = Bridge::for_test_with_deliveries(d);
+        running_thread(&mut b, &agent).await;
+        b.ledger.disposed(&ThreadKey::new("C1", ROOT), &[ROOT.to_string()]);
+        let before = b.threads.get(ROOT).and_then(|e| e.repo_path.clone());
+        agent
+            .refuse_cd
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        b.on_inbound(&in_thread("1782000009.000200", "<@U_BOT> cd /work/app")).await;
+        settle().await;
+
+        assert_eq!(
+            b.threads.get(ROOT).and_then(|e| e.repo_path.clone()),
+            before,
+            "the record moved although the agent did not"
+        );
+        assert!(
+            slack.calls().iter().any(|c| c.contains("did not move") || c.contains("移らなかった")),
+            "{:?}",
+            slack.calls()
+        );
+    }
+
+    /// `route` sets the channel's default and **leaves running threads alone** — that separation is
+    /// the whole reason the two verbs exist.
+    #[tokio::test]
+    async fn route_sets_the_channel_and_leaves_threads_alone() {
+        let (d, _slack, agent, _clock) = flow_deps("route-only-channel");
+        let ((mut b, _fx), _deliv) = Bridge::for_test_with_deliveries(d);
+        running_thread(&mut b, &agent).await;
+        let before = b.threads.get(ROOT).and_then(|e| e.repo_path.clone());
+
+        b.on_inbound(&channel_msg("1782000009.000300", "U_OWNER", "<@U_BOT> route /work/app"))
+            .await;
+        settle().await;
+
+        assert_eq!(b.access.repo_path("C1", &Host::home()).0, "/work/app");
+        assert_eq!(
+            b.threads.get(ROOT).and_then(|e| e.repo_path.clone()),
+            before,
+            "route moved a thread that was already running"
+        );
+        assert!(
+            agent.cd_to.lock().unwrap().is_empty(),
+            "route told an agent to move"
+        );
+    }
+
     /// A registered folder that has since gone away: say so instead of starting in the home directory.
     #[tokio::test]
     async fn a_missing_project_folder_stops_the_start() {
         let (d, slack, agent, _clock) = flow_deps("repo-gone");
         let (mut b, _fx) = Bridge::for_test(d);
-        b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "<@U_BOT> pwd /work/proj")).await;
+        b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "<@U_BOT> route /work/proj")).await;
         agent.missing_dirs.lock().unwrap().push("/work/proj".into());
         b.on_inbound(&channel_msg(ROOT, "U_OWNER", "<@U_BOT> fix the tests")).await;
         settle().await;

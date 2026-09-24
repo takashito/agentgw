@@ -1,7 +1,7 @@
 //! Commands aimed at agentgw itself: status / pwd and the Owner commands
 //! (warm / set-home / allow-bot / remove-bot).
 
-use super::PwdMode;
+use super::Target;
 use crate::agent::SessionId;
 use crate::chat::InboundMsg;
 use crate::bridge::state::{self as bridge};
@@ -250,101 +250,156 @@ impl Bridge {
         });
     }
 
-    /// The three forms of `pwd`. Resolution goes through the same resolve_repo_path
-    /// as spawn, so the displayed path is always where the agent actually starts.
-    pub(super) fn pwd_answer(
+    /// Move this thread to another folder **on this machine**.
+    ///
+    /// **The agent moves itself.** Claude Code's own `/cd` keeps the conversation, loads the new
+    /// folder's `CLAUDE.md` and settings, and files the session where `--resume` will find it. Doing
+    /// it by hand instead would mean copying the record to a directory whose name we can only guess
+    /// at, and tearing the agent down to do it — for a move that never leaves the machine.
+    ///
+    /// The row is written only after the agent says it arrived, so a refusal leaves both where they
+    /// were rather than pointing the record at a folder the agent is not in.
+    async fn cd_here(&mut self, key: &ThreadKey, root_ts: &str, path: &str, ctx: &LogCtx) -> String {
+        let machine = self.machine_name.clone();
+        // **Not in the middle of a turn.** Typing into the box while the agent is working is how a
+        // command ends up as part of the answer, so this waits like every other TUI command does
+        if !self.ledger.pending(key).is_empty() {
+            return crate::t!(
+                "The agent is busy. Send `stop` first, then `cd`.",
+                "エージェントが作業中です。`stop` で止めてから `cd` を送ってください。"
+            );
+        }
+        // No agent running: nothing to tell. The row alone decides where the next one starts
+        let Ok((target, _)) =
+            self.tui_guard("cd", "recording it only", "refusing (busy)", key, root_ts, ctx)
+        else {
+            self.record_thread_cwd(root_ts, path, ctx);
+            return moved_here(&machine, path);
+        };
+        // Answer the trust prompt in the record, the way spawning already does, so `/cd` doesn't stop
+        // on a modal nobody is watching
+        if let Err(e) = self.deps.agent.pre_answer_dialogs(path) {
+            ctx.error("bridge", &format!("cd: could not pre-answer dialogs for {path}: {e}"));
+        }
+        if self.deps.agent.cd(&target, path, key, ctx).await != Some(true) {
+            ctx.info("bridge", &format!("cd: the agent did not move to {path}"));
+            return cd_refused(path);
+        }
+        self.record_thread_cwd(root_ts, path, ctx);
+        moved_here(&machine, path)
+    }
+
+    /// Write down that this thread works in `path` from now on.
+    fn record_thread_cwd(&mut self, root_ts: &str, path: &str, ctx: &LogCtx) {
+        let mut entry = self.threads.get(root_ts).cloned().unwrap_or_default();
+        entry.repo_path = Some(path.to_string());
+        self.threads.upsert(root_ts, entry);
+        if let Err(e) = self.threads.save() {
+            ctx.error("bridge", &format!("threads.json save failed: {e}"));
+        }
+    }
+
+    /// Where this thread works, for `pwd`.
+    ///
+    /// **This thread's own machine and folder, not its channel's.** The machine is simply this one:
+    /// `pwd` is not answered by the gateway, it is delivered to whichever machine handles the thread,
+    /// so the one running this *is* the answer. Reading it from the channel named the machine the
+    /// thread used to be on, and reading it from the thread's row named nobody — that field is the
+    /// gateway's copy and is never written on a machine (measured 2026-09-24: 0 of 32 rows).
+    pub(super) fn pwd_answer(&mut self, msg: &InboundMsg, root_ts: &str) -> String {
+        let (repo_path, _) = self.thread_cwd(root_ts, &msg.channel);
+        PwdEntry {
+            machine: self.machine_name.clone(),
+            repo_path,
+        }
+        .render()
+    }
+
+    /// `cd` and `route` once the gateway is out of the picture — either there is none, or the target
+    /// named a machine it has never heard of.
+    ///
+    /// A path with no machine in it is this machine's own business, and the two verbs part company
+    /// here: `route` writes the channel's folder, `cd` moves this thread into it.
+    pub(super) async fn set_target(
         &mut self,
         msg: &InboundMsg,
-        mode: PwdMode,
+        target: Target,
+        for_thread: bool,
         dm: bool,
+        key: &ThreadKey,
         root_ts: &str,
         ctx: &LogCtx,
     ) -> String {
-        let me = self.machine_name.clone();
-        match mode {
-            PwdMode::Usage => pwd_usage(),
+        let typed = match target {
+            Target::Usage => return if for_thread { cd_usage() } else { route_usage() },
             // Only the gateway knows the machines and answers these. Reaching a Bridge means there is
             // no gateway, or no such machine behind it
-            PwdMode::On { machine, .. } => crate::t!(
-                "No machine named `{machine}` is connected. This machine works on its own.",
-                "`{machine}` という名前のマシンはつながっていません。このマシンは単独で動いています。"
-            ),
-            // **This thread's own machine and folder, not its channel's.**
-            //
-            // The machine is simply this one: a bare `pwd` is not answered by the gateway, it is
-            // delivered to whichever machine handles the thread, so the one running this *is* the
-            // answer. Reading it from the channel named the machine the thread used to be on, and
-            // reading it from the thread's row named nobody — that field is the gateway's copy and
-            // is never written on a machine (measured 2026-09-24: 0 of 32 rows).
-            PwdMode::Current => {
-                let (repo_path, _) = self.thread_cwd(root_ts, &msg.channel);
-                PwdEntry {
-                    machine: me.clone(),
-                    repo_path,
-                }
-                .render()
+            Target::Machine { machine, .. } => {
+                return crate::t!(
+                    "No machine named `{machine}` is connected. This machine works on its own.",
+                    "`{machine}` という名前のマシンはつながっていません。このマシンは単独で動いています。"
+                );
             }
-            // A DM has no route (its agent always starts at Home), so say so
-            // instead of silently recording it
-            PwdMode::Set(_) if dm || !crate::chat::slack::SlackId::is_channel(&msg.channel) => {
+            Target::Path(typed) => typed,
+        };
+        // No shell ever sees this path (tmux gets it as is), so `~` and relative paths are
+        // resolved here, on the machine that runs this channel's agents
+        let path = &bridge::absolute_project_path(&typed, &Host::home());
+        if !self.deps.agent.workdir_exists(path) {
+            ctx.info(
+                "bridge",
+                &format!("slack-events: no folder {path} here msg={}", msg.ts),
+            );
+            return bridge::no_such_folder(path, &self.machine_name);
+        }
+        if for_thread {
+            return self.cd_here(key, root_ts, path, ctx).await;
+        }
+        // A DM has no route (its agent always starts at Home), so say so
+        // instead of silently recording it
+        if dm || !crate::chat::slack::SlackId::is_channel(&msg.channel) {
+            ctx.info(
+                "bridge",
+                &format!(
+                    "slack-events: route refused — not a channel (dm={dm}) msg={}",
+                    msg.ts
+                ),
+            );
+            return route_dm_refusal();
+        }
+        let op = bridge::AccessOp::SetRepo {
+            channel: msg.channel.clone(),
+            path: path.clone(),
+        };
+        match self.access.apply(op) {
+            Ok((access, message, warnings)) => {
+                self.adopt_access(access, ctx);
+                // No thread = nothing to say, just keep the gateway's copy current (`channels`)
+                self.ask_the_gateway(
+                    crate::bridge::gateway::link::LinkFrame::ProjectSet {
+                        channel: msg.channel.clone(),
+                        thread_ts: String::new(),
+                        result: Ok(path.clone()),
+                        thread_only: false,
+                    },
+                    ctx,
+                );
                 ctx.info(
                     "bridge",
                     &format!(
-                        "slack-events: pwd set refused — not a channel (dm={dm}) msg={}",
-                        msg.ts
+                        "slack-events: route channel={} path={path} msg={}",
+                        msg.channel, msg.ts
                     ),
                 );
-                pwd_dm_set_refusal()
+                with_warnings(&message, &warnings)
             }
-            PwdMode::Set(typed) => {
-                // No shell ever sees this path (tmux gets it as is), so `~` and relative paths are
-                // resolved here, on the machine that runs this channel's agents
-                let path = &bridge::absolute_project_path(&typed, &Host::home());
-                if !self.deps.agent.workdir_exists(path) {
-                    ctx.info(
-                        "bridge",
-                        &format!("slack-events: pwd set refused — no folder {path} msg={}", msg.ts),
-                    );
-                    return bridge::no_such_folder(path, &self.machine_name);
-                }
-                let op = bridge::AccessOp::SetRepo {
-                    channel: msg.channel.clone(),
-                    path: path.clone(),
-                };
-                match self.access.apply(op) {
-                    Ok((access, message, warnings)) => {
-                        self.adopt_access(access, ctx);
-                        // No thread = nothing to say, just keep the gateway's copy current (`channels`)
-                        self.ask_the_gateway(
-                            crate::bridge::gateway::link::LinkFrame::ProjectSet {
-                                channel: msg.channel.clone(),
-                                thread_ts: String::new(),
-                                result: Ok(path.clone()),
-                                thread_only: false,
-                            },
-                            ctx,
-                        );
-                        ctx.info(
-                            "bridge",
-                            &format!(
-                                "slack-events: pwd set channel={} path={path} msg={}",
-                                msg.channel, msg.ts
-                            ),
-                        );
-                        with_warnings(&message, &warnings)
-                    }
-                    // For a path that fails validation, the error text itself is what the Owner reads
-                    Err(e) => {
-                        ctx.error(
-                            "bridge",
-                            &format!(
-                                "slack-events: pwd set failed for {}:{root_ts}: {e}",
-                                msg.channel
-                            ),
-                        );
-                        e
-                    }
-                }
+            // For a path that fails validation, the error text itself is what the Owner reads
+            Err(e) => {
+                ctx.error(
+                    "bridge",
+                    &format!("slack-events: route failed for {}:{root_ts}: {e}", msg.channel),
+                );
+                e
             }
         }
     }
@@ -855,16 +910,24 @@ pub(super) fn help(machines: bool, agent: &dyn crate::agent::Agent) -> String {
     if machines {
         channels.push(("channels", crate::t!("show which machine handles this channel and the others", "このチャンネルとほかのチャンネルを受け持つマシンを見る")));
     }
-    channels.push(("pwd", crate::t!("show this channel's project directory", "このチャンネルの作業ディレクトリを見る")));
-    channels.push(("pwd <path>", crate::t!("set this channel's project directory (`/…`, `~/…`)", "このチャンネルの作業ディレクトリを決める(`/…`・`~/…`)")));
+    channels.push(("route <path>", crate::t!("set this channel's project directory (`/…`, `~/…`)", "このチャンネルの作業ディレクトリを決める(`/…`・`~/…`)")));
     if machines {
-        channels.push(("pwd <machine>[:<path>]", crate::t!("map this channel to a machine (its home folder or specific path)", "このチャンネルをマシンに割り当てる(そのマシンの家、またはパスを指定)")));
+        channels.push(("route <machine>[:<path>]", crate::t!("map this channel to a machine (its home folder or specific path)", "このチャンネルをマシンに割り当てる(そのマシンの家、またはパスを指定)")));
     }
     channels.push(("warm on|off [<#channel>]", crate::t!("keep an agent started ahead of time for a channel", "チャンネルのエージェントを先に起動しておくか")));
     channels.push(("allow-bot <@bot>", crate::t!("let a bot's messages start work", "そのボットの投稿で作業を始められるようにする")));
     channels.push(("remove-bot <@bot>", crate::t!("stop letting that bot's messages through", "そのボットの投稿を通さないようにする")));
     channels.push(("set-home", crate::t!("send notices to this channel", "通知をこのチャンネルに出す")));
     section(&mut lines, crate::t!("Channels", "チャンネル"), channels);
+    let mut threads: Vec<(&str, String)> = vec![(
+        "pwd",
+        crate::t!("show where this thread works", "このスレッドの作業ディレクトリを見る"),
+    )];
+    threads.push(("cd <path>", crate::t!("move this thread to that folder", "このスレッドをそのフォルダへ移す")));
+    if machines {
+        threads.push(("cd <machine>[:<path>]", crate::t!("move this thread to that machine, conversation and all", "このスレッドをそのマシンへ移す(会話ごと)")));
+    }
+    section(&mut lines, crate::t!("Threads", "スレッド"), threads);
     section(
         &mut lines,
         crate::t!("Agent Gateway", "Agent Gateway"),
@@ -891,29 +954,84 @@ pub(super) fn help(machines: bool, agent: &dyn crate::agent::Agent) -> String {
     lines.join("\n")
 }
 
-/// What `pwd` accepts. Answered when a message starts with `pwd` but the rest is none of the forms —
-/// a mistyped path is a mistake to point out, not a sentence to hand to the agent.
-fn pwd_usage() -> String {
+/// `pwd` **shows and nothing else**, so anything after it is a mistake to point out rather than a
+/// sentence to hand to the agent. It says which verb changes what, because that is the question a
+/// person who typed an argument was asking.
+pub(super) fn pwd_usage() -> String {
     crate::t!(
-        "`pwd` takes one of these:\n\
-         • `pwd` — this channel's project folder\n\
-         • `pwd /srv/app` · `pwd ~/dev/app` · `pwd ./dev/app` — work in that folder\n\
-         • `pwd <machine>` — hand this channel to that machine (its home folder)\n\
-         • `pwd <machine>:~/dev/app` — hand it over and work in that folder there",
-        "`pwd` の書き方:\n\
-         • `pwd` — このチャンネルの作業ディレクトリを見る\n\
-         • `pwd /srv/app`・`pwd ~/dev/app`・`pwd ./dev/app` — そのフォルダで作業する\n\
-         • `pwd <マシン>` — このチャンネルをそのマシンに任せる(そのマシンの家のディレクトリ)\n\
-         • `pwd <マシン>:~/dev/app` — そのマシンに任せて、そのフォルダで作業する"
+        "`pwd` shows where this thread works and takes nothing else.\n\
+         • `cd …` — move **this thread**\n\
+         • `route …` — set **this channel's** default, for the threads it starts next",
+        "`pwd` はこのスレッドの作業ディレクトリを見るだけで、引数は取りません。\n\
+         • `cd …` — **このスレッド**を移す\n\
+         • `route …` — **このチャンネル**の既定を決める(これから立つスレッド用)"
     )
 }
 
-/// The answer when `pwd <path>` is typed in a DM. A DM's agent always runs in the default directory —
-/// there is nothing to set, so say so instead of silently doing nothing.
-fn pwd_dm_set_refusal() -> String {
+/// What `cd` accepts.
+fn cd_usage() -> String {
+    crate::t!(
+        "`cd` moves **this thread**. It takes one of these:\n\
+         • `cd ~/dev/app` · `cd /srv/app` — move it to that folder\n\
+         • `cd <machine>` — move it to that machine (its home folder)\n\
+         • `cd <machine>:~/dev/app` — move it to that folder there\n\
+         The conversation carries on. On the same machine the agent keeps running; \
+         to another machine, its record goes with it.",
+        "`cd` は**このスレッド**を移します。書き方:\n\
+         • `cd ~/dev/app`・`cd /srv/app` — そのフォルダへ移す\n\
+         • `cd <マシン>` — そのマシンへ移す(そのマシンの家のディレクトリ)\n\
+         • `cd <マシン>:~/dev/app` — そのマシンの、そのフォルダへ移す\n\
+         会話はそのまま続きます。同じマシンの中ならエージェントは走ったまま、\
+         別のマシンなら記録ごと運ばれます。"
+    )
+}
+
+/// What `route` accepts.
+fn route_usage() -> String {
+    crate::t!(
+        "`route` sets **this channel's** machine and folder. It takes one of these:\n\
+         • `route <machine>` — hand this channel to that machine (its home folder)\n\
+         • `route <machine>:~/dev/app` — hand it over and work in that folder there\n\
+         • `route ~/dev/app` — keep the machine, change the folder\n\
+         It decides where the threads this channel starts **next** begin. \
+         Threads already running stay where they are — move one with `cd`.",
+        "`route` は**このチャンネル**のマシンと作業ディレクトリを決めます。書き方:\n\
+         • `route <マシン>` — このチャンネルをそのマシンに任せる(そのマシンの家のディレクトリ)\n\
+         • `route <マシン>:~/dev/app` — そのマシンの、そのフォルダに任せる\n\
+         • `route ~/dev/app` — マシンはそのままで、フォルダだけ決める\n\
+         決まるのは**これから立つ**スレッドの既定です。\
+         動いているスレッドはそのまま — 移すには `cd` を使います。"
+    )
+}
+
+/// The answer when `route <path>` is typed in a DM. A DM's agent always runs in the default
+/// directory — there is nothing to set, so say so instead of silently doing nothing.
+fn route_dm_refusal() -> String {
     crate::t!(
         "Agents in DMs always work in the default directory; only channels can have their own.",
         "DM のエージェントは常に既定のディレクトリで動きます。作業ディレクトリを決められるのはチャンネルだけです。"
+    )
+}
+
+/// `cd` within one machine, once the agent has moved.
+fn moved_here(machine: &str, path: &str) -> String {
+    crate::t!(
+        "This thread now works in `{}:{}`.",
+        "このスレッドは `{}:{}` で作業します。",
+        machine,
+        path,
+    )
+}
+
+/// `cd` within one machine, when the agent would not move. **Nothing was changed** — say that,
+/// rather than leaving the record pointing somewhere the agent is not.
+fn cd_refused(path: &str) -> String {
+    crate::t!(
+        "The agent did not move to `{}`, so this thread is still where it was. \
+         A folder it has not been trusted with, or one a `Cd` rule forbids, is refused this way.",
+        "エージェントが `{}` へ移らなかったので、このスレッドは元の場所のままです。\
+         信頼していないフォルダや、`Cd` の規則で禁じられているフォルダは、こう断られます。",
+        path,
     )
 }
 
@@ -1115,7 +1233,9 @@ mod tests {
             "usage / usg",
             "status",
             "restart",
-            "pwd <path>",
+            "route <path>",
+            "pwd",
+            "cd <path>",
             "warm on|off [<#channel>]",
             "set-home",
             "allow-bot <@bot>",
@@ -1124,15 +1244,20 @@ mod tests {
         ] {
             assert!(h.contains(word), "{word}");
         }
-        assert!(!h.contains("pwd <machine>")); // A gateway with no machines has nobody to hand a channel to
+        // A gateway with no machines has nobody to hand a channel or a thread to
+        assert!(!h.contains("route <machine>"));
+        assert!(!h.contains("cd <machine>"));
         assert!(h.ends_with("just part of a normal message._"));
     }
 
     #[test]
     fn a_bridge_that_takes_children_lists_the_machine_commands() {
         let h = help(true, &crate::agent::fake::FakeAgent::default());
-        assert!(h.contains("pwd <machine>[:<path>]") && h.contains("channels"));
+        assert!(h.contains("route <machine>[:<path>]") && h.contains("channels"));
         assert!(h.contains("map this channel to a machine"));
+        // The thread's own verb shows up beside it, so the two scopes are visible at once
+        assert!(h.contains("cd <machine>[:<path>]"));
+        assert!(h.contains("move this thread"));
         // Having machines doesn't change the other sections
         assert!(h.contains("status") && h.contains("help / ?"));
     }
