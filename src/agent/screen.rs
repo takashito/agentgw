@@ -315,7 +315,8 @@ impl<'a> Pane<'a> {
         let mut rows: Vec<(usize, String, String)> = Vec::new();
         for (i, l) in block.iter().enumerate() {
             if !numbered || row_number(l).is_some() {
-                rows.push((top + i, text(l), String::new()));
+                let (label, detail) = split_column(&text(l));
+                rows.push((top + i, label, detail));
             } else if let Some((_, _, detail)) = rows.last_mut() {
                 if !detail.is_empty() {
                     detail.push(' ');
@@ -925,6 +926,22 @@ fn dialog_title(head: &[&str], footer: &str) -> String {
     title.chars().take(DIALOG_TITLE_CAP - 1).collect::<String>() + "\u{2026}"
 }
 
+/// Split a row into what it is called and what it says about itself.
+///
+/// **The TUI lays a row out in columns**, padding with spaces so the descriptions line up:
+/// `Opus 5.5               Most capable for ambitious work`. A button has no columns, so the
+/// padding came through as one long label with the end cut off ("Opus 5.5    Most capable for
+/// ambitio…"). Two spaces in a row are that padding — a name does not contain them.
+fn split_column(row: &str) -> (String, String) {
+    match row.find("  ") {
+        Some(i) => (
+            row[..i].trim_end().to_string(),
+            row[i..].trim_start().to_string(),
+        ),
+        None => (row.to_string(), String::new()),
+    }
+}
+
 /// The number the TUI writes in front of a row (`\u{276f} 1. Set it up` -> `Some(1)`).
 /// A row's description, written on the line below it, carries none.
 fn row_number(line: &str) -> Option<u32> {
@@ -1407,8 +1424,13 @@ the full history gets re-read on your next message.
         let d = Pane::new(MODEL_SCREEN).dialog().expect("a modal is up");
         assert_eq!(d.title, "Select model");
         assert_eq!(d.options.len(), 10, "{:?}", d.options);
-        assert!(d.options[0].starts_with("Default (recommended)"), "{:?}", d.options[0]);
-        assert!(d.options[9].starts_with("Opus 4.6"), "{:?}", d.options[9]);
+        // **The name alone.** The screen aligns each description in a column, and carrying that
+        // padding into a button gave "Opus 5.5      Most capable for ambitio\u{2026}"
+        assert_eq!(d.options[1], "Opus 5.5");
+        assert_eq!(d.details[1], "Most capable for ambitious work");
+        assert_eq!(d.options[0], "Default (recommended)");
+        assert_eq!(d.options[9], "Opus 4.6");
+        assert!(d.options.iter().all(|o| !o.contains("  ")), "{:?}", d.options);
         assert_eq!(d.selected, 5, "the cursor is on the sixth row");
         assert_eq!(d.footer, "Enter to set as default \u{b7} s to use this session only \u{b7} Esc to cancel");
     }
