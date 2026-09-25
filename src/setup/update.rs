@@ -1,4 +1,4 @@
-//! `upgrade`: fetch a release of agentgw and put it where the running binary is.
+//! `update`: fetch a release of agentgw and put it where the running binary is.
 //!
 //! **The gateway and every machine use the same steps**, so one path is tested and one path runs:
 //! download next to the running binary → compare with the release's `.sha256` → (macOS) sign →
@@ -88,8 +88,8 @@ pub fn running_binary() -> Result<PathBuf, String> {
     if exe.components().any(|c| c.as_os_str() == "target") {
         let path = exe.display();
         return Err(crate::t!(
-            "this agentgw runs from a build folder ({path}); upgrade only replaces an installed one",
-            "この agentgw はビルドの置き場から動いています({path})。upgrade が入れ替えるのは入れた物だけです"
+            "this agentgw runs from a build folder ({path}); update only replaces an installed one",
+            "この agentgw はビルドの置き場から動いています({path})。update が入れ替えるのは入れた物だけです"
         ));
     }
     Ok(exe)
@@ -194,7 +194,7 @@ pub async fn self_replace(tag: &str) -> Result<(), String> {
     let sum = String::from_utf8_lossy(&sum).to_string();
     tokio::task::spawn_blocking(move || put_in_place(&new, &sum, &target, &want))
         .await
-        .map_err(|e| format!("the upgrade stopped: {e}"))?
+        .map_err(|e| format!("the update stopped: {e}"))?
 }
 
 #[cfg(test)]
@@ -202,7 +202,7 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("agentgw-upgrade-{name}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("agentgw-update-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d

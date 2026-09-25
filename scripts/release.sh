@@ -5,7 +5,7 @@
 #
 # The tag is the version in Cargo.toml. If the tag already exists, only the assets are replaced.
 # Assets are named `agentgw-<triple>` — install.sh and add-machine fetch them by that name —
-# each with an `agentgw-<triple>.sha256` beside it, which `upgrade` checks the download against.
+# each with an `agentgw-<triple>.sha256` beside it, which `update` checks the download against.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -23,7 +23,7 @@ for out in "$build_dir"/*/release/agentgw; do
   [ -f "$out" ] || continue
   triple="$(basename "$(dirname "$(dirname "$out")")")"
   cp "$out" "$staging/agentgw-$triple"
-  # The checksum `upgrade` compares a download with. Just the hex digits
+  # The checksum `update` compares a download with. Just the hex digits
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$out" | cut -d' ' -f1 > "$staging/agentgw-$triple.sha256"
   else

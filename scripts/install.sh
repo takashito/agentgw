@@ -11,8 +11,8 @@
 #   2. curl from a GitHub release (**public repo: no auth, no gh**), checked against the
 #      release's .sha256
 #
-# **This is for the first install.** Later versions arrive with `upgrade` (in Slack, or
-# `agentgw upgrade` on the gateway), which replaces the binary on every machine in turn.
+# **This is for the first install.** Later versions arrive with `update` (in Slack, or
+# `agentgw update` on the gateway), which replaces the binary on every machine in turn.
 #
 # A new machine installs with this one line (**not `curl … | bash`** — stdin would no
 # longer be the terminal, and `agentgw install` could not ask for the tokens):
@@ -147,7 +147,7 @@ elif [ -n "$triple" ]; then
     fi
     if curl -fsSL "$url" -o "$staging/agentgw-$triple" 2>/dev/null; then
       say "==> Downloaded $url" "==> ダウンロードしました: $url"
-      # **Checked against the release's .sha256** — the same check `upgrade` makes. A release made
+      # **Checked against the release's .sha256** — the same check `update` makes. A release made
       # before checksums were uploaded has none: say so and go on, so an older version can still be pinned
       if curl -fsSL "$url.sha256" -o "$staging/sum" 2>/dev/null; then
         want="$(tr -d ' \n' < "$staging/sum" | cut -c1-64 | tr 'A-F' 'a-f')"

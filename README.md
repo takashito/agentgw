@@ -258,7 +258,7 @@ Mention the bot (`@agentgw <command>`), or type in a thread it's working in.
 | `status` | Version, active threads and warm agents |
 | `route` | Which machine handles this channel and the others |
 | `machines` | The gateway and every machine: how each one links, the address it links from, and the version it runs |
-| `upgrade [version]` | Install the latest release on the gateway, then on each machine in turn (`agentgw upgrade` from the gateway's terminal does the same) |
+| `update [version]` | Install the latest release on the gateway, then on each machine in turn (`agentgw update` from the gateway's terminal does the same) |
 | `pwd` | Show where this thread works |
 | `cd <path>` · `cd <machine>[:<path>]` | Move **this thread** to that folder, or to that machine — conversation and all |
 | `route <path>` · `route <machine>[:<path>]` | Set **this channel's** folder and machine, which decides where the threads it starts next begin |

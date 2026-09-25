@@ -938,7 +938,7 @@ pub(super) fn help(machines: bool, agent: &dyn crate::agent::Agent) -> String {
             ("status", crate::t!("version, connected gateway, assigned channels, active threads", "版・つながっているゲートウェイ・受け持つチャンネル・動いているスレッド")),
             ("machines", crate::t!("the gateway and every machine, with where each can be reached", "ゲートウェイと各マシン、それぞれの居場所")),
             ("restart", crate::t!("restart agentgw (picks up a new version)", "agentgw を再起動する(新しい版を読み込む)")),
-            ("upgrade [version]", crate::t!("the latest release on the gateway, then on each machine in turn", "最新の release をゲートウェイに、次に各マシンへ1台ずつ入れる")),
+            ("update [version]", crate::t!("the latest release on the gateway, then on each machine in turn", "最新の release をゲートウェイに、次に各マシンへ1台ずつ入れる")),
         ],
     );
     section(

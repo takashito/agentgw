@@ -663,7 +663,7 @@ pub struct Link {
     #[serde(rename = "lastSeen", default, skip_serializing_if = "String::is_empty")]
     pub last_seen: String,
     /// The agentgw version the machine said it runs when it last connected. Empty for a machine too
-    /// old to say — `upgrade` can't reach those, so they are installed by hand once.
+    /// old to say — `update` can't reach those, so they are installed by hand once.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub version: String,
     #[serde(flatten)]
@@ -709,7 +709,7 @@ fn is_loopback(host: &str) -> bool {
         || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
-/// An `upgrade` going through the fleet: the gateway first, then each machine **one at a time**.
+/// An `update` going through the fleet: the gateway first, then each machine **one at a time**.
 #[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
 pub struct Rollout {
     /// The version everything is going to (`0.56.0`).
@@ -738,7 +738,7 @@ pub struct RolloutStep {
     /// One of the `RolloutStep::` constants. Kept as text so a newer state survives a round trip.
     #[serde(default)]
     pub state: String,
-    /// When it was told to upgrade (ms since the epoch).
+    /// When it was told to update (ms since the epoch).
     #[serde(rename = "startedMs", default, skip_serializing_if = "is_zero")]
     pub started_ms: u64,
     /// Why it failed.
@@ -754,11 +754,11 @@ fn is_zero(n: &u64) -> bool {
 
 impl RolloutStep {
     pub const PENDING: &'static str = "pending";
-    pub const UPGRADING: &'static str = "upgrading";
+    pub const UPDATING: &'static str = "updating";
     pub const DONE: &'static str = "done";
     pub const FAILED: &'static str = "failed";
     pub const OFFLINE: &'static str = "offline";
-    /// Never said its version: too old to understand `upgrade`.
+    /// Never said its version: too old to understand `update`.
     pub const TOO_OLD: &'static str = "tooOld";
 
     pub fn new(id: &str, from: &str) -> Self {
@@ -772,14 +772,14 @@ impl RolloutStep {
 
     /// Still to do something about (anything else is where it ended).
     pub fn open(&self) -> bool {
-        self.state == Self::PENDING || self.state == Self::UPGRADING
+        self.state == Self::PENDING || self.state == Self::UPDATING
     }
 }
 
 /// What the gateway does next for a [`Rollout`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum RolloutNext {
-    /// Tell this machine to upgrade.
+    /// Tell this machine to update.
     Send(String),
     /// A machine is on its way; look again later.
     Wait,
@@ -818,12 +818,12 @@ impl Rollout {
                     step.state = RolloutStep::TOO_OLD.to_string();
                     continue;
                 }
-                step.state = RolloutStep::UPGRADING.to_string();
+                step.state = RolloutStep::UPDATING.to_string();
                 step.started_ms = now_ms;
                 return RolloutNext::Send(step.id.clone());
             }
             // On its way: it has the time it takes to download, restart and reconnect
-            if now_ms.saturating_sub(step.started_ms) > crate::setup::upgrade::COME_BACK_MS {
+            if now_ms.saturating_sub(step.started_ms) > crate::setup::update::COME_BACK_MS {
                 step.state = RolloutStep::FAILED.to_string();
                 step.note = crate::t!(
                     "did not come back on {target} within 5 minutes",
@@ -836,13 +836,13 @@ impl Rollout {
         RolloutNext::Finished
     }
 
-    /// The machine said it could not upgrade. Only the one on its way can fail — a stray answer from
+    /// The machine said it could not update. Only the one on its way can fail — a stray answer from
     /// another is ignored.
     pub fn failed(&mut self, id: &str, why: &str) -> bool {
         match self
             .machines
             .iter_mut()
-            .find(|s| s.id == id && s.state == RolloutStep::UPGRADING)
+            .find(|s| s.id == id && s.state == RolloutStep::UPDATING)
         {
             Some(step) => {
                 step.state = RolloutStep::FAILED.to_string();
@@ -881,10 +881,10 @@ pub struct Access {
     /// **A machine's gateway.** Unset on a gateway.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gateway: Option<Link>,
-    /// **An `upgrade` in progress**, on the gateway. Kept here rather than in memory because the
+    /// **An `update` in progress**, on the gateway. Kept here rather than in memory because the
     /// gateway replaces itself halfway through: the process that finishes is not the one that started.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub upgrade: Option<Rollout>,
+    pub update: Option<Rollout>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -1658,7 +1658,7 @@ mod tests {
         let v = versions.clone();
         let ask = |id: &str| v.get(id).unwrap_or(&"").to_string();
         assert_eq!(r.advance("gw", "0.56.0", &all, ask, T0 + 20), RolloutNext::Wait);
-        assert_eq!(states(&r), ["done", "upgrading", "pending"]);
+        assert_eq!(states(&r), ["done", "updating", "pending"]);
         // `a` came back saying the new version
         versions.insert("a", "0.56.0");
         let v = versions.clone();
@@ -1692,7 +1692,7 @@ mod tests {
         let all = ["a".to_string(), "b".to_string()];
         assert_eq!(r.advance("gw", "0.56.0", &all, old, T0), RolloutNext::Send("a".into()));
         // Gone to restart, not back yet
-        let wait = T0 + crate::setup::upgrade::COME_BACK_MS;
+        let wait = T0 + crate::setup::update::COME_BACK_MS;
         assert_eq!(r.advance("gw", "0.56.0", &b_only, old, wait), RolloutNext::Wait);
         assert_eq!(r.advance("gw", "0.56.0", &b_only, old, wait + 1), RolloutNext::Send("b".into()));
         assert_eq!(states(&r)[1], "failed");
@@ -1722,11 +1722,11 @@ mod tests {
         let mut r = rollout(&[("gw", "0.55.0"), ("a", "0.55.0")]);
         r.channel = "D1".into();
         r.progress_ts = "1.2".into();
-        r.machines[0].state = RolloutStep::UPGRADING.into();
+        r.machines[0].state = RolloutStep::UPDATING.into();
         r.machines[0].started_ms = T0;
-        let access = Access { upgrade: Some(r.clone()), ..Default::default() };
+        let access = Access { update: Some(r.clone()), ..Default::default() };
         let back = Access::from_str(&serde_json::to_string(&access).unwrap()).unwrap();
-        assert_eq!(back.upgrade, Some(r));
+        assert_eq!(back.update, Some(r));
         // A machine's version is kept on its record
         let with = r#"{"owner":"U1","machines":{"pve":{"version":"0.55.0"}}}"#;
         assert_eq!(Access::from_str(with).unwrap().machines["pve"].version, "0.55.0");

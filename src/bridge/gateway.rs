@@ -181,11 +181,11 @@ pub mod link {
             url: String,
         },
         /// The agentgw version this machine runs. Sent on connecting, beside [`LinkFrame::MachineHost`],
-        /// so `machines` can show it and `upgrade` can tell when a machine came back on the new one.
+        /// so `machines` can show it and `update` can tell when a machine came back on the new one.
         MachineVersion { version: String },
-        /// `upgrade [version]`, asked from wherever the Owner typed it — only the gateway knows every
+        /// `update [version]`, asked from wherever the Owner typed it — only the gateway knows every
         /// machine. `None` = the latest release.
-        StartUpgrade {
+        StartUpdate {
             channel: String,
             thread_ts: String,
             #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -193,9 +193,9 @@ pub mod link {
         },
         /// gateway → machine: replace yourself with this release and restart. A machine too old to
         /// know this frame drops it, and the gateway gives up on it after a while.
-        Upgrade { version: String },
-        /// machine → gateway: could not upgrade (still running the version it had).
-        UpgradeFailed { version: String, why: String },
+        Update { version: String },
+        /// machine → gateway: could not update (still running the version it had).
+        UpdateFailed { version: String, why: String },
         /// `machines`, asked from a machine — same reason as [`LinkFrame::Channels`].
         Machines { channel: String, thread_ts: String },
         /// `route`, asked from a machine. **The gateway only sees messages that mention the bot**, and a
@@ -1898,15 +1898,15 @@ pub(crate) fn entrances(listen: &str, serve_json: Option<&str>) -> Vec<Entrance>
     out
 }
 
-/// The progress message of an `upgrade`, redrawn from the rollout each time (so the process that
+/// The progress message of an `update`, redrawn from the rollout each time (so the process that
 /// finishes draws the same message the one that started did). **Pure function.**
 pub fn rollout_text(r: &crate::bridge::state::Rollout, me: &str, finished: bool) -> String {
     use crate::bridge::state::RolloutStep as S;
     let t = &r.target;
     let mut out = vec![if finished {
-        crate::t!("*Upgrade to v{t} finished*", "*v{t} への upgrade が終わりました*")
+        crate::t!("*Update to v{t} finished*", "*v{t} への update が終わりました*")
     } else {
-        crate::t!("*Upgrading to v{t}*", "*v{t} に上げています*")
+        crate::t!("*Updating to v{t}*", "*v{t} に上げています*")
     }];
     for s in &r.machines {
         let id = &s.id;
@@ -1920,11 +1920,11 @@ pub fn rollout_text(r: &crate::bridge::state::Rollout, me: &str, finished: bool)
         let note = &s.note;
         let line = match s.state.as_str() {
             S::DONE => format!("● {name}  {versions}"),
-            S::UPGRADING => crate::t!("◌ {name}  {versions} — upgrading…", "◌ {name}  {versions} — 更新中…"),
+            S::UPDATING => crate::t!("◌ {name}  {versions} — updating…", "◌ {name}  {versions} — 更新中…"),
             S::PENDING => format!("· {name}  {versions}"),
             S::OFFLINE => crate::t!("× {name}  offline — skipped", "× {name}  オフライン — 飛ばしました"),
             S::TOO_OLD => crate::t!(
-                "× {name}  {from} is too old to upgrade itself — install it by hand once",
+                "× {name}  {from} is too old to update itself — install it by hand once",
                 "× {name}  {from} は古くて自分では上がれません — 一度だけ手で入れてください"
             ),
             _ => crate::t!("× {name}  {versions} — {note}, skipped", "× {name}  {versions} — {note}。飛ばしました"),
@@ -1963,10 +1963,10 @@ fn machines_md(rows: &[MachineRow]) -> String {
             true => "🟢",
             false => "🔴",
         };
-        // Not in a code span — one eats width. `⬆` marks what `upgrade` would move; `?` never said
+        // Not in a code span — one eats width. `⬆` marks what `update` would move; `?` never said
         let state = match r.version.as_str() {
             "" => format!("{dot} ?"),
-            v if crate::setup::upgrade::older(v, env!("CARGO_PKG_VERSION")) => format!("{dot} {v} ⬆"),
+            v if crate::setup::update::older(v, env!("CARGO_PKG_VERSION")) => format!("{dot} {v} ⬆"),
             v => format!("{dot} {v}"),
         };
         out.push(format!("| {id} | {host} | {ip} | {link} | {state} |"));
@@ -2946,16 +2946,16 @@ impl Fleet {
                         .await;
                 }
             }
-            link::LinkFrame::StartUpgrade {
+            link::LinkFrame::StartUpdate {
                 channel,
                 thread_ts,
                 version,
-            } => self.start_upgrade(&channel, &thread_ts, version).await,
-            link::LinkFrame::UpgradeFailed { version, why } => {
-                rlog("error", &format!("{bridge_id}: could not upgrade to {version}: {why}"));
+            } => self.start_update(&channel, &thread_ts, version).await,
+            link::LinkFrame::UpdateFailed { version, why } => {
+                rlog("error", &format!("{bridge_id}: could not update to {version}: {why}"));
                 let id = bridge_id.to_string();
                 self.edit_access(|a| {
-                    if let Some(r) = a.upgrade.as_mut() {
+                    if let Some(r) = a.update.as_mut() {
                         r.failed(&id, &why);
                     }
                 })
@@ -2965,38 +2965,38 @@ impl Fleet {
         }
     }
 
-    /// `upgrade [version]`: write down the rollout and post the message that follows it.
-    /// [`Self::drive_upgrades`] does the rest — **including after the gateway has replaced itself**,
+    /// `update [version]`: write down the rollout and post the message that follows it.
+    /// [`Self::drive_updates`] does the rest — **including after the gateway has replaced itself**,
     /// which is why the plan lives in access.json and not here.
-    pub(crate) async fn start_upgrade(self: &Arc<Self>, channel: &str, thread_ts: &str, named: Option<String>) {
+    pub(crate) async fn start_update(self: &Arc<Self>, channel: &str, thread_ts: &str, named: Option<String>) {
         use crate::bridge::state::{Rollout, RolloutStep};
-        use crate::setup::upgrade;
+        use crate::setup::update;
         // Asked from the terminal: no thread, the message goes to the channel itself
         let thread = (!thread_ts.is_empty()).then_some(thread_ts);
-        if let Some(r) = self.access().upgrade {
+        if let Some(r) = self.access().update {
             let t = &r.target;
             let text = crate::t!(
-                "An upgrade to v{t} is already under way.",
-                "v{t} への upgrade がすでに進んでいます。"
+                "An update to v{t} is already under way.",
+                "v{t} への update がすでに進んでいます。"
             );
             self.post(channel, thread, &text).await;
             return;
         }
         let tag = match &named {
-            Some(v) => upgrade::tag_of(v),
-            None => match upgrade::latest_tag().await {
+            Some(v) => update::tag_of(v),
+            None => match update::latest_tag().await {
                 Ok(t) => t,
                 Err(e) => {
-                    let text = crate::t!("Cannot upgrade: {e}", "upgrade できません: {e}");
+                    let text = crate::t!("Cannot update: {e}", "update できません: {e}");
                     self.post(channel, thread, &text).await;
                     return;
                 }
             },
         };
-        let target = upgrade::version_of(&tag).to_string();
+        let target = update::version_of(&tag).to_string();
         let me = env!("CARGO_PKG_VERSION");
         // Only a version named on purpose goes down
-        if named.is_none() && upgrade::older(&target, me) {
+        if named.is_none() && update::older(&target, me) {
             let text = crate::t!(
                 "The latest release (v{target}) is older than this gateway (v{me}). Nothing to do.",
                 "最新の release(v{target})はこのゲートウェイ(v{me})より古いので、何もしません。"
@@ -3032,16 +3032,16 @@ impl Fleet {
             .await
         {
             Ok(ts) => r.progress_ts = ts,
-            Err(e) => rlog("error", &format!("upgrade: could not post the progress message: {e}")),
+            Err(e) => rlog("error", &format!("update: could not post the progress message: {e}")),
         }
-        rlog("info", &format!("upgrade: starting a rollout to v{}", r.target));
-        self.edit_access(|a| a.upgrade = Some(r)).await;
+        rlog("info", &format!("update: starting a rollout to v{}", r.target));
+        self.edit_access(|a| a.update = Some(r)).await;
     }
 
-    /// Carries an `upgrade` through, one machine at a time. **The only clock the rollout has** — it
+    /// Carries an `update` through, one machine at a time. **The only clock the rollout has** — it
     /// looks every 2 seconds, and a process that starts with a rollout in access.json picks it up
     /// (the gateway restarts halfway through its own rollout).
-    pub async fn drive_upgrades(self: Arc<Self>) {
+    pub async fn drive_updates(self: Arc<Self>) {
         use crate::bridge::state::RolloutNext;
         let born = std::time::Instant::now();
         let mut shown = String::new();
@@ -3049,7 +3049,7 @@ impl Fleet {
         loop {
             tick.tick().await;
             let access = self.access();
-            let Some(mut r) = access.upgrade.clone() else {
+            let Some(mut r) = access.update.clone() else {
                 shown.clear();
                 continue;
             };
@@ -3074,26 +3074,26 @@ impl Fleet {
             let finished = next == RolloutNext::Finished;
             // **Written down before the machine is told** — telling the gateway itself restarts it
             if finished {
-                self.edit_access(|a| a.upgrade = None).await;
-                rlog("info", &format!("upgrade: rollout to v{} finished", r.target));
+                self.edit_access(|a| a.update = None).await;
+                rlog("info", &format!("update: rollout to v{} finished", r.target));
             } else if r != before {
                 let saved = r.clone();
-                self.edit_access(|a| a.upgrade = Some(saved)).await;
+                self.edit_access(|a| a.update = Some(saved)).await;
             }
             if let RolloutNext::Send(id) = &next {
-                rlog("info", &format!("upgrade: telling {id} to upgrade to v{}", r.target));
-                let frame = link::LinkFrame::Upgrade { version: r.target.clone() };
+                rlog("info", &format!("update: telling {id} to update to v{}", r.target));
+                let frame = link::LinkFrame::Update { version: r.target.clone() };
                 if !self.send_frame(id, &frame).await {
                     let why = crate::t!("could not reach it", "届きませんでした");
                     r.failed(id, &why);
                     let saved = r.clone();
-                    self.edit_access(|a| a.upgrade = Some(saved)).await;
+                    self.edit_access(|a| a.update = Some(saved)).await;
                 }
             }
             let text = rollout_text(&r, &self.self_id, finished);
             if text != shown && !r.progress_ts.is_empty() {
                 if let Err(e) = self.api.update_message(&r.channel, &r.progress_ts, &text).await {
-                    rlog("error", &format!("upgrade: could not update the progress message: {e}"));
+                    rlog("error", &format!("update: could not update the progress message: {e}"));
                 }
                 shown = text;
             }
@@ -3506,10 +3506,10 @@ async fn on_status(
         .into_response()
 }
 
-/// `agentgw upgrade` from the terminal. Same key as `/status`. **The CLI replaces nothing itself** —
-/// it asks the running gateway, so there is one way an upgrade happens. The progress goes to the notice
+/// `agentgw update` from the terminal. Same key as `/status`. **The CLI replaces nothing itself** —
+/// it asks the running gateway, so there is one way an update happens. The progress goes to the notice
 /// channel, since there is no thread to answer in.
-async fn on_start_upgrade(
+async fn on_start_update(
     State(fleet): State<Arc<Fleet>>,
     headers: HeaderMap,
     body: String,
@@ -3525,14 +3525,14 @@ async fn on_start_upgrade(
         return (
             StatusCode::CONFLICT,
             crate::t!(
-                "no notice channel to report in yet — send `upgrade` in Slack instead",
-                "報告先の通知チャンネルがまだありません — Slack で `upgrade` を送ってください"
+                "no notice channel to report in yet — send `update` in Slack instead",
+                "報告先の通知チャンネルがまだありません — Slack で `update` を送ってください"
             ),
         )
             .into_response();
     };
     let version = (!body.trim().is_empty()).then(|| body.trim().to_string());
-    tokio::spawn(async move { fleet.start_upgrade(&home, "", version).await });
+    tokio::spawn(async move { fleet.start_update(&home, "", version).await });
     (StatusCode::ACCEPTED, "accepted").into_response()
 }
 
@@ -3569,7 +3569,7 @@ pub(super) async fn bind_link_port(addr: std::net::SocketAddr, what: &str) -> Op
 async fn serve_children_on(fleet: Arc<Fleet>, listener: tokio::net::TcpListener) {
     let app = Router::new()
         .route("/status", get(on_status))
-        .route("/upgrade", axum::routing::post(on_start_upgrade))
+        .route("/update", axum::routing::post(on_start_update))
         .route(link::PROBE_PATH, get(on_upgrade))
         .route("/bridge/{id}", get(on_upgrade))
         .with_state(fleet);
@@ -3910,15 +3910,15 @@ impl Cli {
         );
     }
 
-    /// `agentgw upgrade [version]`: ask the running gateway to start one.
-    pub async fn upgrade(dir: &StateDir, args: &[String]) -> i32 {
+    /// `agentgw update [version]`: ask the running gateway to start one.
+    pub async fn update(dir: &StateDir, args: &[String]) -> i32 {
         let env = Self::env_of(dir);
         let Some(token) = env.get("AGENTGW_LINK_TOKEN") else {
             eprintln!(
                 "{}",
                 crate::t!(
-                    "upgrade runs on the gateway. On a machine, send `upgrade` in Slack.",
-                    "upgrade はゲートウェイで打ちます。マシンでは Slack で `upgrade` を送ってください。"
+                    "update runs on the gateway. On a machine, send `update` in Slack.",
+                    "update はゲートウェイで打ちます。マシンでは Slack で `update` を送ってください。"
                 )
             );
             return 2;
@@ -3936,7 +3936,7 @@ impl Cli {
                 &format!("x-api-token: {token}"),
                 "--data-raw",
                 &version,
-                &format!("http://{listen}/upgrade"),
+                &format!("http://{listen}/update"),
             ])
             .output()
             .await;
@@ -3947,8 +3947,8 @@ impl Cli {
                 println!(
                     "{}",
                     crate::t!(
-                        "The gateway is upgrading. Progress is posted in the notice channel.",
-                        "ゲートウェイが upgrade を始めました。進み具合は通知チャンネルに出ます。"
+                        "The gateway is updating. Progress is posted in the notice channel.",
+                        "ゲートウェイが update を始めました。進み具合は通知チャンネルに出ます。"
                     )
                 );
                 0
@@ -5367,7 +5367,7 @@ mod tests {
         assert!(alone.contains("agentgw add-machine user@host"), "{alone}");
     }
 
-    /// The version sits in the status cell: `⬆` on what `upgrade` would move, `?` on what never said.
+    /// The version sits in the status cell: `⬆` on what `update` would move, `?` on what never said.
     #[test]
     fn machines_table_marks_the_ones_behind_the_gateway() {
         let row = |id: &str, online, version: &str| MachineRow {
@@ -5399,7 +5399,7 @@ mod tests {
             target: "0.56.0".into(),
             machines: vec![
                 step("dock", "0.55.0", S::DONE, ""),
-                step("pve", "0.55.0", S::UPGRADING, ""),
+                step("pve", "0.55.0", S::UPDATING, ""),
                 step("nas", "", S::TOO_OLD, ""),
                 step("mac", "0.55.0", S::OFFLINE, ""),
                 step("box", "0.55.0", S::FAILED, "checksum mismatch"),
@@ -5408,23 +5408,23 @@ mod tests {
             ..Default::default()
         };
         let out = rollout_text(&r, "dock", false);
-        assert!(out.starts_with("*Upgrading to v0.56.0*"), "{out}");
+        assert!(out.starts_with("*Updating to v0.56.0*"), "{out}");
         assert!(out.contains("● *dock* (gateway)  0.55.0 → 0.56.0"), "{out}");
-        assert!(out.contains("◌ *pve*  0.55.0 → 0.56.0 — upgrading…"), "{out}");
+        assert!(out.contains("◌ *pve*  0.55.0 → 0.56.0 — updating…"), "{out}");
         assert!(out.contains("× *nas*  ? is too old"), "{out}");
         assert!(out.contains("× *mac*  offline — skipped"), "{out}");
         assert!(out.contains("× *box*  0.55.0 → 0.56.0 — checksum mismatch, skipped"), "{out}");
         assert!(out.contains("· *pi*  0.54.0 → 0.56.0"), "{out}");
-        assert!(rollout_text(&r, "dock", true).starts_with("*Upgrade to v0.56.0 finished*"));
+        assert!(rollout_text(&r, "dock", true).starts_with("*Update to v0.56.0 finished*"));
     }
 
     #[test]
-    fn the_upgrade_frames_round_trip() {
+    fn the_update_frames_round_trip() {
         for f in [
-            link::LinkFrame::Upgrade { version: "0.56.0".into() },
-            link::LinkFrame::UpgradeFailed { version: "0.56.0".into(), why: "404".into() },
+            link::LinkFrame::Update { version: "0.56.0".into() },
+            link::LinkFrame::UpdateFailed { version: "0.56.0".into(), why: "404".into() },
             link::LinkFrame::MachineVersion { version: "0.55.0".into() },
-            link::LinkFrame::StartUpgrade { channel: "D1".into(), thread_ts: "1.0".into(), version: None },
+            link::LinkFrame::StartUpdate { channel: "D1".into(), thread_ts: "1.0".into(), version: None },
         ] {
             assert_eq!(link::decode(&link::encode(&f)).unwrap(), f, "{f:?}");
         }

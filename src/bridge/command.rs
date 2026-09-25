@@ -175,9 +175,9 @@ pub enum Cmd {
     Channels,
     /// `machines` / `machine` — the gateway and every machine it knows, with where each can be reached.
     Machines,
-    /// `upgrade [version]` — the gateway, then every machine one at a time. `None` = the latest release.
+    /// `update [version]` — the gateway, then every machine one at a time. `None` = the latest release.
     /// **The gateway runs it**; wherever it is typed, it is passed up.
-    Upgrade(Option<String>),
+    Update(Option<String>),
     Owner(OwnerCmd),
 }
 
@@ -255,11 +255,11 @@ impl Cmd {
         if let Some(bare) = Self::pwd(msg) {
             return Some(Cmd::Pwd(bare));
         }
-        // Only a version counts as its argument, so "upgrade the docs" stays a sentence
-        if let Some(v) = Self::value_of(msg, "upgrade", |v| {
-            crate::setup::upgrade::older("0.0.0", v).then(|| crate::setup::upgrade::version_of(v).to_string())
+        // Only a version counts as its argument, so "update the docs" stays a sentence
+        if let Some(v) = Self::value_of(msg, "update", |v| {
+            crate::setup::update::older("0.0.0", v).then(|| crate::setup::update::version_of(v).to_string())
         }) {
-            return Some(Cmd::Upgrade(v));
+            return Some(Cmd::Update(v));
         }
         Self::owner(msg).map(Cmd::Owner)
     }
@@ -286,7 +286,7 @@ impl Cmd {
             Cmd::Route(_) => "route",
             Cmd::Channels => "route",
             Cmd::Machines => "machines",
-            Cmd::Upgrade(_) => "upgrade",
+            Cmd::Update(_) => "update",
             Cmd::Owner(oc) => return format!("owner-command '{}'", oc.verb),
         };
         format!("'{name}'")
@@ -957,10 +957,10 @@ impl Bridge {
                 }
             }
             // Same: only the gateway knows every machine, and it is the one that goes first
-            Cmd::Upgrade(version) => {
-                ctx.info("bridge", &format!("slack-events: upgrade command msg={}", msg.ts));
+            Cmd::Update(version) => {
+                ctx.info("bridge", &format!("slack-events: update command msg={}", msg.ts));
                 if !self.ask_the_gateway(
-                    crate::bridge::gateway::link::LinkFrame::StartUpgrade {
+                    crate::bridge::gateway::link::LinkFrame::StartUpdate {
                         channel: msg.channel.clone(),
                         thread_ts: root_ts.to_string(),
                         version,
@@ -968,7 +968,7 @@ impl Bridge {
                     &ctx,
                 ) {
                     let text = crate::t!(
-                        "This machine works on its own. Upgrade it with install.sh.",
+                        "This machine works on its own. Update it with install.sh.",
                         "このマシンは単独で動いています。install.sh で上げてください。"
                     );
                     self.post(&msg.channel, root_ts, text, key);
@@ -1254,14 +1254,14 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_takes_only_a_version_as_its_argument() {
+    fn update_takes_only_a_version_as_its_argument() {
         let agent = crate::agent::fake::FakeAgent::default();
         let parse = |text: &str| Cmd::parse(&Message::new(text, None), &agent);
-        assert_eq!(parse("upgrade"), Some(Cmd::Upgrade(None)));
-        assert_eq!(parse("upgrade v0.56.0"), Some(Cmd::Upgrade(Some("0.56.0".into()))));
-        assert_eq!(parse("upgrade 0.56.0"), Some(Cmd::Upgrade(Some("0.56.0".into()))));
+        assert_eq!(parse("update"), Some(Cmd::Update(None)));
+        assert_eq!(parse("update v0.56.0"), Some(Cmd::Update(Some("0.56.0".into()))));
+        assert_eq!(parse("update 0.56.0"), Some(Cmd::Update(Some("0.56.0".into()))));
         // A sentence goes to the agent
-        assert_eq!(parse("upgrade the docs"), None);
+        assert_eq!(parse("update the docs"), None);
     }
 
     #[test]
