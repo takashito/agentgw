@@ -158,6 +158,9 @@ impl Api {
         let blocks: Vec<SlackBlock> = vec![
             SlackSectionBlock::new()
                 .with_text(SlackBlockText::MarkDown(body.clone().into()))
+                // Same reason as the dialog prompt: the arguments being approved must be read
+                // without a click
+                .with_expand(true)
                 .into(),
             SlackActionsBlock::new(vec![
                 button("Allow", "allow")
@@ -228,6 +231,10 @@ impl Api {
         let blocks: Vec<SlackBlock> = vec![
             SlackSectionBlock::new()
                 .with_text(SlackBlockText::MarkDown(dialog_body(dialog, None, true).into()))
+                // **Or Slack hides the question behind "Show more".** A section is rendered
+                // with that link unless it is told to expand -- which is why the progress
+                // message, far longer but a markdown block, never folds
+                .with_expand(true)
                 .into(),
             SlackActionsBlock::new(buttons).into(),
         ];
@@ -1788,11 +1795,9 @@ fn dialog_body(d: &crate::agent::Dialog, chosen: Option<usize>, open: bool) -> S
         .map(|(i, o)| {
             let mark = if chosen == Some(i) { "\u{25b6}" } else { " " };
             let head = format!("{mark} *{}.* {o}", i + 1);
-            // **One line per row.** Slack folds a tall message behind "Show more" whatever it is
-            // made of -- taking the rows out of a code block was not enough, because a row and
-            // its description on separate lines is still two lines each
             match d.details.get(i).filter(|x| !x.is_empty()) {
-                Some(detail) => format!("{head} \u{2014} {detail}"),
+                // NBSP, because Slack eats an ordinary indent
+                Some(detail) => format!("{head}\n{}{detail}", "\u{a0}".repeat(6)),
                 None => head,
             }
         })
@@ -2137,13 +2142,9 @@ mod tests {
         assert!(out.contains("\u{25b6} *2.* Update the laptop"), "the taken row is not marked: {out}");
         // Folding a long code block behind "Show more" hid the rows of the question itself
         assert!(!out.contains("```"), "the rows went back into a code block: {out}");
-        // Slack folds a tall message behind "Show more", whatever it is made of, so the rows
-        // and their descriptions share a line: a question hidden behind a link is not asked
-        assert_eq!(
-            out.lines().count(),
-            4,
-            "a line per row and no more, or Slack folds the question away: {out}"
-        );
+        // A row's description sits under it again: the fold was the section block being left
+        // to render with a "Show more" link, not the height, and `expand` settles that
+        assert_eq!(out.lines().count(), 5, "{out}");
         // Nothing left inviting an answer that has already been given
         assert!(!out.contains("asking"), "{out}");
 
