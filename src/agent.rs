@@ -446,6 +446,10 @@ pub struct Dialog {
     pub details: Vec<String>,
     /// Index into `options` the cursor is on.
     pub selected: usize,
+    /// True when the agent asked this itself, through the question tool, and the rows came with
+    /// it. False when it was found holding the screen — nobody chose to put it there, and the
+    /// cursor's row is worth pointing out because that is what Enter would take.
+    pub asked: bool,
 }
 
 // ── the agent as the core sees it ──

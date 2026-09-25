@@ -188,11 +188,8 @@ impl Api {
         Ok(res.ts.to_string())
     }
 
-    /// Block Kit prompt offering a modal's rows as buttons. The rows are read off the agent's
-    /// screen, so the wording is the screen's, not ours.
-    ///
-    /// The hint line goes in as well: what confirming does is not always the same
-    /// (`/model`'s reads "Enter to set as default"), and only the screen says so.
+    /// Block Kit prompt offering a modal's rows as buttons. The rows are the agent's own, so
+    /// the wording is its, not ours.
     pub async fn post_dialog_prompt(
         &self,
         channel: &str,
@@ -200,31 +197,6 @@ impl Api {
         req_id: &str,
         dialog: &crate::agent::Dialog,
     ) -> Result<String, String> {
-        let rows: Vec<String> = dialog
-            .options
-            .iter()
-            .enumerate()
-            .map(|(i, o)| {
-                let detail = dialog.details.get(i).filter(|d| !d.is_empty());
-                match detail {
-                    Some(d) => format!("{}. {o}\n     {d}", i + 1),
-                    None => format!("{}. {o}", i + 1),
-                }
-            })
-            .collect();
-        let mut body = format!(
-            "{}\n*{}*\n```{}```",
-            crate::t!(
-                ":keyboard: The agent is waiting on a dialog \u{2014} answer it here and the queued messages go through.",
-                ":keyboard: エージェントが画面の確認待ちで止まっています。ここで答えると、溜まっているメッセージがそのまま渡ります。"
-            ),
-            dialog.title,
-            rows.join("\n"),
-        );
-        // The hint is the screen's own; a question taken from the hook has none to show
-        if !dialog.footer.is_empty() {
-            body.push_str(&format!("\n_{}_", dialog.footer));
-        }
         let button = |label: &str, action: &str| {
             SlackBlockButtonElement::new(
                 format!("perm:{action}:{req_id}").into(),
@@ -239,7 +211,10 @@ impl Api {
             .enumerate()
             .map(|(i, o)| {
                 let mut b = button(&button_label(o), &format!("dlg-{i}"));
-                if i == dialog.selected {
+                // Where the cursor already is, on a dialog nobody chose to open. **Not on a
+                // question** -- there the cursor is only ever on the first row, and colouring
+                // it reads as a recommendation the agent never made
+                if i == dialog.selected && !dialog.asked {
                     b = b.with_style(SlackBlockButtonStyle::Primary);
                 }
                 b.into()
@@ -252,7 +227,7 @@ impl Api {
         );
         let blocks: Vec<SlackBlock> = vec![
             SlackSectionBlock::new()
-                .with_text(SlackBlockText::MarkDown(body.into()))
+                .with_text(SlackBlockText::MarkDown(dialog_body(dialog, None, true).into()))
                 .into(),
             SlackActionsBlock::new(buttons).into(),
         ];
@@ -1801,6 +1776,65 @@ pub fn inbound_from_relay(name: &str, event: &serde_json::Value) -> Option<Inbou
     }
 }
 
+/// The question and its rows, as the thread sees them. `chosen` marks the row that was taken.
+///
+/// **The rows stay after the answer.** Replacing the whole post with "\u{2705} <label>" left the
+/// thread unable to say later what the question had been, or what else had been on offer.
+fn dialog_body(d: &crate::agent::Dialog, chosen: Option<usize>, open: bool) -> String {
+    let rows: Vec<String> = d
+        .options
+        .iter()
+        .enumerate()
+        .map(|(i, o)| {
+            let mark = if chosen == Some(i) { "\u{25b6} " } else { "  " };
+            let head = format!("{mark}{}. {o}", i + 1);
+            match d.details.get(i).filter(|x| !x.is_empty()) {
+                Some(detail) => format!("{head}\n       {detail}"),
+                None => head,
+            }
+        })
+        .collect();
+    let lead = match (open, d.asked) {
+        // Settled: the post says so in its first line, so it needs no invitation
+        (false, _) => String::new(),
+        (true, true) => crate::t!(
+            ":speech_balloon: The agent is asking:",
+            ":speech_balloon: エージェントからの質問です:"
+        ),
+        (true, false) => crate::t!(
+            ":keyboard: A dialog is holding the agent \u{2014} answer it here and the queued messages go through.",
+            ":keyboard: エージェントが画面の確認待ちで止まっています。ここで答えると、溜まっているメッセージがそのまま渡ります。"
+        ),
+    };
+    let mut body = String::new();
+    if !lead.is_empty() {
+        body.push_str(&lead);
+        body.push('\n');
+    }
+    body.push_str(&format!("*{}*\n```{}```", d.title, rows.join("\n")));
+    // The hint is the screen's own; a question taken from the hook has none to show
+    if !d.footer.is_empty() && open {
+        body.push_str(&format!("\n_{}_", d.footer));
+    }
+    body
+}
+
+/// What the prompt becomes once someone has pressed a button: the same question and rows, the
+/// one that was taken marked, and who took it. `chosen` is None when it was cancelled.
+pub fn answered_dialog(d: &crate::agent::Dialog, chosen: Option<usize>, by: &str) -> String {
+    let what = match chosen.and_then(|i| d.options.get(i)) {
+        Some(label) => format!("\u{2705} {label}"),
+        None => format!("\u{1f6ab} {}", crate::t!("Cancelled", "取り消し")),
+    };
+    format!("{what} \u{2014} <@{by}>\n{}", dialog_body(d, chosen, false))
+}
+
+/// What the prompt becomes when the answer could not be given: why, and the question again, so
+/// the thread still shows what was being asked.
+pub fn unanswered_dialog(d: &crate::agent::Dialog, why: &str) -> String {
+    format!("\u{26a0}\u{fe0f} {why}\n{}", dialog_body(d, None, false))
+}
+
 /// Buttons in one actions block, leaving room for Cancel under Slack's 25.
 const DIALOG_BUTTON_CAP: usize = 20;
 
@@ -2076,6 +2110,34 @@ impl SlackId {
 
 #[cfg(test)]
 mod tests {
+
+    /// **The question survives the answer.** The post used to be replaced by "\u{2705} <label>",
+    /// so a thread read a week later showed a tick with nothing to attach it to: neither what
+    /// had been asked nor what else had been on offer (user, 2026-09-25).
+    #[test]
+    fn an_answered_question_still_shows_what_was_asked() {
+        let d = crate::agent::Dialog {
+            title: "Which one next?".into(),
+            footer: String::new(),
+            options: vec!["Watch the screen".into(), "Update the laptop".into()],
+            details: vec!["now and then".into(), String::new()],
+            selected: 0,
+            asked: true,
+        };
+        let out = answered_dialog(&d, Some(1), "U_OWNER");
+        assert!(out.starts_with("\u{2705} Update the laptop \u{2014} <@U_OWNER>"), "{out}");
+        assert!(out.contains("Which one next?"), "the question went missing: {out}");
+        assert!(out.contains("1. Watch the screen"), "the other rows went missing: {out}");
+        assert!(out.contains("now and then"), "the descriptions went missing: {out}");
+        assert!(out.contains("\u{25b6} 2. Update the laptop"), "the taken row is not marked: {out}");
+        // Nothing left inviting an answer that has already been given
+        assert!(!out.contains("asking"), "{out}");
+
+        let off = answered_dialog(&d, None, "U_OWNER");
+        assert!(off.starts_with("\u{1f6ab}"), "{off}");
+        assert!(off.contains("Which one next?"), "{off}");
+        assert!(!off.contains("\u{25b6}"), "nothing was taken, so nothing is marked: {off}");
+    }
 
     /// An event we have no model for is logged by its `type`, and a long body is cut.
     #[test]

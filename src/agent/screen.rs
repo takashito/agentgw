@@ -314,6 +314,7 @@ impl<'a> Pane<'a> {
             title: dialog_title(&lines[from..top], footer),
             footer: footer.trim().to_string(),
             selected,
+            asked: false,
             options: rows.iter().map(|(_, label, _)| label.clone()).collect(),
             details: rows.into_iter().map(|(_, _, detail)| detail).collect(),
         })

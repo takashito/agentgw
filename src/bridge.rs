@@ -191,6 +191,9 @@ pub(crate) struct DialogPending {
     pub window: String,
     /// ts of the posted prompt, for rewriting it once it is answered.
     pub prompt_ts: String,
+    /// What was asked. Kept so the answered post can show the question and the rows again
+    /// instead of replacing them with a tick nobody can read a week later.
+    pub dialog: crate::agent::Dialog,
 }
 
 /// A window that would not take a delivery.
@@ -2351,6 +2354,7 @@ mod tests {
             footer: "Enter to confirm \u{b7} Esc to cancel".into(),
             options: vec!["Yes, I trust it".into(), "No, exit".into()],
             details: vec![String::new(), String::new()],
+            asked: false,
             selected: 1,
         });
         // Not a word from anyone; the thread has simply gone quiet
@@ -2391,6 +2395,7 @@ mod tests {
             footer: "Enter to select \u{b7} Esc to cancel".into(),
             options: vec!["Watch the screen".into(), "Update the laptop".into()],
             details: vec![String::new(), String::new()],
+            asked: false,
             selected: 0,
         });
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -2589,6 +2594,7 @@ mod tests {
             footer: "Enter to confirm \u{b7} Esc to cancel".into(),
             options: vec!["Open System Settings".into(), "Try again".into()],
             details: vec![String::new(), String::new()],
+            asked: false,
             selected: 0,
         });
 

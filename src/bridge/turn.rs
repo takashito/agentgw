@@ -60,6 +60,7 @@ fn question_from(input: &serde_json::Value) -> Option<Dialog> {
         title,
         footer: String::new(),
         selected: 0,
+        asked: true,
         options: rows.iter().map(|(l, _)| l.clone()).collect(),
         details: rows.into_iter().map(|(_, d)| d).collect(),
     })
@@ -1054,6 +1055,7 @@ impl Bridge {
                 d.options.len()
             ),
         );
+
         self.dialog_pending.insert(
             req_id,
             DialogPending {
@@ -1061,6 +1063,7 @@ impl Bridge {
                 thread_ts: thread_ts.to_string(),
                 window: window.to_string(),
                 prompt_ts,
+                dialog: d,
             },
         );
         true
@@ -1079,11 +1082,6 @@ impl Bridge {
             .action
             .strip_prefix("dlg-")
             .and_then(|a| a.parse::<usize>().ok());
-        let picked = self
-            .deps
-            .agent
-            .dialog(&Window::of(&p.window))
-            .and_then(|d| choice.and_then(|i| d.options.get(i).cloned()));
         let answered = self
             .deps
             .agent
@@ -1099,15 +1097,16 @@ impl Bridge {
                         click.req_id, p.window, click.action, click.by
                     ),
                 );
-                let what = picked.unwrap_or_else(|| crate::t!("Cancelled", "取り消し"));
-                format!("✅ {what} — <@{}>", click.by)
+                // **What was asked, not just what was picked.** The rows the thread saw come
+                // from the record, not from the screen, which has moved on by now
+                slack::answered_dialog(&p.dialog, choice, &click.by)
             }
             Err(e) => {
                 ctx.error(
                     "bridge",
                     &format!("dialog reqId={} window={}: {e}", click.req_id, p.window),
                 );
-                format!("⚠️ {e}")
+                slack::unanswered_dialog(&p.dialog, e)
             }
         };
         // Answered, so the thread is no longer silent on purpose
