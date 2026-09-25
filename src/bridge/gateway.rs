@@ -200,9 +200,11 @@ pub mod link {
         Machines { channel: String, thread_ts: String },
         /// `route`, asked from a machine. **The gateway only sees messages that mention the bot**, and a
         /// follow-up in a running thread doesn't; the machine that owns the thread asks on its behalf.
-        /// **The wire name stays `channels`**: the command was renamed to `route`, but a rollout runs
-        /// the gateway ahead of its machines, and a tag only one side knows is a frame the other drops.
-        #[serde(rename = "channels")]
+        /// **Sent as `routes`, still read as `channels`.** This frame only goes machine → gateway, and
+        /// a rollout runs the gateway first — so the new gateway is the one that has to keep
+        /// understanding what a machine says until that machine catches up. The alias is what makes the
+        /// rename cost nothing; it can go once no machine older than 0.58.11 is left.
+        #[serde(rename = "routes", alias = "channels")]
         Routes { channel: String, thread_ts: String },
         /// `pwd <machine>[:<path>]`, asked from a machine — same reason as [`LinkFrame::Routes`].
         PwdOn {
@@ -5487,18 +5489,17 @@ mod tests {
         assert!(out.contains("C2 → laptop  ○ offline"), "{out}"); // the raw id if the name can't be looked up
     }
 
-    /// The command was renamed to `route`, but **the wire keeps saying `channels`**. A rollout runs the
-    /// gateway ahead of its machines, so for a while the two ends are different versions — a tag only
-    /// one of them knows is a frame the other drops, and `route` would go unanswered until they meet.
+    /// The wire says `routes` now — and **an older machine's `channels` still reads**. This frame only
+    /// goes machine → gateway and a rollout runs the gateway first, so that one alias is the whole cost
+    /// of the rename: there is no window where `route` goes unanswered.
     #[test]
-    fn the_route_frame_still_says_channels_on_the_wire() {
+    fn the_route_frame_reads_both_names() {
         let frame = link::LinkFrame::Routes {
             channel: "C1".into(),
             thread_ts: "1.2".into(),
         };
         let wire = serde_json::to_string(&frame).unwrap();
-        assert!(wire.contains(r#""t":"channels""#), "{wire}");
-        // …and an older machine's frame still reads here
+        assert!(wire.contains(r#""t":"routes""#), "{wire}");
         let old = r#"{"t":"channels","channel":"C1","thread_ts":"1.2"}"#;
         assert_eq!(serde_json::from_str::<link::LinkFrame>(old).unwrap(), frame);
     }
