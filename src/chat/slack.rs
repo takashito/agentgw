@@ -234,7 +234,7 @@ impl Api {
             // to read before answering. Slack takes buttons alongside one either way
             SlackBlock::Markdown(SlackMarkdownBlock {
                 block_id: None,
-                text: dialog_body(dialog, None, true),
+                text: dialog_body(dialog, true),
             }),
             SlackActionsBlock::new(buttons).into(),
         ];
@@ -1787,14 +1787,13 @@ pub fn inbound_from_relay(name: &str, event: &serde_json::Value) -> Option<Inbou
 ///
 /// **The rows stay after the answer.** Replacing the whole post with "\u{2705} <label>" left the
 /// thread unable to say later what the question had been, or what else had been on offer.
-fn dialog_body(d: &crate::agent::Dialog, chosen: Option<usize>, open: bool) -> String {
+fn dialog_body(d: &crate::agent::Dialog, open: bool) -> String {
     let rows: Vec<String> = d
         .options
         .iter()
         .enumerate()
         .map(|(i, o)| {
-            let mark = if chosen == Some(i) { "\u{25b6}" } else { " " };
-            let head = format!("{mark} **{}.** {o}", i + 1);
+            let head = format!("**{}.** {o}", i + 1);
             match d.details.get(i).filter(|x| !x.is_empty()) {
                 // NBSP, because Slack eats an ordinary indent
                 Some(detail) => format!("{head}\n{}{detail}", "\u{a0}".repeat(6)),
@@ -1836,13 +1835,15 @@ pub fn answered_dialog(d: &crate::agent::Dialog, chosen: Option<usize>, by: &str
         Some(label) => format!("\u{2705} {label}"),
         None => format!("\u{1f6ab} {}", crate::t!("Cancelled", "取り消し")),
     };
-    format!("{what} \u{2014} <@{by}>\n{}", dialog_body(d, chosen, false))
+    // **Under the question, not over it.** The answer read as a headline with the question
+    // buried beneath it; what was asked comes first and the verdict closes it
+    format!("{}\n{what} \u{2014} <@{by}>", dialog_body(d, false))
 }
 
 /// What the prompt becomes when the answer could not be given: why, and the question again, so
 /// the thread still shows what was being asked.
 pub fn unanswered_dialog(d: &crate::agent::Dialog, why: &str) -> String {
-    format!("\u{26a0}\u{fe0f} {why}\n{}", dialog_body(d, None, false))
+    format!("{}\n\u{26a0}\u{fe0f} {why}", dialog_body(d, false))
 }
 
 /// Buttons in one actions block, leaving room for Cancel under Slack's 25.
@@ -2135,25 +2136,24 @@ mod tests {
             asked: true,
         };
         let out = answered_dialog(&d, Some(1), "U_OWNER");
-        assert!(out.starts_with("\u{2705} Update the laptop \u{2014} <@U_OWNER>"), "{out}");
-        assert!(out.contains("Which one next?"), "the question went missing: {out}");
+        // **The question first, the answer under it.** The verdict on top read as a headline
+        // with what was asked buried beneath it
+        assert!(out.starts_with("**Which one next?**"), "{out}");
+        assert!(
+            out.trim_end().ends_with("\u{2705} Update the laptop \u{2014} <@U_OWNER>"),
+            "{out}"
+        );
         assert!(out.contains("**1.** Watch the screen"), "the other rows went missing: {out}");
         assert!(out.contains("now and then"), "the descriptions went missing: {out}");
-        assert!(out.contains("\u{25b6} **2.** Update the laptop"), "the taken row is not marked: {out}");
-        // Folding a long code block behind "Show more" hid the rows of the question itself
         assert!(!out.contains("```"), "the rows went back into a code block: {out}");
-        // A markdown block reads `**bold**`; mrkdwn's single asterisks would show as asterisks
-        assert!(!out.contains("*Which one next?*") || out.contains("**Which one next?**"), "{out}");
-        // A row's description sits under it again: the fold was the section block being left
-        // to render with a "Show more" link, not the height, and `expand` settles that
-        assert_eq!(out.lines().count(), 5, "{out}");
+        assert!(!out.contains("\u{25b6}"), "the row marker is back: {out}");
         // Nothing left inviting an answer that has already been given
         assert!(!out.contains("asking"), "{out}");
 
         let off = answered_dialog(&d, None, "U_OWNER");
-        assert!(off.starts_with("\u{1f6ab}"), "{off}");
+        assert!(off.trim_end().ends_with("<@U_OWNER>"), "{off}");
+        assert!(off.contains("\u{1f6ab}"), "{off}");
         assert!(off.contains("Which one next?"), "{off}");
-        assert!(!off.contains("\u{25b6}"), "nothing was taken, so nothing is marked: {off}");
     }
 
     /// An event we have no model for is logged by its `type`, and a long body is cut.

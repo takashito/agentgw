@@ -1130,6 +1130,7 @@ impl Bridge {
         b.forget_unresumable_threads(&LogCtx::default());
         // Fold the permission prompts the previous process left waiting — their buttons answer nobody
         b.fold_stale_perm_prompts(&LogCtx::default()).await;
+        b.adopt_dialog_prompts(&LogCtx::default());
         // Pick up threads the previous process was waiting to answer (only those with live agents)
         b.restore_pending(&LogCtx::default());
         // Re-deliver requests that never got handed over (start an agent to hand them to if there is none)
@@ -2211,6 +2212,7 @@ mod tests {
         let (mut b, _fx) = Bridge::for_test(d);
 
         b.fold_stale_perm_prompts(&LogCtx::default()).await;
+        b.adopt_dialog_prompts(&LogCtx::default());
 
         let calls = slack.calls();
         assert!(
@@ -2399,6 +2401,54 @@ mod tests {
             slack.calls().iter().filter(|c| c.starts_with("dialog C1")).count(),
             asked,
             "the same modal was offered again: {:?}",
+            slack.calls()
+        );
+    }
+
+    /// **A question outlives the Bridge that asked it.** The pending table lived only in
+    /// memory, so an update emptied it and the buttons went dead: a click carried an id nobody
+    /// recognised and was dropped in silence, while the dialog sat on the agent's screen where
+    /// a keypress would still have answered it (user, 2026-09-25, mid-answer).
+    #[tokio::test]
+    async fn the_buttons_still_answer_after_the_bridge_restarts() {
+        let (d, slack, agent, _clock) = flow_deps("dialog-restart");
+        let (mut b, _fx) = Bridge::for_test(d.clone());
+        running_thread(&mut b, &agent).await;
+        *agent.dialog.lock().unwrap() = Some(crate::agent::Dialog {
+            title: "Which one next?".into(),
+            footer: "Enter to select \u{b7} Esc to cancel".into(),
+            options: vec!["Keep going".into(), "Stop here".into()],
+            details: vec![String::new(), String::new()],
+            selected: 0,
+            asked: true,
+        });
+        b.offer_dialog("@0", "C1", ROOT, &LogCtx::default()).await;
+        let req_id = b.dialog_pending.keys().next().expect("a prompt is waiting").clone();
+
+        // The Bridge goes away and a new one comes up on the same records
+        drop(b);
+        let (mut next, _fx2) = Bridge::for_test(d);
+        assert!(next.dialog_pending.is_empty(), "nothing is remembered across a restart");
+        next.adopt_dialog_prompts(&LogCtx::default());
+
+        *agent.dialog.lock().unwrap() = Some(crate::agent::Dialog {
+            title: "Which one next?".into(),
+            footer: "Enter to select \u{b7} Esc to cancel".into(),
+            options: vec!["Keep going".into(), "Stop here".into()],
+            details: vec![String::new(), String::new()],
+            selected: 0,
+            asked: true,
+        });
+        next.on_perm_click(slack::PermClick {
+            req_id,
+            action: "dlg-1".into(),
+            by: "U_OWNER".into(),
+        })
+        .await;
+        assert_eq!(
+            *agent.answered.lock().unwrap(),
+            vec![Some(1)],
+            "the click reached the agent's screen: {:?}",
             slack.calls()
         );
     }

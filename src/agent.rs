@@ -432,7 +432,7 @@ pub enum ProbeErr {
 ///
 /// The rows are what a person picks between; `selected` is where the cursor already is, so the
 /// answer is a run of Up/Down and one Enter.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Dialog {
     /// The question, or the line above the rows when the modal does not ask one.
     pub title: String,

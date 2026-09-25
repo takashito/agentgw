@@ -1,6 +1,6 @@
 [package]
 name = "agentgw"
-version = "0.58.11"
+version = "0.58.12"
 edition = "2024"
 license = "MIT"
 

@@ -113,6 +113,21 @@ impl Lifecycle {
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// A dialog offered to a thread as buttons, written down so a restart does not orphan them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PendingDialog {
+    /// The tag the buttons carry.
+    #[serde(rename = "reqId")]
+    pub req_id: String,
+    /// ts of the post whose buttons are waiting.
+    #[serde(rename = "promptTs")]
+    pub prompt_ts: String,
+    /// The window whose screen holds the dialog.
+    pub window: String,
+    /// What was asked, so the answered post can show it again.
+    pub dialog: crate::agent::Dialog,
+}
+
 /// One thread in threads.json = **what the Bridge remembers about that thread**
 /// (which session handles it / where it runs / what was allowed).
 ///
@@ -170,6 +185,15 @@ pub struct ThreadEntry {
     /// lets the next start say so instead of leaving it there.
     #[serde(rename = "permPrompts", default, skip_serializing_if = "Vec::is_empty")]
     pub perm_prompts: Vec<String>,
+    /// The question or dialog this thread is waiting on an answer to, if any.
+    ///
+    /// **Kept whole, unlike a permission prompt.** A permission prompt's way back to the agent
+    /// is a channel inside the process and dies with it, so the next start can only apologise.
+    /// A dialog is different: it is still on the agent's screen, and answering it is pressing
+    /// keys. All the next start needs is what was asked and where — so it is written down, and
+    /// the buttons keep working across a restart.
+    #[serde(rename = "dialogPrompt", default, skip_serializing_if = "Option::is_none")]
+    pub dialog_prompt: Option<PendingDialog>,
     /// Where this conversation was before it was moved here.
     ///
     /// **Told to the agent when it is woken**, because every path in its own record is from the old

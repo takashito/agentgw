@@ -1050,6 +1050,20 @@ impl Bridge {
             ),
         );
 
+        // **Written down, not only remembered.** A restart empties the map, and a button whose
+        // id nobody recognises is ignored in silence -- while the dialog it belongs to is still
+        // on the agent's screen, waiting for the keys this click would have sent
+        if let Some(e) = self.threads.entries.get_mut(thread_ts) {
+            e.dialog_prompt = Some(bridge::PendingDialog {
+                req_id: req_id.clone(),
+                prompt_ts: prompt_ts.clone(),
+                window: window.to_string(),
+                dialog: d.clone(),
+            });
+            if let Err(e) = self.threads.save() {
+                ctx.error("bridge", &format!("threads.json save failed: {e}"));
+            }
+        }
         self.dialog_pending.insert(
             req_id,
             DialogPending {
@@ -1105,6 +1119,14 @@ impl Bridge {
         };
         // Answered, so the thread is no longer silent on purpose
         self.resume_stall_after_perm(&ThreadKey::new(&p.channel, &p.thread_ts), true);
+        if let Some(e) = self.threads.entries.get_mut(&p.thread_ts)
+            && e.dialog_prompt.as_ref().is_some_and(|d| d.req_id == click.req_id)
+        {
+            e.dialog_prompt = None;
+            if let Err(e) = self.threads.save() {
+                ctx.error("bridge", &format!("threads.json save failed: {e}"));
+            }
+        }
         // The same markdown the prompt went out as -- rewriting it as plain text would turn
         // its bold into asterisks
         if let Err(e) = self
@@ -1218,6 +1240,62 @@ impl Bridge {
     /// Prompts the previous Bridge left waiting. **Rewrite them, don't delete them** — deleting takes the
     /// question away with the buttons, and a prompt left as it is answers a click with silence (the reqId
     /// it carries means nothing to this process).
+    /// Take back the dialogs a previous Bridge was waiting on, so their buttons keep working.
+    ///
+    /// **Not the same as a permission prompt**, which this start can only apologise for: that
+    /// one's way back to the agent died with the process. A dialog is still on the agent's
+    /// screen, and answering it is pressing keys — so the record is enough to carry on.
+    ///
+    /// Entries whose window is gone are dropped: the worker went with the restart, so the rows
+    /// belong to a screen that no longer exists.
+    pub(super) fn adopt_dialog_prompts(&mut self, ctx: &LogCtx) {
+        let held: Vec<(String, String, bridge::PendingDialog)> = self
+            .threads
+            .entries
+            .iter()
+            .filter_map(|(thread_ts, e)| {
+                let p = e.dialog_prompt.clone()?;
+                Some((thread_ts.clone(), e.channel_id.clone()?, p))
+            })
+            .collect();
+        let live: std::collections::HashSet<String> = self
+            .deps
+            .agent
+            .windows()
+            .into_iter()
+            .flat_map(|w| [w.id, w.name])
+            .collect();
+        for (thread_ts, channel, p) in held {
+            if !live.contains(&p.window) {
+                ctx.info(
+                    "bridge",
+                    &format!("dialog reqId={} dropped — window {} is gone", p.req_id, p.window),
+                );
+                if let Some(e) = self.threads.entries.get_mut(&thread_ts) {
+                    e.dialog_prompt = None;
+                }
+                continue;
+            }
+            ctx.info(
+                "bridge",
+                &format!("dialog reqId={} taken back — window {}", p.req_id, p.window),
+            );
+            self.dialog_pending.insert(
+                p.req_id,
+                DialogPending {
+                    channel: channel.clone(),
+                    thread_ts: thread_ts.clone(),
+                    window: p.window,
+                    prompt_ts: p.prompt_ts,
+                    dialog: p.dialog,
+                },
+            );
+        }
+        if let Err(e) = self.threads.save() {
+            ctx.error("bridge", &format!("threads.json save failed: {e}"));
+        }
+    }
+
     pub(super) async fn fold_stale_perm_prompts(&mut self, ctx: &LogCtx) {
         let stale: Vec<(String, String, String)> = self
             .threads
