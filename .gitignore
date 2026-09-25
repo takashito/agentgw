@@ -7,3 +7,6 @@
 /docs/
 /.claude/*
 !/.claude/settings.json
+
+# A local guide for another agent — not part of what this repo publishes
+AGENTS.md

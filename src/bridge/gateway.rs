@@ -1361,6 +1361,15 @@ pub enum RouteOutcome {
 ///
 /// Channels with no machine assigned go to the gateway — writing only "unassigned" in the list
 /// leaves the reader unsure where messages written there go.
+/// Is the machine a channel is assigned to here right now?
+///
+/// **The gateway counts as here.** `connected` is the machines that dialled in, and the gateway is
+/// not one of its own machines — reading that list straight marked every channel the gateway itself
+/// handles as offline while it was the one answering the question.
+pub fn is_here(id: &str, self_id: &str, connected: &[String]) -> bool {
+    id == self_id || connected.iter().any(|c| c == id)
+}
+
 pub fn route_table(
     here: &str,
     access: &Access,
@@ -1371,7 +1380,7 @@ pub fn route_table(
     // nothing in the assignments to learn it from
     in_slack: &[String],
 ) -> String {
-    let online = |id: &str| connected.iter().any(|c| c == id);
+    let online = |id: &str| is_here(id, self_id, connected);
     // Channel rows only flag trouble: a row per channel all marked 🟢 is noise (the machines line
     // at the bottom already shows who is up)
     let mark = |id: &str| {
@@ -1682,6 +1691,8 @@ impl Presence {
 pub struct FleetView {
     /// `host:port`. Where machines are accepted.
     pub listen: String,
+    /// This gateway's own name. **Needed to read the channel rows** — a channel can be assigned to it.
+    pub self_id: String,
     pub owner: Option<String>,
     pub home: Option<String>,
     pub routes: Routes,
@@ -2112,7 +2123,7 @@ pub fn format_fleet(
         for (ch, id) in &f.routes {
             let mark = match connected {
                 None => String::new(),
-                Some(c) if c.iter().any(|x| x == id) => crate::t!("  ● online", "  ● オンライン"),
+                Some(c) if is_here(id, &f.self_id, c) => crate::t!("  ● online", "  ● オンライン"),
                 Some(_) => crate::t!("  ○ offline", "  ○ オフライン"),
             };
             out.push(format!("  {} → {id}{mark}", label(Some(ch))));
@@ -2384,7 +2395,7 @@ impl Fleet {
         route_table(
             here,
             &self.access(),
-            &self.machines(),
+            &self.links.connected(),
             &self.self_id,
             &self.homes().await,
             &in_slack,
@@ -3974,6 +3985,7 @@ impl Cli {
         );
         let view = FleetView {
             listen: listen.clone(),
+            self_id: env.get("AGENTGW_BRIDGE_ID").cloned().unwrap_or_default(),
             owner: (!access.owner.is_empty()).then(|| access.owner.clone()),
             home: access.home_channel.clone(),
             routes: access.bridges(),
@@ -5428,6 +5440,7 @@ mod tests {
     fn a_view() -> FleetView {
         FleetView {
             listen: "127.0.0.1:8787".to_string(),
+            self_id: "hub".to_string(),
             owner: Some("U_OWNER".to_string()),
             home: Some("C_HOME".to_string()),
             routes: routes(&[("C1", "desktop"), ("C2", "laptop")]),
@@ -5447,6 +5460,34 @@ mod tests {
         assert!(out.contains("● Machines connected — 1"), "{out}");
         assert!(out.contains("#dev (C1) → desktop  ● online"), "{out}");
         assert!(out.contains("C2 → laptop  ○ offline"), "{out}"); // the raw id if the name can't be looked up
+    }
+
+    /// **The gateway is not one of its own machines**, so a channel it handles read as offline while
+    /// it was the machine answering the question. Both renderings ask the same function now.
+    #[test]
+    fn a_channel_the_gateway_handles_is_not_offline() {
+        let connected = ["desktop".to_string()];
+        assert!(is_here("hub", "hub", &connected), "the gateway is here — it is answering");
+        assert!(is_here("desktop", "hub", &connected));
+        assert!(!is_here("laptop", "hub", &connected));
+
+        // The terminal's `status`
+        let view = FleetView {
+            routes: routes(&[("C1", "hub"), ("C2", "laptop")]),
+            ..a_view()
+        };
+        let out = format_fleet(&view, Some(&connected), &Tunnels::new(), &HashMap::new());
+        assert!(out.contains("C1 → hub  ● online"), "{out}");
+        assert!(out.contains("C2 → laptop  ○ offline"), "{out}");
+
+        // …and Slack's `channels`, given the same list of who dialled in
+        let mut access = Access::default();
+        access.routes.insert(
+            "C1".into(),
+            crate::bridge::state::Route { bridge: Some("hub".into()), ..Default::default() },
+        );
+        let table = route_table("C1", &access, &connected, "hub", &HashMap::new(), &[]);
+        assert!(!table.contains("offline"), "{table}");
     }
 
     #[test]
@@ -5692,6 +5733,7 @@ mod tests {
     fn a_fleet_with_nothing_set_says_so_rather_than_showing_blanks() {
         let view = FleetView {
             listen: "127.0.0.1:8787".to_string(),
+            self_id: "hub".to_string(),
             owner: None,
             home: None,
             routes: Routes::new(),
