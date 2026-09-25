@@ -165,7 +165,7 @@ pub mod link {
         },
         /// The notice channel changed. Sent to every machine so they all write to the same place.
         Home { channel: String },
-        /// `set-home`, asked from a machine — same reason as [`LinkFrame::Channels`].
+        /// `set-home`, asked from a machine — same reason as [`LinkFrame::Routes`].
         SetHome { channel: String, thread_ts: String },
         /// Where this machine's agents start when a channel has no folder of its own. Sent on connecting,
         /// so `route` can show a real path for every channel instead of just the machine's name.
@@ -196,12 +196,15 @@ pub mod link {
         Update { version: String },
         /// machine → gateway: could not update (still running the version it had).
         UpdateFailed { version: String, why: String },
-        /// `machines`, asked from a machine — same reason as [`LinkFrame::Channels`].
+        /// `machines`, asked from a machine — same reason as [`LinkFrame::Routes`].
         Machines { channel: String, thread_ts: String },
         /// `route`, asked from a machine. **The gateway only sees messages that mention the bot**, and a
         /// follow-up in a running thread doesn't; the machine that owns the thread asks on its behalf.
-        Channels { channel: String, thread_ts: String },
-        /// `pwd <machine>[:<path>]`, asked from a machine — same reason as [`LinkFrame::Channels`].
+        /// **The wire name stays `channels`**: the command was renamed to `route`, but a rollout runs
+        /// the gateway ahead of its machines, and a tag only one side knows is a frame the other drops.
+        #[serde(rename = "channels")]
+        Routes { channel: String, thread_ts: String },
+        /// `pwd <machine>[:<path>]`, asked from a machine — same reason as [`LinkFrame::Routes`].
         PwdOn {
             channel: String,
             thread_ts: String,
@@ -2384,7 +2387,8 @@ impl Fleet {
 
     /// The `route` table. **`machines()` and not `links.connected()`**: the gateway is a machine too,
     /// and leaving itself out drew it as offline.
-    async fn channels_table(self: &Arc<Self>, here: &str) -> String {
+    /// The answer to `route`: gather what only the gateway knows, then hand it to [`route_table`].
+    async fn route_answer(self: &Arc<Self>, here: &str) -> String {
         let in_slack = match self.api.bot_channels().await {
             Ok(cs) => cs.into_iter().map(|(id, _)| id).collect(),
             Err(e) => {
@@ -2762,7 +2766,7 @@ impl Fleet {
                 return true;
             }
             RouteOutcome::List => {
-                let table = self.channels_table(channel).await;
+                let table = self.route_answer(channel).await;
                 self.post(channel, Some(&thread), &table).await;
                 return true;
             }
@@ -2950,11 +2954,11 @@ impl Fleet {
                 self.on_project_set(bridge_id, &channel, &thread_ts, result, thread_only)
                     .await
             }
-            link::LinkFrame::Channels {
+            link::LinkFrame::Routes {
                 channel,
                 thread_ts,
             } => {
-                let table = self.channels_table(&channel).await;
+                let table = self.route_answer(&channel).await;
                 self.post(&channel, Some(&thread_ts), &table).await;
             }
             link::LinkFrame::MachineHome { path } => {
@@ -5481,6 +5485,22 @@ mod tests {
         assert!(out.contains("● Machines connected — 1"), "{out}");
         assert!(out.contains("#dev (C1) → desktop  ● online"), "{out}");
         assert!(out.contains("C2 → laptop  ○ offline"), "{out}"); // the raw id if the name can't be looked up
+    }
+
+    /// The command was renamed to `route`, but **the wire keeps saying `channels`**. A rollout runs the
+    /// gateway ahead of its machines, so for a while the two ends are different versions — a tag only
+    /// one of them knows is a frame the other drops, and `route` would go unanswered until they meet.
+    #[test]
+    fn the_route_frame_still_says_channels_on_the_wire() {
+        let frame = link::LinkFrame::Routes {
+            channel: "C1".into(),
+            thread_ts: "1.2".into(),
+        };
+        let wire = serde_json::to_string(&frame).unwrap();
+        assert!(wire.contains(r#""t":"channels""#), "{wire}");
+        // …and an older machine's frame still reads here
+        let old = r#"{"t":"channels","channel":"C1","thread_ts":"1.2"}"#;
+        assert_eq!(serde_json::from_str::<link::LinkFrame>(old).unwrap(), frame);
     }
 
     /// **The gateway is not one of its own machines**, so a channel it handles read as offline while

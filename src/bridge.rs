@@ -3332,7 +3332,7 @@ mod tests {
 
         assert_eq!(
             up_rx.try_recv(),
-            Ok(LinkFrame::Channels { channel: "C1".into(), thread_ts: "1782000001.000100".into() })
+            Ok(LinkFrame::Routes { channel: "C1".into(), thread_ts: "1782000001.000100".into() })
         );
         assert_eq!(
             up_rx.try_recv(),

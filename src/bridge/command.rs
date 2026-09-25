@@ -172,7 +172,7 @@ pub enum Cmd {
     Route(Target),
     /// Bare `route` — which machine handles this channel and the others. **The gateway answers it**;
     /// a machine passes it up (the gateway never sees a follow-up in a running thread — it carries no mention).
-    Channels,
+    Routes,
     /// `machines` / `machine` — the gateway and every machine it knows, with where each can be reached.
     Machines,
     /// `update [version]` — the gateway, then every machine one at a time. `None` = the latest release.
@@ -219,7 +219,7 @@ impl Cmd {
         ("logout", &["logout"], Cmd::Logout),
         // Bare `route` shows the table. With an argument it sets this channel's own line, which is
         // parsed by shape further down — the words here only match a message that is the word alone
-        ("route", &["route"], Cmd::Channels),
+        ("route", &["route"], Cmd::Routes),
         ("machines", &["machines", "machine"], Cmd::Machines),
     ];
 
@@ -284,7 +284,7 @@ impl Cmd {
             Cmd::Pwd(_) => "pwd",
             Cmd::Cd(_) => "cd",
             Cmd::Route(_) => "route",
-            Cmd::Channels => "route",
+            Cmd::Routes => "route",
             Cmd::Machines => "machines",
             Cmd::Update(_) => "update",
             Cmd::Owner(oc) => return format!("owner-command '{}'", oc.verb),
@@ -937,13 +937,13 @@ impl Bridge {
                 }
             }
             // Same: only the gateway knows every channel and machine
-            Cmd::Channels => {
+            Cmd::Routes => {
                 ctx.info(
                     "bridge",
                     &format!("slack-events: channels command msg={}", msg.ts),
                 );
                 if !self.ask_the_gateway(
-                    crate::bridge::gateway::link::LinkFrame::Channels {
+                    crate::bridge::gateway::link::LinkFrame::Routes {
                         channel: msg.channel.clone(),
                         thread_ts: root_ts.to_string(),
                     },

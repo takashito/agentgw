@@ -261,7 +261,7 @@ impl FromRelay {
             F::Update { version } => FromRelay::Update { version },
             // Answers and asks only ever go the other way
             F::ProjectSet { .. }
-            | F::Channels { .. }
+            | F::Routes { .. }
             | F::PwdOn { .. }
             | F::SetHome { .. }
             | F::MachineHome { .. }
