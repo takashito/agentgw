@@ -2384,7 +2384,10 @@ mod tests {
             asked: false,
             selected: 1,
         });
-        // Not a word from anyone; the thread has simply gone quiet
+        // Not a word from anyone, and nothing pending either: the thread has settled, so the
+        // silence watch has already let go of it. **That is the case this is for** — an idle
+        // worker nobody is waiting on is the one whose dialog no one would notice
+        b.stall.clear();
         clock.advance(30_000);
         b.dialog_tick().await;
         assert!(

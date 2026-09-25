@@ -681,34 +681,43 @@ impl Bridge {
             return;
         }
         self.dialog_watch_at_ms = now + DIALOG_WATCH_EVERY_MS;
-        let quiet: Vec<ThreadKey> = self
-            .stall
+        // **Every thread with an agent, not only the ones being watched for silence.** That
+        // watch is dropped the moment a thread settles, so keying off it looked at exactly the
+        // threads with something in flight and never at an idle worker -- which is the one this
+        // is for: nobody is waiting on it, so nobody would notice it stop.
+        let candidates: Vec<(ThreadKey, String)> = self
+            .threads
+            .entries
             .iter()
-            .filter(|(_, s)| now.saturating_sub(s.last_activity_ms) >= DIALOG_WATCH_QUIET_MS)
-            .map(|(key, _)| key.clone())
+            .filter_map(|(thread_ts, e)| {
+                let session = e.agent_id.clone()?;
+                let channel = e.channel_id.clone()?;
+                Some((ThreadKey::new(&channel, thread_ts), session))
+            })
             .collect();
-        for key in quiet {
+        for (key, session) in candidates {
             let (channel, Some(thread_ts)) = key.split() else {
                 continue;
             };
-            let Some(window) = self
-                .threads
-                .get(&thread_ts)
-                .and_then(|e| e.agent_id.clone())
-                .map(|sid| self.workers.window_for(&sid))
-            else {
+            // Mid-turn is not quiet: an agent at work sends hooks, and each re-arms this clock
+            if self
+                .stall
+                .get(&key)
+                .is_some_and(|s| now.saturating_sub(s.last_activity_ms) < DIALOG_WATCH_QUIET_MS)
+            {
                 continue;
-            };
+            }
+            let window = self.workers.window_for(&session);
             // Already waiting on a person here. **Asked about, not latched**: the answer to a
-            // dialog can come from the machine instead of the thread, and a flag saying "waiting"
-            // would then stay up and blind this watch to the next one
+            // dialog can come from the machine instead of the thread, and a flag saying
+            // "waiting" would stay up and blind this watch to the next one
             let waiting = self.dialog_pending.values().any(|p| p.window == window)
                 || self.perm_pending.values().any(|p| p.thread_ts == thread_ts);
             if waiting {
                 continue;
             }
             let ctx = LogCtx {
-                session_id: None,
+                session_id: Some(session.clone()),
                 thread_key: Some(key.clone()),
             };
             if self.offer_dialog(&window, &channel, &thread_ts, &ctx).await {
