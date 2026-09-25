@@ -2403,6 +2403,55 @@ mod tests {
         );
     }
 
+    /// **A worker that outlived a Bridge restart still gets its question asked.** The window
+    /// table is rebuilt from hooks, so the remembered `@N` is gone for exactly the workers that
+    /// have been running longest — and both the question and the watch that should have caught
+    /// it gave up on the empty lookup. Seen on a real machine 2026-09-25: the dialog sat on the
+    /// screen and the thread was told nothing.
+    #[tokio::test]
+    async fn a_question_reaches_the_thread_after_the_bridge_restarted_under_the_worker() {
+        let (d, slack, agent, _clock) = flow_deps("question-inherited");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let sid = running_thread(&mut b, &agent).await;
+        *agent.dialog.lock().unwrap() = Some(crate::agent::Dialog {
+            title: "Which one next?".into(),
+            footer: "Enter to select \u{b7} Esc to cancel".into(),
+            options: vec!["Keep going".into(), "Stop here".into()],
+            details: vec![String::new(), String::new()],
+            selected: 0,
+            asked: false,
+        });
+        // What a restart leaves behind: the session is known, its window id is not
+        b.workers.warm_mut(&sid).window_id = None;
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        b.on_hook(HookEvent {
+            kind: "perm".into(),
+            session_id: sid,
+            payload: serde_json::json!({
+                "tool_name": "AskUserQuestion",
+                "tool_use_id": "toolu_q",
+                "tool_input": {"questions": [{
+                    "question": "Which one next?",
+                    "header": "Next",
+                    "multiSelect": false,
+                    "options": [
+                        {"label": "Keep going", "description": ""},
+                        {"label": "Stop here", "description": ""},
+                    ],
+                }]},
+            }),
+            respond: Some(tx),
+        })
+        .await;
+        assert!(rx.await.unwrap().to_string().contains("\"allow\""));
+        assert!(
+            slack.calls().iter().any(|c| c.starts_with("dialog C1")),
+            "the question never reached the thread: {:?}",
+            slack.calls()
+        );
+    }
+
     /// The question dialog's hook carries the whole question, so the thread is shown **the
     /// question** rather than "may this tool run?", and the tool is let through at once.
     ///

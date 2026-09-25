@@ -155,6 +155,21 @@ impl Workers {
             .and_then(|h| h.window_id.clone())
     }
 
+    /// The window to send keys to, one way or another.
+    ///
+    /// **A worker that outlived a Bridge restart has no `@N` remembered**, because the table is
+    /// rebuilt from hooks and the window id only arrives with one. It is still on screen and
+    /// still reachable, under the name it was spawned with — so anything that gives up when
+    /// `window_of` is empty gives up on exactly the workers that have been running longest.
+    ///
+    /// That is what happened to a question dialog on 2026-09-25: the Bridge had restarted under
+    /// the worker, the rows never reached the thread, and the watch that should have caught it
+    /// was looking the same way and missed it too.
+    pub fn window_for(&self, session_id: &str) -> String {
+        self.window_of(session_id)
+            .unwrap_or_else(|| SessionId::from(session_id.to_string()).window_name())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.hooked.is_empty()
     }

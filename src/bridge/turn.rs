@@ -696,7 +696,7 @@ impl Bridge {
                 .threads
                 .get(&thread_ts)
                 .and_then(|e| e.agent_id.clone())
-                .and_then(|sid| self.workers.window_of(&sid))
+                .map(|sid| self.workers.window_for(&sid))
             else {
                 continue;
             };
@@ -984,13 +984,7 @@ impl Bridge {
         thread_ts: &str,
         ctx: &LogCtx,
     ) {
-        let Some(window) = self.workers.window_of(session_id) else {
-            ctx.error(
-                "bridge",
-                "question: no window for this session; leaving it on the screen",
-            );
-            return;
-        };
+        let window = self.workers.window_for(session_id);
         if !self
             .put_dialog(&window, question, channel, thread_ts, ctx)
             .await

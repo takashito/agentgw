@@ -1391,10 +1391,7 @@ impl Bridge {
         if !self.pending.contains_key(&root_ts) {
             return;
         }
-        let window = self
-            .workers
-            .window_of(session_id)
-            .unwrap_or_else(|| SessionId::from(session_id.to_string()).window_name());
+        let window = self.workers.window_for(session_id);
         let key = key
             .cloned()
             .or_else(|| {
