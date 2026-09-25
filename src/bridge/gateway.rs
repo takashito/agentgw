@@ -4004,27 +4004,12 @@ impl Cli {
     /// `agentgw update [version]`: ask the running gateway to start one.
     pub async fn update(dir: &StateDir, args: &[String]) -> i32 {
         let version = args.first().cloned().unwrap_or_default();
-        let (url, token) = match update_target(&Self::env_of(dir), &Access::load(dir)) {
+        let named = (!version.is_empty()).then_some(version.as_str());
+        let env = Self::env_of(dir);
+        let (url, token) = match update_target(&env, &Access::load(dir)) {
             Ok(Some(t)) => t,
             // No machines: this is the whole fleet. Replace the binary, then restart the service
-            Ok(None) => {
-                let named = (!version.is_empty()).then_some(version.as_str());
-                return match crate::setup::update::update_alone(named).await {
-                    Ok(None) => {
-                        let me = env!("CARGO_PKG_VERSION");
-                        println!("{}", crate::t!("Already on v{me}.", "すでに v{me} です。"));
-                        0
-                    }
-                    Ok(Some(tag)) => {
-                        println!("{}", crate::t!("Updated to {tag}.", "{tag} に上げました。"));
-                        crate::service::Service::run("restart", &[])
-                    }
-                    Err(e) => {
-                        eprintln!("{}", crate::t!("Cannot update: {e}", "update できません: {e}"));
-                        1
-                    }
-                };
-            }
+            Ok(None) => return Self::update_this_one(named).await,
             Err(why) => {
                 eprintln!("{why}");
                 return 2;
@@ -4066,10 +4051,46 @@ impl Cli {
                         "ゲートウェイが {url} で応答しません。動いていますか?"
                     )
                 );
-                1
+                // **A machine cut off from its gateway still updates itself.** Nothing else can reach
+                // it (Slack comes through the gateway), and install.sh is for a first install, not
+                // for this. Only this machine moves; the others wait for the gateway
+                let machine = env
+                    .get("AGENTGW_BRIDGE_ROLE")
+                    .is_some_and(|r| r.trim().eq_ignore_ascii_case("machine"));
+                if !machine {
+                    return 1;
+                }
+                eprintln!(
+                    "{}",
+                    crate::t!(
+                        "Updating this machine alone (the other machines are left to the gateway).",
+                        "このマシンだけを上げます(ほかのマシンはゲートウェイに任せます)。"
+                    )
+                );
+                Self::update_this_one(named).await
             }
             _ => {
                 eprintln!("{said}");
+                1
+            }
+        }
+    }
+
+    /// Replace this agentgw with the release and restart the service — for a gateway with no
+    /// machines, and for a machine that can't reach its gateway.
+    async fn update_this_one(named: Option<&str>) -> i32 {
+        match crate::setup::update::update_alone(named).await {
+            Ok(None) => {
+                let me = env!("CARGO_PKG_VERSION");
+                println!("{}", crate::t!("Already on v{me}.", "すでに v{me} です。"));
+                0
+            }
+            Ok(Some(tag)) => {
+                println!("{}", crate::t!("Updated to {tag}.", "{tag} に上げました。"));
+                crate::service::Service::run("restart", &[])
+            }
+            Err(e) => {
+                eprintln!("{}", crate::t!("Cannot update: {e}", "update できません: {e}"));
                 1
             }
         }
