@@ -1988,11 +1988,11 @@ fn machines_md(rows: &[MachineRow]) -> String {
     let mut out = vec![
         crate::t!("**Machines**", "**マシン**"),
         String::new(),
-        // **The version shares the status cell** rather than taking a column of its own: what runs
-        // there and whether it is up are one fact, and the table is already wide
+        // **The state leads and the version rides with the name.** Whether it is up is what the eye
+        // looks for first, and what runs there is a fact about that machine, not a column of its own
         crate::t!(
-            "| machine | host | address | link | version |",
-            "| マシン | ホスト | アドレス | つなぎ方 | 版 |"
+            "| status | machine | host | address | link |",
+            "| 状態 | マシン | ホスト | アドレス | つなぎ方 |"
         ),
         "|---|---|---|---|---|".to_string(),
     ];
@@ -2002,18 +2002,29 @@ fn machines_md(rows: &[MachineRow]) -> String {
             (true, true) => crate::t!("(not known here)", "(こちらでは分かりません)"),
             _ => cell(&r.host),
         };
-        let (id, ip, link) = (cell(&r.id), cell(&r.ip), &r.link);
-        let dot = match r.online {
-            true => "🟢",
-            false => "🔴",
+        let (ip, link) = (cell(&r.ip), &r.link);
+        // **Only a row that names a machine carries its state.** The gateway takes a row per way in,
+        // and the ones after the first are the same machine — a second dot there reads as a second one
+        let (state, who) = match r.id.is_empty() {
+            true => (String::new(), String::new()),
+            false => {
+                let dot = match r.online {
+                    true => "🟢",
+                    false => "🔴",
+                };
+                let id = cell(&r.id);
+                // Not in a code span — one eats width. `⬆` marks what `update` would move; `?` never said
+                let v = match r.version.as_str() {
+                    "" => "?".to_string(),
+                    v if crate::setup::update::older(v, env!("CARGO_PKG_VERSION")) => {
+                        format!("{v} ⬆")
+                    }
+                    v => v.to_string(),
+                };
+                (dot.to_string(), format!("{id} {v}"))
+            }
         };
-        // Not in a code span — one eats width. `⬆` marks what `update` would move; `?` never said
-        let state = match r.version.as_str() {
-            "" => format!("{dot} ?"),
-            v if crate::setup::update::older(v, env!("CARGO_PKG_VERSION")) => format!("{dot} {v} ⬆"),
-            v => format!("{dot} {v}"),
-        };
-        out.push(format!("| {id} | {host} | {ip} | {link} | {state} |"));
+        out.push(format!("| {state} | {who} | {host} | {ip} | {link} |"));
     }
     // Only the gateway's own ways in — no machine has been added
     if rows.iter().all(|r| r.gateway) {
@@ -5511,18 +5522,19 @@ mod tests {
             row("mac", "", "", "ssh tunnel (me@mac)", false, Some("connection refused"), ""),
         ]);
         // The gateway takes a row per way in, and only the first of them carries the name
-        assert!(out.contains(&format!("| `dock` | `dock.lan` | `127.0.0.1:8787` | gateway | 🟢 {me} |")), "{out}");
+        assert!(out.contains(&format!("| 🟢 | `dock` {me} | `dock.lan` | `127.0.0.1:8787` | gateway |")), "{out}");
+        // The same machine's other ways in carry neither a dot nor a name — both would read as a second machine
         assert!(
-            out.contains(&format!("|  | `dock.example.ts.net` | `100.64.0.1:443` | gateway (tailscale serve) | 🟢 {me} |")),
+            out.contains("|  |  | `dock.example.ts.net` | `100.64.0.1:443` | gateway (tailscale serve) |"),
             "{out}"
         );
         assert!(
-            out.contains(&format!("| `pve` | `pve.example.ts.net` | `100.64.0.9` | direct | 🟢 {me} |")),
+            out.contains(&format!("| 🟢 | `pve` {me} | `pve.example.ts.net` | `100.64.0.9` | direct |")),
             "{out}"
         );
         // Nothing known about where it is, and the reason it is down stays below the table
         assert!(
-            out.contains("| `mac` | (not known here) |  | ssh tunnel (me@mac) | 🔴 ? |"),
+            out.contains("| 🔴 | `mac` ? | (not known here) |  | ssh tunnel (me@mac) |"),
             "{out}"
         );
         assert!(!out.contains("| ssh tunnel (me@mac) — "), "{out}");
@@ -5538,7 +5550,7 @@ mod tests {
         assert!(alone.contains("agentgw add-machine user@host"), "{alone}");
     }
 
-    /// The version sits in the status cell: `⬆` on what `update` would move, `?` on what never said.
+    /// The version rides with the name: `⬆` on what `update` would move, `?` on what never said.
     #[test]
     fn machines_table_marks_the_ones_behind_the_gateway() {
         let row = |id: &str, online, version: &str| MachineRow {
@@ -5552,10 +5564,10 @@ mod tests {
             version: version.into(),
         };
         let out = machines_md(&[row("pve", true, "0.0.1"), row("nas", true, ""), row("mac", false, "0.0.2")]);
-        assert!(out.contains("| direct | 🟢 0.0.1 ⬆ |"), "{out}");
-        assert!(out.contains("| direct | 🟢 ? |"), "{out}");
-        assert!(out.contains("| direct | 🔴 0.0.2 ⬆ |"), "{out}");
-        assert!(out.contains("| machine | host | address | link | version |"), "{out}");
+        assert!(out.contains("| 🟢 | `pve` 0.0.1 ⬆ |"), "{out}");
+        assert!(out.contains("| 🟢 | `nas` ? |"), "{out}");
+        assert!(out.contains("| 🔴 | `mac` 0.0.2 ⬆ |"), "{out}");
+        assert!(out.contains("| status | machine | host | address | link |"), "{out}");
     }
 
     #[test]
