@@ -194,6 +194,8 @@ pub(crate) struct DialogPending {
     /// What was asked. Kept so the answered post can show the question and the rows again
     /// instead of replacing them with a tick nobody can read a week later.
     pub dialog: crate::agent::Dialog,
+    /// The question tool's questions, when the prompt is its form; empty for a screen dialog.
+    pub questions: Vec<crate::agent::Question>,
 }
 
 /// A window that would not take a delivery.
@@ -2353,6 +2355,7 @@ mod tests {
             req_id: req_id.clone(),
             action: "allow".into(),
             by: "U_OWNER".into(),
+            state: serde_json::Value::Null,
         })
         .await;
         let answer = rx.await.unwrap();
@@ -2479,6 +2482,7 @@ mod tests {
             req_id,
             action: "dlg-1".into(),
             by: "U_OWNER".into(),
+            state: serde_json::Value::Null,
         })
         .await;
         assert_eq!(
@@ -2587,6 +2591,7 @@ mod tests {
             req_id,
             action: "dlg-0".into(),
             by: "U_OWNER".into(),
+            state: serde_json::Value::Null,
         })
         .await;
         settle().await;
@@ -2646,7 +2651,7 @@ mod tests {
         b.dialog_tick().await;
         let calls = slack.calls();
         assert_eq!(
-            calls.iter().filter(|c| c.starts_with("dialog C1")).count(),
+            calls.iter().filter(|c| c.starts_with("dialog C1") || c.starts_with("questions C1")).count(),
             1,
             "the question was posted again: {calls:?}"
         );
@@ -2699,7 +2704,7 @@ mod tests {
         .await;
         assert!(rx.await.unwrap().to_string().contains("\"allow\""));
         assert!(
-            slack.calls().iter().any(|c| c.starts_with("dialog C1")),
+            slack.calls().iter().any(|c| c.starts_with("questions C1")),
             "the question never reached the thread: {:?}",
             slack.calls()
         );
@@ -2755,23 +2760,27 @@ mod tests {
         let posted = slack
             .calls()
             .into_iter()
-            .find(|c| c.starts_with("dialog C1"))
+            .find(|c| c.starts_with("questions C1"))
             .expect("the question never reached the thread");
-        assert!(
-            posted.contains("Which one next?") && posted.contains("Update the laptop"),
-            "{posted}"
-        );
+        assert!(posted.contains("Which one next?"), "{posted}");
 
-        // Pressing a row walks the cursor there on the agent's screen
+        // Submit carries what the form held: the second radio button
         let req_id = b.dialog_pending.keys().next().unwrap().clone();
         b.on_perm_click(slack::PermClick {
             req_id,
-            action: "dlg-1".into(),
+            action: "dlg-submit".into(),
             by: "U_OWNER".into(),
+            state: serde_json::json!({"values": {"q0": {"qa0": {
+                "type": "radio_buttons", "selected_option": {"value": "1"}
+            }}}}),
         })
         .await;
-        assert_eq!(*agent.answered.lock().unwrap(), vec![Some(1)]);
+        assert_eq!(
+            *agent.answered_questions.lock().unwrap(),
+            vec![vec![crate::agent::Answer::Pick(1)]]
+        );
     }
+
 
     #[tokio::test]
     async fn the_agent_renames_the_thread_unless_a_person_named_it() {
@@ -2943,6 +2952,7 @@ mod tests {
             req_id,
             action: "dlg-1".into(),
             by: "U_OWNER".into(),
+            state: serde_json::Value::Null,
         })
         .await;
         assert_eq!(*agent.answered.lock().unwrap(), vec![Some(1)]);

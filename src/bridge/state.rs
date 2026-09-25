@@ -126,6 +126,10 @@ pub struct PendingDialog {
     pub window: String,
     /// What was asked, so the answered post can show it again.
     pub dialog: crate::agent::Dialog,
+    /// The question tool's questions, when the prompt is its form. Empty for a dialog read off
+    /// the screen, which is answered row by row instead.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub questions: Vec<crate::agent::Question>,
 }
 
 /// One thread in threads.json = **what the Bridge remembers about that thread**

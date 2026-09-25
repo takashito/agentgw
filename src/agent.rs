@@ -452,6 +452,30 @@ pub struct Dialog {
     pub asked: bool,
 }
 
+/// One question of the question tool, as its hook hands it over.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Question {
+    pub title: String,
+    /// The short name on the question's tab ("Next step").
+    pub header: String,
+    pub options: Vec<String>,
+    /// One per option, empty where the agent wrote none.
+    pub details: Vec<String>,
+    /// Several rows may be ticked, and the answer is the set of them.
+    pub multi: bool,
+}
+
+/// What a person answered to one question.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Answer {
+    /// The row picked, of a single-choice question.
+    Pick(usize),
+    /// The rows ticked, of a multi-choice question, in order.
+    Picks(Vec<usize>),
+    /// Their own words, typed into the question's "Type something" row.
+    Text(String),
+}
+
 // ── the agent as the core sees it ──
 
 /// Starting and driving the coding agent. Implemented by [`claude::Claude`].
@@ -483,6 +507,16 @@ pub trait Agent: Send + Sync + 'static {
     fn interrupt(&self, w: &Window) -> Result<(), String>;
     /// The modal the window is holding, if any. Reads the screen and presses nothing.
     fn dialog(&self, w: &Window) -> Option<Dialog>;
+    /// Answers the question tool's dialog, every question of it, and submits: `answers[i]` is
+    /// the answer to `questions[i]`. Errs, having pressed nothing further, the moment the screen
+    /// is not what the next key expects.
+    async fn answer_questions(
+        &self,
+        w: &Window,
+        questions: &[Question],
+        answers: &[Answer],
+        ctx: &LogCtx,
+    ) -> Result<(), String>;
     /// Answers that modal: moves the cursor onto `choice` and confirms it, or cancels (`None`).
     /// Errs if the modal went away or the cursor would not move -- the caller must not report
     /// an answer that did not land.
@@ -617,6 +651,8 @@ pub mod fake {
         pub dialog: Mutex<Option<Dialog>>,
         /// Every answer `answer_dialog` was asked to give, `None` meaning cancel.
         pub answered: Mutex<Vec<Option<usize>>>,
+        /// Every set of answers `answer_questions` was asked to type in.
+        pub answered_questions: Mutex<Vec<Vec<Answer>>>,
         /// When set, `deliver` fails the way a window with an open dialog does.
         pub fail_deliver: std::sync::atomic::AtomicBool,
         /// Sessions whose conversation history exists (others can't be resumed).
@@ -731,6 +767,17 @@ pub mod fake {
         }
         fn dialog(&self, _w: &Window) -> Option<Dialog> {
             self.dialog.lock().unwrap().clone()
+        }
+        async fn answer_questions(
+            &self,
+            _w: &Window,
+            _questions: &[Question],
+            answers: &[Answer],
+            _ctx: &LogCtx,
+        ) -> Result<(), String> {
+            self.dialog.lock().unwrap().take();
+            self.answered_questions.lock().unwrap().push(answers.to_vec());
+            Ok(())
         }
         async fn answer_dialog(
             &self,

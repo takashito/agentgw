@@ -323,7 +323,7 @@ impl<'a> Pane<'a> {
         let mut rows: Vec<(usize, String, String)> = Vec::new();
         for (i, l) in block.iter().enumerate() {
             if !numbered || row_number(l).is_some() {
-                let (label, detail) = split_column(&text(l));
+                let (label, detail) = split_column(strip_checkbox(&text(l)));
                 rows.push((top + i, label, detail));
             } else if let Some((_, _, detail)) = rows.last_mut() {
                 if !detail.is_empty() {
@@ -934,6 +934,19 @@ fn dialog_title(head: &[&str], footer: &str) -> String {
     title.chars().take(DIALOG_TITLE_CAP - 1).collect::<String>() + "\u{2026}"
 }
 
+/// A multi-choice row's box, ticked or not (`[ ] Alpha`, `[\u{2714}] Bravo`), is not part of its
+/// name. Left on, it went into every button and — worse — made the screen's rows never match
+/// the question the hook had already posted, so the watch took the form down and put the raw
+/// screen up in its place.
+fn strip_checkbox(row: &str) -> &str {
+    for mark in ["[ ] ", "[\u{2714}] ", "[\u{2713}] ", "[x] ", "[X] "] {
+        if let Some(rest) = row.strip_prefix(mark) {
+            return rest;
+        }
+    }
+    row
+}
+
 /// Split a row into what it is called and what it says about itself.
 ///
 /// **The TUI lays a row out in columns**, padding with spaces so the descriptions line up:
@@ -1497,6 +1510,27 @@ the full history gets re-read on your next message.
 
     /// The descriptions under each row used to be counted as rows of their own, which made a
     /// 4-row list look like 7 and put the buttons out of step with the screen.
+    /// A multi-choice row's box is not part of its name. Left on, it made the screen never match
+    /// the question already posted from the hook, and the watch swapped the form for the raw
+    /// screen. Shape as captured from a live dialog 2026-09-25.
+    #[test]
+    fn a_checkbox_is_not_part_of_a_rows_name() {
+        let pane = "\
+\u{2190}  \u{2612} Q1  \u{2610} Q2  \u{2714} Submit  \u{2192}\n\
+Which ones?\n\
+\n\
+  1. [\u{2714}] Alpha\n\
+         first\n\
+\u{276f} 2. [ ] Bravo\n\
+         second\n\
+  3. [ ] Type something\n\
+\n\
+Enter to select \u{b7} Tab/Arrow keys to navigate \u{b7} Esc to cancel";
+        let d = Pane::new(pane).dialog().expect("a modal is up");
+        assert_eq!(&d.options[..2], ["Alpha", "Bravo"]);
+        assert_eq!(d.selected, 1);
+    }
+
     #[test]
     fn a_rows_description_is_not_a_row_of_its_own() {
         let d = Pane::new(QUESTION_MODAL).dialog().expect("a modal is up");

@@ -77,6 +77,12 @@ const DELIVER_SUBMIT_POLL: Duration = Duration::from_millis(200);
 const DIALOG_MOVE_CAP: usize = 12;
 const DIALOG_MOVE_POLL: Duration = Duration::from_millis(80);
 
+/// The pause after answering one question, for the dialog to draw the next.
+const QUESTION_STEP_PAUSE: Duration = Duration::from_millis(250);
+
+/// Reads of the screen, `DIALOG_MOVE_POLL` apart, spent waiting for the review screen.
+const REVIEW_POLLS: usize = 25;
+
 /// How much of a transcript's end to read when asking when it last moved. One entry is a few hundred
 /// bytes at most, so 64KB always spans several.
 const ACTIVITY_TAIL: u64 = 64 * 1024;
@@ -431,6 +437,104 @@ impl Claude {
         Err(crate::t!(
             "the dialog's cursor would not move onto that choice",
             "画面の選択位置をそこまで動かせませんでした"
+        ))
+    }
+
+    /// Walks the dialog's cursor onto row `want`, one press at a time and reading the screen after
+    /// each. Errs if the dialog has gone or the cursor will not get there.
+    async fn cursor_to(&self, w: &Window, want: usize) -> Result<(), String> {
+        for _ in 0..DIALOG_MOVE_CAP {
+            let Some(d) = self.dialog(w) else {
+                return Err(crate::t!(
+                    "the question is no longer on the agent's screen",
+                    "エージェントの画面にその質問はもうありません"
+                ));
+            };
+            if d.selected == want {
+                return Ok(());
+            }
+            let key = if want > d.selected { "Down" } else { "Up" };
+            self.tmux.send_key(w, key)?;
+            tokio::time::sleep(DIALOG_MOVE_POLL).await;
+        }
+        Err(crate::t!(
+            "the question's cursor would not move onto that row",
+            "質問の選択位置をそこまで動かせませんでした"
+        ))
+    }
+
+    /// Types a set of answers into the question tool's dialog and submits them.
+    ///
+    /// **Every key here was measured on a live dialog** (2026-09-25, one key at a time with the
+    /// screen captured after each), not read off documentation:
+    ///
+    /// - a single-choice row is taken with Enter, which moves on to the next question
+    /// - a multi-choice row is ticked with Enter, and the cursor stays; → moves on
+    /// - the "Type something" row, the one after the agent's own, takes typing as soon as the
+    ///   cursor is on it; Enter then moves on
+    /// - with more than one question, or a multi-choice one, a review screen follows ("Ready to
+    ///   submit your answers?" over `❯ 1. Submit answers`) and Enter there sends them
+    ///
+    /// **Enter on an empty "Type something" row declines the whole dialog** — seen while
+    /// measuring. Text answers are never empty by construction, and the cursor is checked onto
+    /// the row before anything is typed.
+    pub async fn answer_questions(
+        &self,
+        w: &Window,
+        questions: &[crate::agent::Question],
+        answers: &[crate::agent::Answer],
+        ctx: &LogCtx,
+    ) -> Result<(), String> {
+        use crate::agent::Answer;
+        for (q, a) in questions.iter().zip(answers) {
+            match a {
+                Answer::Pick(k) => {
+                    self.cursor_to(w, *k).await?;
+                    self.tmux.send_enter(w)?;
+                }
+                Answer::Picks(ks) => {
+                    for k in ks {
+                        self.cursor_to(w, *k).await?;
+                        self.tmux.send_enter(w)?;
+                        tokio::time::sleep(DIALOG_MOVE_POLL).await;
+                    }
+                    self.tmux.send_key(w, "Right")?;
+                }
+                Answer::Text(text) => {
+                    if text.trim().is_empty() {
+                        return Err("an empty text answer would decline the whole dialog".into());
+                    }
+                    self.cursor_to(w, q.options.len()).await?;
+                    self.tmux.send_literal(w, text)?;
+                    tokio::time::sleep(DIALOG_MOVE_POLL).await;
+                    self.tmux.send_enter(w)?;
+                }
+            }
+            tokio::time::sleep(QUESTION_STEP_PAUSE).await;
+        }
+        let reviewed = questions.len() > 1 || questions.iter().any(|q| q.multi);
+        if !reviewed {
+            ctx.info("worker", &format!("{w}: question answered"));
+            return Ok(());
+        }
+        // The review screen carries no cancel hint, so it is found by its own words
+        for _ in 0..REVIEW_POLLS {
+            let pane = self.tmux.capture(w)?;
+            if let Some(line) = pane.lines().rfind(|l| l.contains("Submit answers")) {
+                if !line.trim_start().starts_with('\u{276f}') {
+                    return Err(crate::t!(
+                        "the review screen is not on Submit",
+                        "確認画面の選択位置が「送信」にありません"
+                    ));
+                }
+                ctx.info("worker", &format!("{w}: {} answers submitted", answers.len()));
+                return self.tmux.send_enter(w);
+            }
+            tokio::time::sleep(DIALOG_MOVE_POLL).await;
+        }
+        Err(crate::t!(
+            "the answers went in but the review screen never came up",
+            "答えは打ち込みましたが、確認画面が出ませんでした"
         ))
     }
 
@@ -1214,6 +1318,16 @@ impl crate::agent::Agent for Claude {
         ctx: &LogCtx,
     ) -> Result<(), String> {
         Claude::answer_dialog(self, w, choice, ctx).await
+    }
+
+    async fn answer_questions(
+        &self,
+        w: &Window,
+        questions: &[crate::agent::Question],
+        answers: &[crate::agent::Answer],
+        ctx: &LogCtx,
+    ) -> Result<(), String> {
+        Claude::answer_questions(self, w, questions, answers, ctx).await
     }
 
     fn login_kill(&self) {

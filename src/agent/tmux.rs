@@ -93,6 +93,11 @@ impl Tmux {
         (self.run)(&["send-keys", "-t", w.as_str(), key]).map(|_| ())
     }
 
+    /// Types `text` as it is, with no Enter after it.
+    pub fn send_literal(&self, w: &Window, text: &str) -> Result<(), String> {
+        (self.run)(&["send-keys", "-t", w.as_str(), "-l", "--", text]).map(|_| ())
+    }
+
     /// One Escape (cancels the TUI prompt).
     pub fn send_escape(&self, w: &Window) -> Result<(), String> {
         self.send_key(w, "Escape")

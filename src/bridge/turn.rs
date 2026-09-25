@@ -24,13 +24,6 @@ const QUESTION_TOOL: &str = "AskUserQuestion";
 const DIALOG_WATCH_EVERY_MS: u64 = 10_000;
 const DIALOG_WATCH_QUIET_MS: u64 = 10_000;
 
-/// Reads a question dialog's rows out of the hook payload (`questions[0]`, with each option's
-/// `label` and `description`).
-///
-/// **One single-select question only.** More than one, or a list to tick several of, is left to
-/// the screen: the rows there are the truth about what pressing Enter does, and a button that
-/// says otherwise would be a lie. `selected` is 0 because the cursor starts on the first row,
-/// and `footer` is empty because the payload does not say what the screen writes at its foot.
 /// Is the screen still showing the dialog a prompt was posted for?
 ///
 /// **A question from the hook never reads the same as the screen**, and it is not meant to:
@@ -46,39 +39,71 @@ fn still_asking(posted: &Dialog, screen: &Dialog) -> bool {
     posted.title == screen.title && posted.options == screen.options
 }
 
-fn question_from(input: &serde_json::Value) -> Option<Dialog> {
-    let questions = input.get("questions")?.as_array()?;
-    let [q] = questions.as_slice() else {
-        return None;
+/// Reads the question tool's questions out of its hook payload: `questions[]`, each with its
+/// `question`, `header`, `multiSelect` and `options[]` of `label` / `description`. **Every
+/// shape** — one question or several, one choice or many — because the form in the thread can
+/// show each of them; the screen only has to take the keys.
+fn questions_from(input: &serde_json::Value) -> Option<Vec<crate::agent::Question>> {
+    let text = |v: &serde_json::Value, k: &str| {
+        v.get(k).and_then(|x| x.as_str()).unwrap_or_default().to_string()
     };
-    if q.get("multiSelect").and_then(|m| m.as_bool()) == Some(true) {
-        return None;
-    }
-    let title = q.get("question")?.as_str()?.to_string();
-    let options = q.get("options")?.as_array()?;
-    let rows: Vec<(String, String)> = options
+    let questions: Vec<crate::agent::Question> = input
+        .get("questions")?
+        .as_array()?
         .iter()
-        .filter_map(|o| {
-            let label = o.get("label")?.as_str()?.to_string();
-            let detail = o
-                .get("description")
-                .and_then(|d| d.as_str())
-                .unwrap_or_default()
-                .to_string();
-            (!label.is_empty()).then_some((label, detail))
+        .map(|q| {
+            let options = q.get("options").and_then(|o| o.as_array())?;
+            let labels: Vec<String> = options.iter().map(|o| text(o, "label")).collect();
+            if labels.is_empty() || labels.iter().any(|l| l.is_empty()) {
+                return None;
+            }
+            Some(crate::agent::Question {
+                title: text(q, "question"),
+                header: text(q, "header"),
+                details: options.iter().map(|o| text(o, "description")).collect(),
+                options: labels,
+                multi: q.get("multiSelect").and_then(|m| m.as_bool()) == Some(true),
+            })
         })
-        .collect();
-    if rows.len() != options.len() || rows.is_empty() {
-        return None;
-    }
-    Some(Dialog {
-        title,
-        footer: String::new(),
-        selected: 0,
-        asked: true,
-        options: rows.iter().map(|(l, _)| l.clone()).collect(),
-        details: rows.into_iter().map(|(_, d)| d).collect(),
-    })
+        .collect::<Option<_>>()?;
+    (!questions.is_empty()).then_some(questions)
+}
+
+/// The answers a person gave in the form, read from the state Slack sends with the Submit
+/// click. `Err(i)` names the first question left unanswered.
+///
+/// Written text wins over a pick: filling the box is the more deliberate act. A multi-choice
+/// question needs at least one tick.
+fn answers_from_state(
+    questions: &[crate::agent::Question],
+    state: &serde_json::Value,
+) -> Result<Vec<crate::agent::Answer>, usize> {
+    use crate::agent::Answer;
+    let values = &state["values"];
+    let index = |o: &serde_json::Value| o["value"].as_str().and_then(|v| v.parse::<usize>().ok());
+    questions
+        .iter()
+        .enumerate()
+        .map(|(i, q)| {
+            let written = values[format!("t{i}")][format!("ta{i}")]["value"]
+                .as_str()
+                .map(str::trim)
+                .unwrap_or_default();
+            if !written.is_empty() {
+                return Ok(Answer::Text(written.to_string()));
+            }
+            let chosen = &values[format!("q{i}")][format!("qa{i}")];
+            if q.multi {
+                let mut picks: Vec<usize> = chosen["selected_options"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(index).collect())
+                    .unwrap_or_default();
+                picks.sort_unstable();
+                return if picks.is_empty() { Err(i) } else { Ok(Answer::Picks(picks)) };
+            }
+            index(&chosen["selected_option"]).map(Answer::Pick).ok_or(i)
+        })
+        .collect()
 }
 
 /// How many times one message may be re-sent after turn failures (`TURN_FAILURE_RETRY_CAP`).
@@ -751,10 +776,79 @@ impl Bridge {
             let Some(d) = on_screen else {
                 continue;
             };
-            if self.put_dialog(&window, d, &channel, &thread_ts, &ctx).await {
+            if self.put_dialog(&window, d, Vec::new(), &channel, &thread_ts, &ctx).await {
                 // Waiting for a person on purpose now; the prompt is the thread's answer
                 self.suspend_stall_for_perm(&key);
             }
+        }
+    }
+
+    /// The question form's Submit: read what was chosen and written, type it into the dialog,
+    /// and rewrite the post with the questions and their answers.
+    ///
+    /// **A question left unanswered keeps the form up.** Typing only some of the answers would
+    /// leave the dialog half filled on the agent's screen, so nothing is pressed; the thread is
+    /// told which one is missing and the same Submit works once it is filled.
+    async fn on_questions_submit(&mut self, click: &slack::PermClick, p: DialogPending, ctx: &LogCtx) {
+        let answers = match answers_from_state(&p.questions, &click.state) {
+            Ok(a) => a,
+            Err(i) => {
+                let n = i + 1;
+                let text = crate::t!(
+                    "\u{26a0}\u{fe0f} Question {n} has no answer yet \u{2014} pick or write one and press Submit again.",
+                    "\u{26a0}\u{fe0f} {n}問目がまだ未回答です。選ぶか書いてから、もう一度「送信」を押してください。"
+                );
+                if let Err(e) = self.deps.slack.post_markdown(&p.channel, &text, Some(&p.thread_ts)).await {
+                    ctx.debug("bridge", &format!("unanswered notice failed: {e}"));
+                }
+                self.dialog_pending.insert(click.req_id.clone(), p);
+                return;
+            }
+        };
+        let typed = self
+            .deps
+            .agent
+            .answer_questions(&Window::of(&p.window), &p.questions, &answers, ctx)
+            .await;
+        let done = match &typed {
+            Ok(()) => {
+                self.delivery_trouble.remove(&p.window);
+                ctx.info(
+                    "bridge",
+                    &format!(
+                        "questions reqId={} window={} -> {} answered (by {})",
+                        click.req_id,
+                        p.window,
+                        answers.len(),
+                        click.by
+                    ),
+                );
+                slack::answered_questions(&p.questions, &answers, &click.by)
+            }
+            Err(e) => {
+                ctx.error(
+                    "bridge",
+                    &format!("questions reqId={} window={}: {e}", click.req_id, p.window),
+                );
+                format!("\u{26a0}\u{fe0f} {e}\n{}", slack::answered_questions(&p.questions, &[], &click.by))
+            }
+        };
+        self.resume_stall_after_perm(&ThreadKey::new(&p.channel, &p.thread_ts), true);
+        if let Some(e) = self.threads.entries.get_mut(&p.thread_ts)
+            && e.dialog_prompt.as_ref().is_some_and(|d| d.req_id == click.req_id)
+        {
+            e.dialog_prompt = None;
+            if let Err(e) = self.threads.save() {
+                ctx.error("bridge", &format!("threads.json save failed: {e}"));
+            }
+        }
+        if let Err(e) = self
+            .deps
+            .slack
+            .update_markdown(&p.channel, &p.prompt_ts, &done)
+            .await
+        {
+            ctx.debug("bridge", &format!("questions prompt update failed: {e}"));
         }
     }
 
@@ -929,8 +1023,8 @@ impl Bridge {
             // from here; the rest used to fall through to "may this tool run?", which asked the
             // person for permission to ask them something. They go to the screen instead, where
             // the watch reads the dialog the tool is about to draw
-            if let Some(q) = question_from(&ev.payload["tool_input"]) {
-                self.offer_question(&ev.session_id, q, &channel, &thread_ts, ctx)
+            if let Some(qs) = questions_from(&ev.payload["tool_input"]) {
+                self.offer_question(&ev.session_id, qs, &channel, &thread_ts, ctx)
                     .await;
             }
             return;
@@ -1067,14 +1161,24 @@ impl Bridge {
     pub(super) async fn offer_question(
         &mut self,
         session_id: &str,
-        question: Dialog,
+        questions: Vec<crate::agent::Question>,
         channel: &str,
         thread_ts: &str,
         ctx: &LogCtx,
     ) {
         let window = self.workers.window_for(session_id);
+        // What the screen will show first, for the watch to recognise as this prompt's own
+        let first = &questions[0];
+        let shown = Dialog {
+            title: first.title.clone(),
+            footer: String::new(),
+            options: first.options.clone(),
+            details: first.details.clone(),
+            selected: 0,
+            asked: true,
+        };
         if !self
-            .put_dialog(&window, question, channel, thread_ts, ctx)
+            .put_dialog(&window, shown, questions, channel, thread_ts, ctx)
             .await
         {
             return;
@@ -1100,7 +1204,7 @@ impl Bridge {
         let Some(d) = self.deps.agent.dialog(&Window::of(window)) else {
             return false;
         };
-        self.put_dialog(window, d, channel, thread_ts, ctx).await
+        self.put_dialog(window, d, Vec::new(), channel, thread_ts, ctx).await
     }
 
     /// Posts the rows and writes down what the click will have to answer. Shared by the two
@@ -1109,6 +1213,7 @@ impl Bridge {
         &mut self,
         window: &str,
         d: Dialog,
+        questions: Vec<crate::agent::Question>,
         channel: &str,
         thread_ts: &str,
         ctx: &LogCtx,
@@ -1122,12 +1227,18 @@ impl Bridge {
         static NEXT_REQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = NEXT_REQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let req_id = format!("d{:x}-{n}", self.deps.clock.now_ms());
-        let prompt_ts = match self
-            .deps
-            .slack
-            .post_dialog_prompt(channel, thread_ts, &req_id, &d)
-            .await
-        {
+        let posted = if questions.is_empty() {
+            self.deps
+                .slack
+                .post_dialog_prompt(channel, thread_ts, &req_id, &d)
+                .await
+        } else {
+            self.deps
+                .slack
+                .post_questions(channel, thread_ts, &req_id, &questions)
+                .await
+        };
+        let prompt_ts = match posted {
             Ok(ts) => ts,
             Err(e) => {
                 ctx.error("bridge", &format!("dialog prompt post failed: {e}"));
@@ -1151,6 +1262,7 @@ impl Bridge {
                 prompt_ts: prompt_ts.clone(),
                 window: window.to_string(),
                 dialog: d.clone(),
+                questions: questions.clone(),
             });
             if let Err(e) = self.threads.save() {
                 ctx.error("bridge", &format!("threads.json save failed: {e}"));
@@ -1164,6 +1276,7 @@ impl Bridge {
                 window: window.to_string(),
                 prompt_ts,
                 dialog: d,
+                questions,
             },
         );
         true
@@ -1178,6 +1291,10 @@ impl Bridge {
             session_id: None,
             thread_key: Some(ThreadKey::new(&p.channel, &p.thread_ts)),
         };
+        if !p.questions.is_empty() && click.action == "dlg-submit" {
+            self.on_questions_submit(click, p, &ctx).await;
+            return;
+        }
         let choice = click
             .action
             .strip_prefix("dlg-")
@@ -1380,6 +1497,7 @@ impl Bridge {
                     window: p.window,
                     prompt_ts: p.prompt_ts,
                     dialog: p.dialog,
+                    questions: p.questions,
                 },
             );
         }
@@ -2346,6 +2464,39 @@ pub async fn execute_tool(
 
 #[cfg(test)]
 mod tests {
+
+    fn q(multi: bool) -> crate::agent::Question {
+        crate::agent::Question {
+            title: "?".into(),
+            header: "H".into(),
+            options: vec!["A".into(), "B".into(), "C".into()],
+            details: vec![String::new(); 3],
+            multi,
+        }
+    }
+
+    /// What Slack sends with Submit, read into answers — ticks sorted, words over a pick, and the
+    /// first unanswered question named rather than typed into the dialog half done.
+    #[test]
+    fn answers_are_read_from_the_forms_state() {
+        use crate::agent::Answer;
+        let qs = [q(false), q(true), q(false)];
+        let state = serde_json::json!({"values": {
+            "q0": {"qa0": {"type": "radio_buttons", "selected_option": {"value": "2"}}},
+            "q1": {"qa1": {"type": "checkboxes", "selected_options": [{"value": "2"}, {"value": "0"}]}},
+            "q2": {"qa2": {"type": "radio_buttons", "selected_option": {"value": "1"}}},
+            "t2": {"ta2": {"type": "plain_text_input", "value": "  my own words "}},
+        }});
+        assert_eq!(
+            answers_from_state(&qs, &state),
+            Ok(vec![Answer::Pick(2), Answer::Picks(vec![0, 2]), Answer::Text("my own words".into())])
+        );
+        let half = serde_json::json!({"values": {
+            "q0": {"qa0": {"type": "radio_buttons", "selected_option": {"value": "0"}}},
+            "q1": {"qa1": {"type": "checkboxes", "selected_options": []}},
+        }});
+        assert_eq!(answers_from_state(&qs, &half), Err(1));
+    }
     use super::*;
     use crate::chat::fake::FakeChat;
 

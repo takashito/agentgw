@@ -190,6 +190,33 @@ impl Api {
         Ok(res.ts.to_string())
     }
 
+    /// The question tool's questions as a form in the thread. See [`question_blocks`].
+    pub async fn post_questions(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        req_id: &str,
+        questions: &[crate::agent::Question],
+    ) -> Result<String, String> {
+        let blocks = question_blocks(req_id, questions)?;
+        let title = questions.first().map_or("", |q| q.title.as_str());
+        let req = SlackApiChatPostMessageRequest::new(
+            channel.into(),
+            SlackMessageContent::new()
+                .with_text(format!("Question: {title}"))
+                .with_blocks(blocks),
+        )
+        .with_thread_ts(thread_ts.into())
+        .with_unfurl_links(false);
+        let res = self
+            .client
+            .open_session(&self.token)
+            .chat_post_message(&req)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(res.ts.to_string())
+    }
+
     /// Block Kit prompt offering a modal's rows as buttons. The rows are the agent's own, so
     /// the wording is its, not ours.
     pub async fn post_dialog_prompt(
@@ -1085,6 +1112,16 @@ impl crate::chat::Chat for Api {
     ) -> Result<String, String> {
         Api::post_dialog_prompt(self, channel, thread_ts, req_id, dialog).await
     }
+
+    async fn post_questions(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        req_id: &str,
+        questions: &[crate::agent::Question],
+    ) -> Result<String, String> {
+        Api::post_questions(self, channel, thread_ts, req_id, questions).await
+    }
     async fn open_dm(&self, user_id: &str) -> Result<String, String> {
         Api::open_dm(self, user_id).await
     }
@@ -1221,6 +1258,9 @@ pub struct PermClick {
     pub action: String,
     /// Who pressed it (for audit and logs).
     pub by: String,
+    /// What the message's inputs held when it was pressed (Slack's `state`) — the question
+    /// form's radio buttons, checkboxes and text boxes. `Null` for a plain button.
+    pub state: serde_json::Value,
 }
 
 /// Block Kit buttons. Only **the fact that it was pressed** is passed to the main loop; no decision is made here
@@ -1317,6 +1357,7 @@ async fn on_interaction_event(
             req_id: req_id.to_string(),
             action: action.to_string(),
             by: by.clone(),
+            state: serde_json::to_value(&ev.state).unwrap_or(serde_json::Value::Null),
         };
         let guard = state.read().await;
         match guard.get_user_state::<tokio::sync::mpsc::Sender<PermClick>>() {
@@ -1849,6 +1890,116 @@ fn dialog_body(d: &crate::agent::Dialog, open: bool) -> String {
     body
 }
 
+/// The question form: for each question its title, then radio buttons (one choice) or
+/// checkboxes (several), and for a one-choice question a box for their own words; one Submit
+/// and one Cancel at the foot.
+///
+/// **Only Submit and Cancel carry the `perm:` tag.** Ticking a box or picking a radio also
+/// sends Slack an action; those ids are left untagged so the click reader passes them by, and
+/// Submit reads them all at once from the state Slack sends with it.
+///
+/// The form is written as Block Kit JSON and read into the crate's types — the shape is Slack's
+/// own documentation verbatim, and it was posted against the live API before being relied on.
+pub fn question_blocks(
+    req_id: &str,
+    questions: &[crate::agent::Question],
+) -> Result<Vec<SlackBlock>, String> {
+    use serde_json::json;
+    let plain = |t: &str| json!({"type": "plain_text", "text": button_label(t)});
+    let many = questions.len() > 1;
+    // One heading for the whole form, then each question under its own number. A marker on
+    // the first question alone read as if only that one were being asked
+    let mut blocks = vec![json!({"type": "markdown", "text": crate::t!(
+        ":speech_balloon: **The agent is asking**",
+        ":speech_balloon: **エージェントからの質問**"
+    )})];
+    for (i, q) in questions.iter().enumerate() {
+        if i > 0 {
+            // Without a rule the next question sat hard against the previous one's text box
+            blocks.push(json!({"type": "divider"}));
+        }
+        let number = if many { format!("{}. ", i + 1) } else { String::new() };
+        blocks.push(json!({"type": "markdown", "text": format!("**{number}{}**", q.title)}));
+        let options: Vec<serde_json::Value> = q
+            .options
+            .iter()
+            .enumerate()
+            .map(|(k, label)| {
+                let mut o = json!({"text": plain(label), "value": k.to_string()});
+                if let Some(d) = q.details.get(k).filter(|d| !d.is_empty()) {
+                    o["description"] = plain(d);
+                }
+                o
+            })
+            .collect();
+        let kind = if q.multi { "checkboxes" } else { "radio_buttons" };
+        blocks.push(json!({
+            "type": "actions",
+            "block_id": format!("q{i}"),
+            "elements": [{"type": kind, "action_id": format!("qa{i}"), "options": options}],
+        }));
+        if !q.multi {
+            // Quiet: a short label and the explanation as a placeholder inside the box. A bold
+            // "Or in your own words (optional)" over every question outweighed the question
+            blocks.push(json!({
+                "type": "input",
+                "block_id": format!("t{i}"),
+                "optional": true,
+                "label": plain("\u{270f}\u{fe0f}"),
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": format!("ta{i}"),
+                    "placeholder": plain(&crate::t!(
+                        "Or write your own answer",
+                        "選択肢に無いときは、ここに書く"
+                    )),
+                },
+            }));
+        }
+    }
+    blocks.push(json!({
+        "type": "actions",
+        "elements": [
+            {"type": "button", "style": "primary", "action_id": format!("perm:dlg-submit:{req_id}"),
+             "text": plain(&crate::t!("Submit", "送信"))},
+            {"type": "button", "style": "danger", "action_id": format!("perm:dlg-cancel:{req_id}"),
+             "text": plain(&crate::t!("Cancel (Esc)", "取り消す (Esc)"))},
+        ],
+    }));
+    serde_json::from_value(serde_json::Value::Array(blocks)).map_err(|e| e.to_string())
+}
+
+/// The question form once answered: every question with what was given under it, and who.
+/// With no answers (the typing failed) it is the questions alone, so the thread still shows
+/// what was asked.
+pub fn answered_questions(
+    questions: &[crate::agent::Question],
+    answers: &[crate::agent::Answer],
+    by: &str,
+) -> String {
+    use crate::agent::Answer;
+    let many = questions.len() > 1;
+    let mut out = Vec::new();
+    for (i, q) in questions.iter().enumerate() {
+        let number = if many { format!("{}. ", i + 1) } else { String::new() };
+        out.push(format!("**{number}{}**", q.title));
+        let label = |k: &usize| q.options.get(*k).cloned().unwrap_or_default();
+        match answers.get(i) {
+            Some(Answer::Pick(k)) => out.push(format!("\u{2192} {}", label(k))),
+            Some(Answer::Picks(ks)) => out.push(format!(
+                "\u{2192} {}",
+                ks.iter().map(label).collect::<Vec<_>>().join(" / ")
+            )),
+            Some(Answer::Text(t)) => out.push(format!("\u{2192} \u{201c}{t}\u{201d}")),
+            None => {}
+        }
+    }
+    if !answers.is_empty() {
+        out.push(format!("\u{2705} {} \u{2014} <@{by}>", crate::t!("Answered", "回答済み")));
+    }
+    out.join("\n")
+}
+
 /// What the prompt becomes once someone has pressed a button: the same question and rows, the
 /// one that was taken marked, and who took it. `chosen` is None when it was cancelled.
 pub fn answered_dialog(d: &crate::agent::Dialog, chosen: Option<usize>, by: &str) -> String {
@@ -1902,6 +2053,7 @@ pub fn perm_click_from_relay(
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string(),
+        state: body.get("state").cloned().unwrap_or(serde_json::Value::Null),
     })
 }
 
@@ -2156,6 +2308,30 @@ impl SlackId {
 
 #[cfg(test)]
 mod tests {
+
+    fn q(title: &str, multi: bool) -> crate::agent::Question {
+        crate::agent::Question {
+            title: title.into(),
+            header: "H".into(),
+            options: vec!["Alpha".into(), "Bravo".into()],
+            details: vec!["first".into(), String::new()],
+            multi,
+        }
+    }
+
+    /// The form is written as JSON and read into the crate's types; a shape the crate cannot
+    /// read would only show at run time, as a question that never reaches the thread.
+    #[test]
+    fn the_question_form_reads_into_blocks_for_every_shape() {
+        let qs = [q("One?", false), q("Several?", true)];
+        let blocks = question_blocks("r1", &qs).expect("the form reads into blocks");
+        let json = serde_json::to_string(&blocks).unwrap();
+        assert!(json.contains("radio_buttons") && json.contains("checkboxes"), "{json}");
+        assert!(json.contains("plain_text_input"), "a one-choice question takes words: {json}");
+        assert!(json.contains("perm:dlg-submit:r1") && json.contains("perm:dlg-cancel:r1"));
+        // Only Submit and Cancel are tagged for the click reader; ticking a box is not a click
+        assert_eq!(json.matches("perm:").count(), 2, "{json}");
+    }
 
     /// **The question survives the answer.** The post used to be replaced by "\u{2705} <label>",
     /// so a thread read a week later showed a tick with nothing to attach it to: neither what

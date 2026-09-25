@@ -294,6 +294,15 @@ pub trait Chat: Send + Sync + 'static {
         tool_name: &str,
         tool_input: &serde_json::Value,
     ) -> Result<String, String>;
+    /// The question tool's questions as a form: radio buttons or checkboxes per question, a
+    /// text box for their own words, and one Submit. Returns the post's ts.
+    async fn post_questions(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        req_id: &str,
+        questions: &[crate::agent::Question],
+    ) -> Result<String, String>;
     /// Block Kit prompt offering a modal's rows as buttons, so the dialog holding the agent can
     /// be answered from the thread. Returns the post's ts.
     async fn post_dialog_prompt(
@@ -522,6 +531,17 @@ pub mod fake {
             _i: &serde_json::Value,
         ) -> Result<String, String> {
             self.record(format!("perm {c} {th} {id} {tool}"))?;
+            Ok(self.ts())
+        }
+        async fn post_questions(
+            &self,
+            c: &str,
+            th: &str,
+            id: &str,
+            qs: &[crate::agent::Question],
+        ) -> Result<String, String> {
+            let titles: Vec<&str> = qs.iter().map(|q| q.title.as_str()).collect();
+            self.record(format!("questions {c} {th} {id} [{}]", titles.join(" | ")))?;
             Ok(self.ts())
         }
         async fn post_dialog_prompt(
