@@ -1898,6 +1898,40 @@ pub(crate) fn entrances(listen: &str, serve_json: Option<&str>) -> Vec<Entrance>
     out
 }
 
+/// Where `agentgw update` asks, and with which key. **The gateway runs every update**, so it is asked
+/// wherever this is typed: on the gateway, its own link port; on a machine, the gateway it dials
+/// (the same address its link uses, so whatever front or tunnel carries the link carries this too).
+///
+/// Told apart by role, **not by the key** — a machine holds the same key to present to its gateway,
+/// and reading "has the key" as "is the gateway" sent a machine's request to its own loopback.
+pub fn update_target(env: &HashMap<String, String>, access: &Access) -> Result<(String, String), String> {
+    let token = env.get("AGENTGW_LINK_TOKEN").filter(|t| !t.is_empty());
+    let role = env.get("AGENTGW_BRIDGE_ROLE").map(|r| r.trim().to_lowercase());
+    if role.as_deref() == Some("machine") {
+        let url = access.gateway.as_ref().map(|g| g.link_url.clone()).unwrap_or_default();
+        return match (url.is_empty(), token) {
+            (false, Some(t)) => Ok((
+                format!("{}/update", crate::setup::add_machine::probe_base(&url)),
+                t.clone(),
+            )),
+            _ => Err(crate::t!(
+                "This machine doesn't know its gateway, so it can't ask it. Send `update` in Slack instead.",
+                "このマシンはゲートウェイを知らないので、頼めません。Slack で `update` を送ってください。"
+            )),
+        };
+    }
+    if env.contains_key("AGENTGW_LINK_LISTEN")
+        && let Some(t) = token
+    {
+        let port = crate::bridge::machine::link_port(|k| env.get(k).cloned());
+        return Ok((format!("http://127.0.0.1:{port}/update"), t.clone()));
+    }
+    Err(crate::t!(
+        "This agentgw works on its own, with no gateway to run an update. Install the new version with install.sh.",
+        "この agentgw は単独で動いていて、update を回すゲートウェイがありません。install.sh で新しい版を入れてください。"
+    ))
+}
+
 /// Held while the gateway reads, changes and writes access.json — see `Fleet::edit_access`.
 static EDITING: Mutex<()> = Mutex::new(());
 
@@ -3939,18 +3973,13 @@ impl Cli {
 
     /// `agentgw update [version]`: ask the running gateway to start one.
     pub async fn update(dir: &StateDir, args: &[String]) -> i32 {
-        let env = Self::env_of(dir);
-        let Some(token) = env.get("AGENTGW_LINK_TOKEN") else {
-            eprintln!(
-                "{}",
-                crate::t!(
-                    "update runs on the gateway. On a machine, send `update` in Slack.",
-                    "update はゲートウェイで打ちます。マシンでは Slack で `update` を送ってください。"
-                )
-            );
-            return 2;
+        let (url, token) = match update_target(&Self::env_of(dir), &Access::load(dir)) {
+            Ok(t) => t,
+            Err(why) => {
+                eprintln!("{why}");
+                return 2;
+            }
         };
-        let listen = format!("127.0.0.1:{}", crate::bridge::machine::link_port(|k| env.get(k).cloned()));
         let version = args.first().cloned().unwrap_or_default();
         let out = tokio::process::Command::new("curl")
             .args([
@@ -3963,7 +3992,7 @@ impl Cli {
                 &format!("x-api-token: {token}"),
                 "--data-raw",
                 &version,
-                &format!("http://{listen}/update"),
+                &url,
             ])
             .output()
             .await;
@@ -3981,7 +4010,13 @@ impl Cli {
                 0
             }
             "" | "000" => {
-                eprintln!("{}", crate::t!("The gateway did not answer. Is it running?", "ゲートウェイが応答しません。動いていますか?"));
+                eprintln!(
+                    "{}",
+                    crate::t!(
+                        "The gateway did not answer at {url}. Is it running?",
+                        "ゲートウェイが {url} で応答しません。動いていますか?"
+                    )
+                );
                 1
             }
             _ => {
@@ -4548,6 +4583,30 @@ mod tests {
             .collect();
         assert!(lost.is_empty(), "reports overwritten by another machine's: {lost:?}");
         let _ = std::fs::remove_dir_all(dir.path());
+    }
+
+    #[test]
+    fn update_is_asked_of_the_gateway_wherever_it_is_typed() {
+        let env = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        };
+        // On the gateway: its own link port
+        let gw = env(&[("AGENTGW_LINK_LISTEN", "127.0.0.1:8787"), ("AGENTGW_LINK_TOKEN", "k")]);
+        let (url, token) = update_target(&gw, &Access::default()).unwrap();
+        assert_eq!((url.as_str(), token.as_str()), ("http://127.0.0.1:8787/update", "k"));
+        // On a machine: **the gateway it dials**, not its own loopback — it holds the key too
+        let m = env(&[("AGENTGW_BRIDGE_ROLE", "machine"), ("AGENTGW_LINK_TOKEN", "k")]);
+        let dialing = |url: &str| Access {
+            gateway: Some(crate::bridge::state::Link { link_url: url.into(), ..Default::default() }),
+            ..Default::default()
+        };
+        let (url, _) = update_target(&m, &dialing("wss://gw.example.ts.net")).unwrap();
+        assert_eq!(url, "https://gw.example.ts.net/update");
+        let (url, _) = update_target(&m, &dialing("ws://127.0.0.1:8799")).unwrap();
+        assert_eq!(url, "http://127.0.0.1:8799/update", "through the tunnel the link uses");
+        // A machine that doesn't know its gateway, and a Bridge on its own, say so
+        assert!(update_target(&m, &Access::default()).is_err());
+        assert!(update_target(&env(&[]), &Access::default()).unwrap_err().contains("on its own"));
     }
 
     /// A finished rollout has to be **gone** from disk, or the next tick finishes it again.
