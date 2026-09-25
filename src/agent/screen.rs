@@ -322,7 +322,10 @@ impl<'a> Pane<'a> {
         // numbers are used, a number is what marks a row.
         let mut rows: Vec<(usize, String, String)> = Vec::new();
         for (i, l) in block.iter().enumerate() {
-            if !numbered || row_number(l).is_some() {
+            // **The cursor's line is a row, numbered or not.** A several-choice list has a
+            // "Submit" line the cursor can stand on; left out, the cursor had nowhere to be, and a
+            // dialog plainly on screen read as no dialog at all (real machine, 2026-09-25)
+            if !numbered || row_number(l).is_some() || top + i == cursor {
                 let (label, detail) = split_column(strip_checkbox(&text(l)));
                 rows.push((top + i, label, detail));
             } else if let Some((_, _, detail)) = rows.last_mut() {
@@ -1529,6 +1532,36 @@ Enter to select \u{b7} Tab/Arrow keys to navigate \u{b7} Esc to cancel";
         let d = Pane::new(pane).dialog().expect("a modal is up");
         assert_eq!(&d.options[..2], ["Alpha", "Bravo"]);
         assert_eq!(d.selected, 1);
+    }
+
+    /// The **real** screen from a machine where answering failed (2026-09-25): the cursor on the
+    /// unnumbered "Submit" line of a several-choice list. It read as no dialog, and the answer
+    /// was refused with the dialog in plain sight.
+    const CURSOR_ON_SUBMIT: &str = "\
+\u{2190}  \u{2610} Next step  \u{2714} Submit  \u{2192}\n\
+\n\
+What would you like to look at next? (pick any)\n\
+\n\
+  1. [ ] The build\n\
+         run cargo build / test and see whether it passes\n\
+  2. [ ] Production\n\
+         run status and check the versions and routes\n\
+  3. [ ] Recent commits\n\
+         list what went in over the last few days\n\
+  4. [ ] The sticky\n\
+         check how the progress message is drawn\n\
+  5. [ ] Type something\n\
+\u{276f}    Submit\n\
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+  6. Chat about this\n\
+\n\
+Enter to select \u{b7} \u{2191}/\u{2193} to navigate \u{b7} ctrl+g to edit in VS Code \u{b7} Esc to cancel";
+
+    #[test]
+    fn the_cursor_on_an_unnumbered_line_still_reads_as_a_dialog() {
+        let d = Pane::new(CURSOR_ON_SUBMIT).dialog().expect("the dialog is on screen");
+        assert_eq!(&d.options[..5], ["The build", "Production", "Recent commits", "The sticky", "Type something"]);
+        assert_eq!(d.options[d.selected], "Submit");
     }
 
     #[test]

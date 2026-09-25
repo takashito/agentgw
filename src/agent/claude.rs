@@ -77,8 +77,9 @@ const DELIVER_SUBMIT_POLL: Duration = Duration::from_millis(200);
 const DIALOG_MOVE_CAP: usize = 12;
 const DIALOG_MOVE_POLL: Duration = Duration::from_millis(80);
 
-/// The pause after answering one question, for the dialog to draw the next.
-const QUESTION_STEP_PAUSE: Duration = Duration::from_millis(250);
+/// Reads, `DIALOG_MOVE_POLL` apart, spent waiting for the screen to show a key's effect. A
+/// busy machine takes well past one poll to redraw; this is the ceiling, not the usual wait.
+const REDRAW_POLLS: usize = 25;
 
 /// Reads of the screen, `DIALOG_MOVE_POLL` apart, spent waiting for the review screen.
 const REVIEW_POLLS: usize = 25;
@@ -410,58 +411,78 @@ impl Claude {
             ctx.info("worker", &format!("{w}: dialog cancelled (Escape)"));
             return self.tmux.send_escape(w);
         };
-        for _ in 0..DIALOG_MOVE_CAP {
-            let Some(d) = self.dialog(w) else {
-                return Err(crate::t!(
-                    "the dialog is no longer on the agent's screen",
-                    "エージェントの画面にその確認はもうありません"
-                ));
-            };
-            if want >= d.options.len() {
-                return Err(crate::t!(
-                    "that choice is not on the dialog any more",
-                    "その選択肢はもう画面にありません"
-                ));
-            }
-            if d.selected == want {
-                ctx.info(
-                    "worker",
-                    &format!("{w}: dialog answered with {:?}", d.options[want]),
-                );
-                return self.tmux.send_enter(w);
-            }
-            let key = if want > d.selected { "Down" } else { "Up" };
-            self.tmux.send_key(w, key)?;
-            tokio::time::sleep(DIALOG_MOVE_POLL).await;
+        let Some(d) = self.dialog(w) else {
+            return Err(crate::t!(
+                "the dialog is no longer on the agent's screen",
+                "エージェントの画面にその確認はもうありません"
+            ));
+        };
+        if want >= d.options.len() {
+            return Err(crate::t!(
+                "that choice is not on the dialog any more",
+                "その選択肢はもう画面にありません"
+            ));
         }
-        Err(crate::t!(
-            "the dialog's cursor would not move onto that choice",
-            "画面の選択位置をそこまで動かせませんでした"
-        ))
+        let label = d.options[want].clone();
+        self.cursor_to(w, want).await?;
+        ctx.info("worker", &format!("{w}: dialog answered with {label:?}"));
+        self.tmux.send_enter(w)
     }
+
 
     /// Walks the dialog's cursor onto row `want`, one press at a time and reading the screen after
     /// each. Errs if the dialog has gone or the cursor will not get there.
     async fn cursor_to(&self, w: &Window, want: usize) -> Result<(), String> {
+        let gone = || {
+            crate::t!(
+                "the question is no longer on the agent's screen",
+                "エージェントの画面にその質問はもうありません"
+            )
+        };
+        let mut d = self.dialog(w).ok_or_else(gone)?;
         for _ in 0..DIALOG_MOVE_CAP {
-            let Some(d) = self.dialog(w) else {
-                return Err(crate::t!(
-                    "the question is no longer on the agent's screen",
-                    "エージェントの画面にその質問はもうありません"
-                ));
-            };
             if d.selected == want {
                 return Ok(());
             }
             let key = if want > d.selected { "Down" } else { "Up" };
             self.tmux.send_key(w, key)?;
-            tokio::time::sleep(DIALOG_MOVE_POLL).await;
+            d = self.until_moved(w, d.selected).await.ok_or_else(gone)?;
         }
         Err(crate::t!(
             "the question's cursor would not move onto that row",
             "質問の選択位置をそこまで動かせませんでした"
         ))
     }
+
+    /// Reads the dialog until its cursor has left row `from` — **the screen, not a timer, says
+    /// when a key has landed**. A fixed pause read a busy machine's old frame, saw the cursor
+    /// where it had been, pressed again and overshot: past the options, past "Type something",
+    /// onto the Submit line (a real machine under load, 2026-09-25). None if the dialog goes.
+    async fn until_moved(&self, w: &Window, from: usize) -> Option<crate::agent::Dialog> {
+        let mut last = None;
+        for _ in 0..REDRAW_POLLS {
+            tokio::time::sleep(DIALOG_MOVE_POLL).await;
+            let d = self.dialog(w)?;
+            if d.selected != from {
+                return Some(d);
+            }
+            last = Some(d);
+        }
+        last
+    }
+
+    /// Waits for the dialog to move on from the question titled `title` — to the next one, or
+    /// off the list to the review screen — so the next question's keys meet its own screen.
+    async fn until_next_question(&self, w: &Window, title: &str) {
+        for _ in 0..REDRAW_POLLS {
+            tokio::time::sleep(DIALOG_MOVE_POLL).await;
+            match self.dialog(w) {
+                Some(d) if d.title == title => continue,
+                _ => return,
+            }
+        }
+    }
+
 
     /// Types a set of answers into the question tool's dialog and submits them.
     ///
@@ -487,6 +508,7 @@ impl Claude {
     ) -> Result<(), String> {
         use crate::agent::Answer;
         for (q, a) in questions.iter().zip(answers) {
+            let asked = self.dialog(w).map(|d| d.title).unwrap_or_default();
             match a {
                 Answer::Pick(k) => {
                     self.cursor_to(w, *k).await?;
@@ -510,7 +532,7 @@ impl Claude {
                     self.tmux.send_enter(w)?;
                 }
             }
-            tokio::time::sleep(QUESTION_STEP_PAUSE).await;
+            self.until_next_question(w, &asked).await;
         }
         let reviewed = questions.len() > 1 || questions.iter().any(|q| q.multi);
         if !reviewed {
@@ -2651,11 +2673,32 @@ mod tests {
     /// Answering a dialog from the thread: walk the cursor a row at a time, reading the screen
     /// after each press, and only then confirm. **The screen is the proof the key landed** —
     /// counting presses instead would confirm whatever row the cursor happened to be on.
+    /// A busy machine redraws late. Judging from a frame that still shows the old cursor, the
+    /// walk pressed Down again and overshot — past the options, onto the Submit line (real
+    /// machine, 2026-09-25). It waits for the screen to show the move instead.
+    #[tokio::test]
+    async fn a_late_redraw_does_not_make_the_cursor_overshoot() {
+        use crate::agent::screen::tests::{TRUST_PANE_NO_FIRST, TRUST_PANE_YES_SECOND};
+        let (calls, c) = deliver_probe(vec![
+            TRUST_PANE_NO_FIRST,
+            TRUST_PANE_NO_FIRST, // the frame after Down, not yet redrawn
+            TRUST_PANE_NO_FIRST,
+            TRUST_PANE_NO_FIRST,
+            TRUST_PANE_YES_SECOND,
+        ]);
+        c.answer_dialog(&Window::of("@42"), Some(1), &LogCtx::default())
+            .await
+            .unwrap();
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.iter().filter(|c| c.ends_with(" Down")).count(), 1, "{calls:?}");
+        assert_eq!(enters(&calls), 1);
+    }
+
     #[tokio::test]
     async fn a_dialog_is_answered_by_moving_the_cursor_then_confirming() {
         use crate::agent::screen::tests::{TRUST_PANE_NO_FIRST, TRUST_PANE_YES_SECOND};
-        // First read: "No, exit" selected. After one Down the second read shows Yes selected
-        let (calls, c) = deliver_probe(vec![TRUST_PANE_NO_FIRST, TRUST_PANE_YES_SECOND]);
+        // "No, exit" selected until the one Down lands; then Yes is
+        let (calls, c) = deliver_probe(vec![TRUST_PANE_NO_FIRST, TRUST_PANE_NO_FIRST, TRUST_PANE_YES_SECOND]);
         c.answer_dialog(&Window::of("@42"), Some(1), &LogCtx::default())
             .await
             .unwrap();
