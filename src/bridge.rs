@@ -2397,13 +2397,37 @@ mod tests {
         );
         let asked = slack.calls().iter().filter(|c| c.starts_with("dialog C1")).count();
 
-        // Asked once, not once a round, while it waits for a person
+        // Asked once, not once a round, while the same question is still on the screen
         clock.advance(30_000);
         b.dialog_tick().await;
         assert_eq!(
             slack.calls().iter().filter(|c| c.starts_with("dialog C1")).count(),
             asked,
             "the same modal was offered again: {:?}",
+            slack.calls()
+        );
+
+        // **A prompt nobody clicked must not hold the window for ever.** Once the screen moves
+        // on, the old post says so and the new dialog is offered -- before this, the first
+        // unanswered prompt blocked every dialog after it (real machine, 2026-09-25)
+        *agent.dialog.lock().unwrap() = Some(crate::agent::Dialog {
+            title: "Select model".into(),
+            footer: "Enter to set as default \u{b7} Esc to cancel".into(),
+            options: vec!["Opus".into(), "Fable".into()],
+            details: vec![String::new(), String::new()],
+            selected: 0,
+            asked: false,
+        });
+        clock.advance(30_000);
+        b.dialog_tick().await;
+        assert!(
+            slack.calls().iter().any(|c| c.contains("Select model")),
+            "the next dialog was never offered: {:?}",
+            slack.calls()
+        );
+        assert!(
+            slack.calls().iter().any(|c| c.starts_with("update_md C1") && c.contains("buttons do nothing")),
+            "the prompt it replaced was left looking live: {:?}",
             slack.calls()
         );
     }

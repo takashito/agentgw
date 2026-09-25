@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agentgw"
-version = "0.58.18"
+version = "0.58.19"
 dependencies = [
  "async-trait",
  "axum",

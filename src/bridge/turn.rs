@@ -708,23 +708,75 @@ impl Bridge {
             {
                 continue;
             }
-            let window = self.workers.window_for(&session);
-            // Already waiting on a person here. **Asked about, not latched**: the answer to a
-            // dialog can come from the machine instead of the thread, and a flag saying
-            // "waiting" would stay up and blind this watch to the next one
-            let waiting = self.dialog_pending.values().any(|p| p.window == window)
-                || self.perm_pending.values().any(|p| p.thread_ts == thread_ts);
-            if waiting {
+            if self.perm_pending.values().any(|p| p.thread_ts == thread_ts) {
                 continue;
             }
             let ctx = LogCtx {
                 session_id: Some(session.clone()),
                 thread_key: Some(key.clone()),
             };
-            if self.offer_dialog(&window, &channel, &thread_ts, &ctx).await {
+            let window = self.workers.window_for(&session);
+            let on_screen = self.deps.agent.dialog(&Window::of(&window));
+            // A prompt already up for this window holds the place **only while it still matches
+            // the screen**. Skipping on its mere existence meant one nobody ever clicked blocked
+            // the window for good: the dialog it named was long gone, and the next one -- and
+            // every one after -- was never offered (seen on a real machine 2026-09-25).
+            let waiting = self
+                .dialog_pending
+                .iter()
+                .find(|(_, p)| p.window == window)
+                .map(|(req_id, p)| (req_id.clone(), p.dialog.clone()));
+            if let Some((req_id, asked)) = waiting {
+                let same = on_screen
+                    .as_ref()
+                    .is_some_and(|d| d.title == asked.title && d.options == asked.options);
+                if same {
+                    continue; // the same question, still waiting for a person
+                }
+                self.retire_dialog_prompt(&req_id, &ctx).await;
+            }
+            let Some(d) = on_screen else {
+                continue;
+            };
+            if self.put_dialog(&window, d, &channel, &thread_ts, &ctx).await {
                 // Waiting for a person on purpose now; the prompt is the thread's answer
                 self.suspend_stall_for_perm(&key);
             }
+        }
+    }
+
+    /// Takes down a prompt whose dialog the screen has moved on from: says so in the post, and
+    /// forgets it, here and in the record. **Not an answer** — nothing is pressed on the agent.
+    async fn retire_dialog_prompt(&mut self, req_id: &str, ctx: &LogCtx) {
+        let Some(p) = self.dialog_pending.remove(req_id) else {
+            return;
+        };
+        ctx.info(
+            "bridge",
+            &format!("dialog reqId={req_id} retired — the screen has moved on"),
+        );
+        if let Some(e) = self.threads.entries.get_mut(&p.thread_ts)
+            && e.dialog_prompt.as_ref().is_some_and(|d| d.req_id == req_id)
+        {
+            e.dialog_prompt = None;
+            if let Err(e) = self.threads.save() {
+                ctx.error("bridge", &format!("threads.json save failed: {e}"));
+            }
+        }
+        let text = slack::unanswered_dialog(
+            &p.dialog,
+            &crate::t!(
+                "This is no longer what the agent's screen is showing, so these buttons do nothing.",
+                "エージェントの画面はもう別のものになっているので、このボタンは効きません。"
+            ),
+        );
+        if let Err(e) = self
+            .deps
+            .slack
+            .update_markdown(&p.channel, &p.prompt_ts, &text)
+            .await
+        {
+            ctx.debug("bridge", &format!("dialog prompt update failed: {e}"));
         }
     }
 
