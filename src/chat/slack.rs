@@ -204,18 +204,27 @@ impl Api {
             .options
             .iter()
             .enumerate()
-            .map(|(i, o)| format!("{}. {o}", i + 1))
+            .map(|(i, o)| {
+                let detail = dialog.details.get(i).filter(|d| !d.is_empty());
+                match detail {
+                    Some(d) => format!("{}. {o}\n     {d}", i + 1),
+                    None => format!("{}. {o}", i + 1),
+                }
+            })
             .collect();
-        let body = format!(
-            "{}\n*{}*\n```{}```\n_{}_",
+        let mut body = format!(
+            "{}\n*{}*\n```{}```",
             crate::t!(
                 ":keyboard: The agent is waiting on a dialog \u{2014} answer it here and the queued messages go through.",
                 ":keyboard: エージェントが画面の確認待ちで止まっています。ここで答えると、溜まっているメッセージがそのまま渡ります。"
             ),
             dialog.title,
             rows.join("\n"),
-            dialog.footer,
         );
+        // The hint is the screen's own; a question taken from the hook has none to show
+        if !dialog.footer.is_empty() {
+            body.push_str(&format!("\n_{}_", dialog.footer));
+        }
         let button = |label: &str, action: &str| {
             SlackBlockButtonElement::new(
                 format!("perm:{action}:{req_id}").into(),

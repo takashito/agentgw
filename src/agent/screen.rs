@@ -238,9 +238,15 @@ impl<'a> Pane<'a> {
     /// mistaken for a stuck one. The check ignores the dialog type: modals we don't know by name
     /// are exactly what causes silence, so no table of wordings.
     pub fn modal_footer(&self) -> Option<&'a str> {
-        self.0
-            .split('\n')
-            .find(|l| l.to_ascii_lowercase().contains("esc to cancel"))
+        let lines: Vec<&str> = self.0.split('\n').collect();
+        let from = lines.len().saturating_sub(MODAL_FOOTER_TAIL);
+        lines[from..]
+            .iter()
+            .find(|l| {
+                let t = l.trim().to_ascii_lowercase();
+                t.ends_with(CANCEL_HINT)
+            })
+            .copied()
     }
 
     /// The rows a modal is offering and which one the cursor sits on. `None` when no modal
@@ -279,19 +285,37 @@ impl<'a> Pane<'a> {
                 .iter()
                 .position(|l| !is_row(l))
                 .unwrap_or(at - cursor);
-        let options: Vec<String> = lines[top..bottom]
-            .iter()
-            .map(|l| strip_modal_decoration(l.trim()).trim_end().to_string())
-            .collect();
-        // An empty row means that `❯` was the input box under the modal, not a choice
-        if options.iter().any(|o| o.is_empty()) {
+        // A numbered list writes each row's description on the line below it, indented further
+        // (seen on the question dialog 2026-09-25). Those lines are the row's continuation, not
+        // rows of their own: where numbers are used, they are what marks a row.
+        let block = &lines[top..bottom];
+        let numbered = block.iter().any(|l| row_number(l).is_some());
+        let text = |l: &str| strip_modal_decoration(l.trim()).trim_end().to_string();
+        // A numbered list writes each row's description on the line below it, indented further
+        // (the question dialog, seen 2026-09-25). Those lines belong to the row above: where
+        // numbers are used, a number is what marks a row.
+        let mut rows: Vec<(usize, String, String)> = Vec::new();
+        for (i, l) in block.iter().enumerate() {
+            if !numbered || row_number(l).is_some() {
+                rows.push((top + i, text(l), String::new()));
+            } else if let Some((_, _, detail)) = rows.last_mut() {
+                if !detail.is_empty() {
+                    detail.push(' ');
+                }
+                detail.push_str(&text(l));
+            }
+        }
+        // An empty row means that `\u{276f}` was the input box under the modal, not a choice
+        if rows.is_empty() || rows.iter().any(|(_, label, _)| label.is_empty()) {
             return None;
         }
+        let selected = rows.iter().position(|(i, _, _)| *i == cursor)?;
         Some(crate::agent::Dialog {
             title: dialog_title(&lines[from..top], footer),
             footer: footer.trim().to_string(),
-            selected: cursor - top,
-            options,
+            selected,
+            options: rows.iter().map(|(_, label, _)| label.clone()).collect(),
+            details: rows.into_iter().map(|(_, _, detail)| detail).collect(),
         })
     }
 
@@ -821,6 +845,20 @@ fn parse_percent_line(line: &str) -> Option<u32> {
 
 /// Strip leading decoration, in order: decoration → option number → whitespace.
 /// How far above the cancel hint a modal's own text can be. Past that is scrollback.
+/// The words every cancel hint ends with.
+const CANCEL_HINT: &str = "esc to cancel";
+
+/// How close to the foot of the pane a real hint line sits. The TUI draws it just above the
+/// input box: the tallest real case (the auto mode onboarding) leaves 5 lines below it.
+///
+/// **Both anchors earn their keep.** The check used to be "these words appear anywhere on the
+/// screen", and a thread that merely *talked* about dialogs jammed itself: an agent's own
+/// sentence with the words in the middle was read as a modal, every delivery was refused, and
+/// the person was told to answer a dialog that was not there (57 refusals over an hour on a
+/// real machine 2026-09-25). Ending with the words drops the sentence that runs on; the tail
+/// drops the same words quoted higher up the conversation.
+const MODAL_FOOTER_TAIL: usize = 10;
+
 const DIALOG_LOOK_BACK: usize = 30;
 
 /// Characters of the modal's question kept for the thread. A paragraph, not an essay.
@@ -857,6 +895,17 @@ fn dialog_title(head: &[&str], footer: &str) -> String {
         return title;
     }
     title.chars().take(DIALOG_TITLE_CAP - 1).collect::<String>() + "\u{2026}"
+}
+
+/// The number the TUI writes in front of a row (`\u{276f} 1. Set it up` -> `Some(1)`).
+/// A row's description, written on the line below it, carries none.
+fn row_number(line: &str) -> Option<u32> {
+    let t = line.trim().trim_start_matches(MODAL_DECORATION);
+    let digits = t.len() - t.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    if digits == 0 || !(t[digits..].starts_with('.') || t[digits..].starts_with(')')) {
+        return None;
+    }
+    t[..digits].parse().ok()
 }
 
 fn strip_modal_decoration(line: &str) -> &str {
@@ -1256,6 +1305,46 @@ the full history gets re-read on your next message.
 \n\
  Enter to confirm \u{b7} Esc to cancel";
 
+    /// A **real** pane, captured 2026-09-25 while a thread jammed. Nothing was on screen but
+    /// the conversation — and the agent's own sentence about dialogs was read as a modal, so
+    /// every delivery was refused for an hour (57 retries) and the person was told to go and
+    /// answer a dialog that did not exist.
+    ///
+    /// Local details taken out; the load-bearing parts are kept as captured: the sentence runs
+    /// on past the words, it sits 14 lines above the foot, and the status line at the very
+    /// bottom says `esc to interrupt`, which a working agent always shows.
+    const JAMMED_PANE: &str = "\
+\u{25cf} The test never reached the new code path: the bridge only looks at the screen when a\n\
+  \u{2014} then Slack's stop button sent ESC and cancelled it. The dialog's footer does contain Esc to cancel, so detection should fire.\n\
+\n\
+  I've asked whether to add the deferred screen watch.\n\
+\n\
+\u{273b} Cooked for 1m 16s \u{b7} done 1:47 AM\n\
+\n\
+\u{276f} [Image #1] I am seeing issue.\n\
+  \u{23bf}  [Image #1]\n\
+\n\
+\u{25cf} Capturing the pane and finding the false footer\n\
+\n\
+\u{2500}\u{2500}\u{2500}\u{2500}\n\
+\u{276f} \u{a0}\n\
+\u{2500}\u{2500}\u{2500}\u{2500}\n\
+  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle) \u{b7} esc to interrupt \u{2190} for agents\n";
+
+    #[test]
+    fn a_sentence_about_dialogs_is_not_a_dialog() {
+        let p = Pane::new(JAMMED_PANE);
+        assert_eq!(
+            p.modal_footer(),
+            None,
+            "the agent's own words were read as a modal"
+        );
+        assert_eq!(p.dialog(), None);
+        // The same words at the foot of the pane, written as the TUI writes them, still count
+        let real = format!("{JAMMED_PANE}\n \u{276f} 1. Go ahead\n   2. Stop\n\n Enter to confirm \u{b7} Esc to cancel");
+        assert!(Pane::new(&real).modal_footer().is_some());
+    }
+
     #[test]
     fn dialog_reads_rows_that_carry_no_numbers() {
         let d = Pane::new(PERMISSION_MODAL).dialog().expect("a modal is up");
@@ -1276,6 +1365,43 @@ the full history gets re-read on your next message.
             d.title,
             "Grant the missing permissions in System Settings, then select \"Try again\"."
         );
+    }
+
+    /// The question dialog (`AskUserQuestion`), read back from a screenshot of a real pane
+    /// 2026-09-25. **Every row carries a description on the line below it**, and Claude Code
+    /// adds rows of its own past the ones that were asked for.
+    ///
+    /// From an image, so the decoration cannot be sworn to; the shape it is read for — a number
+    /// in front of every row, descriptions indented under them — is plain in the picture.
+    const QUESTION_MODAL: &str = "\
+ Which one next?\n\
+\n\
+ \u{276f} 1. Watch the screen\n\
+      Look at a quiet worker now and then, so nobody has to speak first\n\
+   2. Update the laptop\n\
+      It is the only one left behind\n\
+   3. Nothing for now\n\
+      Stop once this is confirmed\n\
+   4. Type something.\n\
+\n\
+ Enter to select \u{b7} \u{2191}/\u{2193} to navigate \u{b7} Esc to cancel";
+
+    /// The descriptions under each row used to be counted as rows of their own, which made a
+    /// 4-row list look like 7 and put the buttons out of step with the screen.
+    #[test]
+    fn a_rows_description_is_not_a_row_of_its_own() {
+        let d = Pane::new(QUESTION_MODAL).dialog().expect("a modal is up");
+        assert_eq!(
+            d.options,
+            [
+                "Watch the screen",
+                "Update the laptop",
+                "Nothing for now",
+                "Type something.",
+            ]
+        );
+        assert_eq!(d.selected, 0);
+        assert_eq!(d.title, "Which one next?");
     }
 
     #[test]

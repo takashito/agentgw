@@ -441,6 +441,9 @@ pub struct Dialog {
     pub footer: String,
     /// The rows, cleaned of their cursor, numbering and indent.
     pub options: Vec<String>,
+    /// What each row means, one per row, empty where the screen says nothing. A numbered list
+    /// writes this under the row; the question dialog's own payload carries it too.
+    pub details: Vec<String>,
     /// Index into `options` the cursor is on.
     pub selected: usize,
 }

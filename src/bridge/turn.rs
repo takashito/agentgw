@@ -4,7 +4,7 @@
 
 use super::{Bridge, DialogPending, Host};
 use crate::agent::Window;
-use crate::agent::{HookEvent, ProbeErr, SessionId};
+use crate::agent::{Dialog, HookEvent, ProbeErr, SessionId};
 use crate::bridge::state as bridge;
 use crate::bridge::state::Disposition;
 use crate::log::LogCtx;
@@ -13,6 +13,57 @@ use crate::clock::WallClock;
 use crate::chat::slack;
 
 const NARRATION_CAP: usize = 600;
+
+/// The tool that asks a person to pick from a list. Its hook payload carries the whole
+/// question, so the thread can be shown the question itself rather than "may this tool run?".
+const QUESTION_TOOL: &str = "AskUserQuestion";
+
+/// How often the quiet threads' screens are looked at, and how long a thread must have been
+/// quiet to be one of them. Long enough that an ordinary turn never brings it on: a working
+/// agent sends hooks, and each of those re-arms the clock this reads.
+const DIALOG_WATCH_EVERY_MS: u64 = 10_000;
+const DIALOG_WATCH_QUIET_MS: u64 = 10_000;
+
+/// Reads a question dialog's rows out of the hook payload (`questions[0]`, with each option's
+/// `label` and `description`).
+///
+/// **One single-select question only.** More than one, or a list to tick several of, is left to
+/// the screen: the rows there are the truth about what pressing Enter does, and a button that
+/// says otherwise would be a lie. `selected` is 0 because the cursor starts on the first row,
+/// and `footer` is empty because the payload does not say what the screen writes at its foot.
+fn question_from(input: &serde_json::Value) -> Option<Dialog> {
+    let questions = input.get("questions")?.as_array()?;
+    let [q] = questions.as_slice() else {
+        return None;
+    };
+    if q.get("multiSelect").and_then(|m| m.as_bool()) == Some(true) {
+        return None;
+    }
+    let title = q.get("question")?.as_str()?.to_string();
+    let options = q.get("options")?.as_array()?;
+    let rows: Vec<(String, String)> = options
+        .iter()
+        .filter_map(|o| {
+            let label = o.get("label")?.as_str()?.to_string();
+            let detail = o
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or_default()
+                .to_string();
+            (!label.is_empty()).then_some((label, detail))
+        })
+        .collect();
+    if rows.len() != options.len() || rows.is_empty() {
+        return None;
+    }
+    Some(Dialog {
+        title,
+        footer: String::new(),
+        selected: 0,
+        options: rows.iter().map(|(l, _)| l.clone()).collect(),
+        details: rows.into_iter().map(|(_, d)| d).collect(),
+    })
+}
 
 /// How many times one message may be re-sent after turn failures (`TURN_FAILURE_RETRY_CAP`).
 /// **Once is deliberate** — failures a re-send fixes (congestion, an API blip, a one-off without a type) clear on the next try.
@@ -137,6 +188,10 @@ impl Bridge {
                 // If blocked, the turn **continues** (re-prompt), so it's not over yet
                 if let Some(key) = key.as_ref().filter(|_| out.get("decision").is_none()) {
                     self.sticky.on_turn_end(key);
+                    // Whatever the thread was waiting for, the turn is over and it is not
+                    // waiting for it any more -- including a question answered on the machine,
+                    // which sends nothing back through the thread
+                    self.resume_stall_after_perm(key, false);
                 }
                 if let Some(respond) = ev.respond.take() {
                     let _ = respond.send(out);
@@ -609,6 +664,60 @@ impl Bridge {
         }
     }
 
+    /// Looks at the screen of every thread that has gone quiet, and offers whatever modal is
+    /// holding it to the thread as buttons.
+    ///
+    /// **A modal fires no hook**, so the screen is the only way to learn about the ones that are
+    /// not a tool call — the workspace-trust question, auto mode, the model selector, an
+    /// operating system asking for a permission. Before this, one was noticed only when someone
+    /// happened to send a message and the delivery was refused; a thread nobody spoke to simply
+    /// stopped (18 minutes on a real machine, and again on 2026-09-25).
+    ///
+    /// It costs one `capture-pane` per quiet thread per round. Threads already waiting on a
+    /// prompt are skipped, so a modal is offered once, not every round.
+    pub(super) async fn dialog_tick(&mut self) {
+        let now = self.deps.clock.now_ms();
+        if now < self.dialog_watch_at_ms {
+            return;
+        }
+        self.dialog_watch_at_ms = now + DIALOG_WATCH_EVERY_MS;
+        let quiet: Vec<ThreadKey> = self
+            .stall
+            .iter()
+            .filter(|(_, s)| now.saturating_sub(s.last_activity_ms) >= DIALOG_WATCH_QUIET_MS)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in quiet {
+            let (channel, Some(thread_ts)) = key.split() else {
+                continue;
+            };
+            let Some(window) = self
+                .threads
+                .get(&thread_ts)
+                .and_then(|e| e.agent_id.clone())
+                .and_then(|sid| self.workers.window_of(&sid))
+            else {
+                continue;
+            };
+            // Already waiting on a person here. **Asked about, not latched**: the answer to a
+            // dialog can come from the machine instead of the thread, and a flag saying "waiting"
+            // would then stay up and blind this watch to the next one
+            let waiting = self.dialog_pending.values().any(|p| p.window == window)
+                || self.perm_pending.values().any(|p| p.thread_ts == thread_ts);
+            if waiting {
+                continue;
+            }
+            let ctx = LogCtx {
+                session_id: None,
+                thread_key: Some(key.clone()),
+            };
+            if self.offer_dialog(&window, &channel, &thread_ts, &ctx).await {
+                // Waiting for a person on purpose now; the prompt is the thread's answer
+                self.suspend_stall_for_perm(&key);
+            }
+        }
+    }
+
     /// Writes the ledger to pending.json if it changed. Called from the tick and right before shutting down, nowhere else —
     /// saves aren't sprinkled over the code that touches the ledger, so new paths can't forget to write.
     pub(super) fn save_ledger(&mut self) {
@@ -730,6 +839,23 @@ impl Bridge {
             let _ = respond.send(serde_json::json!({}));
             return;
         };
+        // The question dialog carries its whole question in this payload, so there is nothing
+        // worth asking about the tool itself: let it open and put **the question** in the
+        // thread instead. Answering it there is what the person wanted to do anyway.
+        //
+        // Allowing at once also drops the wait: this hook gives up after 125s, and a question
+        // left for someone to come back to used to freeze the worker when it did.
+        if tool == QUESTION_TOOL
+            && let Some(q) = question_from(&ev.payload["tool_input"])
+        {
+            let _ = respond.send(crate::bridge::command::ToolPermission::decision_output(
+                "allow",
+                "Slack bridge (question)",
+            ));
+            self.offer_question(&ev.session_id, q, &channel, &thread_ts, ctx)
+                .await;
+            return;
+        }
         // Don't ask for a scope the person already approved. Check the narrower one (thread) first
         for (granted, scope) in [
             (
@@ -844,6 +970,37 @@ impl Bridge {
         }
     }
 
+    /// Puts a question dialog's own question in the thread, rows and all, and remembers it so
+    /// the click can answer the dialog on the agent's screen.
+    ///
+    /// The rows come from the hook, not the screen; the screen is read only when someone
+    /// presses a button, to walk the cursor onto the row they chose.
+    pub(super) async fn offer_question(
+        &mut self,
+        session_id: &str,
+        question: Dialog,
+        channel: &str,
+        thread_ts: &str,
+        ctx: &LogCtx,
+    ) {
+        let Some(window) = self.workers.window_of(session_id) else {
+            ctx.error(
+                "bridge",
+                "question: no window for this session; leaving it on the screen",
+            );
+            return;
+        };
+        if !self
+            .put_dialog(&window, question, channel, thread_ts, ctx)
+            .await
+        {
+            return;
+        }
+        // The agent is silent because it is waiting for a person, which is not silence to
+        // report. Same standing as a permission prompt: the question in the thread is the reply
+        self.suspend_stall_for_perm(&ThreadKey::new(channel, thread_ts));
+    }
+
     /// Offers the modal holding `window` to the thread as buttons. False when the screen is
     /// holding no modal (the delivery was refused for some other reason) or the prompt could
     /// not be posted -- the caller then says what it would have said anyway.
@@ -860,6 +1017,19 @@ impl Bridge {
         let Some(d) = self.deps.agent.dialog(&Window::of(window)) else {
             return false;
         };
+        self.put_dialog(window, d, channel, thread_ts, ctx).await
+    }
+
+    /// Posts the rows and writes down what the click will have to answer. Shared by the two
+    /// ways a dialog is noticed: read off the screen, or handed over by the question hook.
+    async fn put_dialog(
+        &mut self,
+        window: &str,
+        d: Dialog,
+        channel: &str,
+        thread_ts: &str,
+        ctx: &LogCtx,
+    ) -> bool {
         // One live prompt per window. An older one would answer a modal that has moved on
         self.dialog_pending.retain(|_, p| p.window != window);
         static NEXT_REQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -940,6 +1110,8 @@ impl Bridge {
                 format!("⚠️ {e}")
             }
         };
+        // Answered, so the thread is no longer silent on purpose
+        self.resume_stall_after_perm(&ThreadKey::new(&p.channel, &p.thread_ts), true);
         if let Err(e) = self
             .deps
             .slack

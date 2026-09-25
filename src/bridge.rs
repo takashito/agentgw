@@ -90,6 +90,8 @@ pub struct Bridge {
     sticky: slack::StickyBoard,
     /// Tool permissions waiting for a person's click. reqId → the waiting agent and the prompt to delete.
     perm_pending: HashMap<String, PermPending>,
+    /// When the quiet threads' screens may be looked at again (epoch ms).
+    dialog_watch_at_ms: u64,
     /// Dialogs on an agent's screen offered to the thread as buttons. reqId -> which window.
     /// One entry per window: a newer prompt for the same window replaces the older one, so a
     /// stale prompt cannot answer a modal that has since changed.
@@ -241,6 +243,7 @@ impl Bridge {
             lifecycle: bridge::Lifecycle::new(),
             sticky: slack::StickyBoard::default(),
             perm_pending: HashMap::new(),
+            dialog_watch_at_ms: 0,
             dialog_pending: HashMap::new(),
             narration: HashMap::new(),
             hooks_file: config.hooks_file,
@@ -1145,6 +1148,7 @@ impl Bridge {
                     b.run_drains().await;
                     b.flush_stickies().await;
                     b.expire_perm_prompts().await;
+                    b.dialog_tick().await;
                     b.retry_pending(&LogCtx::default());
                     b.warn_unreceived(&LogCtx::default());
                     b.give_up_stuck_deliveries(&LogCtx::default());
@@ -2332,6 +2336,110 @@ mod tests {
         );
     }
 
+    /// **Nobody has to speak first.** A modal that is not a tool call fires no hook, so it used
+    /// to be noticed only when someone happened to send a message and the delivery was refused
+    /// — a thread nobody was talking to just stopped. The quiet screens are looked at instead.
+    #[tokio::test]
+    async fn a_dialog_on_a_quiet_worker_reaches_the_thread_unprompted() {
+        let (d, slack, agent, clock) = flow_deps("quiet-dialog");
+        let (mut b, _fx) = Bridge::for_test(d);
+        running_thread(&mut b, &agent).await;
+        settle().await;
+        *agent.dialog.lock().unwrap() = Some(crate::agent::Dialog {
+            title: "Do you trust this folder?".into(),
+            footer: "Enter to confirm \u{b7} Esc to cancel".into(),
+            options: vec!["Yes, I trust it".into(), "No, exit".into()],
+            details: vec![String::new(), String::new()],
+            selected: 1,
+        });
+        // Not a word from anyone; the thread has simply gone quiet
+        clock.advance(30_000);
+        b.dialog_tick().await;
+        assert!(
+            slack.calls().iter().any(|c| c.starts_with("dialog C1") && c.contains("No, exit")),
+            "the quiet worker's dialog was never offered: {:?}",
+            slack.calls()
+        );
+        let asked = slack.calls().iter().filter(|c| c.starts_with("dialog C1")).count();
+
+        // Asked once, not once a round, while it waits for a person
+        clock.advance(30_000);
+        b.dialog_tick().await;
+        assert_eq!(
+            slack.calls().iter().filter(|c| c.starts_with("dialog C1")).count(),
+            asked,
+            "the same modal was offered again: {:?}",
+            slack.calls()
+        );
+    }
+
+    /// The question dialog's hook carries the whole question, so the thread is shown **the
+    /// question** rather than "may this tool run?", and the tool is let through at once.
+    ///
+    /// Asking for permission to ask was the wrong question twice over: the person had to say
+    /// yes before seeing what they were being asked, and the hook gives up after two minutes,
+    /// which froze the worker whenever the answer came later than that.
+    #[tokio::test]
+    async fn a_question_dialog_puts_its_own_question_in_the_thread() {
+        let (d, slack, agent, _clock) = flow_deps("question");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let sid = running_thread(&mut b, &agent).await;
+        // What the agent's screen will show once the tool is allowed to run
+        *agent.dialog.lock().unwrap() = Some(crate::agent::Dialog {
+            title: "Which one next?".into(),
+            footer: "Enter to select \u{b7} Esc to cancel".into(),
+            options: vec!["Watch the screen".into(), "Update the laptop".into()],
+            details: vec![String::new(), String::new()],
+            selected: 0,
+        });
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        b.on_hook(HookEvent {
+            kind: "perm".into(),
+            session_id: sid,
+            payload: serde_json::json!({
+                "tool_name": "AskUserQuestion",
+                "tool_use_id": "toolu_q",
+                "tool_input": {"questions": [{
+                    "question": "Which one next?",
+                    "header": "Next",
+                    "multiSelect": false,
+                    "options": [
+                        {"label": "Watch the screen", "description": "look at a quiet worker now and then"},
+                        {"label": "Update the laptop", "description": "it is the only one left behind"},
+                    ],
+                }]},
+            }),
+            respond: Some(tx),
+        })
+        .await;
+        let answer = rx.await.expect("the tool is answered at once");
+        assert!(answer.to_string().contains("\"allow\""), "{answer}");
+        assert!(
+            !slack.calls().iter().any(|c| c.starts_with("perm ")),
+            "asked for permission instead of asking the question: {:?}",
+            slack.calls()
+        );
+        let posted = slack
+            .calls()
+            .into_iter()
+            .find(|c| c.starts_with("dialog C1"))
+            .expect("the question never reached the thread");
+        assert!(
+            posted.contains("Which one next?") && posted.contains("Update the laptop"),
+            "{posted}"
+        );
+
+        // Pressing a row walks the cursor there on the agent's screen
+        let req_id = b.dialog_pending.keys().next().unwrap().clone();
+        b.on_perm_click(slack::PermClick {
+            req_id,
+            action: "dlg-1".into(),
+            by: "U_OWNER".into(),
+        })
+        .await;
+        assert_eq!(*agent.answered.lock().unwrap(), vec![Some(1)]);
+    }
+
     #[tokio::test]
     async fn the_agent_renames_the_thread_unless_a_person_named_it() {
         // Observed: the agent calls set_thread_title when the topic moves on, and the rename goes
@@ -2479,6 +2587,7 @@ mod tests {
             title: "Grant the missing permissions in System Settings.".into(),
             footer: "Enter to confirm \u{b7} Esc to cancel".into(),
             options: vec!["Open System Settings".into(), "Try again".into()],
+            details: vec![String::new(), String::new()],
             selected: 0,
         });
 
