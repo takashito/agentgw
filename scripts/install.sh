@@ -6,10 +6,13 @@
 #
 # **Runs on any machine.** The same script runs on the gateway (with the repo checked out)
 # and on a machine that `add-machine` set up (no repo, no Rust). Only the binary's source differs:
-#   1. --from <path>   a binary handed over (what add-machine copied with scp)
-#   2. curl from a GitHub release (**public repo: no auth, no gh**)
-#   3. gh from a GitHub release (fallback for a private repo; needs auth)
-#   4. the output of `cargo dist` (only with the repo checked out)
+#   1. --from <path>   a binary handed over (what add-machine copied with scp, or a local
+#                      `cargo dist` build named on purpose)
+#   2. curl from a GitHub release (**public repo: no auth, no gh**), checked against the
+#      release's .sha256
+#
+# **This is for the first install.** Later versions arrive with `upgrade` (in Slack, or
+# `agentgw upgrade` on the gateway), which replaces the binary on every machine in turn.
 #
 # A new machine installs with this one line (**not `curl … | bash`** — stdin would no
 # longer be the terminal, and `agentgw install` could not ask for the tokens):
@@ -51,11 +54,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 prefix="${PREFIX:-$HOME/.local/bin}"
 target="$prefix/agentgw"
-# CARGO_TARGET_DIR may be set per developer, so don't hard-code where builds land
-build_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
 
 # **Don't rely on rustc** — machines have no Rust. Derive the triple from uname
 # (same table as `triple_for` in src/fleet.rs)
@@ -146,47 +146,40 @@ elif [ -n "$triple" ]; then
       url="https://github.com/$repo/releases/latest/download/agentgw-$triple"
     fi
     if curl -fsSL "$url" -o "$staging/agentgw-$triple" 2>/dev/null; then
-      binary="$staging/agentgw-$triple"
-      chmod 755 "$binary"
       say "==> Downloaded $url" "==> ダウンロードしました: $url"
-    fi
-  fi
-  # 3. **gh from a release.** For a private repo (needs auth)
-  if [ -z "$binary" ] && command -v gh >/dev/null 2>&1; then
-    if gh release download ${AGENTGW_TAG:+"$AGENTGW_TAG"} \
-         --repo "$repo" \
-         --pattern "agentgw-$triple" --dir "$staging" --clobber 2>/dev/null; then
+      # **Checked against the release's .sha256** — the same check `upgrade` makes. A release made
+      # before checksums were uploaded has none: say so and go on, so an older version can still be pinned
+      if curl -fsSL "$url.sha256" -o "$staging/sum" 2>/dev/null; then
+        want="$(tr -d ' \n' < "$staging/sum" | cut -c1-64 | tr 'A-F' 'a-f')"
+        if command -v sha256sum >/dev/null 2>&1; then
+          got="$(sha256sum "$staging/agentgw-$triple" | cut -d' ' -f1)"
+        else
+          got="$(shasum -a 256 "$staging/agentgw-$triple" | cut -d' ' -f1)"
+        fi
+        if [ "$got" != "$want" ]; then
+          say "Stopped. The download doesn't match the release's checksum." \
+              "中止しました。落とした物が release のチェックサムと合いません。" >&2
+          say "  expected $want" "  期待 $want" >&2
+          say "  got      $got" "  実際 $got" >&2
+          exit 1
+        fi
+        say "  checksum matches" "  チェックサムが合いました"
+      else
+        say "  This release has no checksum to compare with (continuing)" \
+            "  この release には照合するチェックサムがありません(続けます)"
+      fi
       binary="$staging/agentgw-$triple"
       chmod 755 "$binary"
-      say "==> Downloaded $(basename "$binary") from the GitHub release" \
-          "==> GitHub の release から $(basename "$binary") をダウンロードしました"
     fi
   fi
 fi
 
 if [ -z "$binary" ]; then
-  # 4. The output of `cargo dist`. **Only with the repo checked out.** Stops if it's older than the source
-  binary="$build_dir/$triple/release/agentgw"
-  if [ ! -e "$binary" ]; then
-    say "Stopped. There's no binary to install." "中止しました。入れるバイナリがありません。" >&2
-    say "  cargo dist                  # build one here" \
-        "  cargo dist                  # ここでビルドする" >&2
-    say "  gh auth login               # or let gh download the release" \
-        "  gh auth login               # または gh で release を落とせるようにする" >&2
-    exit 1
-  fi
-  # **Close with `|| true`.** find can exit non-zero when it finds nothing, and inside an
-  # assignment `set -e` would end the script before the message
-  if [ -d "$repo_root/src" ]; then
-    stale="$(cd "$repo_root" && find src Cargo.toml Cargo.lock -newer "$binary" -print -quit 2>/dev/null || true)"
-    if [ -n "$stale" ]; then
-      say "Stopped. The binary is older than the source." "中止しました。バイナリがソースより古いままです。" >&2
-      say "  binary: $(date -r "$binary" '+%m/%d %H:%M') / ${stale}: $(date -r "$stale" '+%m/%d %H:%M')" \
-          "  バイナリ: $(date -r "$binary" '+%m/%d %H:%M') / ${stale}: $(date -r "$stale" '+%m/%d %H:%M')" >&2
-      say "  Run cargo dist to rebuild, then try again." "  cargo dist でビルドし直してから、もう一度実行してください。" >&2
-      exit 1
-    fi
-  fi
+  say "Stopped. Couldn't download agentgw for this machine ($(uname -sm))." \
+      "中止しました。このマシン用の agentgw を落とせませんでした($(uname -sm))。" >&2
+  say "  To install a binary you have, pass it: scripts/install.sh --from <binary>" \
+      "  手元のバイナリを入れるなら名指ししてください: scripts/install.sh --from <バイナリ>" >&2
+  exit 1
 fi
 
 say "==> Installing to $target" "==> $target に置きます"
