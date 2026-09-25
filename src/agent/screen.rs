@@ -47,7 +47,25 @@ const LOGIN_ERROR_MARKERS: [&str; 9] = [
 /// Decoration that can lead a line **the screen printed itself** (frame, selector, option number).
 const MODAL_DECORATION: &[char] = &[
     ' ', '\t', '│', '┃', '|', '┆', '╎', '▏', '▕', '>', '❯', '➤', '·', '•', '-', '–', '—',
+    // The "more above / more below" arrows a long list wears on its first and last visible row.
+    // Without these the row keeps its arrow, loses its number, and is read as the description of
+    // the row above it -- the model list came through with nine rows instead of ten
+    '\u{2193}', '\u{2191}',
 ];
+
+/// Characters a modal draws its frame and rules with. A line of nothing else is a separator,
+/// not something to read out in the thread.
+const MODAL_RULE: &[char] = &[
+    '\u{2594}', '\u{2581}', '\u{2500}', '\u{2501}', '\u{2550}', '\u{2504}', '\u{2508}', '\u{254c}',
+    '\u{2014}', '\u{2013}', '-', '_', '=',
+];
+
+/// True for a line that is only a rule. The model screen draws one above its title, and joining
+/// it in put a row of box-drawing characters in the thread where the question should be.
+fn is_rule(line: &str) -> bool {
+    let t = line.trim();
+    !t.is_empty() && t.chars().all(|c| MODAL_RULE.contains(&c))
+}
 
 /// Usage-limit modal prompts.
 const LIMIT_PROMPTS: Prompts = &[
@@ -875,23 +893,32 @@ const DIALOG_TITLE_CAP: usize = 300;
 /// a `?` taken from the whole pane would pick up something a person said that is still in the
 /// scrollback.
 fn dialog_title(head: &[&str], footer: &str) -> String {
-    let paragraphs: Vec<String> = head
-        .split(|l| l.trim().is_empty())
-        .filter(|p| !p.is_empty())
+    let paragraphs: Vec<Vec<String>> = head
+        // A rule is a separator like a blank line, not a line of text: the model screen draws
+        // one above its title, and joining it in wrote box-drawing characters into the thread
+        .split(|l| l.trim().is_empty() || is_rule(l))
         .map(|p| {
             p.iter()
-                .map(|l| strip_modal_decoration(l.trim()).trim_end())
+                .map(|l| strip_modal_decoration(l.trim()).trim_end().to_string())
+                .filter(|l| !l.is_empty())
                 .collect::<Vec<_>>()
-                .join(" ")
         })
-        .filter(|p| !p.is_empty())
+        .filter(|p: &Vec<String>| !p.is_empty())
         .collect();
-    let title = paragraphs
+    let chosen = paragraphs
         .iter()
         .rev()
-        .find(|p| p.contains('?'))
-        .or_else(|| paragraphs.last())
-        .map_or_else(|| footer.trim().to_string(), |p| p.clone());
+        .find(|p| p.iter().any(|l| l.contains('?')))
+        .or_else(|| paragraphs.last());
+    let title = match chosen {
+        // **A question is joined, a heading is not.** The screen wraps a question over several
+        // lines, so its words have to be put back together; a heading is followed by its own
+        // blurb, and reading that out as well buried the two words that said what was being
+        // asked ("Select model", under a paragraph about default models).
+        Some(p) if p.iter().any(|l| l.contains('?')) => p.join(" "),
+        Some(p) => p[0].clone(),
+        None => footer.trim().to_string(),
+    };
     if title.chars().count() <= DIALOG_TITLE_CAP {
         return title;
     }
@@ -1344,6 +1371,46 @@ the full history gets re-read on your next message.
         // The same words at the foot of the pane, written as the TUI writes them, still count
         let real = format!("{JAMMED_PANE}\n \u{276f} 1. Go ahead\n   2. Stop\n\n Enter to confirm \u{b7} Esc to cancel");
         assert!(Pane::new(&real).modal_footer().is_some());
+    }
+
+    /// The **real** `/model` screen, captured from a live pane 2026-09-25. Three things the
+    /// other fixtures do not have: a rule above the title, a heading with its own blurb
+    /// under it, and a list long enough to wear a scroll arrow on its last visible row.
+    const MODEL_SCREEN: &str = "\
+\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\u{2594}\n\
+   Select model\n\
+   Switch between Claude models. Your pick becomes the default for new sessions. For other/previous model names, specify with --model.\n\
+\n\
+     1.  Default (recommended)  Opus 5.5 \u{b7} Best for everyday, complex tasks\n\
+     2.  Opus 5.5               Most capable for ambitious work\n\
+     3.  Fable 5.1              For your toughest challenges\n\
+     4.  Sonnet 5               Most efficient for everyday tasks\n\
+     5.  Haiku 4.5              Fastest for quick answers\n\
+   \u{276f} 6.  Opus 5 \u{2714}               Best for everyday, complex tasks\n\
+     7.  Fable 5                Most capable for your hardest and longest-running tasks\n\
+     8.  Opus 4.8               Best for everyday, complex tasks\n\
+     9.  Opus 4.7               Best for everyday, complex tasks\n\
+   \u{2193} 10. Opus 4.6               Best for everyday, complex tasks\n\
+      \u{2026} +1 model\n\
+\n\
+   \u{25cf} High effort (default) \u{2190}/\u{2192} to adjust\n\
+\n\
+   Use /fast to turn on Fast mode (Opus 5.5).\n\
+\n\
+   Enter to set as default \u{b7} s to use this session only \u{b7} Esc to cancel";
+
+    /// Everything the live screen broke at once: the title came out as a row of box-drawing
+    /// characters followed by the blurb, and the tenth row -- the one wearing the scroll arrow --
+    /// was swallowed as the ninth row's description, so it had no button.
+    #[test]
+    fn the_real_model_screen_reads_as_a_heading_and_ten_rows() {
+        let d = Pane::new(MODEL_SCREEN).dialog().expect("a modal is up");
+        assert_eq!(d.title, "Select model");
+        assert_eq!(d.options.len(), 10, "{:?}", d.options);
+        assert!(d.options[0].starts_with("Default (recommended)"), "{:?}", d.options[0]);
+        assert!(d.options[9].starts_with("Opus 4.6"), "{:?}", d.options[9]);
+        assert_eq!(d.selected, 5, "the cursor is on the sixth row");
+        assert_eq!(d.footer, "Enter to set as default \u{b7} s to use this session only \u{b7} Esc to cancel");
     }
 
     #[test]

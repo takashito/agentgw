@@ -205,7 +205,7 @@ impl Api {
                 SlackBlockPlainTextOnly::from(label),
             )
         };
-        // Slack takes 25 elements in one actions block and 75 characters in a button
+        // Slack takes 75 characters in a button, and shows five of them per actions block
         let mut buttons: Vec<SlackActionBlockElement> = dialog
             .options
             .iter()
@@ -227,7 +227,7 @@ impl Api {
                 .with_style(SlackBlockButtonStyle::Danger)
                 .into(),
         );
-        let blocks: Vec<SlackBlock> = vec![
+        let mut blocks: Vec<SlackBlock> = vec![
             // **A markdown block, not a section.** A section is for text with a control
             // beside it, and it folds behind "Show more" unless told otherwise -- useful where
             // folding is wanted (a long diff, a long command), wrong for a question someone has
@@ -236,8 +236,15 @@ impl Api {
                 block_id: None,
                 text: dialog_body(dialog, true),
             }),
-            SlackActionsBlock::new(buttons).into(),
         ];
+        // **Five to a block.** Slack shows five buttons of an actions block and folds the rest
+        // behind "+ N more", so a ten-row list arrived with half its choices hidden. Blocks of
+        // five each show in full — checked against the real API before relying on it
+        blocks.extend(
+            buttons
+                .chunks(BUTTONS_PER_BLOCK)
+                .map(|row| SlackActionsBlock::new(row.to_vec()).into()),
+        );
         let req = SlackApiChatPostMessageRequest::new(
             channel.into(),
             SlackMessageContent::new()
@@ -1848,6 +1855,9 @@ pub fn unanswered_dialog(d: &crate::agent::Dialog, why: &str) -> String {
 
 /// Buttons in one actions block, leaving room for Cancel under Slack's 25.
 const DIALOG_BUTTON_CAP: usize = 20;
+
+/// How many buttons Slack shows in one actions block before folding the rest away.
+const BUTTONS_PER_BLOCK: usize = 5;
 
 /// A row as a button label. Slack takes 75 characters and rejects an empty one.
 fn button_label(option: &str) -> String {
