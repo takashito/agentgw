@@ -1029,6 +1029,10 @@ impl Bridge {
         };
         e.awaiting_perm = true;
         e.shown = false;
+        // **Waiting, not working.** Slack marks a `suspended` session in the sidebar, so a thread
+        // held at a question or an approval stands out from the ones that are simply busy —
+        // before, it spun like all of them and had to be opened to be noticed
+        e.thinking.wait();
     }
 
     /// A permission was settled. `rearm` = a person clicked (restart measuring silence).
@@ -1038,10 +1042,16 @@ impl Bridge {
         let Some(e) = self.stall.get_mut(key) else {
             return;
         };
-        e.awaiting_perm = false;
+        let was_waiting = std::mem::replace(&mut e.awaiting_perm, false);
         e.shown = false;
         if rearm {
             e.last_activity_ms = self.deps.clock.now_ms();
+            // A person answered, so the turn goes on. **Said here, not left to the next hook**:
+            // ordinary activity only re-arms the silence watch, so the thread would have kept its
+            // "waiting on you" mark while the agent was already back at work
+            if was_waiting {
+                e.thinking.set(true);
+            }
         }
     }
 

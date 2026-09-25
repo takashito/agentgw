@@ -560,11 +560,20 @@ impl Api {
     /// status of "is checking the plumbing…" came out as "Claude is working…"), so the text that
     /// callers pass only decides busy from idle.
     ///
-    pub async fn set_busy(&self, channel: &str, thread_ts: &str, busy: bool) -> Result<(), String> {
-        let status = if busy {
-            SlackAgentSessionStatus::Processing
-        } else {
-            SlackAgentSessionStatus::Active
+    pub async fn set_presence(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        presence: crate::chat::Presence,
+    ) -> Result<(), String> {
+        use crate::chat::Presence;
+        let status = match presence {
+            Presence::Working => SlackAgentSessionStatus::Processing,
+            Presence::Idle => SlackAgentSessionStatus::Active,
+            // "The agent cannot make progress until the user intervenes, for example when the
+            // agent needs user clarification or a tool approval" (the method's reference). Shown
+            // as an attention mark in the sidebar, where `processing` spins like every other
+            Presence::Waiting => SlackAgentSessionStatus::Suspended,
         };
         let req = SlackApiAgentsSessionsSetStatusRequest::new(status)
             .with_channel_id(channel.into())
@@ -960,13 +969,13 @@ fn without_markup(text: &str) -> String {
 impl dyn Chat {
     /// Send one assistant status call and log it. **best-effort, but never silent** —
     /// both success and failure are logged. Not blocking the caller is the caller's responsibility.
-    pub async fn busy(&self, channel: &str, thread_ts: &str, busy: bool) {
+    pub async fn presence(&self, channel: &str, thread_ts: &str, presence: crate::chat::Presence) {
         let ctx = LogCtx {
             session_id: None,
             thread_key: Some(ThreadKey::new(channel, thread_ts)),
         };
-        let what = if busy { "busy" } else { "idle" };
-        match self.set_busy(channel, thread_ts, busy).await {
+        let what = presence.word();
+        match self.set_presence(channel, thread_ts, presence).await {
             Ok(()) => ctx.debug("bridge", &format!("session {what}")),
             Err(e) => ctx.debug("bridge", &format!("session {what} failed: {e}")),
         }
@@ -1138,8 +1147,13 @@ impl crate::chat::Chat for Api {
     ) -> Result<(), String> {
         Api::upload_file(self, channel, thread_ts, path).await
     }
-    async fn set_busy(&self, channel: &str, thread_ts: &str, busy: bool) -> Result<(), String> {
-        Api::set_busy(self, channel, thread_ts, busy).await
+    async fn set_presence(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        presence: crate::chat::Presence,
+    ) -> Result<(), String> {
+        Api::set_presence(self, channel, thread_ts, presence).await
     }
     async fn start_session(
         &self,
@@ -1913,24 +1927,24 @@ pub const SILENCE_MS: u64 = 3_000;
 /// catches the rest, so **it never gets stuck** — at worst "the agent's shimmer disappears
 /// during the command". Fix it once a shared per-thread-key registry (Arc/Weak + cleanup)
 /// is worth threading through the 10 places that create a guard
-pub struct Thinking(tokio::sync::mpsc::UnboundedSender<bool>);
+pub struct Thinking(tokio::sync::mpsc::UnboundedSender<crate::chat::Presence>);
 
 impl Thinking {
     pub fn new(api: crate::chat::ChatRef, channel: &str, thread_ts: &str, busy: bool) -> Self {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<bool>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::chat::Presence>();
         let (channel, thread_ts) = (channel.to_string(), thread_ts.to_string());
         tokio::spawn(async move {
             // **Only changes go out.** Slack draws the busy state itself now, so two "is typing…"
             // in the same second are the same picture twice — and the compact tick re-sets every
             // 800ms. A thread starts idle, so a guard that never showed anything sends nothing on
             // Drop either
-            let mut sent = false;
-            while let Some(busy) = rx.recv().await {
-                if busy == sent {
+            let mut sent = crate::chat::Presence::Idle;
+            while let Some(now) = rx.recv().await {
+                if now == sent {
                     continue;
                 }
-                sent = busy;
-                api.busy(&channel, &thread_ts, busy).await;
+                sent = now;
+                api.presence(&channel, &thread_ts, now).await;
             }
         });
         let t = Self(tx);
@@ -1945,7 +1959,18 @@ impl Thinking {
 
     /// Busy while a turn is in flight, idle when it is over.
     pub fn set(&self, busy: bool) {
-        let _ = self.0.send(busy);
+        let now = if busy {
+            crate::chat::Presence::Working
+        } else {
+            crate::chat::Presence::Idle
+        };
+        let _ = self.0.send(now);
+    }
+
+    /// Held until a person answers something — a question or a tool approval. Leaves when the
+    /// turn goes on (`set(true)`) or ends (`set(false)`, or the guard's drop).
+    pub fn wait(&self) {
+        let _ = self.0.send(crate::chat::Presence::Waiting);
     }
 }
 

@@ -369,7 +369,7 @@ impl Bridge {
             slack::Api::brief_call(
                 "restart: thinking status set failed",
                 self.deps.slack
-                    .set_busy(channel, root_ts, true),
+                    .set_presence(channel, root_ts, crate::chat::Presence::Working),
                 ctx,
             )
             .await;
@@ -445,7 +445,7 @@ impl Bridge {
         if let Some((channel, root_ts)) = req {
             slack::Api::brief_call(
                 "restart: thinking status clear failed",
-                self.deps.slack.set_busy(channel, root_ts, false),
+                self.deps.slack.set_presence(channel, root_ts, crate::chat::Presence::Idle),
                 ctx,
             )
             .await;
@@ -2485,6 +2485,72 @@ mod tests {
             *agent.answered.lock().unwrap(),
             vec![Some(1)],
             "the click reached the agent's screen: {:?}",
+            slack.calls()
+        );
+    }
+
+    /// **A thread waiting on a person says so.** Held at a question it used to spin like every
+    /// busy thread; now it goes `suspended`, which Slack marks in the sidebar, and goes back to
+    /// working the moment someone answers — not at the next hook, which only re-arms the
+    /// silence watch and would have left the "waiting on you" mark up while the agent worked.
+    #[tokio::test]
+    async fn a_thread_waiting_on_a_question_is_marked_waiting_until_answered() {
+        let (d, slack, agent, _clock) = flow_deps("presence");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let sid = running_thread(&mut b, &agent).await;
+        settle().await;
+        let statuses = |s: &FakeChat| -> Vec<String> {
+            s.calls().into_iter().filter(|c| c.starts_with("status C1")).collect()
+        };
+
+        *agent.dialog.lock().unwrap() = Some(crate::agent::Dialog {
+            title: "Which one next?".into(),
+            footer: String::new(),
+            options: vec!["Keep going".into(), "Stop here".into()],
+            details: vec![String::new(), String::new()],
+            selected: 0,
+            asked: true,
+        });
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        b.on_hook(HookEvent {
+            kind: "perm".into(),
+            session_id: sid,
+            payload: serde_json::json!({
+                "tool_name": "AskUserQuestion",
+                "tool_use_id": "toolu_q",
+                "tool_input": {"questions": [{
+                    "question": "Which one next?",
+                    "header": "Next",
+                    "multiSelect": false,
+                    "options": [
+                        {"label": "Keep going", "description": ""},
+                        {"label": "Stop here", "description": ""},
+                    ],
+                }]},
+            }),
+            respond: Some(tx),
+        })
+        .await;
+        settle().await;
+        assert_eq!(
+            statuses(&slack).last().map(String::as_str),
+            Some(format!("status C1 {ROOT} waiting").as_str()),
+            "{:?}",
+            slack.calls()
+        );
+
+        let req_id = b.dialog_pending.keys().next().unwrap().clone();
+        b.on_perm_click(slack::PermClick {
+            req_id,
+            action: "dlg-0".into(),
+            by: "U_OWNER".into(),
+        })
+        .await;
+        settle().await;
+        assert_eq!(
+            statuses(&slack).last().map(String::as_str),
+            Some(format!("status C1 {ROOT} busy").as_str()),
+            "still marked waiting after the answer: {:?}",
             slack.calls()
         );
     }

@@ -234,6 +234,31 @@ impl FetchedMsg {
 
 /// What the core asks of the chat platform: post, edit, react, read. Implemented by
 /// `chat::slack::Api`; the methods still speak Slack's terms (`ts`, `thread_ts`).
+/// What a thread's agent session shows in Slack.
+///
+/// **Waiting is its own state, not a kind of busy.** A thread held at a question or a tool
+/// approval is not working — it cannot move until a person does something — and Slack has a
+/// state for exactly that (`suspended`: "the agent needs user clarification or a tool
+/// approval"). It shows as an attention mark in the sidebar, so the threads waiting on someone
+/// can be found without opening each channel; left as busy they spun like every working thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Presence {
+    Idle,
+    Working,
+    Waiting,
+}
+
+impl Presence {
+    /// For the log line.
+    pub fn word(self) -> &'static str {
+        match self {
+            Presence::Idle => "idle",
+            Presence::Working => "busy",
+            Presence::Waiting => "waiting",
+        }
+    }
+}
+
 #[async_trait]
 pub trait Chat: Send + Sync + 'static {
     async fn post_message(
@@ -308,9 +333,14 @@ pub trait Chat: Send + Sync + 'static {
         thread_ts: Option<&str>,
         path: &Path,
     ) -> Result<(), String>;
-    /// Busy while a turn is in flight, idle when it is over. Slack draws it — a working line and,
-    /// with `agent_session_stopped` subscribed, a stop button.
-    async fn set_busy(&self, channel: &str, thread_ts: &str, busy: bool) -> Result<(), String>;
+    /// What the thread's session shows: working, waiting on a person, or idle. Slack draws it —
+    /// a working line and a stop button, an attention mark in the sidebar, or nothing.
+    async fn set_presence(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        presence: Presence,
+    ) -> Result<(), String>;
     /// Register a thread as an agent session named `title` — what the `Agents & tools` sidebar lists.
     async fn start_session(
         &self,
@@ -565,8 +595,8 @@ pub mod fake {
             std::fs::metadata(p).map_err(|e| format!("read {}: {e}", p.display()))?;
             self.record(format!("upload {c} {} {}", th.unwrap_or("-"), p.display()))
         }
-        async fn set_busy(&self, c: &str, th: &str, busy: bool) -> Result<(), String> {
-            self.record(format!("status {c} {th} {}", if busy { "busy" } else { "idle" }))
+        async fn set_presence(&self, c: &str, th: &str, p: Presence) -> Result<(), String> {
+            self.record(format!("status {c} {th} {}", p.word()))
         }
         async fn start_session(&self, c: &str, th: &str, title: &str) -> Result<(), String> {
             self.record(format!("session {c} {th} {title}"))
