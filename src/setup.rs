@@ -4,6 +4,7 @@
 
 pub mod add_machine;
 pub mod ssh;
+pub mod upgrade;
 
 use crate::bridge::gateway::link;
 use crate::state_dir::{StateDir, set_env_keys};

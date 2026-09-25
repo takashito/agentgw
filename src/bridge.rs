@@ -795,6 +795,12 @@ impl Bridge {
                                 "bridge",
                                 &format!("remote link: {} — retrying until it is fixed", f.message()),
                             );
+                            // Refused as too old before anything started: nothing here to wind down,
+                            // so step down and let the service manager start the new binary
+                            if f == machine::Fatal::WrongVersion && machine::upgrade_after_refusal().await {
+                                LogCtx::default().info("bridge", "remote link: upgraded — restarting into the new binary");
+                                std::process::exit(0);
+                            }
                             continue;
                         }
                         Some(_) => continue, // anything arriving before acceptance is dropped
@@ -843,6 +849,8 @@ impl Bridge {
         let (down_tx, down_rx) = mpsc::channel::<machine::FromRelay>(64);
         // The signal that the link to the gateway was re-established (only machines use it)
         let (relink_tx, mut relink_rx) = mpsc::channel(4);
+        // A new binary is in place (`upgrade`): restart into it the way `restart` does
+        let (upgraded_tx, mut upgraded_rx) = mpsc::channel::<String>(4);
         consume_restart_marker(&dir, api.as_ref()).await;
 
         // When accepting machines, Slack events go here **before being folded**. Once it's decided whose they are,
@@ -896,6 +904,7 @@ impl Bridge {
                 tokio::spawn(crate::bridge::gateway::serve_children(fleet.clone(), addr));
             }
             tokio::spawn(fleet.clone().watch_presence());
+            tokio::spawn(fleet.clone().drive_upgrades());
             {
                 // Frames the gateway addresses to itself, handled exactly as a machine handles the
                 // ones that come down its link
@@ -910,6 +919,7 @@ impl Bridge {
                     gateway_url: String::new(),
                     left: left_tx.clone(),
                     arriving: arriving_tx.clone(),
+                    upgraded: upgraded_tx.clone(),
                 };
                 let mut down_rx = down_rx;
                 tokio::spawn(async move {
@@ -1017,6 +1027,7 @@ impl Bridge {
                     gateway_url: link_address.clone(),
                     left: left_tx.clone(),
                     arriving: arriving_tx.clone(),
+                    upgraded: upgraded_tx.clone(),
                 };
                 tokio::spawn(async move {
                     while let Some(item) = rx.recv().await {
@@ -1162,6 +1173,9 @@ impl Bridge {
                 // A restart request from the operator. Joins the same path as Slack's `restart`,
                 // skipping the checklist, status and marker since there's no requester thread
                 _ = sigusr1.recv() => b.maintenance_restart("SIGUSR1", None, &LogCtx::default()).await,
+                // `upgrade` put a new binary where this one was started from. The same restart as
+                // `restart`: agents keep running, and the service manager starts the new file
+                Some(why) = upgraded_rx.recv() => b.maintenance_restart(&why, None, &LogCtx::default()).await,
                 else => break,
             }
         }
@@ -1342,6 +1356,8 @@ struct RelaySinks {
     left: mpsc::Sender<(String, String, String, String)>,
     /// Slices of a conversation arriving from the machine that had the thread.
     arriving: mpsc::Sender<ArrivingThread>,
+    /// A new binary is in place: the main loop restarts into it (the reason goes in the log).
+    upgraded: mpsc::Sender<String>,
 }
 
 /// Tell the gateway where this machine works for each of its channels. The folders are **this machine's
@@ -1374,6 +1390,9 @@ fn report_folders(
         host,
         ip,
         url: gateway_url.unwrap_or_default().to_string(),
+    });
+    let _ = up.send(crate::bridge::gateway::link::LinkFrame::MachineVersion {
+        version: env!("CARGO_PKG_VERSION").to_string(),
     });
     for (channel, route) in bridge::Access::load(dir).routes {
         let Some(path) = route.repo_path.filter(|p| !p.is_empty()) else {
@@ -1429,6 +1448,7 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
         gateway_url,
         left,
         arriving,
+        upgraded,
     } = sinks;
     match item {
         machine::FromRelay::Event { name, event } => {
@@ -1569,6 +1589,38 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
         // keep running. New Slack messages just stop coming until a person fixes the config and restarts
         machine::FromRelay::Fatal(f) => {
             LogCtx::default().error("bridge", &format!("remote link: {} — no new messages will arrive (running workers keep going)", f.message()));
+            if f == machine::Fatal::WrongVersion && machine::upgrade_after_refusal().await {
+                let _ = upgraded.send("upgrade after the gateway refused this version".into()).await;
+            }
+        }
+        // The gateway's `upgrade`: replace this binary, then restart into it. **Off this task** — the
+        // download takes a while, and Slack events keep flowing meanwhile
+        machine::FromRelay::Upgrade { version } => {
+            let (up, upgraded) = (up.clone(), upgraded.clone());
+            tokio::spawn(async move {
+                let me = env!("CARGO_PKG_VERSION");
+                // Already there (a repeated ask): say so, and the gateway counts it done
+                if crate::setup::upgrade::version_of(&version) == me {
+                    let _ = up.send(crate::bridge::gateway::link::LinkFrame::MachineVersion {
+                        version: me.to_string(),
+                    });
+                    return;
+                }
+                let tag = crate::setup::upgrade::tag_of(&version);
+                LogCtx::default().info("bridge", &format!("upgrade: {me} → {tag}"));
+                match crate::setup::upgrade::self_replace(&tag).await {
+                    Ok(()) => {
+                        let _ = upgraded.send(format!("upgrade to {tag}")).await;
+                    }
+                    Err(why) => {
+                        LogCtx::default().error("bridge", &format!("upgrade to {tag} failed: {why}"));
+                        let _ = up.send(crate::bridge::gateway::link::LinkFrame::UpgradeFailed {
+                            version,
+                            why,
+                        });
+                    }
+                }
+            });
         }
     }
 }
@@ -1852,7 +1904,7 @@ mod tests {
         let (reload, mut reload_rx) = mpsc::channel(4);
         let (relink, _relink_rx) = mpsc::channel(4);
         let (up, mut up_rx) = mpsc::unbounded_channel();
-        let sinks = RelaySinks { msg_tx, click_tx, dir: dir.clone(), reload, relink, up, machine: "desk".into(), gateway_url: String::new(), left: mpsc::channel(4).0, arriving: mpsc::channel(4).0 };
+        let sinks = RelaySinks { msg_tx, click_tx, dir: dir.clone(), reload, relink, up, machine: "desk".into(), gateway_url: String::new(), left: mpsc::channel(4).0, arriving: mpsc::channel(4).0, upgraded: mpsc::channel(4).0 };
         let ask = |path: &str| machine::FromRelay::SetProject {
             channel: "C1".into(),
             thread_ts: "1.1".into(),
@@ -1902,6 +1954,7 @@ mod tests {
             gateway_url: String::new(),
             left: mpsc::channel(4).0,
             arriving: mpsc::channel(4).0,
+            upgraded: mpsc::channel(4).0,
         };
         pump_relay(
             machine::FromRelay::Linked {
@@ -3148,6 +3201,11 @@ mod tests {
         };
         assert!(!host.is_empty(), "a machine always knows its own name");
         assert_eq!(url, "ws://hub.lan:8787");
+        // …and what it runs, so `machines` can show it and `upgrade` can tell when it came back
+        assert_eq!(
+            up_rx.try_recv(),
+            Ok(LinkFrame::MachineVersion { version: env!("CARGO_PKG_VERSION").into() })
+        );
         assert_eq!(
             up_rx.try_recv(),
             Ok(LinkFrame::ProjectSet {

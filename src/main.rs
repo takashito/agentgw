@@ -58,6 +58,12 @@ async fn main() {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             std::process::exit(agentgw::setup::add_machine::cli(&rest).await);
         }
+        // Ask the running gateway to upgrade itself and then every machine
+        "upgrade" => {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            let dir = agentgw::state_dir::StateDir::resolve();
+            std::process::exit(agentgw::bridge::gateway::Cli::upgrade(&dir, &rest).await);
+        }
         "install" | "uninstall" => {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             std::process::exit(agentgw::setup::run(&cmd, &rest));
@@ -92,6 +98,7 @@ async fn main() {
                      \n\
                      First:      install  set up this machine (as the gateway or as a machine) and start it\n\
                      Day to day: status | restart | shutdown | start | uninstall\n\
+                     Upgrade:    upgrade [version]   the gateway, then every machine one at a time\n\
                      \n\
                      Add a machine (run on the gateway):\n  \
                      add-machine user@host   install agentgw on another machine and connect it here\n\
@@ -101,6 +108,7 @@ async fn main() {
                      \n\
                      まず:   install            このマシンを設定して起動する(ゲートウェイかマシンかを訊きます)\n\
                      ふだん: status | restart | shutdown | start | uninstall\n\
+                     上げる: upgrade [版]         ゲートウェイ、次に各マシンを1台ずつ\n\
                      \n\
                      マシンを足すとき(ゲートウェイで):\n  \
                      add-machine user@host   ほかのマシンに agentgw を入れて、ここにつなぐ\n\

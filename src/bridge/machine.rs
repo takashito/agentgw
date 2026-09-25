@@ -64,6 +64,43 @@ impl Fatal {
     }
 }
 
+/// The gateway refused this version (426): **upgrade to the latest release**, so a machine left behind by
+/// a change in the link format finds its own way back. `true` = a new binary is in place and the caller
+/// should restart.
+///
+/// **Once per process**, and only to something newer — if the latest is no newer than us the refusal is
+/// not ours to fix, and trying again on every reconnect would download the same file every few seconds.
+pub async fn upgrade_after_refusal() -> bool {
+    static TRIED: AtomicBool = AtomicBool::new(false);
+    if TRIED.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    let ctx = LogCtx::default();
+    let me = env!("CARGO_PKG_VERSION");
+    let latest = match crate::setup::upgrade::latest_tag().await {
+        Ok(t) => t,
+        Err(e) => {
+            ctx.error("bridge", &format!("remote link: refused as too old, and {e}"));
+            return false;
+        }
+    };
+    if !crate::setup::upgrade::older(me, &latest) {
+        ctx.error(
+            "bridge",
+            &format!("remote link: refused as too old, but the latest release ({latest}) is no newer than {me}"),
+        );
+        return false;
+    }
+    ctx.info("bridge", &format!("remote link: refused as too old — upgrading {me} → {latest}"));
+    match crate::setup::upgrade::self_replace(&latest).await {
+        Ok(()) => true,
+        Err(e) => {
+            ctx.error("bridge", &format!("remote link: could not upgrade to {latest}: {e}"));
+            false
+        }
+    }
+}
+
 /// What the Bridge uses out of what arrives from the Relay.
 pub enum FromRelay {
     /// Accepted. The bot token (**in memory only**) and the current home.
@@ -120,6 +157,8 @@ pub enum FromRelay {
         last: bool,
         data: String,
     },
+    /// Replace this machine's agentgw with this release, then restart.
+    Upgrade { version: String },
     /// A refusal that talking won't fix. **No retry.**
     Fatal(Fatal),
 }
@@ -219,6 +258,7 @@ impl FromRelay {
                 data,
             },
             F::Home { channel } => FromRelay::Home { channel },
+            F::Upgrade { version } => FromRelay::Upgrade { version },
             // Answers and asks only ever go the other way
             F::ProjectSet { .. }
             | F::Channels { .. }
@@ -226,6 +266,9 @@ impl FromRelay {
             | F::SetHome { .. }
             | F::MachineHome { .. }
             | F::MachineHost { .. }
+            | F::MachineVersion { .. }
+            | F::StartUpgrade { .. }
+            | F::UpgradeFailed { .. }
             | F::Machines { .. } => {
                 return None;
             }

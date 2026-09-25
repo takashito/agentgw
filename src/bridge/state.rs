@@ -662,6 +662,10 @@ pub struct Link {
     /// When this link last carried a connection.
     #[serde(rename = "lastSeen", default, skip_serializing_if = "String::is_empty")]
     pub last_seen: String,
+    /// The agentgw version the machine said it runs when it last connected. Empty for a machine too
+    /// old to say — `upgrade` can't reach those, so they are installed by hand once.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub version: String,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -705,6 +709,151 @@ fn is_loopback(host: &str) -> bool {
         || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
+/// An `upgrade` going through the fleet: the gateway first, then each machine **one at a time**.
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
+pub struct Rollout {
+    /// The version everything is going to (`0.56.0`).
+    pub target: String,
+    /// Where the progress message is, so the next process edits the same one.
+    #[serde(default)]
+    pub channel: String,
+    #[serde(rename = "threadTs", default)]
+    pub thread_ts: String,
+    #[serde(rename = "progressTs", default)]
+    pub progress_ts: String,
+    /// In the order they go. The gateway is first.
+    #[serde(default)]
+    pub machines: Vec<RolloutStep>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// One machine's part in a [`Rollout`].
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
+pub struct RolloutStep {
+    pub id: String,
+    /// The version it ran when the rollout started. Empty = it never said.
+    #[serde(default)]
+    pub from: String,
+    /// One of the `RolloutStep::` constants. Kept as text so a newer state survives a round trip.
+    #[serde(default)]
+    pub state: String,
+    /// When it was told to upgrade (ms since the epoch).
+    #[serde(rename = "startedMs", default, skip_serializing_if = "is_zero")]
+    pub started_ms: u64,
+    /// Why it failed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+impl RolloutStep {
+    pub const PENDING: &'static str = "pending";
+    pub const UPGRADING: &'static str = "upgrading";
+    pub const DONE: &'static str = "done";
+    pub const FAILED: &'static str = "failed";
+    pub const OFFLINE: &'static str = "offline";
+    /// Never said its version: too old to understand `upgrade`.
+    pub const TOO_OLD: &'static str = "tooOld";
+
+    pub fn new(id: &str, from: &str) -> Self {
+        RolloutStep {
+            id: id.to_string(),
+            from: from.to_string(),
+            state: Self::PENDING.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Still to do something about (anything else is where it ended).
+    pub fn open(&self) -> bool {
+        self.state == Self::PENDING || self.state == Self::UPGRADING
+    }
+}
+
+/// What the gateway does next for a [`Rollout`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum RolloutNext {
+    /// Tell this machine to upgrade.
+    Send(String),
+    /// A machine is on its way; look again later.
+    Wait,
+    /// Every machine has ended one way or another.
+    Finished,
+}
+
+impl Rollout {
+    /// Move the rollout on from what is known now, and say what to do. **Pure** — the gateway passes
+    /// in who is connected and what each said it runs (`me` answers with `my_version`: the gateway
+    /// is not connected to itself). Machines go one at a time: the next one is only told once the one
+    /// before has ended, and **ending badly doesn't stop the rest**.
+    pub fn advance(
+        &mut self,
+        me: &str,
+        my_version: &str,
+        connected: &[String],
+        version_of: impl Fn(&str) -> String,
+        now_ms: u64,
+    ) -> RolloutNext {
+        let target = self.target.clone();
+        for step in self.machines.iter_mut().filter(|s| s.open()) {
+            let is_me = step.id == me;
+            let here = is_me || connected.iter().any(|c| c == &step.id);
+            let runs = if is_me { my_version.to_string() } else { version_of(&step.id) };
+            if here && runs == target {
+                step.state = RolloutStep::DONE.to_string();
+                continue;
+            }
+            if step.state == RolloutStep::PENDING {
+                if !here {
+                    step.state = RolloutStep::OFFLINE.to_string();
+                    continue;
+                }
+                if runs.is_empty() {
+                    step.state = RolloutStep::TOO_OLD.to_string();
+                    continue;
+                }
+                step.state = RolloutStep::UPGRADING.to_string();
+                step.started_ms = now_ms;
+                return RolloutNext::Send(step.id.clone());
+            }
+            // On its way: it has the time it takes to download, restart and reconnect
+            if now_ms.saturating_sub(step.started_ms) > crate::setup::upgrade::COME_BACK_MS {
+                step.state = RolloutStep::FAILED.to_string();
+                step.note = crate::t!(
+                    "did not come back on {target} within 5 minutes",
+                    "5分以内に {target} で戻ってきませんでした"
+                );
+                continue;
+            }
+            return RolloutNext::Wait;
+        }
+        RolloutNext::Finished
+    }
+
+    /// The machine said it could not upgrade. Only the one on its way can fail — a stray answer from
+    /// another is ignored.
+    pub fn failed(&mut self, id: &str, why: &str) -> bool {
+        match self
+            .machines
+            .iter_mut()
+            .find(|s| s.id == id && s.state == RolloutStep::UPGRADING)
+        {
+            Some(step) => {
+                step.state = RolloutStep::FAILED.to_string();
+                step.note = why.to_string();
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 /// access.json. Empty owner = nobody gets in (fail-closed).
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct Access {
@@ -732,6 +881,10 @@ pub struct Access {
     /// **A machine's gateway.** Unset on a gateway.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gateway: Option<Link>,
+    /// **An `upgrade` in progress**, on the gateway. Kept here rather than in memory because the
+    /// gateway replaces itself halfway through: the process that finishes is not the one that started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upgrade: Option<Rollout>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -1473,6 +1626,111 @@ mod tests {
 
     use super::*;
     use crate::chat::deletion_notice;
+
+    fn rollout(ids: &[(&str, &str)]) -> Rollout {
+        Rollout {
+            target: "0.56.0".into(),
+            machines: ids.iter().map(|(id, from)| RolloutStep::new(id, from)).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn states(r: &Rollout) -> Vec<&str> {
+        r.machines.iter().map(|s| s.state.as_str()).collect()
+    }
+
+    const T0: u64 = 1_000_000;
+
+    #[test]
+    fn machines_go_one_at_a_time() {
+        let mut r = rollout(&[("gw", "0.55.0"), ("a", "0.55.0"), ("b", "0.55.0")]);
+        let all = ["a".to_string(), "b".to_string()];
+        let mut versions: HashMap<&str, &str> = HashMap::from([("a", "0.55.0"), ("b", "0.55.0")]);
+        // The gateway goes first
+        let v = versions.clone();
+        let ask = |id: &str| v.get(id).unwrap_or(&"").to_string();
+        assert_eq!(r.advance("gw", "0.55.0", &all, ask, T0), RolloutNext::Send("gw".into()));
+        // The successor runs the new version: the gateway is done, and only then is `a` told
+        let v = versions.clone();
+        let ask = |id: &str| v.get(id).unwrap_or(&"").to_string();
+        assert_eq!(r.advance("gw", "0.56.0", &all, ask, T0 + 10), RolloutNext::Send("a".into()));
+        // `a` is on its way and `b` is not told yet
+        let v = versions.clone();
+        let ask = |id: &str| v.get(id).unwrap_or(&"").to_string();
+        assert_eq!(r.advance("gw", "0.56.0", &all, ask, T0 + 20), RolloutNext::Wait);
+        assert_eq!(states(&r), ["done", "upgrading", "pending"]);
+        // `a` came back saying the new version
+        versions.insert("a", "0.56.0");
+        let v = versions.clone();
+        let ask = |id: &str| v.get(id).unwrap_or(&"").to_string();
+        assert_eq!(r.advance("gw", "0.56.0", &all, ask, T0 + 30), RolloutNext::Send("b".into()));
+        versions.insert("b", "0.56.0");
+        let v = versions.clone();
+        let ask = |id: &str| v.get(id).unwrap_or(&"").to_string();
+        assert_eq!(r.advance("gw", "0.56.0", &all, ask, T0 + 40), RolloutNext::Finished);
+        assert_eq!(states(&r), ["done", "done", "done"]);
+    }
+
+    #[test]
+    fn a_failed_machine_is_skipped_and_the_rest_go_on() {
+        let mut r = rollout(&[("gw", "0.56.0"), ("a", "0.55.0"), ("b", "0.55.0")]);
+        let all = ["a".to_string(), "b".to_string()];
+        let old = |_: &str| "0.55.0".to_string();
+        assert_eq!(r.advance("gw", "0.56.0", &all, old, T0), RolloutNext::Send("a".into()));
+        assert!(r.failed("a", "checksum mismatch"));
+        assert_eq!(r.advance("gw", "0.56.0", &all, old, T0 + 10), RolloutNext::Send("b".into()));
+        assert_eq!(r.machines[1].note, "checksum mismatch");
+        // Only the one on its way can fail
+        assert!(!r.failed("a", "again"));
+    }
+
+    #[test]
+    fn a_machine_that_does_not_come_back_is_skipped_after_five_minutes() {
+        let mut r = rollout(&[("gw", "0.56.0"), ("a", "0.55.0"), ("b", "0.55.0")]);
+        let old = |_: &str| "0.55.0".to_string();
+        let b_only = ["b".to_string()];
+        let all = ["a".to_string(), "b".to_string()];
+        assert_eq!(r.advance("gw", "0.56.0", &all, old, T0), RolloutNext::Send("a".into()));
+        // Gone to restart, not back yet
+        let wait = T0 + crate::setup::upgrade::COME_BACK_MS;
+        assert_eq!(r.advance("gw", "0.56.0", &b_only, old, wait), RolloutNext::Wait);
+        assert_eq!(r.advance("gw", "0.56.0", &b_only, old, wait + 1), RolloutNext::Send("b".into()));
+        assert_eq!(states(&r)[1], "failed");
+        assert!(r.machines[1].note.contains("5 minutes"), "{}", r.machines[1].note);
+    }
+
+    #[test]
+    fn a_machine_back_on_the_old_version_keeps_the_rollout_waiting() {
+        let mut r = rollout(&[("gw", "0.56.0"), ("a", "0.55.0")]);
+        let all = ["a".to_string()];
+        let old = |_: &str| "0.55.0".to_string();
+        assert_eq!(r.advance("gw", "0.56.0", &all, old, T0), RolloutNext::Send("a".into()));
+        assert_eq!(r.advance("gw", "0.56.0", &all, old, T0 + 60_000), RolloutNext::Wait);
+    }
+
+    #[test]
+    fn offline_and_too_old_machines_are_skipped_without_being_told() {
+        let mut r = rollout(&[("gw", "0.56.0"), ("away", "0.55.0"), ("old", ""), ("current", "0.56.0")]);
+        let here = ["old".to_string(), "current".to_string()];
+        let ask = |id: &str| if id == "current" { "0.56.0".to_string() } else { String::new() };
+        assert_eq!(r.advance("gw", "0.56.0", &here, ask, T0), RolloutNext::Finished);
+        assert_eq!(states(&r), ["done", "offline", "tooOld", "done"]);
+    }
+
+    #[test]
+    fn the_rollout_survives_a_round_trip_through_access_json() {
+        let mut r = rollout(&[("gw", "0.55.0"), ("a", "0.55.0")]);
+        r.channel = "D1".into();
+        r.progress_ts = "1.2".into();
+        r.machines[0].state = RolloutStep::UPGRADING.into();
+        r.machines[0].started_ms = T0;
+        let access = Access { upgrade: Some(r.clone()), ..Default::default() };
+        let back = Access::from_str(&serde_json::to_string(&access).unwrap()).unwrap();
+        assert_eq!(back.upgrade, Some(r));
+        // A machine's version is kept on its record
+        let with = r#"{"owner":"U1","machines":{"pve":{"version":"0.55.0"}}}"#;
+        assert_eq!(Access::from_str(with).unwrap().machines["pve"].version, "0.55.0");
+    }
 
     #[test]
     fn a_link_says_which_address_has_to_be_open() {

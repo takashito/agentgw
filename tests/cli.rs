@@ -69,3 +69,11 @@ fn install_reaches_setup() {
     assert_eq!(out.status.code(), Some(1), "{text}");
     assert!(text.starts_with("install: "), "{text}");
 }
+
+#[test]
+fn upgrade_on_a_machine_that_is_not_the_gateway_says_where_to_run_it() {
+    // No .env with a link key: this is not a gateway, and nothing is asked of anyone
+    let (code, text) = agentgw(&["upgrade"]);
+    assert_eq!(code, 2, "{text}");
+    assert!(text.contains("upgrade runs on the gateway"), "{text}");
+}
