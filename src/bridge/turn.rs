@@ -1201,6 +1201,12 @@ impl Bridge {
         thread_ts: &str,
         ctx: &LogCtx,
     ) -> bool {
+        // **Already asked here: leave it.** A message sent while the question's form waits is
+        // refused by the same dialog, and offering it again replaced the form — the question
+        // tool's own, with its checkboxes and text box — by rows read off the screen
+        if self.dialog_pending.values().any(|p| p.thread_ts == thread_ts) {
+            return true;
+        }
         let Some(d) = self.deps.agent.dialog(&Window::of(window)) else {
             return false;
         };

@@ -2536,6 +2536,48 @@ mod tests {
         );
     }
 
+    /// A message sent while the question's form waits is refused by the dialog, and that refusal
+    /// used to offer the dialog again — replacing the form with rows read off the screen. The
+    /// form stays, and the message goes in once the question is answered.
+    #[tokio::test]
+    async fn a_message_sent_while_the_form_waits_leaves_the_form_alone() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (d, slack, agent, _clock) = flow_deps("form-then-message");
+        let ((mut b, _fx), mut deliv) = Bridge::for_test_with_deliveries(d);
+        let sid = running_thread(&mut b, &agent).await;
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        b.on_hook(HookEvent {
+            kind: "perm".into(),
+            session_id: sid,
+            payload: serde_json::json!({
+                "tool_name": "AskUserQuestion",
+                "tool_use_id": "toolu_q",
+                "tool_input": {"questions": [{
+                    "question": "Which one next?", "header": "Next", "multiSelect": true,
+                    "options": [{"label": "Keep going", "description": ""}, {"label": "Stop here", "description": ""}],
+                }]},
+            }),
+            respond: Some(tx),
+        })
+        .await;
+        // The dialog is up, so the next message is refused
+        agent.fail_deliver.store(true, SeqCst);
+        *agent.dialog.lock().unwrap() = Some(crate::agent::Dialog {
+            title: "Which one next?".into(),
+            footer: "Enter to select \u{b7} Esc to cancel".into(),
+            options: vec!["Keep going".into(), "Stop here".into(), "Type something".into()],
+            details: vec![String::new(); 3],
+            selected: 0,
+            asked: false,
+        });
+        b.on_inbound(&in_thread("1782000000.000200", "while you wait")).await;
+        settle_deliveries(&mut b, &mut deliv).await;
+        let calls = slack.calls();
+        assert!(!calls.iter().any(|c| c.starts_with("dialog C1")), "the form was replaced: {calls:?}");
+        assert_eq!(calls.iter().filter(|c| c.starts_with("questions C1")).count(), 1, "{calls:?}");
+        assert!(!calls.iter().any(|c| c.contains("Couldn't hand this to the agent")), "{calls:?}");
+    }
+
     /// **A thread waiting on a person says so.** Held at a question it used to spin like every
     /// busy thread; now it goes `suspended`, which Slack marks in the sidebar, and goes back to
     /// working the moment someone answers — not at the next hook, which only re-arms the
