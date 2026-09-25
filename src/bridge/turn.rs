@@ -1105,10 +1105,12 @@ impl Bridge {
         };
         // Answered, so the thread is no longer silent on purpose
         self.resume_stall_after_perm(&ThreadKey::new(&p.channel, &p.thread_ts), true);
+        // The same markdown the prompt went out as -- rewriting it as plain text would turn
+        // its bold into asterisks
         if let Err(e) = self
             .deps
             .slack
-            .update_message(&p.channel, &p.prompt_ts, &done)
+            .update_markdown(&p.channel, &p.prompt_ts, &done)
             .await
         {
             ctx.debug("bridge", &format!("dialog prompt update failed: {e}"));

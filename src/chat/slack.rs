@@ -143,7 +143,7 @@ impl Api {
             .chars()
             .take(600)
             .collect();
-        let body = format!(":lock: *Permission requested* — `{tool_name}`\n```{preview}```");
+        let body = format!(":lock: **Permission requested** — `{tool_name}`\n```{preview}```");
         let channel_grant_label = if channel.starts_with('D') {
             "Allow for User"
         } else {
@@ -156,12 +156,11 @@ impl Api {
             )
         };
         let blocks: Vec<SlackBlock> = vec![
-            SlackSectionBlock::new()
-                .with_text(SlackBlockText::MarkDown(body.clone().into()))
-                // Same reason as the dialog prompt: the arguments being approved must be read
-                // without a click
-                .with_expand(true)
-                .into(),
+            // Same reason as the dialog prompt: what is being approved has to be readable
+            SlackBlock::Markdown(SlackMarkdownBlock {
+                block_id: None,
+                text: body.clone(),
+            }),
             SlackActionsBlock::new(vec![
                 button("Allow", "allow")
                     .with_style(SlackBlockButtonStyle::Primary)
@@ -229,13 +228,14 @@ impl Api {
                 .into(),
         );
         let blocks: Vec<SlackBlock> = vec![
-            SlackSectionBlock::new()
-                .with_text(SlackBlockText::MarkDown(dialog_body(dialog, None, true).into()))
-                // **Or Slack hides the question behind "Show more".** A section is rendered
-                // with that link unless it is told to expand -- which is why the progress
-                // message, far longer but a markdown block, never folds
-                .with_expand(true)
-                .into(),
+            // **A markdown block, not a section.** A section is for text with a control
+            // beside it, and it folds behind "Show more" unless told otherwise -- useful where
+            // folding is wanted (a long diff, a long command), wrong for a question someone has
+            // to read before answering. Slack takes buttons alongside one either way
+            SlackBlock::Markdown(SlackMarkdownBlock {
+                block_id: None,
+                text: dialog_body(dialog, None, true),
+            }),
             SlackActionsBlock::new(buttons).into(),
         ];
         let req = SlackApiChatPostMessageRequest::new(
@@ -1794,7 +1794,7 @@ fn dialog_body(d: &crate::agent::Dialog, chosen: Option<usize>, open: bool) -> S
         .enumerate()
         .map(|(i, o)| {
             let mark = if chosen == Some(i) { "\u{25b6}" } else { " " };
-            let head = format!("{mark} *{}.* {o}", i + 1);
+            let head = format!("{mark} **{}.** {o}", i + 1);
             match d.details.get(i).filter(|x| !x.is_empty()) {
                 // NBSP, because Slack eats an ordinary indent
                 Some(detail) => format!("{head}\n{}{detail}", "\u{a0}".repeat(6)),
@@ -1821,7 +1821,7 @@ fn dialog_body(d: &crate::agent::Dialog, chosen: Option<usize>, open: bool) -> S
     // of the very question it was being asked (user, 2026-09-25). A question has to be readable
     // where it is posted.
     let marker = if d.asked && open { ":speech_balloon: " } else { "" };
-    body.push_str(&format!("{marker}*{}*\n{}", d.title, rows.join("\n")));
+    body.push_str(&format!("{marker}**{}**\n{}", d.title, rows.join("\n")));
     // The hint is the screen's own; a question taken from the hook has none to show
     if !d.footer.is_empty() && open {
         body.push_str(&format!("\n_{}_", d.footer));
@@ -2137,11 +2137,13 @@ mod tests {
         let out = answered_dialog(&d, Some(1), "U_OWNER");
         assert!(out.starts_with("\u{2705} Update the laptop \u{2014} <@U_OWNER>"), "{out}");
         assert!(out.contains("Which one next?"), "the question went missing: {out}");
-        assert!(out.contains("*1.* Watch the screen"), "the other rows went missing: {out}");
+        assert!(out.contains("**1.** Watch the screen"), "the other rows went missing: {out}");
         assert!(out.contains("now and then"), "the descriptions went missing: {out}");
-        assert!(out.contains("\u{25b6} *2.* Update the laptop"), "the taken row is not marked: {out}");
+        assert!(out.contains("\u{25b6} **2.** Update the laptop"), "the taken row is not marked: {out}");
         // Folding a long code block behind "Show more" hid the rows of the question itself
         assert!(!out.contains("```"), "the rows went back into a code block: {out}");
+        // A markdown block reads `**bold**`; mrkdwn's single asterisks would show as asterisks
+        assert!(!out.contains("*Which one next?*") || out.contains("**Which one next?**"), "{out}");
         // A row's description sits under it again: the fold was the section block being left
         // to render with a "Show more" link, not the height, and `expand` settles that
         assert_eq!(out.lines().count(), 5, "{out}");
