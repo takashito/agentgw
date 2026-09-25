@@ -2163,10 +2163,21 @@ impl Fleet {
     }
 
     /// Rewrite access.json and make the Bridge itself reread it.
+    ///
+    /// **One edit at a time.** Each machine's link runs on its own task, and a save lays whole keys
+    /// over the file — `machines` is one key. Two machines reporting at once each read the file,
+    /// changed their own row and wrote the whole map back, so the later one put the other's row back
+    /// as it was (seen on a real gateway: a machine back on 0.57.0 stayed recorded as 0.56.0, which
+    /// would leave `update` waiting for it to come back). Read, change and write under one lock.
     async fn edit_access(&self, f: impl FnOnce(&mut Access)) {
-        let mut access = self.access();
-        f(&mut access);
-        if let Err(e) = access.save(&self.dir) {
+        static EDITING: Mutex<()> = Mutex::new(());
+        let saved = {
+            let _one = EDITING.lock().unwrap_or_else(|e| e.into_inner());
+            let mut access = self.access();
+            f(&mut access);
+            access.save(&self.dir)
+        };
+        if let Err(e) = saved {
             rlog("error", &format!("could not save access.json: {e}"));
             return;
         }
@@ -4458,12 +4469,15 @@ mod tests {
     // ── Gateway endpoints, key, order ──────────────────────────
 
     fn a_fleet() -> (Arc<Fleet>, tokio::sync::mpsc::Receiver<InboundMsg>) {
+        a_fleet_in(StateDir::at(
+            std::env::temp_dir().join(format!("slack-relay-test-{}", std::process::id())),
+        ))
+    }
+
+    fn a_fleet_in(dir: StateDir) -> (Arc<Fleet>, tokio::sync::mpsc::Receiver<InboundMsg>) {
         let (msg_tx, msg_rx) = tokio::sync::mpsc::channel(4);
         let (click_tx, _click_rx) = tokio::sync::mpsc::channel(4);
         let (reload, _reload_rx) = tokio::sync::mpsc::channel(4);
-        let dir = StateDir::at(
-            std::env::temp_dir().join(format!("slack-relay-test-{}", std::process::id())),
-        );
         let fleet = Arc::new(Fleet {
             homes: Default::default(),
             links: LinkServer::new(),
@@ -4485,6 +4499,39 @@ mod tests {
             tunnels: Default::default(),
         });
         (fleet, msg_rx)
+    }
+
+    /// Machines report at the same moment (every one of them does after the gateway restarts), each
+    /// from its own link task. **Every report has to survive** — the version is what `update` waits on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn machines_reporting_at_once_keep_each_others_versions() {
+        let dir = StateDir::at(
+            std::env::temp_dir().join(format!("agentgw-versions-race-{}", std::process::id())),
+        );
+        let _ = std::fs::remove_dir_all(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let (fleet, _rx) = a_fleet_in(dir.clone());
+        let ids: Vec<String> = (0..24).map(|i| format!("m{i}")).collect();
+        let tasks: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                let (fleet, id) = (fleet.clone(), id.clone());
+                tokio::spawn(async move {
+                    let frame = link::LinkFrame::MachineVersion { version: "0.57.0".into() };
+                    fleet.on_machine_frame(&id, frame).await;
+                })
+            })
+            .collect();
+        for t in tasks {
+            t.await.unwrap();
+        }
+        let access = Access::load(&dir);
+        let lost: Vec<&String> = ids
+            .iter()
+            .filter(|id| access.machines.get(*id).map(|l| l.version.as_str()) != Some("0.57.0"))
+            .collect();
+        assert!(lost.is_empty(), "reports overwritten by another machine's: {lost:?}");
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     /// Send one raw HTTP request and read only the status line.
