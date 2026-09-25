@@ -188,7 +188,6 @@ impl Bridge {
                 let out = self.stop_decision(key.as_ref(), &ev, &ctx);
                 // If blocked, the turn **continues** (re-prompt), so it's not over yet
                 if let Some(key) = key.as_ref().filter(|_| out.get("decision").is_none()) {
-                    self.sticky.on_turn_end(key);
                     // Whatever the thread was waiting for, the turn is over and it is not
                     // waiting for it any more -- including a question answered on the machine,
                     // which sends nothing back through the thread
