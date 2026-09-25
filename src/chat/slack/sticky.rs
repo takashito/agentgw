@@ -340,10 +340,14 @@ pub struct StickyBoard {
     /// Settled thread → **whether follow-up work after the answer may open a new progress message**.
     /// `true` is a round answered with reply/edit; `false` is a round that went silent via no_reply/react or an interruption.
     settled: std::collections::HashMap<ThreadKey, bool>,
-    /// Threads whose round has already answered. Assistant text landing after that is the agent
-    /// talking to its own terminal, so it is dropped for the rest of the turn. It used to be kept
-    /// and replayed above the follow-up work, which put a clipped copy of the answer in Slack.
-    answered: std::collections::HashSet<ThreadKey>,
+    /// Narration that arrived after settling. **Kept, not drawn** (`push_narration` /
+    /// `open_after_answer` below put it in and take it out).
+    held: std::collections::HashMap<ThreadKey, Vec<String>>,
+    /// Threads whose turn is over (the agent stopped). The harness asks it to keep talking after
+    /// that -- "your previous response had no visible output" -- so text and even tool calls trickle
+    /// in for a while, aimed at its terminal, not at the thread. Nothing that arrives now may draw
+    /// or open anything. Cleared at the next `on_turn_start`.
+    closed: std::collections::HashSet<ThreadKey>,
 }
 
 impl StickyBoard {
@@ -511,19 +515,33 @@ impl StickyBoard {
     ///
     /// A new progress message may be opened **only when a real tool runs**
     /// (= proof that work continues after the answer). Only tool rows reach here; narration after
-    /// the answer is dropped by `push_narration` and never arrives.
+    /// settling is diverted to the held buffer by `push_narration` and never arrives.
     ///
     /// Returns "whether this row may be drawn".
     /// `by_tool` = whether this row is a tool. **A round settled in silence resumes only on a tool** —
     /// if real work runs after no_reply / react, it needs a record.
     /// Narration alone does not open one.
     fn open_after_answer(&mut self, key: &ThreadKey, by_tool: bool) -> bool {
+        // Work that starts after the turn ended is not the round continuing -- it is the agent
+        // answering the harness. It gets no progress message of its own.
+        if self.closed.contains(key) {
+            return false;
+        }
         match self.settled.get(key) {
             None => true, // not settled yet — business as usual
             Some(false) if !by_tool => false,
             _ => {
                 self.settled.remove(key);
-                self.stickies.insert(key.clone(), Sticky::default());
+                let mut s = Sticky::default();
+                // Show the held narration **above** the follow-up work
+                s.items.extend(
+                    self.held
+                        .remove(key)
+                        .into_iter()
+                        .flatten()
+                        .map(|text| RenderItem::Narration { text }),
+                );
+                self.stickies.insert(key.clone(), s);
                 true
             }
         }
@@ -533,10 +551,20 @@ impl StickyBoard {
     pub fn on_turn_start(&mut self, key: &ThreadKey) {
         self.stickies.insert(key.clone(), Sticky::default());
         self.settled.remove(key);
-        // A new round may narrate again. The flag is cleared **here and only here** -- narration
-        // keeps trickling in for seconds after the turn ended, and clearing it at turn end would
-        // let those late lines through.
-        self.answered.remove(key);
+        self.held.remove(key); // do not carry over to the next turn (a safety net for anything not dropped at turn end)
+        self.closed.remove(key);
+    }
+
+    /// The turn ended. Held narration nobody showed by now **was a closing remark**,
+    /// so drop it. Keeping it until the next message
+    /// arrives would leave it behind forever for threads where no message ever comes again.
+    ///
+    /// The round also **closes here**: text and tool calls keep trickling in for a while afterwards
+    /// (the harness asks the agent to keep talking once the answer went out as a tool call alone),
+    /// and none of it is addressed to the thread. Only `on_turn_start` opens it again.
+    pub fn on_turn_end(&mut self, key: &ThreadKey) {
+        self.held.remove(key);
+        self.closed.insert(key.clone());
     }
 
     /// A PostToolUse with the same tool_use_id replaces the PreToolUse ◌ row with •/×/🚫.
@@ -601,10 +629,21 @@ impl StickyBoard {
 
     /// Add one line of narration that became final (accumulating deltas is the caller's job).
     pub fn push_narration(&mut self, key: &ThreadKey, text: &str) {
-        // Once the round has answered, the answer is the whole of what the thread gets. Anything the
-        // agent writes afterwards is addressed to its terminal, and posting it puts a clipped
-        // near-duplicate of the answer under the answer. Silent until the next turn starts.
-        if self.answered.contains(key) {
+        // Straggling text after the turn ended is addressed to the terminal -- not kept either,
+        // or it would sit in the buffer until the thread speaks again
+        if self.closed.contains(key) {
+            return;
+        }
+        // Narration after settling is **kept, not drawn**. If a real tool runs after the answer,
+        // that proves "work continues", and `open_after_answer` shows it all together.
+        // If the turn ends with nothing running, it was a closing remark and the next
+        // `on_turn_start` drops it. Without this, a progress message holding only "● Replied in Slack."
+        // appears under the answer and nobody deletes it
+        if self.settled.get(key) == Some(&true) {
+            self.held
+                .entry(key.clone())
+                .or_default()
+                .push(text.to_string());
             return;
         }
         if !self.open_after_answer(key, false) {
@@ -740,7 +779,6 @@ impl StickyBoard {
         // Only answered rounds allow a new progress message for follow-up progress
         let answered_with_text = !matches!(kind, "no_reply" | "react");
         self.settled.insert(key.clone(), answered_with_text);
-        self.answered.insert(key.clone());
         match self.stickies.remove(key) {
             Some(Sticky {
                 posted_ts: Some(ts),
@@ -1687,8 +1725,8 @@ mod tests {
         assert_eq!(dirty.len(), 1);
         assert_eq!(dirty[0].1, None, "返事の下に**新しく**出す(編集ではない)");
         assert!(
-            !dirty[0].2.contains("ついでに調べました"),
-            "返事のあとの地の文は Slack に出さない: {}",
+            dirty[0].2.contains("● ついでに調べました"),
+            "{}",
             dirty[0].2
         );
         assert!(dirty[0].2.contains("Read"), "{}", dirty[0].2);
@@ -1722,13 +1760,14 @@ mod tests {
             "締めのナレーションだけでは新しい付箋を起こさない"
         );
         assert!(r.take_final(&k).is_none());
+        // Dropping happens **at turn end**. Do not leave it behind in threads where no message comes next
+        // (waiting for `on_turn_start` leaves behind entries for threads that never speak again).
+        // Past that point the round is closed -- see `nothing_after_the_turn_ended_reaches_the_thread`
+        r.on_turn_end(&k);
         r.tool_at(&k, "t2", "Read", "/x", ToolStatus::Done);
-        let dirty = r.take_dirty(100_000);
-        assert_eq!(dirty.len(), 1);
         assert!(
-            !dirty[0].2.contains("返信しました"),
-            "捨てたはずの控えが混ざった: {}",
-            dirty[0].2
+            r.take_dirty(100_000).is_empty(),
+            "ターンが終わった後は何も起こさない"
         );
 
         // A round that chose silence — rows after settling do not create a progress message (prevents silence looking like a message)
@@ -1754,36 +1793,34 @@ mod tests {
         assert!(q.take_final(&k).is_none());
     }
 
-    /// The bug this guards: after `reply` the agent kept writing terminal-facing text (the harness
-    /// asks it to), the text was kept and replayed when follow-up work opened a new progress
-    /// message, and Slack got a clipped near-duplicate of the answer under the answer.
-    /// Nothing the agent writes after answering reaches the thread, however much work follows.
+    /// The bug this guards, read off four live cases: the round replied, the turn ended, and then
+    /// the harness asked the agent to keep talking ("no visible output"). What it wrote next was a
+    /// summary for its terminal, and a tool it ran afterwards opened a progress message that
+    /// replayed the summary -- clipped -- under the answer, reading as a broken duplicate reply.
+    ///
+    /// **Nothing that arrives after the turn ended reaches the thread**, text or tool.
+    /// Continued work *within* the turn is untouched (the test above covers it).
     #[test]
-    fn text_written_after_the_answer_never_reaches_the_thread() {
+    fn nothing_after_the_turn_ended_reaches_the_thread() {
         let k = ThreadKey::parse("k");
         let mut b = StickyBoard::default();
         b.on_turn_start(&k);
-        b.push_narration(&k, "調べます");
         b.tool_at(&k, "t1", "Bash", "cargo test", ToolStatus::Done);
         b.set_posted(&k, "999.1");
         assert!(matches!(b.settle(&k, "reply"), StickyAction::Keep));
+        b.on_turn_end(&k); // the agent stopped -- the round is over
 
-        // The summary it writes for its terminal right after replying
+        // The harness nudges it; everything from here is aimed at the terminal
         b.push_narration(&k, "Slack に返信しました。要点は…");
-        // Work goes on, so a new progress message does open -- but only with the work in it
         b.tool_at(&k, "t2", "Bash", "git status", ToolStatus::Done);
-        // …and text written later in the same turn stays out too
         b.push_narration(&k, "まとめると以上です");
-        let dirty = b.take_dirty(99_000);
-        assert_eq!(dirty.len(), 1);
-        assert!(dirty[0].2.contains("git status"), "{}", dirty[0].2);
         assert!(
-            !dirty[0].2.contains("返信しました") && !dirty[0].2.contains("まとめると"),
-            "返事のあとの地の文が漏れた: {}",
-            dirty[0].2
+            b.take_dirty(99_000).is_empty(),
+            "ターンが終わった後の地の文もツールも出さない"
         );
+        assert!(b.take_final(&k).is_none());
 
-        // The next turn narrates normally again
+        // The next turn is business as usual again
         b.on_turn_start(&k);
         b.push_narration(&k, "次のターン");
         let dirty = b.take_dirty(100_000);
