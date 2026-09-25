@@ -467,6 +467,11 @@ impl Bridge {
         if let Err(e) = access.save(&self.deps.dir) {
             ctx.error("bridge", &format!("access.json save failed: {e}"));
         }
+        self.use_access(access, ctx);
+    }
+
+    /// Use this access from now on, **without writing it**.
+    fn use_access(&mut self, access: bridge::Access, ctx: &LogCtx) {
         self.access = access;
         // When settings change, adjust the pool **right away**. Waiting for the next death or restart
         // leaves `warm off` sitting there without releasing anything
@@ -714,10 +719,14 @@ impl Bridge {
         }
     }
 
+    /// **Reads only.** It used to save what it had just read, and on a gateway that is a second
+    /// writer racing the fleet: it read, the fleet wrote, and the save put the older copy back —
+    /// a machine's reported version, or a rollout's progress, undone a moment after it was written
+    /// (seen on a real gateway: `update` told a machine twice, and finished twice).
     fn reload_from_disk(&mut self) {
         let ctx = LogCtx::default();
         let access = bridge::Access::load(&self.deps.dir);
-        self.adopt_access(access, &ctx);
+        self.use_access(access, &ctx);
         self.threads = bridge::Threads::load(&self.deps.dir);
         ctx.info(
             "bridge",
@@ -2061,6 +2070,22 @@ mod tests {
             dir: crate::state_dir::StateDir::at(path),
         };
         (deps, slack, agent, clock)
+    }
+
+    /// Rereading access.json writes nothing: on a gateway the fleet writes the same file, and a save
+    /// of what was just read puts an older copy back over whatever the fleet wrote in between.
+    #[tokio::test]
+    async fn rereading_access_writes_nothing() {
+        let (d, _slack, _agent, _clock) = flow_deps("reread");
+        let dir = d.dir.clone();
+        let (mut b, _fx) = Bridge::for_test(d);
+        // What a save would add (`allowedBots` is always written) is not there to begin with
+        std::fs::write(dir.join("access.json"), r#"{"owner":"U_OWNER"}"#).unwrap();
+        b.reload_from_disk();
+        // (The pool may patch its own `pools` key; that one is the Bridge's alone)
+        let after = std::fs::read_to_string(dir.join("access.json")).unwrap();
+        assert!(!after.contains("allowedBots"), "the settings were written back: {after}");
+        assert_eq!(b.access.owner, "U_OWNER");
     }
 
     fn channel_msg(ts: &str, user: &str, text: &str) -> InboundMsg {
