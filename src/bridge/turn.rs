@@ -1312,6 +1312,12 @@ impl Bridge {
         if name.is_empty() {
             return;
         }
+        // **The question gets its own post, with the rows as buttons.** A line on the board
+        // saying the agent called a tool adds nothing, and it is the one tool whose whole point
+        // is already visible in the thread
+        if name == QUESTION_TOOL {
+            return;
+        }
         // A failed call comes as `PostToolUseFailure`, which carries `error` / `is_error` at the
         // top level instead of `tool_response`
         let content = match p["error"].is_null() {

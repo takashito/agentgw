@@ -1788,9 +1788,11 @@ fn dialog_body(d: &crate::agent::Dialog, chosen: Option<usize>, open: bool) -> S
         .map(|(i, o)| {
             let mark = if chosen == Some(i) { "\u{25b6}" } else { " " };
             let head = format!("{mark} *{}.* {o}", i + 1);
+            // **One line per row.** Slack folds a tall message behind "Show more" whatever it is
+            // made of -- taking the rows out of a code block was not enough, because a row and
+            // its description on separate lines is still two lines each
             match d.details.get(i).filter(|x| !x.is_empty()) {
-                // NBSP, because Slack eats an ordinary indent
-                Some(detail) => format!("{head}\n{}{detail}", "\u{a0}".repeat(6)),
+                Some(detail) => format!("{head} \u{2014} {detail}"),
                 None => head,
             }
         })
@@ -1798,10 +1800,8 @@ fn dialog_body(d: &crate::agent::Dialog, chosen: Option<usize>, open: bool) -> S
     let lead = match (open, d.asked) {
         // Settled: the post says so in its first line, so it needs no invitation
         (false, _) => String::new(),
-        (true, true) => crate::t!(
-            ":speech_balloon: The agent is asking:",
-            ":speech_balloon: エージェントからの質問です:"
-        ),
+        // A question spends no line on an invitation -- the marker rides on the title below
+        (true, true) => String::new(),
         (true, false) => crate::t!(
             ":keyboard: A dialog is holding the agent \u{2014} answer it here and the queued messages go through.",
             ":keyboard: エージェントが画面の確認待ちで止まっています。ここで答えると、溜まっているメッセージがそのまま渡ります。"
@@ -1815,7 +1815,8 @@ fn dialog_body(d: &crate::agent::Dialog, chosen: Option<usize>, open: bool) -> S
     // **Not a code block.** Slack folds a long one behind "Show more", which hid half the rows
     // of the very question it was being asked (user, 2026-09-25). A question has to be readable
     // where it is posted.
-    body.push_str(&format!("*{}*\n{}", d.title, rows.join("\n")));
+    let marker = if d.asked && open { ":speech_balloon: " } else { "" };
+    body.push_str(&format!("{marker}*{}*\n{}", d.title, rows.join("\n")));
     // The hint is the screen's own; a question taken from the hook has none to show
     if !d.footer.is_empty() && open {
         body.push_str(&format!("\n_{}_", d.footer));
@@ -2136,6 +2137,13 @@ mod tests {
         assert!(out.contains("\u{25b6} *2.* Update the laptop"), "the taken row is not marked: {out}");
         // Folding a long code block behind "Show more" hid the rows of the question itself
         assert!(!out.contains("```"), "the rows went back into a code block: {out}");
+        // Slack folds a tall message behind "Show more", whatever it is made of, so the rows
+        // and their descriptions share a line: a question hidden behind a link is not asked
+        assert_eq!(
+            out.lines().count(),
+            4,
+            "a line per row and no more, or Slack folds the question away: {out}"
+        );
         // Nothing left inviting an answer that has already been given
         assert!(!out.contains("asking"), "{out}");
 
