@@ -1786,10 +1786,11 @@ fn dialog_body(d: &crate::agent::Dialog, chosen: Option<usize>, open: bool) -> S
         .iter()
         .enumerate()
         .map(|(i, o)| {
-            let mark = if chosen == Some(i) { "\u{25b6} " } else { "  " };
-            let head = format!("{mark}{}. {o}", i + 1);
+            let mark = if chosen == Some(i) { "\u{25b6}" } else { " " };
+            let head = format!("{mark} *{}.* {o}", i + 1);
             match d.details.get(i).filter(|x| !x.is_empty()) {
-                Some(detail) => format!("{head}\n       {detail}"),
+                // NBSP, because Slack eats an ordinary indent
+                Some(detail) => format!("{head}\n{}{detail}", "\u{a0}".repeat(6)),
                 None => head,
             }
         })
@@ -1811,7 +1812,10 @@ fn dialog_body(d: &crate::agent::Dialog, chosen: Option<usize>, open: bool) -> S
         body.push_str(&lead);
         body.push('\n');
     }
-    body.push_str(&format!("*{}*\n```{}```", d.title, rows.join("\n")));
+    // **Not a code block.** Slack folds a long one behind "Show more", which hid half the rows
+    // of the very question it was being asked (user, 2026-09-25). A question has to be readable
+    // where it is posted.
+    body.push_str(&format!("*{}*\n{}", d.title, rows.join("\n")));
     // The hint is the screen's own; a question taken from the hook has none to show
     if !d.footer.is_empty() && open {
         body.push_str(&format!("\n_{}_", d.footer));
@@ -2127,9 +2131,11 @@ mod tests {
         let out = answered_dialog(&d, Some(1), "U_OWNER");
         assert!(out.starts_with("\u{2705} Update the laptop \u{2014} <@U_OWNER>"), "{out}");
         assert!(out.contains("Which one next?"), "the question went missing: {out}");
-        assert!(out.contains("1. Watch the screen"), "the other rows went missing: {out}");
+        assert!(out.contains("*1.* Watch the screen"), "the other rows went missing: {out}");
         assert!(out.contains("now and then"), "the descriptions went missing: {out}");
-        assert!(out.contains("\u{25b6} 2. Update the laptop"), "the taken row is not marked: {out}");
+        assert!(out.contains("\u{25b6} *2.* Update the laptop"), "the taken row is not marked: {out}");
+        // Folding a long code block behind "Show more" hid the rows of the question itself
+        assert!(!out.contains("```"), "the rows went back into a code block: {out}");
         // Nothing left inviting an answer that has already been given
         assert!(!out.contains("asking"), "{out}");
 
