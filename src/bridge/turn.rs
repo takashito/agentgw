@@ -920,15 +920,19 @@ impl Bridge {
         //
         // Allowing at once also drops the wait: this hook gives up after 125s, and a question
         // left for someone to come back to used to freeze the worker when it did.
-        if tool == QUESTION_TOOL
-            && let Some(q) = question_from(&ev.payload["tool_input"])
-        {
+        if tool == QUESTION_TOOL {
             let _ = respond.send(crate::bridge::command::ToolPermission::decision_output(
                 "allow",
                 "Slack bridge (question)",
             ));
-            self.offer_question(&ev.session_id, q, &channel, &thread_ts, ctx)
-                .await;
+            // **Allowed whatever its shape.** Only a single, single-choice question is taken
+            // from here; the rest used to fall through to "may this tool run?", which asked the
+            // person for permission to ask them something. They go to the screen instead, where
+            // the watch reads the dialog the tool is about to draw
+            if let Some(q) = question_from(&ev.payload["tool_input"]) {
+                self.offer_question(&ev.session_id, q, &channel, &thread_ts, ctx)
+                    .await;
+            }
             return;
         }
         // Don't ask for a scope the person already approved. Check the narrower one (thread) first

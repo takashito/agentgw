@@ -2489,6 +2489,49 @@ mod tests {
         );
     }
 
+    /// **The question tool is never put to a person as "may this run?"**, whatever its shape. A
+    /// multi-select question fell outside what the hook takes and landed on the old permission
+    /// prompt — the person was asked for permission to be asked something (real machine,
+    /// 2026-09-25). It is allowed, and the screen watch takes it from there.
+    #[tokio::test]
+    async fn a_multi_select_question_is_allowed_without_asking() {
+        let (d, slack, agent, _clock) = flow_deps("question-multi");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let sid = running_thread(&mut b, &agent).await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        b.on_hook(HookEvent {
+            kind: "perm".into(),
+            session_id: sid,
+            payload: serde_json::json!({
+                "tool_name": "AskUserQuestion",
+                "tool_use_id": "toolu_m",
+                "tool_input": {"questions": [{
+                    "question": "Which ones?",
+                    "header": "Pick",
+                    "multiSelect": true,
+                    "options": [
+                        {"label": "Build", "description": ""},
+                        {"label": "Status", "description": ""},
+                    ],
+                }]},
+            }),
+            respond: Some(tx),
+        })
+        .await;
+        // Bounded: sent to the permission prompt instead, the hook waits for a click that never
+        // comes, and an unbounded await hangs the whole suite rather than failing this test
+        let answer = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("the tool was left waiting for a person instead of being allowed")
+            .unwrap();
+        assert!(answer.to_string().contains("\"allow\""), "{answer}");
+        assert!(
+            !slack.calls().iter().any(|c| c.starts_with("perm ")),
+            "asked for permission to ask: {:?}",
+            slack.calls()
+        );
+    }
+
     /// **A thread waiting on a person says so.** Held at a question it used to spin like every
     /// busy thread; now it goes `suspended`, which Slack marks in the sidebar, and goes back to
     /// working the moment someone answers — not at the next hook, which only re-arms the

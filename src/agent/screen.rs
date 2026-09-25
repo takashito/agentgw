@@ -257,8 +257,16 @@ impl<'a> Pane<'a> {
     /// are exactly what causes silence, so no table of wordings.
     pub fn modal_footer(&self) -> Option<&'a str> {
         let lines: Vec<&str> = self.0.split('\n').collect();
-        let from = lines.len().saturating_sub(MODAL_FOOTER_TAIL);
-        lines[from..]
+        // **Counted from the last line with anything on it**, not the last line of the pane. A
+        // worker that has barely spoken draws its conversation, modal and all, at the top of a
+        // tall pane, and the capture carries every empty row beneath it — enough of them and
+        // the hint fell outside the window, so a modal on a fresh worker was never seen at all
+        let end = lines
+            .iter()
+            .rposition(|l| !l.trim().is_empty())
+            .map_or(0, |i| i + 1);
+        let from = end.saturating_sub(MODAL_FOOTER_TAIL);
+        lines[from..end]
             .iter()
             .find(|l| {
                 let t = l.trim().to_ascii_lowercase();
@@ -1375,6 +1383,17 @@ the full history gets re-read on your next message.
 \u{276f} \u{a0}\n\
 \u{2500}\u{2500}\u{2500}\u{2500}\n\
   \u{23f5}\u{23f5} auto mode on (shift+tab to cycle) \u{b7} esc to interrupt \u{2190} for agents\n";
+
+    /// A worker that has barely spoken: its conversation, the modal with it, sits at the top of
+    /// the pane and the capture runs on through every empty row below. The hint was counted from
+    /// the bottom of the pane, so thirty blank rows put it out of reach and the modal was never
+    /// seen (a fresh worker on a real machine, 2026-09-25 — eleven minutes and nothing posted).
+    #[test]
+    fn a_modal_on_a_short_screen_is_seen_through_the_blank_rows_under_it() {
+        let pane = format!("{TRUST_PANE}{}", "\n".repeat(30));
+        let d = Pane::new(&pane).dialog().expect("the modal is up");
+        assert_eq!(d.options, ["Yes, I trust this folder", "No, exit"]);
+    }
 
     #[test]
     fn a_sentence_about_dialogs_is_not_a_dialog() {
