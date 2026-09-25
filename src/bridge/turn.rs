@@ -31,6 +31,21 @@ const DIALOG_WATCH_QUIET_MS: u64 = 10_000;
 /// the screen: the rows there are the truth about what pressing Enter does, and a button that
 /// says otherwise would be a lie. `selected` is 0 because the cursor starts on the first row,
 /// and `footer` is empty because the payload does not say what the screen writes at its foot.
+/// Is the screen still showing the dialog a prompt was posted for?
+///
+/// **A question from the hook never reads the same as the screen**, and it is not meant to:
+/// the hook carries the rows the agent wrote, and the screen adds rows of its own after them
+/// ("Type something.", "Chat about this") and words the heading its own way. Comparing the
+/// two as equals retired every question ten seconds after it went up and posted it again from
+/// the screen — seen on a real machine as the question vanishing and coming back. For those,
+/// the agent's rows at the head of the screen's list are the match.
+fn still_asking(posted: &Dialog, screen: &Dialog) -> bool {
+    if posted.asked {
+        return screen.options.starts_with(&posted.options);
+    }
+    posted.title == screen.title && posted.options == screen.options
+}
+
 fn question_from(input: &serde_json::Value) -> Option<Dialog> {
     let questions = input.get("questions")?.as_array()?;
     let [q] = questions.as_slice() else {
@@ -724,12 +739,10 @@ impl Bridge {
             let waiting = self
                 .dialog_pending
                 .iter()
-                .find(|(_, p)| p.window == window)
+                .find(|(_, p)| p.thread_ts == thread_ts)
                 .map(|(req_id, p)| (req_id.clone(), p.dialog.clone()));
             if let Some((req_id, asked)) = waiting {
-                let same = on_screen
-                    .as_ref()
-                    .is_some_and(|d| d.title == asked.title && d.options == asked.options);
+                let same = on_screen.as_ref().is_some_and(|d| still_asking(&asked, d));
                 if same {
                     continue; // the same question, still waiting for a person
                 }
@@ -1087,7 +1100,11 @@ impl Bridge {
         ctx: &LogCtx,
     ) -> bool {
         // One live prompt per window. An older one would answer a modal that has moved on
-        self.dialog_pending.retain(|_, p| p.window != window);
+        // One live prompt per **thread**. Keyed by the window string it used to miss the same
+        // window under its other name: before a restart the prompt says `@1`, after it the
+        // lookup says `w-<session>`, and the thread got the question twice
+        self.dialog_pending
+            .retain(|_, p| p.thread_ts != thread_ts && p.window != window);
         static NEXT_REQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = NEXT_REQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let req_id = format!("d{:x}-{n}", self.deps.clock.now_ms());

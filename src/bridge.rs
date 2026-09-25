@@ -2438,7 +2438,7 @@ mod tests {
     /// a keypress would still have answered it (user, 2026-09-25, mid-answer).
     #[tokio::test]
     async fn the_buttons_still_answer_after_the_bridge_restarts() {
-        let (d, slack, agent, _clock) = flow_deps("dialog-restart");
+        let (d, slack, agent, clock) = flow_deps("dialog-restart");
         let (mut b, _fx) = Bridge::for_test(d.clone());
         running_thread(&mut b, &agent).await;
         *agent.dialog.lock().unwrap() = Some(crate::agent::Dialog {
@@ -2466,6 +2466,15 @@ mod tests {
             selected: 0,
             asked: true,
         });
+        // **Not asked twice.** Before the restart the prompt names the window `@0`; after it, the
+        // new Bridge only knows the worker by name, so a match on the window string missed it
+        // and the watch posted the same question again (real machine, 2026-09-25)
+        let posts = |s: &FakeChat| s.calls().iter().filter(|c| c.starts_with("dialog C1")).count();
+        let before = posts(&slack);
+        clock.advance(30_000);
+        next.dialog_tick().await;
+        assert_eq!(posts(&slack), before, "asked again after the restart: {:?}", slack.calls());
+
         next.on_perm_click(slack::PermClick {
             req_id,
             action: "dlg-1".into(),
@@ -2477,6 +2486,64 @@ mod tests {
             vec![Some(1)],
             "the click reached the agent's screen: {:?}",
             slack.calls()
+        );
+    }
+
+    /// **The watch leaves a live question alone.** The hook carries the agent's rows; the screen
+    /// adds its own after them ("Type something.", "Chat about this"). Treating the two as
+    /// different retired every question ten seconds after it went up and posted it again from
+    /// the screen — on a real machine, the question vanished and came back.
+    #[tokio::test]
+    async fn a_question_from_the_hook_is_not_retired_by_the_screen_that_shows_it() {
+        let (d, slack, agent, clock) = flow_deps("question-vs-screen");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let sid = running_thread(&mut b, &agent).await;
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        b.on_hook(HookEvent {
+            kind: "perm".into(),
+            session_id: sid,
+            payload: serde_json::json!({
+                "tool_name": "AskUserQuestion",
+                "tool_use_id": "toolu_q",
+                "tool_input": {"questions": [{
+                    "question": "Which one next?",
+                    "header": "Next",
+                    "multiSelect": false,
+                    "options": [
+                        {"label": "Keep going", "description": ""},
+                        {"label": "Stop here", "description": ""},
+                    ],
+                }]},
+            }),
+            respond: Some(tx),
+        })
+        .await;
+        // What the screen then shows: the same rows, the TUI's own after them, its own heading
+        *agent.dialog.lock().unwrap() = Some(crate::agent::Dialog {
+            title: "\u{2610} Next".into(),
+            footer: "Enter to select \u{b7} Esc to cancel".into(),
+            options: vec![
+                "Keep going".into(),
+                "Stop here".into(),
+                "Type something.".into(),
+                "Chat about this".into(),
+            ],
+            details: vec![String::new(); 4],
+            selected: 0,
+            asked: false,
+        });
+        b.stall.clear();
+        clock.advance(30_000);
+        b.dialog_tick().await;
+        let calls = slack.calls();
+        assert_eq!(
+            calls.iter().filter(|c| c.starts_with("dialog C1")).count(),
+            1,
+            "the question was posted again: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("buttons do nothing")),
+            "the live question was retired: {calls:?}"
         );
     }
 
