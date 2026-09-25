@@ -1898,6 +1898,9 @@ pub(crate) fn entrances(listen: &str, serve_json: Option<&str>) -> Vec<Entrance>
     out
 }
 
+/// Held while the gateway reads, changes and writes access.json — see `Fleet::edit_access`.
+static EDITING: Mutex<()> = Mutex::new(());
+
 /// The progress message of an `update`, redrawn from the rollout each time (so the process that
 /// finishes draws the same message the one that started did). **Pure function.**
 pub fn rollout_text(r: &crate::bridge::state::Rollout, me: &str, finished: bool) -> String {
@@ -2162,6 +2165,20 @@ impl Fleet {
             .await;
     }
 
+    /// The rollout is over: **remove** it from access.json. `edit_access` can't — a save leaves out
+    /// an empty field, and leaving it out leaves the old value on disk.
+    async fn end_update(&self) {
+        let cleared = {
+            let _one = EDITING.lock().unwrap_or_else(|e| e.into_inner());
+            self.dir.patch_json("access.json", "update", serde_json::Value::Null)
+        };
+        if let Err(e) = cleared {
+            rlog("error", &format!("could not save access.json: {e}"));
+            return;
+        }
+        let _ = self.reload.send(()).await;
+    }
+
     /// Rewrite access.json and make the Bridge itself reread it.
     ///
     /// **One edit at a time.** Each machine's link runs on its own task, and a save lays whole keys
@@ -2170,7 +2187,6 @@ impl Fleet {
     /// as it was (seen on a real gateway: a machine back on 0.57.0 stayed recorded as 0.56.0, which
     /// would leave `update` waiting for it to come back). Read, change and write under one lock.
     async fn edit_access(&self, f: impl FnOnce(&mut Access)) {
-        static EDITING: Mutex<()> = Mutex::new(());
         let saved = {
             let _one = EDITING.lock().unwrap_or_else(|e| e.into_inner());
             let mut access = self.access();
@@ -3085,7 +3101,7 @@ impl Fleet {
             let finished = next == RolloutNext::Finished;
             // **Written down before the machine is told** — telling the gateway itself restarts it
             if finished {
-                self.edit_access(|a| a.update = None).await;
+                self.end_update().await;
                 rlog("info", &format!("update: rollout to v{} finished", r.target));
             } else if r != before {
                 let saved = r.clone();
@@ -4531,6 +4547,21 @@ mod tests {
             .filter(|id| access.machines.get(*id).map(|l| l.version.as_str()) != Some("0.57.0"))
             .collect();
         assert!(lost.is_empty(), "reports overwritten by another machine's: {lost:?}");
+        let _ = std::fs::remove_dir_all(dir.path());
+    }
+
+    /// A finished rollout has to be **gone** from disk, or the next tick finishes it again.
+    #[tokio::test]
+    async fn an_ended_update_is_gone_from_access_json() {
+        let dir = StateDir::at(std::env::temp_dir().join(format!("agentgw-end-update-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let (fleet, _rx) = a_fleet_in(dir.clone());
+        let r = crate::bridge::state::Rollout { target: "0.57.2".into(), ..Default::default() };
+        fleet.edit_access(|a| a.update = Some(r)).await;
+        assert!(Access::load(&dir).update.is_some());
+        fleet.end_update().await;
+        assert_eq!(Access::load(&dir).update, None);
         let _ = std::fs::remove_dir_all(dir.path());
     }
 

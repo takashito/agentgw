@@ -127,6 +127,12 @@ impl JobSpec {
     /// was down for 5 h 15 min this way (the handshake was refused 5 times in a row and the
     /// 1-second restarts hit the limit). launchd never gives up with KeepAlive +
     /// ThrottleInterval=1, so this makes the two behave the same.
+    ///
+    /// **`KillMode=process`: only the Bridge is stopped, never its agents.** The tmux server that
+    /// holds them is started by the Bridge, so it lives in the service's cgroup, and the default
+    /// (`control-group`) kills everything there the moment the Bridge exits — every restart,
+    /// `update` included, took every agent with it (2026-09-25, on a real gateway). `shutdown` and
+    /// `logout` wind the agents down themselves before exiting, so nothing is left behind.
     pub fn systemd_unit(&self) -> String {
         format!(
             "[Unit]\n\
@@ -137,6 +143,7 @@ impl JobSpec {
              \n\
              [Service]\n\
              Type=simple\n\
+             KillMode=process\n\
              ExecStart={program} {args}\n\
              Restart=always\n\
              RestartSec=1\n\
@@ -220,7 +227,59 @@ impl RestartStep {
 /// Service operations (launchd / systemd). The CLI only goes through here.
 pub struct Service;
 
+/// The unit as it should be, if `current` is missing `KillMode=process` (see [`JobSpec::systemd_unit`]).
+/// `None` = nothing to change. **Pure**: units written before the line existed are healed from
+/// what they already say, so their PATH and everything else stay as they were.
+pub fn unit_keeping_workers(current: &str) -> Option<String> {
+    if current.lines().any(|l| l.trim() == "KillMode=process") {
+        return None;
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut placed = false;
+    for line in current.lines() {
+        if line.trim_start().starts_with("KillMode=") {
+            continue;
+        }
+        out.push(line.to_string());
+        if !placed && line.trim() == "[Service]" {
+            out.push("KillMode=process".to_string());
+            placed = true;
+        }
+    }
+    placed.then(|| out.join("\n") + "\n")
+}
+
 impl Service {
+    /// A unit installed before `KillMode=process` kills every agent on each restart. Put the line in
+    /// and have systemd reread it, **at start-up**: `update` replaces the binary but not the unit, so
+    /// this is how an updated machine gets it. It takes effect from the next restart on.
+    pub fn keep_workers_on_restart() {
+        if !cfg!(target_os = "linux") || std::env::var("AGENTGW_MANAGED").as_deref() != Ok("1") {
+            return;
+        }
+        let path = Self::job_path();
+        let Ok(current) = std::fs::read_to_string(&path) else { return };
+        let Some(healed) = unit_keeping_workers(&current) else { return };
+        let ctx = crate::log::LogCtx::default();
+        if let Err(e) = std::fs::write(&path, healed) {
+            ctx.error("bridge", &format!("could not add KillMode=process to {}: {e}", path.display()));
+            return;
+        }
+        let reloaded = Self::ctl_command("systemctl")
+            .args(["--user", "daemon-reload"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        ctx.info(
+            "bridge",
+            &format!(
+                "added KillMode=process to {} (daemon-reload {}) — agents now survive restarts",
+                path.display(),
+                if reloaded { "ok" } else { "failed" }
+            ),
+        );
+    }
+
     /// Operations the CLI accepts. The dispatch in `main` looks up this table.
     pub const COMMANDS: [&'static str; 4] = COMMANDS;
 
@@ -672,6 +731,23 @@ mod tests {
         // **Never give up.** The default rate limit (5 in 10 s) leaves the unit `failed`
         // forever; launchd never gives up, so match it here
         assert!(u.contains("StartLimitIntervalSec=0"), "{u}");
+        // **Only the Bridge is stopped.** The default kills the tmux server with it, and every agent
+        assert!(u.contains("KillMode=process"), "{u}");
+    }
+
+    #[test]
+    fn an_old_unit_is_healed_to_keep_its_agents() {
+        let old = "[Unit]\nDescription=agentgw Bridge\n\n[Service]\nType=simple\nExecStart=/x serve\nEnvironment=PATH=/a:/b\n";
+        let healed = unit_keeping_workers(old).unwrap();
+        assert!(healed.contains("[Service]\nKillMode=process\nType=simple"), "{healed}");
+        assert!(healed.contains("Environment=PATH=/a:/b"), "everything else stays: {healed}");
+        // Once is enough
+        assert_eq!(unit_keeping_workers(&healed), None);
+        // Another KillMode is replaced, not doubled
+        let other = unit_keeping_workers("[Service]\nKillMode=control-group\n").unwrap();
+        assert_eq!(other, "[Service]\nKillMode=process\n");
+        // What we write ourselves needs nothing
+        assert_eq!(unit_keeping_workers(&spec().systemd_unit()), None);
     }
 
     #[test]

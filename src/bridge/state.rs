@@ -883,6 +883,10 @@ pub struct Access {
     pub gateway: Option<Link>,
     /// **An `update` in progress**, on the gateway. Kept here rather than in memory because the
     /// gateway replaces itself halfway through: the process that finishes is not the one that started.
+    ///
+    /// **Ending it can't go through [`Access::save`]**: a save lays only the keys it writes over the
+    /// file, and an empty one isn't written, so the old rollout stayed on disk and the gateway kept
+    /// finishing it every 2 seconds. The gateway clears the key itself (`Fleet::end_update`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub update: Option<Rollout>,
     #[serde(flatten)]
@@ -1728,6 +1732,9 @@ mod tests {
         let back = Access::from_str(&serde_json::to_string(&access).unwrap()).unwrap();
         assert_eq!(back.update, Some(r));
         // A machine's version is kept on its record
+        // A cleared rollout reads back as none
+        let cleared = r#"{"owner":"U1","update":null}"#;
+        assert_eq!(Access::from_str(cleared).unwrap().update, None);
         let with = r#"{"owner":"U1","machines":{"pve":{"version":"0.55.0"}}}"#;
         assert_eq!(Access::from_str(with).unwrap().machines["pve"].version, "0.55.0");
     }

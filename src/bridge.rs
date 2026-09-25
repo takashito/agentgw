@@ -740,6 +740,7 @@ impl Bridge {
             machine::address_of,
         )?;
         let mode = wiring.upstream.clone();
+        crate::service::Service::keep_workers_on_restart();
         LogCtx::default().info(
             "bridge",
             &format!("starting — state dir {}", dir.path().display()),
