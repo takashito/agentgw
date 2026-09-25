@@ -963,15 +963,29 @@ impl Bridge {
                     crate::bridge::gateway::link::LinkFrame::StartUpdate {
                         channel: msg.channel.clone(),
                         thread_ts: root_ts.to_string(),
-                        version,
+                        version: version.clone(),
                     },
                     &ctx,
                 ) {
-                    let text = crate::t!(
-                        "This machine works on its own. Update it with install.sh.",
-                        "このマシンは単独で動いています。install.sh で上げてください。"
-                    );
-                    self.post(&msg.channel, root_ts, text, key);
+                    // **No machines: this one is the whole fleet.** Replace itself, then the same
+                    // restart as SIGUSR1 (agents keep running). Off the main loop — a download takes a while
+                    let (slack, channel, thread) = (self.deps.slack.clone(), msg.channel.clone(), root_ts.to_string());
+                    tokio::spawn(async move {
+                        let text = match crate::setup::update::update_alone(version.as_deref()).await {
+                            Ok(None) => {
+                                let me = env!("CARGO_PKG_VERSION");
+                                crate::t!("Already on v{me}.", "すでに v{me} です。")
+                            }
+                            Ok(Some(tag)) => {
+                                let _ = std::process::Command::new("kill")
+                                    .args(["-USR1", &std::process::id().to_string()])
+                                    .status();
+                                crate::t!("Updated to {tag}. Restarting…", "{tag} に上げました。再起動します…")
+                            }
+                            Err(e) => crate::t!("Cannot update: {e}", "update できません: {e}"),
+                        };
+                        let _ = slack.post_message_no_unfurl(&channel, &text, Some(&thread)).await;
+                    });
                 }
             }
             Cmd::Owner(oc) => {

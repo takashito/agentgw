@@ -69,11 +69,3 @@ fn install_reaches_setup() {
     assert_eq!(out.status.code(), Some(1), "{text}");
     assert!(text.starts_with("install: "), "{text}");
 }
-
-#[test]
-fn update_on_a_bridge_with_no_gateway_says_so() {
-    // No .env: no gateway to ask, and nothing is asked of anyone
-    let (code, text) = agentgw(&["update"]);
-    assert_eq!(code, 2, "{text}");
-    assert!(text.contains("works on its own"), "{text}");
-}

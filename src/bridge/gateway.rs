@@ -1899,37 +1899,44 @@ pub(crate) fn entrances(listen: &str, serve_json: Option<&str>) -> Vec<Entrance>
 }
 
 /// Where `agentgw update` asks, and with which key. **The gateway runs every update**, so it is asked
-/// wherever this is typed: on the gateway, its own link port; on a machine, the gateway it dials
-/// (the same address its link uses, so whatever front or tunnel carries the link carries this too).
+/// wherever this is typed: on a machine, the gateway it dials (the same address its link uses, so
+/// whatever front or tunnel carries the link carries this too); on the gateway, its own link port.
+/// `Ok(None)` = a gateway with no machines — there is no one to ask, and it updates itself.
 ///
-/// Told apart by role, **not by the key** — a machine holds the same key to present to its gateway,
-/// and reading "has the key" as "is the gateway" sent a machine's request to its own loopback.
-pub fn update_target(env: &HashMap<String, String>, access: &Access) -> Result<(String, String), String> {
+/// **Read off the records, not guessed.** A machine says so in `AGENTGW_BRIDGE_ROLE`; a gateway
+/// knows its machines (`access.json`'s `machines`). Not the key — a machine holds the same key to
+/// present to its gateway — and not `AGENTGW_LINK_LISTEN`, which a gateway's `.env` no longer
+/// carries.
+pub fn update_target(
+    env: &HashMap<String, String>,
+    access: &Access,
+) -> Result<Option<(String, String)>, String> {
     let token = env.get("AGENTGW_LINK_TOKEN").filter(|t| !t.is_empty());
     let role = env.get("AGENTGW_BRIDGE_ROLE").map(|r| r.trim().to_lowercase());
     if role.as_deref() == Some("machine") {
         let url = access.gateway.as_ref().map(|g| g.link_url.clone()).unwrap_or_default();
         return match (url.is_empty(), token) {
-            (false, Some(t)) => Ok((
+            (false, Some(t)) => Ok(Some((
                 format!("{}/update", crate::setup::add_machine::probe_base(&url)),
                 t.clone(),
-            )),
+            ))),
             _ => Err(crate::t!(
                 "This machine doesn't know its gateway, so it can't ask it. Send `update` in Slack instead.",
                 "このマシンはゲートウェイを知らないので、頼めません。Slack で `update` を送ってください。"
             )),
         };
     }
-    if env.contains_key("AGENTGW_LINK_LISTEN")
-        && let Some(t) = token
-    {
-        let port = crate::bridge::machine::link_port(|k| env.get(k).cloned());
-        return Ok((format!("http://127.0.0.1:{port}/update"), t.clone()));
+    if access.machines.is_empty() {
+        return Ok(None);
     }
-    Err(crate::t!(
-        "This agentgw works on its own, with no gateway to run an update. Install the new version with install.sh.",
-        "この agentgw は単独で動いていて、update を回すゲートウェイがありません。install.sh で新しい版を入れてください。"
-    ))
+    let Some(t) = token else {
+        return Err(crate::t!(
+            "This gateway has machines but no AGENTGW_LINK_TOKEN in .env, so it can't be asked. Send `update` in Slack instead.",
+            "このゲートウェイにはマシンがありますが、.env に AGENTGW_LINK_TOKEN が無いので頼めません。Slack で `update` を送ってください。"
+        ));
+    };
+    let port = crate::bridge::machine::link_port(|k| env.get(k).cloned());
+    Ok(Some((format!("http://127.0.0.1:{port}/update"), t.clone())))
 }
 
 /// Held while the gateway reads, changes and writes access.json — see `Fleet::edit_access`.
@@ -3973,14 +3980,33 @@ impl Cli {
 
     /// `agentgw update [version]`: ask the running gateway to start one.
     pub async fn update(dir: &StateDir, args: &[String]) -> i32 {
+        let version = args.first().cloned().unwrap_or_default();
         let (url, token) = match update_target(&Self::env_of(dir), &Access::load(dir)) {
-            Ok(t) => t,
+            Ok(Some(t)) => t,
+            // No machines: this is the whole fleet. Replace the binary, then restart the service
+            Ok(None) => {
+                let named = (!version.is_empty()).then_some(version.as_str());
+                return match crate::setup::update::update_alone(named).await {
+                    Ok(None) => {
+                        let me = env!("CARGO_PKG_VERSION");
+                        println!("{}", crate::t!("Already on v{me}.", "すでに v{me} です。"));
+                        0
+                    }
+                    Ok(Some(tag)) => {
+                        println!("{}", crate::t!("Updated to {tag}.", "{tag} に上げました。"));
+                        crate::service::Service::run("restart", &[])
+                    }
+                    Err(e) => {
+                        eprintln!("{}", crate::t!("Cannot update: {e}", "update できません: {e}"));
+                        1
+                    }
+                };
+            }
             Err(why) => {
                 eprintln!("{why}");
                 return 2;
             }
         };
-        let version = args.first().cloned().unwrap_or_default();
         let out = tokio::process::Command::new("curl")
             .args([
                 "-s",
@@ -4590,9 +4616,14 @@ mod tests {
         let env = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
             pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
         };
-        // On the gateway: its own link port
-        let gw = env(&[("AGENTGW_LINK_LISTEN", "127.0.0.1:8787"), ("AGENTGW_LINK_TOKEN", "k")]);
-        let (url, token) = update_target(&gw, &Access::default()).unwrap();
+        // On the gateway: its own link port. **The `.env` a real gateway has** — no AGENTGW_LINK_LISTEN
+        // (0.57.3 required it and turned the gateway away as "on its own")
+        let gw = env(&[("AGENTGW_BRIDGE_ID", "dock"), ("AGENTGW_BRIDGE_ROLE", "gateway"), ("AGENTGW_LINK_TOKEN", "k")]);
+        let with_pve = Access {
+            machines: [("pve".to_string(), Default::default())].into_iter().collect(),
+            ..Default::default()
+        };
+        let (url, token) = update_target(&gw, &with_pve).unwrap().unwrap();
         assert_eq!((url.as_str(), token.as_str()), ("http://127.0.0.1:8787/update", "k"));
         // On a machine: **the gateway it dials**, not its own loopback — it holds the key too
         let m = env(&[("AGENTGW_BRIDGE_ROLE", "machine"), ("AGENTGW_LINK_TOKEN", "k")]);
@@ -4600,13 +4631,16 @@ mod tests {
             gateway: Some(crate::bridge::state::Link { link_url: url.into(), ..Default::default() }),
             ..Default::default()
         };
-        let (url, _) = update_target(&m, &dialing("wss://gw.example.ts.net")).unwrap();
+        let (url, _) = update_target(&m, &dialing("wss://gw.example.ts.net")).unwrap().unwrap();
         assert_eq!(url, "https://gw.example.ts.net/update");
-        let (url, _) = update_target(&m, &dialing("ws://127.0.0.1:8799")).unwrap();
+        let (url, _) = update_target(&m, &dialing("ws://127.0.0.1:8799")).unwrap().unwrap();
         assert_eq!(url, "http://127.0.0.1:8799/update", "through the tunnel the link uses");
-        // A machine that doesn't know its gateway, and a Bridge on its own, say so
+        // A machine that doesn't know its gateway says so
         assert!(update_target(&m, &Access::default()).is_err());
-        assert!(update_target(&env(&[]), &Access::default()).unwrap_err().contains("on its own"));
+        // A gateway with no machines on record asks no one: it updates itself — **key or no key**
+        assert_eq!(update_target(&gw, &Access::default()), Ok(None));
+        let alone = env(&[("AGENTGW_BRIDGE_ID", "desk"), ("AGENTGW_BRIDGE_ROLE", "gateway")]);
+        assert_eq!(update_target(&alone, &Access::default()), Ok(None));
     }
 
     /// A finished rollout has to be **gone** from disk, or the next tick finishes it again.

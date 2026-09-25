@@ -180,6 +180,22 @@ pub async fn latest_tag() -> Result<String, String> {
         .ok_or_else(|| "cannot find the latest release".to_string())
 }
 
+/// **A gateway with no machines updates only itself**: fetch the release, put it in place, and
+/// return what it is now (`Ok(None)` = already on it). The caller restarts. `named` is a version
+/// asked for on purpose (the only way to go down); otherwise the latest release, never an older one.
+pub async fn update_alone(named: Option<&str>) -> Result<Option<String>, String> {
+    let tag = match named {
+        Some(v) => tag_of(v),
+        None => latest_tag().await?,
+    };
+    let me = env!("CARGO_PKG_VERSION");
+    if version_of(&tag) == me || (named.is_none() && older(version_of(&tag), me)) {
+        return Ok(None);
+    }
+    self_replace(&tag).await?;
+    Ok(Some(tag))
+}
+
 /// Fetch `tag` and put it in place of the running binary. Does **not** restart.
 pub async fn self_replace(tag: &str) -> Result<(), String> {
     let target = running_binary()?;
