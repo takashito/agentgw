@@ -294,6 +294,10 @@ fn perm_timeout_line() -> String {
 
 /// Budget (bytes) for one progress message. Leaves headroom below Slack's message body limit.
 const STICKY_BUDGET: usize = 3800;
+/// Where a tool row's summary is cut. A long command used to stop inside its own path
+/// (`…/scratchpad/` and nothing of what it ran), so the row said which tool but not what it did.
+/// The row is free to wrap, and four cut-off rows still leave most of STICKY_BUDGET.
+const SUMMARY_MAX: usize = 100;
 /// Closing line for a round cut off by stop. It goes **under**
 /// the progress so far — it shows the interruption while keeping "how far it got".
 const INTERRUPTED_NOTICE: &str = "└ `Interrupted by user.`";
@@ -794,7 +798,7 @@ impl StickyBoard {
     }
 
     /// The most prominent argument of the tool input, on one line.
-    /// It goes into Slack inline code, so newlines and backquotes are dropped, and it is cut with `…` at 70 chars.
+    /// It goes into Slack inline code, so newlines and backquotes are dropped, and it is cut with `…` at SUMMARY_MAX chars.
     pub fn summarize(name: &str, input: &serde_json::Value) -> String {
         let get = |k: &str| {
             input
@@ -824,8 +828,8 @@ impl StickyBoard {
             .find_map(|k| get(k)),
         };
         let s = raw.unwrap_or_default().replace('\n', " ").replace('`', "");
-        if s.chars().count() > 70 {
-            s.chars().take(70).chain(['…']).collect()
+        if s.chars().count() > SUMMARY_MAX {
+            s.chars().take(SUMMARY_MAX).chain(['…']).collect()
         } else {
             s
         }
@@ -868,7 +872,7 @@ impl StickyBoard {
     /// the parts add up to the total. Anything outside the categories is grouped by tool name ("WebFetch 2").
     ///
     /// Takes `(tool name, summary)`. The Bash check uses only the first token, so
-    /// a summary already clipped to 70 chars is enough.
+    /// a summary already clipped to SUMMARY_MAX chars is enough.
     pub fn tool_breakdown(items: &[(&str, &str)]) -> String {
         let (mut reads, mut searches, mut cmds, mut edits) = (0usize, 0usize, 0usize, 0usize);
         // Keep order of appearance (with a HashMap the order of "WebFetch 2, Skill 1" is unstable)
@@ -1529,9 +1533,12 @@ mod tests {
         ] {
             assert_eq!(StickyBoard::summarize(name, &input), want);
         }
-        // 70 chars + …
-        let long = serde_json::json!({"command": "x".repeat(80)});
-        assert_eq!(StickyBoard::summarize("Bash", &long).chars().count(), 71);
+        // SUMMARY_MAX chars + …
+        let long = serde_json::json!({"command": "x".repeat(SUMMARY_MAX + 20)});
+        assert_eq!(
+            StickyBoard::summarize("Bash", &long).chars().count(),
+            SUMMARY_MAX + 1
+        );
     }
 
     #[test]
