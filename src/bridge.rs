@@ -657,6 +657,12 @@ impl Bridge {
         entry.agent_id = Some(part.session_id.clone());
         entry.channel_id = Some(part.channel.clone());
         entry.repo_path = Some(part.path.clone());
+        // **The owner is here now, whatever the row that arrived says.** The sender's row names the
+        // machine it was on, and on the gateway it lands on top of the owner just written for this
+        // move — after a restart the forwarding table read that older name and sent the thread back
+        // to the machine that had already let go of it, where every message was dropped as addressed
+        // to nobody (a real thread went silent this way, 2026-09-26)
+        entry.bridge = Some(self.machine_name.clone());
         entry.moved_from = Some(crate::bridge::state::MovedFrom {
             machine: part.from_machine.clone(),
             path: part.from_path.clone(),
@@ -3175,6 +3181,8 @@ mod tests {
         // Where it came from, to tell the agent when it wakes
         let from = entry.moved_from.clone().expect("where it came from was dropped");
         assert_eq!((from.machine.as_str(), from.path.as_str()), ("desk", "/home/me/app"));
+        // **This machine owns it now.** The row that arrived named the machine it left
+        assert_eq!(entry.bridge.as_deref(), Some("test-machine"));
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&work);

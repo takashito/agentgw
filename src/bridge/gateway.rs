@@ -2840,10 +2840,21 @@ impl Fleet {
     ) {
         if thread_ts.is_empty() {
             // A folder set on the machine itself: record it so `route` shows where the work happens
+            //
+            // **A machine may only describe a channel that is already its own.** Every machine
+            // replays its whole `routes` table on the handshake (`bridge.rs`, beside `MachineHost`),
+            // and a machine keeps its row for a channel long after the channel was pointed somewhere
+            // else. Taking the row on that word handed the channel back on every reconnect — a Mac
+            // that had lost the channel hours earlier stole it again the next time it woke, quietly,
+            // because nothing here says a word (2026-09-26: `route dock:…` held for 19 minutes,
+            // until the link dropped once)
             if let Ok(abs) = result {
                 let (ch, id) = (channel.to_string(), bridge_id.to_string());
                 self.edit_access(move |a| {
                     let r = a.routes.entry(ch).or_default();
+                    if r.bridge.as_deref().is_some_and(|b| b != id) {
+                        return;
+                    }
                     r.bridge = Some(id);
                     r.repo_path = Some(abs);
                 })
@@ -4626,6 +4637,43 @@ mod tests {
             tunnels: Default::default(),
         });
         (fleet, msg_rx)
+    }
+
+    /// **A machine's handshake replays its own `routes`, and that must not take a channel back.**
+    /// A machine keeps its row for a channel long after the channel was pointed somewhere else, so
+    /// the replay arrives saying "this one is mine, in my folder" — and believing it undid
+    /// `route dock:…` on every reconnect, without a line in any log.
+    #[tokio::test]
+    async fn a_reconnecting_machine_does_not_take_back_a_channel() {
+        let dir = StateDir::at(
+            std::env::temp_dir().join(format!("agentgw-route-replay-{}", std::process::id())),
+        );
+        let _ = std::fs::remove_dir_all(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let mut access = Access::default();
+        let row = access.routes.entry("C1".to_string()).or_default();
+        row.bridge = Some("dock".into());
+        row.repo_path = Some("/mnt/dev/x".into());
+        access.save(&dir).unwrap();
+        let (fleet, _rx) = a_fleet_in(dir.clone());
+
+        fleet
+            .on_machine_frame(
+                "mac",
+                link::LinkFrame::ProjectSet {
+                    channel: "C1".into(),
+                    thread_ts: String::new(),
+                    result: Ok("/Users/t/x".into()),
+                    thread_only: false,
+                },
+            )
+            .await;
+
+        let after = Access::load(&dir);
+        let row = after.routes.get("C1").expect("the row is still there");
+        assert_eq!(row.bridge.as_deref(), Some("dock"), "the channel stayed where it was pointed");
+        assert_eq!(row.repo_path.as_deref(), Some("/mnt/dev/x"), "and so did its folder");
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     /// Machines report at the same moment (every one of them does after the gateway restarts), each
