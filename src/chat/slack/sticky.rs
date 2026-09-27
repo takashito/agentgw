@@ -279,9 +279,8 @@ fn perm_timeout_line() -> String {
     )
 }
 
-/// Where a tool row's summary is cut. A long command used to stop inside its own path
-/// (`…/scratchpad/` and nothing of what it ran), so the row said which tool but not what it did.
-/// The row is free to wrap, and four cut-off rows still leave most of STICKY_BUDGET.
+/// Where a **folded card's row** is cut. The row running now is not cut at all — its box shows
+/// the command whole, and Slack folds what does not fit behind Show more.
 const SUMMARY_MAX: usize = 100;
 /// Closing line for a round cut off by stop. It goes **under**
 /// the progress so far — it shows the interruption while keeping "how far it got".
@@ -634,7 +633,10 @@ impl StickyBoard {
     }
 
     /// The most prominent argument of the tool input, on one line.
-    /// It goes into Slack inline code, so newlines and backquotes are dropped, and it is cut with `…` at SUMMARY_MAX chars.
+    /// **Kept whole.** It used to be flattened onto one line, stripped of backquotes and cut at a
+    /// hundred characters, because it went into Slack inline code where a newline or a stray ` broke
+    /// the run. It now rides a `rich_text` box, which is not read as mrkdwn: a heredoc arrives with
+    /// its line breaks and its quoting intact. The folded card cuts its own rows (first line only).
     pub fn summarize(name: &str, input: &serde_json::Value) -> String {
         let get = |k: &str| {
             input
@@ -663,12 +665,7 @@ impl StickyBoard {
             .iter()
             .find_map(|k| get(k)),
         };
-        let s = raw.unwrap_or_default().replace('\n', " ").replace('`', "");
-        if s.chars().count() > SUMMARY_MAX {
-            s.chars().take(SUMMARY_MAX).chain(['…']).collect()
-        } else {
-            s
-        }
+        raw.unwrap_or_default().to_string()
     }
 
     /// Whether the tool may be folded (Read / Grep / Glob / Bash).
@@ -796,16 +793,23 @@ impl StickyBoard {
                 els.push(Self::run(&format!("{name} "), false));
             }
             if !summary.is_empty() {
-                let head = summary.lines().next().unwrap_or(summary);
-                let one = if head.len() < summary.len() {
-                    format!("{head} …")
-                } else {
-                    head.to_string()
-                };
-                els.push(Self::run(&one, true));
+                els.push(Self::run(&Self::one_line(summary), true));
             }
         }
         json!({"type": "rich_text", "elements": [{"type": "rich_text_section", "elements": els}]})
+    }
+
+    /// One row of a folded card: the summary's **first line**, cut if even that is long.
+    /// A chip that spans lines breaks into one chip per line and the column stops lining up, and a
+    /// heredoc's first line can still run for hundreds of characters.
+    fn one_line(summary: &str) -> String {
+        let head = summary.lines().next().unwrap_or(summary);
+        let cut = head.chars().count() > SUMMARY_MAX;
+        let mut out: String = head.chars().take(SUMMARY_MAX).collect();
+        if cut || head.len() < summary.len() {
+            out.push_str(" …");
+        }
+        out
     }
 
     /// A folded group. `task_id` must be unique **within the message** — a duplicate makes Slack
@@ -939,7 +943,6 @@ impl StickyBoard {
             fold: &mut Vec<(ToolStatus, String, String)>,
             fold_id: &mut String,
             blocks: &mut Vec<serde_json::Value>,
-            running: bool,
         ) {
             if fold.is_empty() {
                 return;
@@ -966,7 +969,7 @@ impl StickyBoard {
             blocks.push(StickyBoard::task_card(
                 &format!("fold-{fold_id}"),
                 &title,
-                running,
+                false,
                 StickyBoard::card_children(&rows),
             ));
             fold.clear();
@@ -983,15 +986,14 @@ impl StickyBoard {
                     }
                     rendered_agents.push(id.clone());
                     if let Some((_, ty, rows)) = groups.iter().find(|(gid, _, _)| *gid == id) {
-                        flush(&mut fold, &mut fold_id, &mut blocks, running);
+                        flush(&mut fold, &mut fold_id, &mut blocks);
                         let children = Self::agent_children(rows);
                         let pairs: Vec<(&str, &str)> =
                             children.iter().map(|(_, n, m)| (*n, *m)).collect();
-                        let busy = children.iter().any(|(s, ..)| *s == ToolStatus::Pending);
                         blocks.push(Self::task_card(
                             &format!("agent-{id}"),
                             &format!("{ty} · {}", Self::tool_breakdown(&pairs)),
-                            busy,
+                            false,
                             Self::card_children(&children),
                         ));
                     }
@@ -1008,15 +1010,14 @@ impl StickyBoard {
                         .unwrap_or_default();
                     rendered_agents.push(id.clone());
                     if let Some((_, ty, rows)) = groups.iter().find(|(gid, _, _)| *gid == id) {
-                        flush(&mut fold, &mut fold_id, &mut blocks, running);
+                        flush(&mut fold, &mut fold_id, &mut blocks);
                         let children = Self::agent_children(rows);
                         let pairs: Vec<(&str, &str)> =
                             children.iter().map(|(_, n, m)| (*n, *m)).collect();
-                        let busy = children.iter().any(|(s, ..)| *s == ToolStatus::Pending);
                         blocks.push(Self::task_card(
                             &format!("agent-{id}"),
                             &format!("{name} {summary} · {ty} · {}", Self::tool_breakdown(&pairs)),
-                            busy,
+                            false,
                             Self::card_children(&children),
                         ));
                     }
@@ -1032,13 +1033,13 @@ impl StickyBoard {
                     match (status, diff) {
                         // Still running: out of the card, so it stays readable.
                         (ToolStatus::Pending, _) => {
-                            flush(&mut fold, &mut fold_id, &mut blocks, running);
+                            flush(&mut fold, &mut fold_id, &mut blocks);
                             blocks.push(Self::running_block(name, summary));
                         }
                         // Finished with a diff: its own markdown block, which is the only block
                         // that paints the fence.
                         (_, Some(d)) => {
-                            flush(&mut fold, &mut fold_id, &mut blocks, running);
+                            flush(&mut fold, &mut fold_id, &mut blocks);
                             blocks.push(Self::markdown_block(&format!(
                                 "{}{} {name} `{summary}`{d}",
                                 INDENT_GUARD,
@@ -1055,16 +1056,26 @@ impl StickyBoard {
                     }
                 }
                 RenderItem::Narration { text } => {
-                    flush(&mut fold, &mut fold_id, &mut blocks, running);
+                    flush(&mut fold, &mut fold_id, &mut blocks);
                     blocks.push(Self::markdown_block(&format!("{NARR_GLYPH} {text}")));
                 }
                 RenderItem::Interrupted => {
-                    flush(&mut fold, &mut fold_id, &mut blocks, running);
+                    flush(&mut fold, &mut fold_id, &mut blocks);
                     blocks.push(Self::markdown_block(INTERRUPTED_NOTICE));
                 }
             }
         }
-        flush(&mut fold, &mut fold_id, &mut blocks, running);
+        flush(&mut fold, &mut fold_id, &mut blocks);
+        // **Only the newest card carries the turn.** Every card above it holds rows that are
+        // finished and done with; spinning all of them said the whole history was still running.
+        if running
+            && let Some(last) = blocks
+                .iter_mut()
+                .rev()
+                .find(|b| b["type"] == "task_card")
+        {
+            last["status"] = json!("in_progress");
+        }
         if perm_timed_out {
             blocks.push(Self::markdown_block(&perm_timeout_line()));
         }
@@ -1607,15 +1618,21 @@ mod tests {
             ("Bash", serde_json::json!({"command": "cargo test"}), "cargo test"),
             ("Read", serde_json::json!({"file_path": "/a/b.rs"}), "/a/b.rs"),
             ("Grep", serde_json::json!({"pattern": "foo"}), "foo"),
-            ("Bash", serde_json::json!({"command": "a`b`\nc"}), "ab c"),
+            // Kept as typed: rich_text is not mrkdwn, so a backquote and a newline both survive
+            ("Bash", serde_json::json!({"command": "a`b`\nc"}), "a`b`\nc"),
         ] {
             assert_eq!(StickyBoard::summarize(name, &input), want);
         }
-        // SUMMARY_MAX chars + …
+        // Kept whole: the box shows it all, and the folded card cuts its own rows
         let long = serde_json::json!({"command": "x".repeat(SUMMARY_MAX + 20)});
         assert_eq!(
             StickyBoard::summarize("Bash", &long).chars().count(),
-            SUMMARY_MAX + 1
+            SUMMARY_MAX + 20
+        );
+        assert_eq!(
+            StickyBoard::one_line(&"x".repeat(SUMMARY_MAX + 20)).chars().count(),
+            SUMMARY_MAX + 2,
+            "畳んだカードの行は切る"
         );
     }
 

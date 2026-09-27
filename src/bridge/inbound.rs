@@ -6,7 +6,7 @@
 //! itself is persisted state and lives in `state.rs`.
 
 use super::{Bridge, Host};
-use crate::bridge::turn::Stall;
+use crate::bridge::turn::{Reason, Stall};
 use crate::agent::Window;
 use crate::agent::{Envelope, SessionId, SpawnReq, WorkerState};
 use crate::bridge::state as bridge;
@@ -625,6 +625,9 @@ impl Bridge {
         )
         .await;
         self.ledger.track(&key, &msg.ts);
+        // A message owing an answer **is** the turn: the same thing `restore_pending` reads back
+        // from threads.json after a restart, so a turn that crosses one keeps its reason.
+        self.presence_add(&key, Reason::Turn);
         // Where `status` should link to from now on: the newest message, not the thread's first one
         self.remember_last_message(&root_ts, msg);
 
@@ -1121,7 +1124,7 @@ impl Bridge {
         key: &ThreadKey,
         session_id: String,
         farewell: Option<(String, String)>,
-        thinking: Option<slack::Thinking>,
+        thinking: Option<crate::bridge::turn::PresenceHold>,
         ctx: &LogCtx,
     ) {
         if self.workers.is_draining(key) {
@@ -1250,6 +1253,10 @@ impl Bridge {
         );
         for key in alive {
             self.touch_thread(&key, false);
+            // **The turn crossed the restart.** Its reason died with the process that set it, so
+            // without this nothing would take the thread's status down when the answer finally
+            // lands — which is how a thread sat showing "Claude is working…" for fifteen minutes.
+            self.presence_add(&key, Reason::Turn);
         }
     }
 
@@ -1279,28 +1286,25 @@ impl Bridge {
         let e = match self.stall.get_mut(key) {
             Some(e) => e,
             None => {
-                let (channel, thread) = key.split();
                 // The API requires thread_ts, so a key without a root isn't watched
-                let Some(ts) = thread else { return };
-                // Create it **silently** (empty = no initial send). Passing `status` would send once
-                // here and again in the shared code below. The single send point is below
+                if key.split().1.is_none() {
+                    return;
+                }
                 self.stall.entry(key.clone()).or_insert(Stall {
                     last_activity_ms: 0,
                     shown: false,
                     awaiting_perm: false,
-                    thinking: slack::Thinking::new(self.deps.slack.clone(), &channel, &ts, false),
                 })
             }
         };
         e.last_activity_ms = self.deps.clock.now_ms();
-        // **The idle one never goes out from here.** Slack draws the busy state itself, with a
-        // stop button beside it, so "activity, but nothing new to show" used to lift a line of text
-        // and now takes the button away and puts it back a moment later (seen on a live thread: it
-        // blinked through the whole turn). A turn ends where it always ended — the entry is
-        // dropped, and its guard sends the clear from the tail of the queue
+        // **Idle never goes out from here.** Slack draws the busy state itself, with a stop button
+        // beside it, so "activity, but nothing new to show" used to take the button away and put it
+        // back a moment later (seen on a live thread: it blinked through the whole turn). A turn
+        // ends where it always ended — where the answer is recorded.
         e.shown = false;
         if busy {
-            e.thinking.set(true);
+            self.presence_add(&key, Reason::Turn);
         }
     }
 

@@ -129,6 +129,13 @@ pub struct Bridge {
     usage_warned_pct: u32,
     /// The silence watch (`armWatchdog` / `showStall`). `thread_key` → [`Stall`].
     stall: HashMap<ThreadKey, Stall>,
+    /// Why each thread counts as busy, and what Slack was last told. **The only writer** of the
+    /// thread's status: everything that used to own a sender of its own now adds and removes a
+    /// reason here instead.
+    presence: std::sync::Arc<std::sync::Mutex<crate::bridge::turn::PresenceBook>>,
+    /// One queue for every status call. Slack takes about 200ms, which the main loop cannot wait
+    /// for; one queue (not one per holder, as before) is what keeps a thread's calls in order.
+    presence_tx: mpsc::UnboundedSender<(ThreadKey, crate::chat::Presence)>,
     /// Whether this has a port for machines to connect to. Only used to decide whether `help` shows the machine commands
     /// (running it is `relay::CommandCtx::route`. Listing it on a machine without one leaves
     /// nobody to route to).
@@ -231,6 +238,19 @@ impl Bridge {
     fn new(deps: Deps, config: Config) -> Bridge {
         // The ledger lives inside threads.json (the entry's `inflight`), so build it after reading
         let threads = bridge::Threads::load(&deps.dir);
+        // One queue for every status call, started before `deps` moves into the struct.
+        let presence_tx = {
+            let (tx, mut rx) = mpsc::unbounded_channel::<(ThreadKey, crate::chat::Presence)>();
+            let api = deps.slack.clone();
+            tokio::spawn(async move {
+                while let Some((key, presence)) = rx.recv().await {
+                    let (channel, root) = key.split();
+                    api.presence(&channel, root.as_deref().unwrap_or(&channel), presence)
+                        .await;
+                }
+            });
+            tx
+        };
         Bridge {
             ledger: bridge::Ledger::load(&threads),
             threads,
@@ -267,6 +287,8 @@ impl Bridge {
             usage_at_risk: false,
             usage_warned_pct: 0,
             stall: HashMap::new(),
+            presence: Default::default(),
+            presence_tx,
             fleet: config.fleet,
             machine_name: config.machine_name,
         }
@@ -442,16 +464,10 @@ impl Bridge {
         //     piling a throwaway pool session into claude's history on every restart.
         //     The successor relies on the pools.json nominations to pick up survivors with `restore_pools`
         //     (only dead slots are started with the same session_id via `--resume`)
-        // Always clear before going down. Left in place, this thread's shimmer lingers with nobody to clear it
-        // (the successor doesn't know about a status it didn't set)
-        if let Some((channel, root_ts)) = req {
-            slack::Api::brief_call(
-                "restart: thinking status clear failed",
-                self.deps.slack.set_presence(channel, root_ts, crate::chat::Presence::Idle),
-                ctx,
-            )
-            .await;
-        }
+        // (g) Nothing to clear here. This used to take the status down for **the thread that asked
+        //     for the restart**, which left every other thread showing "Claude is working…" — and
+        //     when the restart came from the shell there was no such thread at all. The successor
+        //     puts the reason back (`restore_pending`) and takes it down when the answer lands.
         ctx.info(
             "bridge",
             "maintenance restart: stepping down now (the supervisor brings the successor up)",
@@ -3507,8 +3523,15 @@ mod tests {
         clock.advance(slack::SILENCE_MS + 1);
         b.stall_tick();
         settle().await;
-        let thinking = format!("status C1 {ROOT} busy");
-        assert!(!slack.calls().contains(&thinking), "{:?}", slack.calls());
+        // The thread went busy when the message arrived, as any turn does. What matters is that
+        // the watch does not put it **back** after the turn is over.
+        let busy = format!("status C1 {ROOT} busy");
+        assert_eq!(
+            slack.calls().iter().filter(|c| **c == busy).count(),
+            1,
+            "{:?}",
+            slack.calls()
+        );
         // …and the thread is not left looking busy. Either nothing was ever shown (a status that
         // never went up needs no clear — the guard only sends changes), or the last word was the clear
         let last_status = slack.calls().into_iter().rev().find(|c| c.starts_with("status C1"));

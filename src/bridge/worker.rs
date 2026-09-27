@@ -468,9 +468,9 @@ pub struct DrainJob {
     /// Where to post the farewell (channel, thread_ts). Only exit announces it —
     /// for resume the report text already says the session is ending.
     pub farewell: Option<(String, String)>,
-    /// Shimmer shown for the whole drain (only `resume` hands one over). Dropped = cleared when
-    /// the job is taken out of drains. This reservation is what we wait on, so the guard lives here too.
-    pub thinking: Option<crate::chat::slack::Thinking>,
+    /// The reason held for the whole drain (only `resume` hands one over). Dropped when the job
+    /// leaves `drains` — this reservation is what we wait on, so the hold lives here too.
+    pub thinking: Option<crate::bridge::turn::PresenceHold>,
 }
 
 // ── starting, pooling and reaping agents ──

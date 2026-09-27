@@ -12,13 +12,13 @@ use crate::agent::{
     CompactOutcome, CompactProgress, ContextCategory, ContextReport, LoginOutcome, ProbeErr,
     SessionId, UsageRow,
 };
+use crate::bridge::turn::Reason;
 use crate::chat::InboundMsg;
 use crate::log::LogCtx;
 use crate::chat::ThreadKey;
 use crate::clock::WallClock;
 use crate::bridge::turn::UsageProjection;
 use crate::bridge::{Bridge, Host};
-use crate::chat::slack;
 use tokio::sync::mpsc;
 
 /// Sign-in polling (per the constants). The URL normally appears within 1–3 seconds.
@@ -192,8 +192,7 @@ impl Bridge {
             // **Hand the shimmer to the drain.** The resume itself only peeks at tmux once,
             // so holding the guard here would just fire set and clear back to back and never render.
             // The actual waiting happens in the drain, which waits up to 30 seconds for the reply to go out
-            let thinking =
-                slack::Thinking::new(self.deps.slack.clone(), &msg.channel, root_ts, true);
+            let thinking = self.presence_hold(key, Reason::Command("resume"));
             self.push_drain(key, sid, None, Some(thinking), ctx);
         }
     }
@@ -227,8 +226,7 @@ impl Bridge {
             root_ts.to_string(),
             key.clone(),
         );
-        let thinking =
-            slack::Thinking::new(self.deps.slack.clone(), &msg.channel, root_ts, true);
+        let thinking = self.presence_hold(&key, Reason::Command("context"));
         let agent = self.deps.agent.clone();
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = clear (goes away even if the probe fails)
@@ -297,7 +295,7 @@ impl Bridge {
             root_ts.to_string(),
             key.clone(),
         );
-        let thinking = slack::Thinking::new(self.deps.slack.clone(), &msg.channel, root_ts, true);
+        let thinking = self.presence_hold(&key, Reason::Command("usage"));
         let agent = self.deps.agent.clone();
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = clear
@@ -464,7 +462,7 @@ impl Bridge {
             root_ts.to_string(),
             key.clone(),
         );
-        let thinking = slack::Thinking::new(self.deps.slack.clone(), &msg.channel, root_ts, true);
+        let thinking = self.presence_hold(&key, Reason::Command("model"));
         let agent = self.deps.agent.clone();
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = clear (goes away even if the TUI never confirms)
@@ -592,7 +590,7 @@ impl Bridge {
             ));
             return;
         };
-        let thinking = slack::Thinking::new(self.deps.slack.clone(), &msg.channel, root_ts, true);
+        let thinking = self.presence_hold(&key, Reason::Command("effort"));
         let agent = self.deps.agent.clone();
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = clear
@@ -652,7 +650,7 @@ impl Bridge {
             root_ts.to_string(),
             key.clone(),
         );
-        let thinking = slack::Thinking::new(self.deps.slack.clone(), &msg.channel, root_ts, true);
+        let thinking = self.presence_hold(&key, Reason::Command("mode"));
         let agent = self.deps.agent.clone();
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = clear
@@ -869,10 +867,10 @@ impl Bridge {
         self.sign_in.pending.insert(channel.clone(), user.clone());
         let (api, cmd_tx, home) = (self.deps.slack.clone(), self.cmd_tx.clone(), Host::home());
         // Sign-in takes tens of seconds (show the URL, then wait for the code) — keep the shimmer up the whole time
-        let thinking = slack::Thinking::new(self.deps.slack.clone(), &channel, &reply_ts, true);
-        // `thinking` is used in the body, so the async move takes it whole (Drop = clear whichever path exits)
+        let thinking = self.presence_hold(&ThreadKey::new(&channel, &reply_ts), Reason::Command("login"));
         let agent = self.deps.agent.clone();
         tokio::spawn(async move {
+            let _thinking = thinking; // Drop = clear, whichever path exits
             let ctx = LogCtx::default();
             let started = agent.login_begin(&home);
             let mut url = None;
@@ -890,10 +888,6 @@ impl Bridge {
                 // as "timed out without a URL"
                 for _ in 0..URL_POLL_MAX {
                     tokio::time::sleep(LOGIN_POLL).await;
-                    // Up to URL_POLL_MAX seconds until the URL appears — Slack expires the status sooner than that,
-                    // so re-set it each tick (same reason as compact).
-                    // Without that the shimmer vanishes midway and it looks "stuck"
-                    thinking.set(true);
                     url = agent.login_url();
                     if url.is_some() {
                         break;
@@ -953,9 +947,10 @@ impl Bridge {
         let had_owner = !self.access.owner.is_empty();
         // The second half of sign-in (checking the pasted code, up to CODE_POLL_MAX seconds) is also waiting —
         // login_start's guard dropped once the URL was shown, so set it again here
-        let thinking = slack::Thinking::new(self.deps.slack.clone(), &channel, &reply_ts, true);
+        let thinking = self.presence_hold(&ThreadKey::new(&channel, &reply_ts), Reason::Command("code"));
         let agent = self.deps.agent.clone();
         tokio::spawn(async move {
+            let _thinking = thinking; // Drop = clear
             let ctx = LogCtx::default();
             let mut outcome = "timeout";
             if let Err(e) = agent.login_submit_code(&code) {
@@ -970,7 +965,6 @@ impl Bridge {
             } else {
                 for _ in 0..CODE_POLL_MAX {
                     tokio::time::sleep(LOGIN_POLL).await;
-                    thinking.set(true); // don't let it expire (same as waiting for the URL)
                     // Read including scrollback: right after printing "Login successful." the CLI returns to the shell,
                     // and the marker scrolls off screen before the next poll
                     match agent.login_outcome() {
@@ -1041,7 +1035,7 @@ impl Bridge {
         self.sign_in.signing_out = true;
         // The shimmer lasts until `claude auth logout` returns. Tearing down agents afterwards is main's side
         // (CmdFx::LogoutFinished), so holding it here guarantees it **always** goes away
-        let thinking = slack::Thinking::new(self.deps.slack.clone(), channel, root_ts, true);
+        let thinking = self.presence_hold(&ThreadKey::new(channel, root_ts), Reason::Command("logout"));
         let (cmd_tx, channel, thread_ts) = (
             self.cmd_tx.clone(),
             channel.to_string(),

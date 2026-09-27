@@ -9,6 +9,7 @@ use crate::bridge::state as bridge;
 use crate::bridge::state::Disposition;
 use crate::log::LogCtx;
 use crate::chat::{Chat, FetchedMsg, ThreadKey};
+use std::collections::{HashMap, HashSet};
 use crate::clock::WallClock;
 use crate::chat::slack;
 
@@ -136,13 +137,127 @@ pub(super) struct PermPending {
 
 /// The silence watch for one thread.
 ///
-/// The key is that it **holds the thread's whole status sender**, so
-/// delivery / hooks / watch firing / settle all go through the one serial task of `thinking` = none
-/// overtakes another. Back when each was its own `tokio::spawn`, "delivery's `is typing…`" and
-/// "the watch's clear" went out in any order and cancelled each other.
-///
 /// Dropping the entry makes `slack::Thinking`'s Drop send a final clear — **it queues at the tail**,
 /// so it never overtakes the set sent just before it.
+/// Why a thread counts as busy right now.
+///
+/// **Reasons, not a status.** Each holder adds its own and takes only its own away, so a command
+/// that finishes while the agent is still working cannot clear the thread (it used to: the command
+/// owned a status sender of its own, and its drop wrote `idle` over a live turn).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) enum Reason {
+    /// A turn is in flight — there are undisposed messages on the ledger.
+    Turn,
+    /// A command is being handled. Named, so the log says what is holding the thread.
+    Command(&'static str),
+    /// A person has been asked something: a tool approval or a question.
+    Perm,
+}
+
+/// Holds one reason for as long as it lives, and gives it back on the way out.
+///
+/// **Commands need this.** They run in a spawned task, so "add here, remove there" would have to
+/// survive every early return inside it; dropping a value cannot be forgotten. What it removes is
+/// **its own reason only**, so a command ending under a running turn leaves the thread busy.
+pub struct PresenceHold {
+    book: std::sync::Arc<std::sync::Mutex<PresenceBook>>,
+    tx: tokio::sync::mpsc::UnboundedSender<(ThreadKey, crate::chat::Presence)>,
+    key: ThreadKey,
+    why: Reason,
+}
+
+impl Drop for PresenceHold {
+    fn drop(&mut self) {
+        let change = self
+            .book
+            .lock()
+            .ok()
+            .and_then(|mut b| b.remove(&self.key, &self.why));
+        if let Some(presence) = change {
+            let _ = self.tx.send((self.key.clone(), presence));
+        }
+    }
+}
+
+/// What each thread is doing, and what Slack was last told about it.
+///
+/// The status is **derived**, never written: `add` / `remove` move reasons, and whatever they add
+/// up to is what goes out. One writer means the ordering the old per-guard senders could not keep.
+#[derive(Default)]
+pub(super) struct PresenceBook {
+    reasons: HashMap<ThreadKey, HashSet<Reason>>,
+    /// **Absent means "not known"**, which is what a fresh process knows about a thread the
+    /// previous one was talking about. Starting it at `Idle` instead is what left a turn that
+    /// crossed a restart showing "Claude is working…" with nobody left to take it down.
+    last_sent: HashMap<ThreadKey, crate::chat::Presence>,
+}
+
+impl PresenceBook {
+    /// Adds a reason. Returns what Slack should be told, or None when nothing changed.
+    pub(super) fn add(&mut self, key: &ThreadKey, why: Reason) -> Option<crate::chat::Presence> {
+        self.reasons.entry(key.clone()).or_default().insert(why);
+        self.changed(key)
+    }
+
+    /// Takes one reason away. Returns what Slack should be told, or None when nothing changed.
+    pub(super) fn remove(&mut self, key: &ThreadKey, why: &Reason) -> Option<crate::chat::Presence> {
+        if let Some(set) = self.reasons.get_mut(key) {
+            set.remove(why);
+            if set.is_empty() {
+                self.reasons.remove(key);
+            }
+        }
+        self.changed(key)
+    }
+
+    /// Drops everything a thread was holding (it is gone, or the turn was abandoned).
+    pub(super) fn clear(&mut self, key: &ThreadKey) -> Option<crate::chat::Presence> {
+        self.reasons.remove(key);
+        self.changed(key)
+    }
+
+    /// What the reasons add up to.
+    fn presence_of(&self, key: &ThreadKey) -> crate::chat::Presence {
+        use crate::chat::Presence;
+        match self.reasons.get(key) {
+            None => Presence::Idle,
+            // **Waiting wins.** A turn is always in flight when the agent stops to ask, and what
+            // the thread needs to show is that it is the person's move, not that work goes on.
+            Some(s) if s.contains(&Reason::Perm) => Presence::Waiting,
+            Some(s) if s.is_empty() => Presence::Idle,
+            Some(_) => Presence::Working,
+        }
+    }
+
+    /// The value to send, if it differs from the last one sent (or none was).
+    fn changed(&mut self, key: &ThreadKey) -> Option<crate::chat::Presence> {
+        let now = self.presence_of(key);
+        if self.last_sent.get(key) == Some(&now) {
+            return None;
+        }
+        self.last_sent.insert(key.clone(), now);
+        Some(now)
+    }
+
+    /// Names of what is holding the thread, for the log.
+    #[allow(dead_code)]
+    pub(super) fn holders(&self, key: &ThreadKey) -> String {
+        let Some(set) = self.reasons.get(key) else {
+            return "-".to_string();
+        };
+        let mut out: Vec<String> = set
+            .iter()
+            .map(|r| match r {
+                Reason::Turn => "turn".to_string(),
+                Reason::Command(name) => format!("command {name}"),
+                Reason::Perm => "perm".to_string(),
+            })
+            .collect();
+        out.sort();
+        out.join(", ")
+    }
+}
+
 pub(super) struct Stall {
     /// When the last activity happened (epoch ms).
     pub(super) last_activity_ms: u64,
@@ -151,10 +266,52 @@ pub(super) struct Stall {
     /// A permission prompt is up and the agent is silent **on purpose**.
     /// Stops the watch (the "Permission requested" prompt itself shows that it's waiting).
     pub(super) awaiting_perm: bool,
-    pub(super) thinking: slack::Thinking,
 }
 
 impl Bridge {
+    /// Adds a reason and tells Slack, if that changed what the thread is doing.
+    pub(super) fn presence_add(&self, key: &ThreadKey, why: Reason) {
+        let change = self.presence.lock().ok().and_then(|mut b| b.add(key, why));
+        self.presence_send(key, change);
+    }
+
+    /// Takes a reason away and tells Slack, if that changed what the thread is doing.
+    /// **A holder only ever removes its own**, so a command ending under a running turn is silent.
+    pub(super) fn presence_remove(&self, key: &ThreadKey, why: &Reason) {
+        let change = self
+            .presence
+            .lock()
+            .ok()
+            .and_then(|mut b| b.remove(key, why));
+        self.presence_send(key, change);
+    }
+
+    /// Drops every reason a thread holds (the turn was abandoned, or the thread is gone).
+    #[allow(dead_code)]
+    pub(super) fn presence_clear(&self, key: &ThreadKey) {
+        let change = self.presence.lock().ok().and_then(|mut b| b.clear(key));
+        self.presence_send(key, change);
+    }
+
+    /// A reason held for as long as the returned value lives. For a command, which runs in a
+    /// spawned task and has many ways out.
+    pub(super) fn presence_hold(&self, key: &ThreadKey, why: Reason) -> PresenceHold {
+        self.presence_add(key, why.clone());
+        PresenceHold {
+            book: self.presence.clone(),
+            tx: self.presence_tx.clone(),
+            key: key.clone(),
+            why,
+        }
+    }
+
+    fn presence_send(&self, key: &ThreadKey, change: Option<crate::chat::Presence>) {
+        let Some(presence) = change else {
+            return;
+        };
+        let _ = self.presence_tx.send((key.clone(), presence));
+    }
+
     /// No milestone until the thread can be looked up.
     pub(super) fn milestone(&mut self, key: Option<&ThreadKey>, event: &str, ctx: &LogCtx) {
         let Some(key) = key else {
@@ -323,8 +480,8 @@ impl Bridge {
     /// Settle it: otherwise the unanswered messages keep the silence watchdog armed and
     /// "is thinking…" stays up on a turn that is already over.
     pub(super) fn settle_told(&mut self, key: &ThreadKey) {
-        // Dropping the entry clears the status (slack::Thinking's Drop)
         self.stall.remove(key);
+        self.presence_remove(key, &Reason::Turn);
         self.ledger.dispose_all(key);
     }
 
@@ -683,21 +840,22 @@ impl Bridge {
             .collect();
         for (key, act) in acts {
             match act {
-                // Just drop it — slack::Thinking's Drop sends the clear from the tail of the queue
-                bridge::StallAction::Settle => drop(self.stall.remove(&key)),
+                bridge::StallAction::Settle => {
+                    self.stall.remove(&key);
+                    self.presence_remove(&key, &Reason::Turn);
+                }
                 bridge::StallAction::Fire => {
                     let Some(e) = self.stall.get_mut(&key) else {
                         continue;
                     };
                     e.shown = true;
-                    e.thinking.set(true);
                     LogCtx {
                         session_id: None,
                         thread_key: Some(key.clone()),
                     }
                     .info(
                         "bridge",
-                        "slack-events: stall watchdog fired — setting the thinking status",
+                        "slack-events: stall watchdog fired",
                     );
                 }
                 bridge::StallAction::Nothing => {}
@@ -1130,7 +1288,7 @@ impl Bridge {
         // **Waiting, not working.** Slack marks a `suspended` session in the sidebar, so a thread
         // held at a question or an approval stands out from the ones that are simply busy —
         // before, it spun like all of them and had to be opened to be noticed
-        e.thinking.wait();
+        self.presence_add(&key, Reason::Perm);
     }
 
     /// A permission was settled. `rearm` = a person clicked (restart measuring silence).
@@ -1148,7 +1306,7 @@ impl Bridge {
             // ordinary activity only re-arms the silence watch, so the thread would have kept its
             // "waiting on you" mark while the agent was already back at work
             if was_waiting {
-                e.thinking.set(true);
+                self.presence_remove(&key, &Reason::Perm);
             }
         }
     }
@@ -1788,10 +1946,10 @@ impl Bridge {
             self.rename_thread(&key, d.title.unwrap_or_default(), &ctx).await;
             return;
         }
-        // An answer came = the shimmer's job is done (any of reply / no_reply / edit_message).
-        // Just drop it — slack::Thinking's Drop sends the clear from the tail of the queue, so
-        // it always clears after, never overtaking, the `is thinking…` the watch just sent
+        // An answer came = the turn is over. The reason goes; anything else still holding the
+        // thread (a command running beside it) keeps it busy on its own.
         self.stall.remove(&key);
+        self.presence_remove(&key, &Reason::Turn);
         let before = self.ledger.pending(&key).len();
         if d.message_ids.is_empty() {
             self.ledger.dispose_all(&key); // no ids = the whole thread is done
@@ -2918,5 +3076,56 @@ mod tests {
             rx.try_recv().is_err(),
             "根が不明なまま台帳を消すと誤射する(best-effort)"
         );
+    }
+
+    /// A command ending under a running turn leaves the thread busy. The old per-command status
+    /// sender wrote `idle` here, and the thread stopped looking busy while the agent worked on.
+    #[test]
+    fn a_command_ending_under_a_running_turn_leaves_the_thread_busy() {
+        use crate::chat::Presence;
+        let (mut b, k) = (PresenceBook::default(), ThreadKey::new("C1", "1.0"));
+        assert_eq!(b.add(&k, Reason::Turn), Some(Presence::Working));
+        assert_eq!(b.add(&k, Reason::Command("usage")), None, "もう busy");
+        assert_eq!(
+            b.remove(&k, &Reason::Command("usage")),
+            None,
+            "ターンが残っているので何も言わない"
+        );
+        assert_eq!(b.remove(&k, &Reason::Turn), Some(Presence::Idle));
+    }
+
+    /// **The first word always goes out.** A fresh process knows nothing about what the previous
+    /// one told Slack, so starting from "idle" would swallow the clear a restart-crossing turn needs.
+    #[test]
+    fn the_first_word_goes_out_even_when_it_is_idle() {
+        use crate::chat::Presence;
+        let (mut b, k) = (PresenceBook::default(), ThreadKey::new("C1", "1.0"));
+        assert_eq!(
+            b.remove(&k, &Reason::Turn),
+            Some(Presence::Idle),
+            "まだ何も送っていないので、空でも1回言う"
+        );
+        assert_eq!(b.remove(&k, &Reason::Turn), None, "2度目は黙る");
+    }
+
+    /// Waiting wins: a turn is always in flight when the agent stops to ask.
+    #[test]
+    fn waiting_wins_over_a_running_turn_and_gives_way_when_answered() {
+        use crate::chat::Presence;
+        let (mut b, k) = (PresenceBook::default(), ThreadKey::new("C1", "1.0"));
+        b.add(&k, Reason::Turn);
+        assert_eq!(b.add(&k, Reason::Perm), Some(Presence::Waiting));
+        assert_eq!(b.remove(&k, &Reason::Perm), Some(Presence::Working));
+    }
+
+    /// What is holding the thread, by name, for the log.
+    #[test]
+    fn the_holders_are_named() {
+        let (mut b, k) = (PresenceBook::default(), ThreadKey::new("C1", "1.0"));
+        b.add(&k, Reason::Turn);
+        b.add(&k, Reason::Command("model"));
+        assert_eq!(b.holders(&k), "command model, turn");
+        b.clear(&k);
+        assert_eq!(b.holders(&k), "-");
     }
 }
