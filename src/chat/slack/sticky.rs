@@ -810,12 +810,19 @@ impl StickyBoard {
 
     /// A folded group. `task_id` must be unique **within the message** — a duplicate makes Slack
     /// reject the whole update, and the progress message then freezes with no sign of why.
-    fn task_card(task_id: &str, title: &str, children: serde_json::Value) -> serde_json::Value {
+    fn task_card(
+        task_id: &str,
+        title: &str,
+        running: bool,
+        children: serde_json::Value,
+    ) -> serde_json::Value {
         json!({
             "type": "task_card",
             "task_id": task_id,
             "title": title,
-            "status": "complete",
+            // The card carries the turn, not the rows inside it: while anything is still running
+            // Slack spins its own mark on the card, which is the one the eye goes to.
+            "status": if running { "in_progress" } else { "complete" },
             "details": children,
         })
     }
@@ -910,6 +917,17 @@ impl StickyBoard {
     /// `markdown` block so the fence keeps its red and green; the running row is a `section`.
     fn blocks_of(items: &[RenderItem], perm_timed_out: bool) -> Vec<serde_json::Value> {
         let groups = Self::agent_groups(items);
+        // The turn is still going while any row is running. The folded card wears that, so the
+        // spinner sits on the line the eye lands on instead of on a row that has already finished.
+        let running = items.iter().any(|it| {
+            matches!(
+                it,
+                RenderItem::Tool {
+                    status: ToolStatus::Pending,
+                    ..
+                }
+            )
+        });
         let mut rendered_agents: Vec<String> = Vec::new();
         let mut blocks: Vec<serde_json::Value> = Vec::new();
         // (status, tool name, summary) of the finished rows waiting to be folded into one card,
@@ -921,6 +939,7 @@ impl StickyBoard {
             fold: &mut Vec<(ToolStatus, String, String)>,
             fold_id: &mut String,
             blocks: &mut Vec<serde_json::Value>,
+            running: bool,
         ) {
             if fold.is_empty() {
                 return;
@@ -947,6 +966,7 @@ impl StickyBoard {
             blocks.push(StickyBoard::task_card(
                 &format!("fold-{fold_id}"),
                 &title,
+                running,
                 StickyBoard::card_children(&rows),
             ));
             fold.clear();
@@ -963,13 +983,15 @@ impl StickyBoard {
                     }
                     rendered_agents.push(id.clone());
                     if let Some((_, ty, rows)) = groups.iter().find(|(gid, _, _)| *gid == id) {
-                        flush(&mut fold, &mut fold_id, &mut blocks);
+                        flush(&mut fold, &mut fold_id, &mut blocks, running);
                         let children = Self::agent_children(rows);
                         let pairs: Vec<(&str, &str)> =
                             children.iter().map(|(_, n, m)| (*n, *m)).collect();
+                        let busy = children.iter().any(|(s, ..)| *s == ToolStatus::Pending);
                         blocks.push(Self::task_card(
                             &format!("agent-{id}"),
                             &format!("{ty} · {}", Self::tool_breakdown(&pairs)),
+                            busy,
                             Self::card_children(&children),
                         ));
                     }
@@ -986,13 +1008,15 @@ impl StickyBoard {
                         .unwrap_or_default();
                     rendered_agents.push(id.clone());
                     if let Some((_, ty, rows)) = groups.iter().find(|(gid, _, _)| *gid == id) {
-                        flush(&mut fold, &mut fold_id, &mut blocks);
+                        flush(&mut fold, &mut fold_id, &mut blocks, running);
                         let children = Self::agent_children(rows);
                         let pairs: Vec<(&str, &str)> =
                             children.iter().map(|(_, n, m)| (*n, *m)).collect();
+                        let busy = children.iter().any(|(s, ..)| *s == ToolStatus::Pending);
                         blocks.push(Self::task_card(
                             &format!("agent-{id}"),
                             &format!("{name} {summary} · {ty} · {}", Self::tool_breakdown(&pairs)),
+                            busy,
                             Self::card_children(&children),
                         ));
                     }
@@ -1008,13 +1032,13 @@ impl StickyBoard {
                     match (status, diff) {
                         // Still running: out of the card, so it stays readable.
                         (ToolStatus::Pending, _) => {
-                            flush(&mut fold, &mut fold_id, &mut blocks);
+                            flush(&mut fold, &mut fold_id, &mut blocks, running);
                             blocks.push(Self::running_block(name, summary));
                         }
                         // Finished with a diff: its own markdown block, which is the only block
                         // that paints the fence.
                         (_, Some(d)) => {
-                            flush(&mut fold, &mut fold_id, &mut blocks);
+                            flush(&mut fold, &mut fold_id, &mut blocks, running);
                             blocks.push(Self::markdown_block(&format!(
                                 "{}{} {name} `{summary}`{d}",
                                 INDENT_GUARD,
@@ -1031,16 +1055,16 @@ impl StickyBoard {
                     }
                 }
                 RenderItem::Narration { text } => {
-                    flush(&mut fold, &mut fold_id, &mut blocks);
+                    flush(&mut fold, &mut fold_id, &mut blocks, running);
                     blocks.push(Self::markdown_block(&format!("{NARR_GLYPH} {text}")));
                 }
                 RenderItem::Interrupted => {
-                    flush(&mut fold, &mut fold_id, &mut blocks);
+                    flush(&mut fold, &mut fold_id, &mut blocks, running);
                     blocks.push(Self::markdown_block(INTERRUPTED_NOTICE));
                 }
             }
         }
-        flush(&mut fold, &mut fold_id, &mut blocks);
+        flush(&mut fold, &mut fold_id, &mut blocks, running);
         if perm_timed_out {
             blocks.push(Self::markdown_block(&perm_timeout_line()));
         }
@@ -1677,6 +1701,34 @@ mod tests {
         assert!(rows.contains("•  cargo test"), "{rows}");
         assert!(rows.contains("×  cargo build"), "{rows}");
         assert!(rows.contains("🚫  rm -rf /tmp/x"), "{rows}");
+    }
+
+    /// While anything is still running the card spins, so the mark the eye lands on is Slack's
+    /// own and not a glyph of ours on a row that already finished.
+    #[test]
+    fn the_card_spins_while_the_turn_is_still_running() {
+        let mut b = StickyBoard::default();
+        b.tool("t1", "Read", "/a.rs", ToolStatus::Done);
+        b.tool("t2", "Bash", "cargo test", ToolStatus::Pending);
+        let blocks = b.take_dirty(10_000).pop().unwrap().2;
+        let card = blocks
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["type"] == "task_card")
+            .unwrap();
+        assert_eq!(card["status"], "in_progress", "{blocks}");
+
+        // and settles to complete once the last row is done
+        b.tool("t2", "Bash", "cargo test", ToolStatus::Done);
+        let blocks = b.take_dirty(20_000).pop().unwrap().2;
+        let card = blocks
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["type"] == "task_card")
+            .unwrap();
+        assert_eq!(card["status"], "complete", "{blocks}");
     }
 
     /// A duplicate `task_id` makes Slack refuse the whole update, and the progress message then
