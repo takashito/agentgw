@@ -1021,7 +1021,7 @@ impl Bridge {
                 self.remove_thread_worktree(&dir, ctx).await;
             }
             // Nothing may be posted into it later either
-            self.awaiting_receipt.retain(|_, (k, _)| k != key);
+            self.awaiting_receipt.retain(|_, (k, ..)| k != key);
             return;
         }
         if !self.ledger.pending(key).iter().any(|id| id == deleted) {
@@ -1512,7 +1512,11 @@ impl Bridge {
                 // Typed in, not yet proven to be in. [`Bridge::warn_unreceived`] comes back to it
                 self.awaiting_receipt.insert(
                     done.msg_ts.clone(),
-                    (done.key.clone(), self.deps.clock.now_ms() + RECEIPT_GRACE_MS),
+                    (
+                        done.key.clone(),
+                        self.deps.clock.now_ms() + RECEIPT_GRACE_MS,
+                        done.window.clone(),
+                    ),
                 );
                 if let Some(q) = self.pending.get_mut(&root_ts) {
                     q.retain(|m| m.ts != done.msg_ts);
@@ -1599,11 +1603,11 @@ impl Bridge {
         let due: Vec<String> = self
             .awaiting_receipt
             .iter()
-            .filter(|(_, (_, at))| now >= *at)
+            .filter(|(_, (_, at, _))| now >= *at)
             .map(|(ts, _)| ts.clone())
             .collect();
         for ts in due {
-            let Some((key, _)) = self.awaiting_receipt.remove(&ts) else {
+            let Some((key, _, window)) = self.awaiting_receipt.remove(&ts) else {
                 continue;
             };
             if !self.ledger.unreceived(&key).contains(&ts) {
@@ -1621,13 +1625,23 @@ impl Bridge {
             let (channel, Some(thread_ts)) = key.split() else {
                 continue;
             };
+            // **Still in the box, a resend only adds to it** — the next body lands behind this one and
+            // is not sent either. Stop clears the box (it sends Escape); after that a resend goes in
+            let stuck = self.deps.agent.input_left(&Window::of(&window));
             self.post_error_frame(
                 channel,
                 thread_ts,
-                crate::t!(
-                    "This never reached the agent — it was typed in, but nothing came back. Send it again if it still matters.",
-                    "これはエージェントに届きませんでした。入力は通りましたが、取り込まれた形跡がありません。必要なら送り直してください。"
-                ),
+                if stuck {
+                    crate::t!(
+                        "This never reached the agent — it is still sitting in the agent's input box, unsent. Sending it again would only add to it: press stop to clear the box, then send it again.",
+                        "これはエージェントに届いていません。エージェントの入力欄に残ったまま送信されていません。このまま送り直すと後ろに継ぎ足されるだけなので、停止ボタンで欄を空にしてから送り直してください。"
+                    )
+                } else {
+                    crate::t!(
+                        "This never reached the agent — it was typed in, but nothing came back. Send it again if it still matters.",
+                        "これはエージェントに届きませんでした。入力は通りましたが、取り込まれた形跡がありません。必要なら送り直してください。"
+                    )
+                },
             );
         }
     }

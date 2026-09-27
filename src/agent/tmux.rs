@@ -60,11 +60,21 @@ impl Tmux {
         }
     }
 
-    /// Push-in: literal typing → a beat → Enter. 3KB in one go is measured to work.
+    /// Push-in: a bracketed paste → a beat → Enter.
+    ///
+    /// **Pasted, not typed.** Typed keys reach the TUI one by one, and on a busy machine a long body
+    /// was still being taken in when every Enter retry had run out — it sat in the box, unsent. A
+    /// bracketed paste arrives as one piece (the box shows `[Pasted text #1 +N lines]`), and an Enter
+    /// right after it submits (measured 2026-09-27: 11KB, macOS and Linux, every time).
+    ///
+    /// The paste goes through a tmux buffer of its own, never the OS clipboard, and `-d` deletes it
+    /// once pasted. One buffer per window, so two deliveries at once cannot paste each other's text.
     pub fn deliver(&self, w: &Window, text: &str) -> Result<(), String> {
         let t = w.as_str();
+        let buffer = format!("agentgw-deliver-{t}");
         // `--` guards against text starting with `-`
-        (self.run)(&["send-keys", "-t", t, "-l", "--", text])?;
+        (self.run)(&["set-buffer", "-b", &buffer, "--", text])?;
+        (self.run)(&["paste-buffer", "-p", "-d", "-b", &buffer, "-t", t])?;
         std::thread::sleep(SETTLE_BEFORE_ENTER);
         (self.run)(&["send-keys", "-t", t, "Enter"])?;
         Ok(())
@@ -226,25 +236,21 @@ mod tests {
     }
 
     #[test]
-    fn deliver_types_then_sends_enter() {
+    fn deliver_pastes_then_sends_enter() {
         let (calls, tmux) = recording();
-        tmux.deliver(&Window::of("1-1"), "hello").unwrap();
+        tmux.deliver(&Window::of("1-1"), "-hello").unwrap();
         let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 2, "type then Enter: {calls:?}");
-        // Put `--` so text starting with `-` still passes as an argument
-        assert_eq!(
-            calls[0],
-            [
-                "send-keys",
-                "-t",
-                "agentgw-workers:1-1",
-                "-l",
-                "--",
-                "hello"
-            ]
-        );
+        assert_eq!(calls.len(), 3, "buffer, paste, Enter: {calls:?}");
+        let buffer = "agentgw-deliver-agentgw-workers:1-1";
+        // `--` so text starting with `-` still passes as an argument
+        assert_eq!(calls[0], ["set-buffer", "-b", buffer, "--", "-hello"]);
+        // `-p` bracketed, `-d` the buffer is gone once pasted
         assert_eq!(
             calls[1],
+            ["paste-buffer", "-p", "-d", "-b", buffer, "-t", "agentgw-workers:1-1"]
+        );
+        assert_eq!(
+            calls[2],
             ["send-keys", "-t", "agentgw-workers:1-1", "Enter"]
         );
     }
@@ -254,7 +260,7 @@ mod tests {
         let (calls, tmux) = recording();
         tmux.deliver(&Window::of("@42"), "hello").unwrap();
         assert_eq!(
-            calls.lock().unwrap()[0][2],
+            calls.lock().unwrap()[1][6],
             "@42",
             "window id needs no session prefix"
         );

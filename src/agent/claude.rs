@@ -66,8 +66,16 @@ const WORKER_STARTUP_PROMPT: &str = "You are a Slack thread worker. There is no 
 /// took longer than that to swallow a body, and the box still holding the text was then read as a failed
 /// delivery: the message stayed queued and the tick **typed the whole body in again**, stacking copies
 /// (one thread received the same request four times).
+///
+/// **A long body gets more.** A body of several KB sent to a busy machine was still being taken in when
+/// the nine presses ran out (2026-09-27): one more press per KB, up to [`DELIVER_SUBMIT_RETRIES_MAX`].
 const DELIVER_SUBMIT_RETRIES: u32 = 9;
+const DELIVER_SUBMIT_RETRIES_MAX: u32 = 50;
 const DELIVER_SUBMIT_POLL: Duration = Duration::from_millis(200);
+
+fn submit_retries(text: &str) -> u32 {
+    (DELIVER_SUBMIT_RETRIES + (text.len() / 1024) as u32).min(DELIVER_SUBMIT_RETRIES_MAX)
+}
 
 /// How many cursor moves an answer to a dialog may take, and the pause after each press.
 ///
@@ -323,7 +331,8 @@ impl Claude {
             return Err(why.to_string());
         }
         self.tmux.deliver(w, text)?;
-        for attempt in 0..=DELIVER_SUBMIT_RETRIES {
+        let retries = submit_retries(text);
+        for attempt in 0..=retries {
             std::thread::sleep(DELIVER_SUBMIT_POLL);
             // If the screen cannot be read, do not press — dropping a stray Enter into a window we cannot see is riskier
             let Ok(pane) = self.tmux.capture(w) else {
@@ -337,7 +346,7 @@ impl Claude {
             if Pane::new(&pane).input_box_empty() {
                 return Ok(());
             }
-            if attempt < DELIVER_SUBMIT_RETRIES {
+            if attempt < retries {
                 self.tmux.send_enter(w)?;
             }
         }
@@ -1331,6 +1340,12 @@ impl crate::agent::Agent for Claude {
 
     fn dialog(&self, w: &Window) -> Option<crate::agent::Dialog> {
         Claude::dialog(self, w)
+    }
+
+    fn input_left(&self, w: &Window) -> bool {
+        self.tmux.capture(w).is_ok_and(|pane| {
+            Self::not_accepting_keys(&pane).is_none() && !Pane::new(&pane).input_box_empty()
+        })
     }
 
     async fn answer_dialog(
@@ -2335,6 +2350,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_long_body_gets_more_presses() {
+        let (calls, c) = deliver_probe(vec!["❯ </channel>\n"]);
+        c.deliver(&Window::of("@42"), &"x".repeat(4096)).unwrap();
+        assert_eq!(enters(&calls.lock().unwrap()), 1 + DELIVER_SUBMIT_RETRIES as usize + 4);
+        assert_eq!(submit_retries(&"x".repeat(1 << 20)), DELIVER_SUBMIT_RETRIES_MAX);
+    }
+
     /// The stall seen on a real machine on 2026-08-18. A modal covering `❯` looks **empty** to `input_box_empty()`,
     /// but the keystrokes are eaten by the modal. For the 18 minutes this returned `Ok`, the Bridge recorded
     /// delivery success while 2 threads went silent.
@@ -2357,7 +2380,8 @@ mod tests {
             assert!(
                 !calls
                     .iter()
-                    .any(|c| c.contains("send-keys") && c.contains(" -l ")),
+                    .any(|c| c.starts_with("paste-buffer")
+                        || (c.contains("send-keys") && c.contains(" -l "))),
                 "{label}: 本文も1文字も送らない: {calls:?}"
             );
         }

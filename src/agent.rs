@@ -507,6 +507,8 @@ pub trait Agent: Send + Sync + 'static {
     fn interrupt(&self, w: &Window) -> Result<(), String>;
     /// The modal the window is holding, if any. Reads the screen and presses nothing.
     fn dialog(&self, w: &Window) -> Option<Dialog>;
+    /// Whether text sits in the input box, unsent. Reads the screen and presses nothing.
+    fn input_left(&self, w: &Window) -> bool;
     /// Answers the question tool's dialog, every question of it, and submits: `answers[i]` is
     /// the answer to `questions[i]`. Errs, having pressed nothing further, the moment the screen
     /// is not what the next key expects.
@@ -655,6 +657,8 @@ pub mod fake {
         pub answered_questions: Mutex<Vec<Vec<Answer>>>,
         /// When set, `deliver` fails the way a window with an open dialog does.
         pub fail_deliver: std::sync::atomic::AtomicBool,
+        /// What `input_left` answers: text sitting unsent in the input box.
+        pub input_left: std::sync::atomic::AtomicBool,
         /// Sessions whose conversation history exists (others can't be resumed).
         pub histories: Mutex<Vec<String>>,
         /// What `failure_type` answers (what the agent's own record says a failed turn died of).
@@ -767,6 +771,9 @@ pub mod fake {
         }
         fn dialog(&self, _w: &Window) -> Option<Dialog> {
             self.dialog.lock().unwrap().clone()
+        }
+        fn input_left(&self, _w: &Window) -> bool {
+            self.input_left.load(Ordering::SeqCst)
         }
         async fn answer_questions(
             &self,

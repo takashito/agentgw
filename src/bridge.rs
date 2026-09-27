@@ -77,7 +77,8 @@ pub struct Bridge {
     /// swallow keys, and calling that a failure made the queue type the same body in again. Receipt is
     /// proven by the `user_prompt` hook or by the transcript, and this is what keeps a body that never
     /// got in from disappearing without a word.
-    awaiting_receipt: HashMap<String, (ThreadKey, u64)>,
+    /// Keyed by message ts: the thread, when to judge, and the window it was typed into.
+    awaiting_receipt: HashMap<String, (ThreadKey, u64, String)>,
     /// The exact text built for a message that has not been confirmed yet, by message ts.
     ///
     /// **Only the first hand-over has it.** A message built with a loop guard ("this bot has posted N
@@ -725,7 +726,7 @@ impl Bridge {
         if let Err(e) = self.threads.save() {
             ctx.error("bridge", &format!("threads.json save failed: {e}"));
         }
-        self.awaiting_receipt.retain(|_, (k, _)| k != &key);
+        self.awaiting_receipt.retain(|_, (k, ..)| k != &key);
     }
 
     /// Write down which machine a thread belongs to, for the gateway to read back after a restart.
@@ -3399,6 +3400,25 @@ mod tests {
         b.warn_unreceived(&LogCtx::default());
         settle().await;
         assert_eq!(told(&slack), 1, "said again: {:?}", slack.calls());
+    }
+
+    /// A body still sitting in the input box: a resend would only be added behind it, so the notice
+    /// says to clear the box first instead of "send it again".
+    #[tokio::test]
+    async fn a_body_left_in_the_input_box_is_told_as_such() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (d, slack, agent, clock) = flow_deps("left-in-box");
+        let ((mut b, _fx), mut deliv) = Bridge::for_test_with_deliveries(d);
+        running_thread(&mut b, &agent).await;
+        b.on_inbound(&in_thread("1782000000.000200", "hello")).await;
+        settle_deliveries(&mut b, &mut deliv).await;
+        agent.input_left.store(true, SeqCst);
+        clock.advance(200_000);
+        b.warn_unreceived(&LogCtx::default());
+        settle().await;
+        let calls = slack.calls();
+        assert!(calls.iter().any(|c| c.contains("still sitting in the agent's input box")), "{calls:?}");
+        assert!(!calls.iter().any(|c| c.contains("Send it again if")), "{calls:?}");
     }
 
     #[tokio::test]
