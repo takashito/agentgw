@@ -279,8 +279,24 @@ pub trait Chat: Send + Sync + 'static {
         text: &str,
         thread_ts: Option<&str>,
     ) -> Result<String, String>;
+    /// Post a body the caller has already laid out as blocks. `text` is the notification
+    /// fallback — a blocks-only post gives an empty notification, so it is never dropped.
+    async fn post_blocks(
+        &self,
+        channel: &str,
+        text: &str,
+        blocks: serde_json::Value,
+        thread_ts: Option<&str>,
+    ) -> Result<String, String>;
     async fn update_message(&self, channel: &str, ts: &str, text: &str) -> Result<(), String>;
     async fn update_markdown(&self, channel: &str, ts: &str, text: &str) -> Result<(), String>;
+    async fn update_blocks(
+        &self,
+        channel: &str,
+        ts: &str,
+        text: &str,
+        blocks: serde_json::Value,
+    ) -> Result<(), String>;
     async fn delete_message(&self, channel: &str, ts: &str) -> Result<(), String>;
     async fn add_reaction(&self, channel: &str, ts: &str, emoji: &str) -> Result<(), String>;
     async fn remove_reaction(&self, channel: &str, ts: &str, emoji: &str) -> Result<(), String>;
@@ -504,11 +520,30 @@ pub mod fake {
             self.record(format!("post_md {c} {} {t}", th.unwrap_or("-")))?;
             Ok(self.ts())
         }
+        async fn post_blocks(
+            &self,
+            c: &str,
+            t: &str,
+            blocks: serde_json::Value,
+            th: Option<&str>,
+        ) -> Result<String, String> {
+            self.record(format!("post_blocks {c} {} {t} {blocks}", th.unwrap_or("-")))?;
+            Ok(self.ts())
+        }
         async fn update_message(&self, c: &str, ts: &str, t: &str) -> Result<(), String> {
             self.record(format!("update {c} {ts} {t}"))
         }
         async fn update_markdown(&self, c: &str, ts: &str, t: &str) -> Result<(), String> {
             self.record(format!("update_md {c} {ts} {t}"))
+        }
+        async fn update_blocks(
+            &self,
+            c: &str,
+            ts: &str,
+            t: &str,
+            blocks: serde_json::Value,
+        ) -> Result<(), String> {
+            self.record(format!("update_blocks {c} {ts} {t} {blocks}"))
         }
         async fn delete_message(&self, c: &str, ts: &str) -> Result<(), String> {
             self.record(format!("delete {c} {ts}"))

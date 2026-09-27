@@ -1855,30 +1855,38 @@ impl Bridge {
     }
 
     /// Pushes one progress message to Slack. Only post waits, since it remembers the ts (update is fire-and-forget).
-    /// **The sticky goes out as a `markdown` block** (`post_markdown` / `update_markdown`), not as mrkdwn:
-    /// that is what makes the ```diff fences in the Edit rows render red/green. The body carries no
-    /// mrkdwn-only markup (indentation is NBSP, there is no `*bold*`), so nothing else changes.
-    async fn flush_sticky(&mut self, key: &ThreadKey, posted: Option<String>, body: String) {
-        if body.is_empty() {
-            return; // Slack rejects an update with empty text
+    /// **The sticky goes out as Block Kit** (`post_blocks` / `update_blocks`): Slack folds the finished
+    /// rows itself (`task_card`) and the running row stays open. The rows that carry a diff ride a
+    /// `markdown` block inside those blocks — that is what keeps the ```diff fences red and green.
+    async fn flush_sticky(
+        &mut self,
+        key: &ThreadKey,
+        posted: Option<String>,
+        blocks: serde_json::Value,
+    ) {
+        if blocks.as_array().is_none_or(|b| b.is_empty()) {
+            return; // Slack rejects a message with no blocks and no text
         }
         let (channel, root) = key.split();
         let ctx = LogCtx {
             session_id: None,
             thread_key: Some(key.clone()),
         };
+        // The notification fallback. A blocks-only post gives an empty notification.
+        let alt = crate::t!("Working…", "処理中…");
         match posted {
             Some(ts) => {
                 let api = self.deps.slack.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = api.update_markdown(&channel, &ts, &body).await {
+                    if let Err(e) = api.update_blocks(&channel, &ts, &alt, blocks).await {
                         ctx.error("bridge", &format!("sticky update failed: {e}"));
                     }
                 });
             }
             None => match self
-                .deps.slack
-                .post_markdown(&channel, &body, root.as_deref())
+                .deps
+                .slack
+                .post_blocks(&channel, &alt, blocks, root.as_deref())
                 .await
             {
                 Ok(ts) => self.sticky.set_posted(key, &ts),

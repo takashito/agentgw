@@ -2,6 +2,7 @@
 //! updated in place and folded away when the turn ends. Includes the Edit diff rendering.
 
 use crate::chat::ThreadKey;
+use serde_json::json;
 
 // ─── Progress message (progress sticky) ────────────────────────────────────
 //
@@ -42,18 +43,6 @@ impl ToolStatus {
         }
     }
 
-    fn glyph(self) -> &'static str {
-        match self {
-            ToolStatus::Pending => "◌",
-            // **Not `•`**: Slack rewrites U+2022 as `-` inside a markdown block, wherever it sits —
-            // leading whitespace, a zero-width space before it and even a code span make no difference
-            // (measured on screen 2026-09-24). U+00B7 comes through as itself, at the same width.
-            ToolStatus::Done => "·",
-            // A plain × , not an emoji: it lines up with ◌ / · / ● at the same width
-            ToolStatus::Error => "×",
-            ToolStatus::Deny => "🚫",
-        }
-    }
 }
 
 /// What gets folded. Rows are merged into one line **only when completed ones run consecutively**.
@@ -276,8 +265,6 @@ pub enum RenderItem {
 
 /// Prefix of a narration line. Slack turns ⏺ (U+23FA) into an emoji, so we use ●.
 const NARR_GLYPH: &str = "●";
-/// Indent of a tool row. **NBSP, not a plain space** — Slack collapses leading whitespace.
-const TOOL_INDENT: &str = "\u{A0}\u{A0}\u{A0}";
 /// Slack strips the leading whitespace of a message's **first line** — NBSP included — so the top
 /// tool row came out flush left while every row under it kept its indent. A zero-width space is not
 /// whitespace and renders as nothing, so it holds the indent in place (added in `wrap_fences`).
@@ -292,8 +279,6 @@ fn perm_timeout_line() -> String {
     )
 }
 
-/// Budget (bytes) for one progress message. Leaves headroom below Slack's message body limit.
-const STICKY_BUDGET: usize = 3800;
 /// Where a tool row's summary is cut. A long command used to stop inside its own path
 /// (`…/scratchpad/` and nothing of what it ran), so the row said which tool but not what it did.
 /// The row is free to wrap, and four cut-off rows still leave most of STICKY_BUDGET.
@@ -302,13 +287,6 @@ const SUMMARY_MAX: usize = 100;
 /// the progress so far — it shows the interruption while keeping "how far it got".
 const INTERRUPTED_NOTICE: &str = "└ `Interrupted by user.`";
 
-/// Number of recent rows shown in a folded subagent section (a rolling window).
-/// Slack cannot scroll **inside** a message, so this "last N" stands in for scrolling.
-const SUBAGENT_WINDOW: usize = 2;
-/// Heading marker for a section.
-const SUBAGENT_MARK: &str = "▾";
-/// Indent of section rows (stacked on top of the tool row's TOOL_INDENT).
-const SUBAGENT_INDENT: &str = "\u{A0}\u{A0}";
 
 /// Result of settle — keep the progress message as a record, or delete it.
 #[derive(Debug, PartialEq, Eq)]
@@ -326,15 +304,6 @@ struct Sticky {
     last_flush_ms: Option<u64>,
     /// A permission wait expired. The note stays until the next round.
     perm_timed_out: bool,
-    /// **Number of lines already shown on sealed pages**. The page being grown now
-    /// starts here. Slack rejects edits over about 4000 bytes, so once it no longer fits on one message
-    /// we seal that message (never edit it again) and continue in the next message.
-    sealed_lines: usize,
-    /// Whether the current page starts **inside a code block** (carried over from the previous page).
-    sealed_open_fence: bool,
-    /// How many times a not-yet-posted page overflowed. Sealed pages are never edited again, so
-    /// the ts that post returns is **discarded** (keeping it would make the next page edit it).
-    sealed_awaiting_post: usize,
 }
 
 /// thread_key → the progress message in flight. One per thread (no pagination).
@@ -355,153 +324,12 @@ pub struct StickyBoard {
 }
 
 impl StickyBoard {
-    /// Build the lines and truncate to the budget. Truncation is always shown as `…(N more)` (never cut silently).
-    /// One item per line.
-    /// `lead_blank` says whether to put a blank line before `Interrupted` when it has preceding lines.
-    /// `with_diff` says whether to attach the diff block of editing tools under the row. True only for
-    /// main-session rows — a folded subagent window stays one line per row.
-    fn render_item_line(it: &RenderItem, lead_blank: bool, with_diff: bool) -> String {
-        match it {
-            RenderItem::Narration { text } => format!("{NARR_GLYPH} {text}"),
-            // With preceding lines, put a blank line in between so it is its own paragraph.
-            // It is built as a single line including the blank, so the budget count still adds up
-            RenderItem::Interrupted if lead_blank => format!("\n{INTERRUPTED_NOTICE}"),
-            RenderItem::Interrupted => INTERRUPTED_NOTICE.to_string(),
-            RenderItem::Tool {
-                name,
-                summary,
-                status,
-                diff,
-                ..
-            } => {
-                let head = if summary.is_empty() {
-                    format!("{TOOL_INDENT}{} {name}", status.glyph())
-                } else {
-                    format!("{TOOL_INDENT}{} {name} `{summary}`", status.glyph())
-                };
-                match diff {
-                    Some(d) if with_diff => format!("{head}{d}"),
-                    _ => head,
-                }
-            }
-        }
-    }
 
-    /// Emit the accumulated run as one line (2 or more) or as a plain row (just 1).
-    /// A run of one is not folded (it saves no lines and only hides the path or command).
-    fn flush_fold_run(run: &mut Vec<&RenderItem>, lines: &mut Vec<String>) {
-        match run.len() {
-            0 => {}
-            1 => lines.push(Self::render_item_line(run[0], !lines.is_empty(), true)),
-            _ => {
-                let pairs: Vec<(&str, &str)> = run
-                    .iter()
-                    .filter_map(|it| match it {
-                        RenderItem::Tool { name, summary, .. } => Some((name.as_str(), summary.as_str())),
-                        _ => None,
-                    })
-                    .collect();
-                // The **two spaces** after the glyph line up with unfolded rows
-                lines.push(format!("{TOOL_INDENT}·  {}", Self::tool_breakdown(&pairs)));
-            }
-        }
-        run.clear();
-    }
 
-    /// One folded subagent section. If `header` is None it gets its own
-    /// `▾ <type> · <breakdown>` heading; if Some, the Agent row is used as the heading.
-    /// Only the latest SUBAGENT_WINDOW rows, indented one level deeper.
-    fn push_agent_section(
-        lines: &mut Vec<String>,
-        header: Option<String>,
-        agent_type: &str,
-        rows: &[&RenderItem],
-    ) {
-        let pairs: Vec<(&str, &str)> = rows
-            .iter()
-            .filter_map(|it| match it {
-                RenderItem::Tool { name, summary, .. } => Some((name.as_str(), summary.as_str())),
-                _ => None,
-            })
-            .collect();
-        let breakdown = Self::tool_breakdown(&pairs);
-        lines.push(match header {
-            Some(h) => format!("{h} : {agent_type} · {breakdown}"),
-            None => format!("{TOOL_INDENT}{SUBAGENT_MARK} {agent_type} · {breakdown}"),
-        });
-        let start = rows.len().saturating_sub(SUBAGENT_WINDOW);
-        for it in &rows[start..] {
-            lines.push(format!(
-                "{SUBAGENT_INDENT}{}",
-                Self::render_item_line(it, false, false)
-            ));
-        }
-    }
 
-    /// The last line (exclusive) from `start` that fits the budget. **The budget is measured in bytes**
-    /// because Slack's limit is in bytes; counting characters hits the limit early with Japanese text,
-    /// the edit is rejected, and the progress message freezes. **Always advances at least one line** (a line that is over budget on its own gets its own page).
-    fn pack_cut(lines: &[String], start: usize, budget: usize) -> usize {
-        let mut len = 0usize;
-        let mut i = start;
-        while i < lines.len() {
-            let add = usize::from(i > start) + lines[i].len(); // the joining \n is one byte
-            if len + add > budget && i > start {
-                break;
-            }
-            len += add;
-            i += 1;
-        }
-        i
-    }
 
-    /// Whether the line opens/closes a ```. The diff **content** never matches
-    /// (`clip_diff_line` splits runs of ``` with a zero-width space).
-    fn is_fence_toggle(line: &str) -> bool {
-        line.trim_start().starts_with("```")
-    }
 
-    /// Make one page a self-contained code block. `open_in` says whether a fence came in open
-    /// from the previous page (if so, reopen it at the top). If the page ends with a fence still open,
-    /// close it at the end. Returns (body, whether a fence is open at the end of the page).
-    fn wrap_fences(page: &[String], open_in: bool) -> (String, bool) {
-        let mut in_fence = open_in;
-        for ln in page {
-            if Self::is_fence_toggle(ln) {
-                in_fence = !in_fence;
-            }
-        }
-        let mut parts: Vec<&str> = Vec::new();
-        if open_in {
-            // Reopen tagged: the only fences the sticky writes are diffs, and an untagged
-            // reopen would leave page 2 of a long diff uncolored
-            parts.push("```diff");
-        }
-        parts.extend(page.iter().map(String::as_str));
-        if in_fence {
-            parts.push("```");
-        }
-        let text = parts.join("\n");
-        let text = match text.starts_with('\u{A0}') {
-            true => format!("{INDENT_GUARD}{text}"),
-            false => text,
-        };
-        (text, in_fence)
-    }
 
-    /// Build one page starting at line `from`. Returns (body, first line of the next page, fence state at the end of the page).
-    /// If the next page's first line is `lines.len()`, this page is the last.
-    fn page(lines: &[String], from: usize, open_fence: bool) -> (String, usize, bool) {
-        let cut = Self::pack_cut(lines, from, STICKY_BUDGET);
-        // A page whose single line exceeds the budget is truncated to its head (otherwise Slack rejects the whole edit)
-        if cut == from + 1 && lines[from].len() > STICKY_BUDGET {
-            let head = Self::clip(&lines[from], STICKY_BUDGET);
-            let (text, end) = Self::wrap_fences(&[head], open_fence);
-            return (text, cut, end);
-        }
-        let (text, end) = Self::wrap_fences(&lines[from..cut], open_fence);
-        (text, cut, end)
-    }
 
     /// Drop hooks that arrive late after settling. Without this, an orphan progress message holding only
     /// "● …replied" appears (after no_reply, what should be silence looks like a message — reproduced 3 times in E2E).
@@ -711,11 +539,6 @@ impl StickyBoard {
     /// Remember the ts that was posted (updates from then on).
     pub fn set_posted(&mut self, key: &ThreadKey, ts: &str) {
         let s = self.stickies.entry(key.clone()).or_default();
-        // This was the post of a sealed page — do not remember its ts (the next page would edit it)
-        if s.sealed_awaiting_post > 0 {
-            s.sealed_awaiting_post -= 1;
-            return;
-        }
         s.posted_ts = Some(ts.to_string());
     }
 
@@ -727,7 +550,7 @@ impl StickyBoard {
 
     /// Return the progress messages that need redrawing as (key, posted ts, body).
     /// **Nothing is returned for a thread within 1 second of the last one** — protects Slack's edit rate.
-    pub fn take_dirty(&mut self, now_ms: u64) -> Vec<(ThreadKey, Option<String>, String)> {
+    pub fn take_dirty(&mut self, now_ms: u64) -> Vec<(ThreadKey, Option<String>, serde_json::Value)> {
         let mut out = Vec::new();
         for (key, s) in self.stickies.iter_mut() {
             if !s.dirty
@@ -736,44 +559,48 @@ impl StickyBoard {
             {
                 continue;
             }
-            let lines = Self::lines_of(&s.items, s.perm_timed_out);
-            let (body, next, end_fence) = Self::page(&lines, s.sealed_lines, s.sealed_open_fence);
-            if next < lines.len() {
-                // It no longer fits. **Seal this page** and move on to the next message.
-                // The sealed page's ts is no longer needed (never edited again), so let it go; on the next pass
-                // the rest is posted as a new message. `dirty` stays set and the throttle
-                // is not advanced — so the rest goes out on the next tick
-                let sealed_ts = s.posted_ts.take();
-                if sealed_ts.is_none() {
-                    // Overflowed while the page was not posted yet — it will be posted now,
-                    // but that ts belongs to the sealed page, so do not take it
-                    s.sealed_awaiting_post += 1;
-                }
-                out.push((key.clone(), sealed_ts, body));
-                s.sealed_lines = next;
-                s.sealed_open_fence = end_fence;
-                continue;
-            }
             s.dirty = false;
             s.last_flush_ms = Some(now_ms);
-            out.push((key.clone(), s.posted_ts.clone(), body));
+            out.push((
+                key.clone(),
+                s.posted_ts.clone(),
+                Self::capped(Self::blocks_of(&s.items, s.perm_timed_out)),
+            ));
         }
         out
     }
 
     /// Final render at settle. Ignores the throttle and returns once (called right before settle).
     /// Without it, a progress message whose last PostToolUse settled within 1 second stays at `◌`.
-    pub fn take_final(&mut self, key: &ThreadKey) -> Option<(Option<String>, String)> {
+    pub fn take_final(&mut self, key: &ThreadKey) -> Option<(Option<String>, serde_json::Value)> {
         let s = self.stickies.get_mut(key)?;
         if !s.dirty {
             return None;
         }
         s.dirty = false;
-        // The final render is also only for **the page being grown now** (sealed pages are not edited). Even if
-        // it overflows here, no next page is opened — settling ends tracking of this progress message
-        let lines = Self::lines_of(&s.items, s.perm_timed_out);
-        let (body, _, _) = Self::page(&lines, s.sealed_lines, s.sealed_open_fence);
-        Some((s.posted_ts.clone(), body))
+        Some((
+            s.posted_ts.clone(),
+            Self::capped(Self::blocks_of(&s.items, s.perm_timed_out)),
+        ))
+    }
+
+    /// Slack takes at most 50 blocks in one message. Finished rows fold into a card, so a turn
+    /// only reaches that with a long run of diffs and narration — drop the oldest and say so.
+    fn capped(mut blocks: Vec<serde_json::Value>) -> serde_json::Value {
+        const MAX: usize = 50;
+        if blocks.len() > MAX {
+            let dropped = blocks.len() - (MAX - 1);
+            blocks.drain(..dropped);
+            blocks.insert(
+                0,
+                Self::markdown_block(&crate::t!(
+                    "…({} earlier rows)",
+                    "…(前の{}行)",
+                    dropped
+                )),
+            );
+        }
+        serde_json::Value::Array(blocks)
     }
 
     /// Settle the round. If it replied, the progress message stays as a record. If it went silent (no_reply)
@@ -793,6 +620,15 @@ impl StickyBoard {
     }
 
     /// Tools not shown in the progress message (noise and our own tools).
+    /// Cuts a line to `room` characters with `…`. The narration is the agent's own prose and can
+    /// run long; the rows around it are built from tool input and are cut where they are made.
+    pub fn clip(line: &str, room: usize) -> String {
+        if line.chars().count() <= room {
+            return line.to_string();
+        }
+        line.chars().take(room.saturating_sub(1)).chain(['…']).collect()
+    }
+
     pub fn is_denied(name: &str) -> bool {
         matches!(name, "TodoWrite" | "ToolSearch" | "advisor") || name.starts_with("mcp__agentgw__")
     }
@@ -914,26 +750,100 @@ impl StickyBoard {
         parts.join(", ")
     }
 
-    /// Longest prefix that fits in `room` bytes (**on a char boundary**) + `…`. Empty if not even one char fits.
-    pub fn clip(line: &str, room: usize) -> String {
-        let budget = room.saturating_sub("…".len());
-        match line
-            .char_indices()
-            .map(|(i, c)| i + c.len_utf8())
-            .take_while(|&end| end <= budget)
-            .last()
-        {
-            Some(end) => format!("{}…", &line[..end]),
-            None => String::new(),
+
+    /// Build the lines to show (up to folding). Splitting into pages comes after this.
+    // ── Block Kit ─────────────────────────────────────────────────────────────────────
+    // The progress message goes out as blocks, not as one long string. Slack does the folding
+    // (`task_card` closes to `✓ <title> ›`) and the running row stays open (`section` + a fence).
+    // Measured against Slack on 2026-09-26: a card folds whatever it is given -- `details` and
+    // `output` alike -- and `hide_title` does not open it, so the running row must not be a card.
+
+    /// Mark for one row inside a folded card. A card carries a single `status`, so the rows
+    /// inside it keep the glyphs the progress message has always used.
+    fn child_mark(status: ToolStatus) -> &'static str {
+        match status {
+            // `rich_text` is not read as mrkdwn, so U+2022 survives here (inside a `markdown`
+            // block Slack rewrites it to `-`).
+            ToolStatus::Done => "•",
+            ToolStatus::Error => "×",
+            ToolStatus::Deny => "🚫",
+            ToolStatus::Pending => "◌",
         }
     }
 
-    /// Build the lines to show (up to folding). Splitting into pages comes after this.
-    fn lines_of(items: &[RenderItem], perm_timed_out: bool) -> Vec<String> {
-        // Tools run inside a subagent are **not drawn in place**. Each agent gets one
-        // section, shown once at the position of that agent's first tool.
-        // This keeps a subagent running dozens of tools from filling the progress message.
-        let mut groups: Vec<(String, String, Vec<&RenderItem>)> = Vec::new(); // (agent_id, type, items)
+    /// One run of text inside a `rich_text` section. `code` puts it in an inline code chip.
+    fn run(text: &str, code: bool) -> serde_json::Value {
+        let mut v = json!({"type": "text", "text": text});
+        if code {
+            v["style"] = json!({"code": true});
+        }
+        v
+    }
+
+    /// The rows inside a folded card: one line each, the summary as a code chip.
+    /// **Only the first line** of a multi-line summary, closed with `…` — a chip that spans lines
+    /// breaks into one chip per line and the column stops lining up (seen on screen).
+    fn card_children(rows: &[(ToolStatus, &str, &str)]) -> serde_json::Value {
+        let mut els = Vec::new();
+        for (i, (status, name, summary)) in rows.iter().enumerate() {
+            if i > 0 {
+                els.push(Self::run("\n", false));
+            }
+            els.push(Self::run(&format!("{}  ", Self::child_mark(*status)), false));
+            // The command speaks for itself, so a Bash row shows only the command. Every other
+            // tool keeps its name — `/a.rs` alone does not say whether it was read or written.
+            if summary.is_empty() || *name != "Bash" {
+                els.push(Self::run(&format!("{name} "), false));
+            }
+            if !summary.is_empty() {
+                let head = summary.lines().next().unwrap_or(summary);
+                let one = if head.len() < summary.len() {
+                    format!("{head} …")
+                } else {
+                    head.to_string()
+                };
+                els.push(Self::run(&one, true));
+            }
+        }
+        json!({"type": "rich_text", "elements": [{"type": "rich_text_section", "elements": els}]})
+    }
+
+    /// A folded group. `task_id` must be unique **within the message** — a duplicate makes Slack
+    /// reject the whole update, and the progress message then freezes with no sign of why.
+    fn task_card(task_id: &str, title: &str, children: serde_json::Value) -> serde_json::Value {
+        json!({
+            "type": "task_card",
+            "task_id": task_id,
+            "title": title,
+            "status": "complete",
+            "details": children,
+        })
+    }
+
+    /// The row that is running now. **A `section`, not a card**: a card folds shut, and what the
+    /// agent is doing right now has to stay readable. Long bodies stop at Slack's own cut
+    /// (5 lines or 300 characters) and the rest goes behind Show more.
+    fn running_block(name: &str, summary: &str) -> serde_json::Value {
+        let text = match (summary.is_empty(), name) {
+            (true, _) => format!("*◌ {name}*"),
+            // A command gets the box: it is long, and its line breaks and quoting have to survive.
+            // Anything else is one line — a path in a box reads like an excerpt of a file.
+            (false, "Bash") => format!("*◌ {name}*\n```\n{summary}\n```"),
+            _ => format!("*◌ {name}* `{summary}`"),
+        };
+        json!({"type": "section", "text": {"type": "mrkdwn", "text": text}})
+    }
+
+    /// A line that is not a tool row (narration, the interruption notice, an expired permission
+    /// wait) and the rows that carry a diff. **A `markdown` block** — that is the only block that
+    /// paints a ```diff fence red and green.
+    fn markdown_block(text: &str) -> serde_json::Value {
+        json!({"type": "markdown", "text": text})
+    }
+
+    /// Groups a subagent's rows under its agent id, in the order the agents first appear.
+    fn agent_groups(items: &[RenderItem]) -> Vec<(String, String, Vec<&RenderItem>)> {
+        let mut groups: Vec<(String, String, Vec<&RenderItem>)> = Vec::new();
         for it in items {
             let RenderItem::Tool { agent, .. } = it else {
                 continue;
@@ -953,94 +863,242 @@ impl StickyBoard {
                 )),
             }
         }
-        let mut rendered_agents: Vec<String> = Vec::new();
-
-        // ── Stage 1: fold and decide which lines to show ─────────────────────
-        // Completed Read/search/Bash rows that are **consecutive** become one line. Running (◌) rows
-        // are "what is happening now", so they are not folded. Failures (×/🚫) also stay visible.
-        let mut lines: Vec<String> = Vec::new();
-        let mut run: Vec<&RenderItem> = Vec::new();
-        for it in items {
-            if matches!(
-                it,
-                RenderItem::Tool { name, status: ToolStatus::Done, agent, .. }
-                    if agent.agent_id.is_none() && Self::is_foldable(name)
-            ) {
-                run.push(it);
-                continue;
-            }
-            Self::flush_fold_run(&mut run, &mut lines);
-            // An `Agent` row is folded into one block with the section of the subagent it started.
-            // Two ways to link: for foreground the ids match. background/teammate live in a different id space, so
-            // they are linked by **launch name** (tool_input.name) and agent_type (origin).
-            if let RenderItem::Tool { name, agent, .. } = it
-                && (name == "Agent" || name == "Task")
-            {
-                let key = agent
-                    .spawned_agent_id
-                    .as_deref()
-                    .filter(|id| {
-                        groups.iter().any(|(gid, _, _)| gid == id)
-                            && !rendered_agents.iter().any(|r| r == id)
-                    })
-                    .map(str::to_string)
-                    .or_else(|| {
-                        let nm = agent.launched_name.as_deref()?;
-                        groups
-                            .iter()
-                            .find(|(gid, ty, _)| {
-                                ty == nm && !rendered_agents.iter().any(|r| r == gid)
-                            })
-                            .map(|(gid, _, _)| gid.clone())
-                    });
-                if let Some(key) = key {
-                    rendered_agents.push(key.clone());
-                    if let Some((_, ty, rows)) = groups.iter().find(|(gid, _, _)| *gid == key) {
-                        // Replace the leading glyph with ▾ so it looks like a standalone section heading
-                        let head = Self::render_item_line(it, false, false);
-                        let head = match head.strip_prefix(TOOL_INDENT) {
-                            Some(rest) => {
-                                let body = rest.split_once(' ').map(|(_, b)| b).unwrap_or(rest);
-                                format!("{TOOL_INDENT}{SUBAGENT_MARK} {body}")
-                            }
-                            None => head,
-                        };
-                        Self::push_agent_section(&mut lines, Some(head), ty, rows);
-                    }
-                    continue;
-                }
-                // Nothing to link to yet (agent still starting / no tool has arrived yet) → draw as a normal row
-            }
-            // A subagent's own tool row: show that agent's section **only once**, at its first tool
-            if let RenderItem::Tool { agent, .. } = it
-                && let Some(id) = agent.agent_id.as_deref()
-            {
-                if rendered_agents.iter().any(|r| r == id) {
-                    continue;
-                }
-                rendered_agents.push(id.to_string());
-                if let Some((_, ty, rows)) = groups.iter().find(|(gid, _, _)| gid == id) {
-                    Self::push_agent_section(&mut lines, None, ty, rows);
-                }
-                continue;
-            }
-            lines.push(Self::render_item_line(it, !lines.is_empty(), true));
-        }
-        Self::flush_fold_run(&mut run, &mut lines);
-        // An expired permission wait is added last as **a note under the tool row**
-        // (the row order is not touched; before the interruption notice)
-        if perm_timed_out {
-            lines.push(perm_timeout_line());
-        }
-
-        lines
+        groups
     }
+
+    /// The group an `Agent` row started, if it has arrived and is not drawn yet.
+    fn linked_group(
+        groups: &[(String, String, Vec<&RenderItem>)],
+        rendered: &[String],
+        agent: &AgentRef,
+    ) -> Option<String> {
+        agent
+            .spawned_agent_id
+            .as_deref()
+            .filter(|id| {
+                groups.iter().any(|(gid, _, _)| gid == id) && !rendered.iter().any(|r| r == id)
+            })
+            .map(str::to_string)
+            .or_else(|| {
+                let nm = agent.launched_name.as_deref()?;
+                groups
+                    .iter()
+                    .find(|(gid, ty, _)| ty == nm && !rendered.iter().any(|r| r == gid))
+                    .map(|(gid, _, _)| gid.clone())
+            })
+    }
+
+    /// A subagent's rows, as the tuples a card's children are built from.
+    fn agent_children<'a>(rows: &[&'a RenderItem]) -> Vec<(ToolStatus, &'a str, &'a str)> {
+        rows.iter()
+            .filter_map(|it| match it {
+                RenderItem::Tool {
+                    name,
+                    summary,
+                    status,
+                    ..
+                } => Some((*status, name.as_str(), summary.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The progress message as Block Kit.
+    ///
+    /// Three layers, in the order they were decided against the real client:
+    /// finished rows fold into a `task_card`; a row that carries a diff stays out of the card in a
+    /// `markdown` block so the fence keeps its red and green; the running row is a `section`.
+    fn blocks_of(items: &[RenderItem], perm_timed_out: bool) -> Vec<serde_json::Value> {
+        let groups = Self::agent_groups(items);
+        let mut rendered_agents: Vec<String> = Vec::new();
+        let mut blocks: Vec<serde_json::Value> = Vec::new();
+        // (status, tool name, summary) of the finished rows waiting to be folded into one card,
+        // with the id of the first of them — the card's `task_id`.
+        let mut fold: Vec<(ToolStatus, String, String)> = Vec::new();
+        let mut fold_id = String::new();
+
+        fn flush(
+            fold: &mut Vec<(ToolStatus, String, String)>,
+            fold_id: &mut String,
+            blocks: &mut Vec<serde_json::Value>,
+        ) {
+            if fold.is_empty() {
+                return;
+            }
+            let rows: Vec<(ToolStatus, &str, &str)> = fold
+                .iter()
+                .map(|(s, n, m)| (*s, n.as_str(), m.as_str()))
+                .collect();
+            let pairs: Vec<(&str, &str)> = rows.iter().map(|(_, n, m)| (*n, *m)).collect();
+            let failed = fold.iter().filter(|(s, ..)| *s == ToolStatus::Error).count();
+            let denied = fold.iter().filter(|(s, ..)| *s == ToolStatus::Deny).count();
+            let mut title = StickyBoard::tool_breakdown(&pairs);
+            // Only when something went wrong — so trouble shows without opening the card.
+            let mut trouble = Vec::new();
+            if failed > 0 {
+                trouble.push(crate::t!("{} failed", "{}件 失敗", failed));
+            }
+            if denied > 0 {
+                trouble.push(crate::t!("{} denied", "{}件 拒否", denied));
+            }
+            if !trouble.is_empty() {
+                title = format!("{title} · {}", trouble.join(", "));
+            }
+            blocks.push(StickyBoard::task_card(
+                &format!("fold-{fold_id}"),
+                &title,
+                StickyBoard::card_children(&rows),
+            ));
+            fold.clear();
+            fold_id.clear();
+        }
+
+        for it in items {
+            match it {
+                // A subagent's rows are drawn once, as that agent's own card.
+                RenderItem::Tool { agent, .. } if agent.agent_id.is_some() => {
+                    let id = agent.agent_id.clone().unwrap_or_default();
+                    if rendered_agents.iter().any(|r| *r == id) {
+                        continue;
+                    }
+                    rendered_agents.push(id.clone());
+                    if let Some((_, ty, rows)) = groups.iter().find(|(gid, _, _)| *gid == id) {
+                        flush(&mut fold, &mut fold_id, &mut blocks);
+                        let children = Self::agent_children(rows);
+                        let pairs: Vec<(&str, &str)> =
+                            children.iter().map(|(_, n, m)| (*n, *m)).collect();
+                        blocks.push(Self::task_card(
+                            &format!("agent-{id}"),
+                            &format!("{ty} · {}", Self::tool_breakdown(&pairs)),
+                            Self::card_children(&children),
+                        ));
+                    }
+                }
+                // An `Agent` row and the subagent it started are one card: the row names what was
+                // asked for, the group says what the agent did. Linked by id, or by launch name
+                // when the agent lives in another id space (background / teammate).
+                RenderItem::Tool {
+                    name, summary, agent, ..
+                } if (name == "Agent" || name == "Task")
+                    && Self::linked_group(&groups, &rendered_agents, agent).is_some() =>
+                {
+                    let id = Self::linked_group(&groups, &rendered_agents, agent)
+                        .unwrap_or_default();
+                    rendered_agents.push(id.clone());
+                    if let Some((_, ty, rows)) = groups.iter().find(|(gid, _, _)| *gid == id) {
+                        flush(&mut fold, &mut fold_id, &mut blocks);
+                        let children = Self::agent_children(rows);
+                        let pairs: Vec<(&str, &str)> =
+                            children.iter().map(|(_, n, m)| (*n, *m)).collect();
+                        blocks.push(Self::task_card(
+                            &format!("agent-{id}"),
+                            &format!("{name} {summary} · {ty} · {}", Self::tool_breakdown(&pairs)),
+                            Self::card_children(&children),
+                        ));
+                    }
+                }
+                RenderItem::Tool {
+                    id,
+                    name,
+                    summary,
+                    status,
+                    diff,
+                    ..
+                } => {
+                    match (status, diff) {
+                        // Still running: out of the card, so it stays readable.
+                        (ToolStatus::Pending, _) => {
+                            flush(&mut fold, &mut fold_id, &mut blocks);
+                            blocks.push(Self::running_block(name, summary));
+                        }
+                        // Finished with a diff: its own markdown block, which is the only block
+                        // that paints the fence.
+                        (_, Some(d)) => {
+                            flush(&mut fold, &mut fold_id, &mut blocks);
+                            blocks.push(Self::markdown_block(&format!(
+                                "{}{} {name} `{summary}`{d}",
+                                INDENT_GUARD,
+                                Self::child_mark(*status),
+                                d = d
+                            )));
+                        }
+                        _ => {
+                            if fold.is_empty() {
+                                fold_id = id.clone();
+                            }
+                            fold.push((*status, name.clone(), summary.clone()));
+                        }
+                    }
+                }
+                RenderItem::Narration { text } => {
+                    flush(&mut fold, &mut fold_id, &mut blocks);
+                    blocks.push(Self::markdown_block(&format!("{NARR_GLYPH} {text}")));
+                }
+                RenderItem::Interrupted => {
+                    flush(&mut fold, &mut fold_id, &mut blocks);
+                    blocks.push(Self::markdown_block(INTERRUPTED_NOTICE));
+                }
+            }
+        }
+        flush(&mut fold, &mut fold_id, &mut blocks);
+        if perm_timed_out {
+            blocks.push(Self::markdown_block(&perm_timeout_line()));
+        }
+        blocks
+    }
+
 
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The text a person sees, pulled back out of the blocks so a test can assert on it.
+    /// A card contributes its title and then its rows, one per line.
+    fn text_of(blocks: &serde_json::Value) -> String {
+        fn runs(v: &serde_json::Value, out: &mut String) {
+            match v {
+                serde_json::Value::Array(a) => a.iter().for_each(|x| runs(x, out)),
+                serde_json::Value::Object(o) => {
+                    if o.get("type").and_then(|t| t.as_str()) == Some("text")
+                        && let Some(t) = o.get("text").and_then(|t| t.as_str())
+                    {
+                        out.push_str(t);
+                        return;
+                    }
+                    for k in ["elements", "details", "output"] {
+                        if let Some(x) = o.get(k) {
+                            runs(x, out);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = String::new();
+        for b in blocks.as_array().map(|a| a.as_slice()).unwrap_or_default() {
+            match b.get("type").and_then(|t| t.as_str()) {
+                Some("task_card") => {
+                    out.push_str(b.get("title").and_then(|t| t.as_str()).unwrap_or_default());
+                    out.push('\n');
+                    let mut rows = String::new();
+                    runs(b, &mut rows);
+                    out.push_str(&rows);
+                }
+                Some("section") => out.push_str(
+                    b.get("text")
+                        .and_then(|t| t.get("text"))
+                        .and_then(|t| t.as_str())
+                        .unwrap_or_default(),
+                ),
+                _ => out.push_str(b.get("text").and_then(|t| t.as_str()).unwrap_or_default()),
+            }
+            out.push('\n');
+        }
+        out.truncate(out.trim_end_matches('\n').len());
+        out
+    }
 
     impl StickyBoard {
         /// For tests — a main agent row in the default thread `k`.
@@ -1161,7 +1219,7 @@ mod tests {
             &AgentRef::default(),
             &input,
         );
-        let body = running.take_dirty(10_000).pop().unwrap().2;
+        let body = running.take_dirty(10_000).pop().map(|t| text_of(&t.2)).unwrap();
         assert!(!body.contains("```"), "走行中は出さない: {body}");
 
         let mut done = StickyBoard::default();
@@ -1174,7 +1232,7 @@ mod tests {
             &AgentRef::default(),
             &input,
         );
-        let body = done.take_dirty(10_000).pop().unwrap().2;
+        let body = done.take_dirty(10_000).pop().map(|t| text_of(&t.2)).unwrap();
         assert!(body.contains("Edit `/x.rs` (+1 -1)"), "{body}");
         assert!(body.contains("```diff\n-a\n+b\n```"), "{body}");
 
@@ -1192,7 +1250,7 @@ mod tests {
             },
             &input,
         );
-        let body = folded.take_dirty(10_000).pop().unwrap().2;
+        let body = folded.take_dirty(10_000).pop().map(|t| text_of(&t.2)).unwrap();
         assert!(!body.contains("```"), "畳んだ窓には持ち込まない: {body}");
     }
 
@@ -1224,16 +1282,14 @@ mod tests {
             ToolStatus::Done,
             &sub,
         );
-        let body = b.take_dirty(10_000).pop().unwrap().2;
+        let body = b.take_dirty(10_000).pop().map(|t| text_of(&t.2)).unwrap();
         // The heading is the Agent row, but its leading • is replaced by ▾
         assert!(
-            body.contains(&format!(
-                "{TOOL_INDENT}▾ Agent `コードを調べる` : Explore · Read 1 file"
-            )),
+            body.contains("Agent コードを調べる · Explore · Read 1 file"),
             "{body}"
         );
         // A standalone ▾ Explore heading does **not** appear (never shown twice)
-        assert_eq!(body.matches('▾').count(), 1, "{body}");
+        assert_eq!(body.matches("Explore").count(), 1, "{body}");
     }
 
     #[test]
@@ -1267,12 +1323,12 @@ mod tests {
             ToolStatus::Done,
             &sub,
         );
-        let body = b.take_dirty(10_000).pop().unwrap().2;
+        let body = b.take_dirty(10_000).pop().map(|t| text_of(&t.2)).unwrap();
         assert!(
-            body.contains("▾ Agent `レビューを頼む` : reviewer · Ran 1 command"),
+            body.contains("Agent レビューを頼む · reviewer · Ran 1 command"),
             "{body}"
         );
-        assert_eq!(body.matches('▾').count(), 1, "{body}");
+        assert_eq!(body.matches("reviewer").count(), 1, "{body}");
     }
 
     #[test]
@@ -1280,8 +1336,8 @@ mod tests {
         // Stays a normal row until the subagent's first tool arrives
         let mut b = StickyBoard::default();
         b.tool("t0", "Agent", "調査", ToolStatus::Pending);
-        let body = b.take_dirty(10_000).pop().unwrap().2;
-        assert_eq!(body, format!("{INDENT_GUARD}{TOOL_INDENT}◌ Agent `調査`"), "{body}");
+        let body = b.take_dirty(10_000).pop().map(|t| text_of(&t.2)).unwrap();
+        assert_eq!(body, "*◌ Agent* `調査`", "{body}");
     }
 
     #[test]
@@ -1302,17 +1358,14 @@ mod tests {
                 &sub,
             );
         }
-        let body = b.take_dirty(10_000).pop().unwrap().2;
+        let body = b.take_dirty(10_000).pop().map(|t| text_of(&t.2)).unwrap();
         // Heading is ▾ + agent name + breakdown
         assert!(
-            body.contains(&format!("{TOOL_INDENT}▾ Explore · Read 3 files")),
+            body.contains("Explore · Read 3 files"),
             "{body}"
         );
         // Only the latest 2, indented one level deeper
-        assert!(
-            !body.contains("/a.rs"),
-            "古い行はスクロールアウトする: {body}"
-        );
+        assert!(body.contains("/a.rs"), "畳まれるので全部載せる: {body}");
         assert!(body.contains("/b.rs"), "{body}");
         assert!(body.contains("/c.rs"), "{body}");
     }
@@ -1346,9 +1399,9 @@ mod tests {
             ToolStatus::Done,
             &a2,
         );
-        let body = b.take_dirty(10_000).pop().unwrap().2;
-        assert!(body.contains("▾ Explore · Read 1 file"), "{body}");
-        assert!(body.contains("▾ general-purpose · Ran 1 command"), "{body}");
+        let body = b.take_dirty(10_000).pop().map(|t| text_of(&t.2)).unwrap();
+        assert!(body.contains("Explore · Read 1 file"), "{body}");
+        assert!(body.contains("general-purpose · Ran 1 command"), "{body}");
     }
 
     #[test]
@@ -1369,9 +1422,9 @@ mod tests {
             &sub,
         );
         b.push_narration(&ThreadKey::parse("k"), "後で言うこと");
-        let body = b.take_dirty(10_000).pop().unwrap().2;
+        let body = b.take_dirty(10_000).pop().map(|t| text_of(&t.2)).unwrap();
         let first = body.find("先に言うこと").unwrap();
-        let sect = body.find("▾ Explore").unwrap();
+        let sect = body.find("Explore").unwrap();
         let last = body.find("後で言うこと").unwrap();
         assert!(
             first < sect && sect < last,
@@ -1404,8 +1457,8 @@ mod tests {
             ToolStatus::Done,
             &sub,
         );
-        let body = b.take_dirty(10_000).pop().unwrap().2;
-        assert!(body.contains("▾ Explore · Read 2 files"), "{body}");
+        let body = b.take_dirty(10_000).pop().map(|t| text_of(&t.2)).unwrap();
+        assert!(body.contains("Explore · Read 2 files"), "{body}");
         assert!(
             body.contains("/a.rs") && body.contains("/b.rs"),
             "窓は2件: {body}"
@@ -1431,7 +1484,7 @@ mod tests {
         let mut timed = StickyBoard::default();
         timed.tool_at(&k, "t1", "Bash", "rm -rf /tmp/x", ToolStatus::Pending);
         timed.on_perm_timeout(&k);
-        let (_, out) = timed.take_final(&k).expect("付箋が出ていない");
+        let (_, out) = timed.take_final(&k).map(|(t, b)| (t, text_of(&b))).expect("付箋が出ていない");
         assert!(out.contains("⚠️ No answer to the permission request — timed out"), "{out}");
         assert!(out.contains("◌ Bash"), "行は触らず ◌ のまま: {out}");
         assert!(!out.contains("🚫"), "満期で行を落としてはいけない: {out}");
@@ -1440,7 +1493,7 @@ mod tests {
         let mut lone = StickyBoard::default();
         lone.on_perm_timeout(&ThreadKey::parse("k2"));
         let (_, out) = lone
-            .take_final(&ThreadKey::parse("k2"))
+            .take_final(&ThreadKey::parse("k2")).map(|(t, b)| (t, text_of(&b)))
             .expect("付箋が出ていない");
         assert!(out.contains("⚠️ No answer to the permission request — timed out"), "{out}");
 
@@ -1448,8 +1501,8 @@ mod tests {
         let mut denied = StickyBoard::default();
         denied.tool_at(&k, "t1", "Bash", "rm -rf /tmp/x", ToolStatus::Pending);
         denied.on_perm_denied(&k, "t1");
-        let (_, out) = denied.take_final(&k).expect("付箋が出ていない");
-        assert!(out.contains("🚫 Bash"), "{out}");
+        let (_, out) = denied.take_final(&k).map(|(t, b)| (t, text_of(&b))).expect("付箋が出ていない");
+        assert!(out.contains("🚫"), "{out}");
         assert!(!out.contains("ツール許可待ちタイムアウト"), "{out}");
     }
 
@@ -1459,21 +1512,22 @@ mod tests {
         b.tool("t1", "Read", "/a.rs", ToolStatus::Done);
         b.tool("t2", "Read", "/b.rs", ToolStatus::Done);
         b.tool("t3", "Grep", "foo", ToolStatus::Done);
-        let body = b.take_dirty(10_000).pop().unwrap().2;
-        assert_eq!(
-            body,
-            format!("{INDENT_GUARD}{TOOL_INDENT}·  Read 2 files, Searched for 1 pattern"),
+        let body = b.take_dirty(10_000).pop().map(|t| text_of(&t.2)).unwrap();
+        assert!(
+            body.starts_with("Read 2 files, Searched for 1 pattern"),
             "{body}"
         );
     }
 
     #[test]
     fn a_lone_finished_row_stays_expanded() {
-        // Folding a single row saves no lines and only hides the path — folding starts at two
+        // Slack folds the card, so even one finished row rides in it — the title says what was
+        // done and the path is one click away.
         let mut b = StickyBoard::default();
         b.tool("t1", "Read", "/a.rs", ToolStatus::Done);
-        let body = b.take_dirty(10_000).pop().unwrap().2;
-        assert_eq!(body, format!("{INDENT_GUARD}{TOOL_INDENT}· Read `/a.rs`"), "{body}");
+        let body = b.take_dirty(10_000).pop().map(|t| text_of(&t.2)).unwrap();
+        assert!(body.starts_with("Read 1 file"), "{body}");
+        assert!(body.contains("•  Read /a.rs"), "{body}");
     }
 
     #[test]
@@ -1482,12 +1536,12 @@ mod tests {
         b.tool("t1", "Read", "/a.rs", ToolStatus::Done);
         b.tool("t2", "Read", "/b.rs", ToolStatus::Pending); // running
         b.tool("t3", "Read", "/c.rs", ToolStatus::Error); // failed
-        let body = b.take_dirty(10_000).pop().unwrap().2;
-        // A run with only one completed row is not folded; running and failed rows each keep their own line
-        assert!(body.contains("`/a.rs`"), "{body}");
-        assert!(body.contains("◌ Read `/b.rs`"), "{body}");
-        assert!(body.contains("× Read `/c.rs`"), "{body}");
-        assert!(!body.contains("Read 2 files"), "{body}");
+        let body = b.take_dirty(10_000).pop().map(|t| text_of(&t.2)).unwrap();
+        // The running row stays out of the card; the finished and the failed ones ride in it
+        assert!(body.contains("◌ Read* `/b.rs`"), "{body}");
+        assert!(body.contains("•  Read /a.rs"), "{body}");
+        assert!(body.contains("×  Read /c.rs"), "{body}");
+        assert!(body.contains("1 failed"), "{body}");
     }
 
     #[test]
@@ -1498,7 +1552,7 @@ mod tests {
         b.push_narration(&ThreadKey::parse("k"), "次を調べます");
         b.tool("t3", "Bash", "cargo test", ToolStatus::Done);
         b.tool("t4", "Bash", "cargo fmt", ToolStatus::Done);
-        let body = b.take_dirty(10_000).pop().unwrap().2;
+        let body = b.take_dirty(10_000).pop().map(|t| text_of(&t.2)).unwrap();
         assert!(body.contains("Read 2 files"), "{body}");
         assert!(body.contains("● 次を調べます"), "{body}");
         assert!(body.contains("Ran 2 commands"), "{body}");
@@ -1581,7 +1635,7 @@ mod tests {
         b.push_narration(&ThreadKey::parse("k"), "ビルドを確認します");
         let dirty = b.take_dirty(10_000);
         assert_eq!(dirty.len(), 1);
-        assert!(dirty[0].2.contains("· Bash `cargo test`") && dirty[0].2.contains("● ビルド"));
+        assert!(text_of(&dirty[0].2).contains("cargo test") && text_of(&dirty[0].2).contains("● ビルド"));
         // A re-flush within 1 second is held back by the rate guard
         b.push_narration(&ThreadKey::parse("k"), "続き");
         assert!(b.take_dirty(10_500).is_empty());
@@ -1600,119 +1654,67 @@ mod tests {
         );
     }
 
-    /// When it no longer fits on one message, seal that message and continue
-    /// in **the next message** (never cut and drop). Slack rejects edits over about 4000 bytes.
+
+    /// The finished rows ride in one card, and its title says what went wrong without opening it.
     #[test]
-    fn an_overflowing_sticky_seals_the_page_and_continues_on_a_new_message() {
-        let k = ThreadKey::parse("k");
+    fn finished_rows_fold_into_one_card_whose_title_counts_the_trouble() {
         let mut b = StickyBoard::default();
-        b.on_turn_start(&k);
-        // Use Edit, which is **not** folded. With Bash/Read they would fold into one line and never overflow
-        for i in 0..500 {
-            b.upsert_tool_t(
-                &k,
-                &format!("t{i}"),
-                "Edit",
-                &format!("{i}-{}", "x".repeat(60)),
-                ToolStatus::Done,
-                &AgentRef::default(),
-            );
-        }
-        b.set_posted(&k, "999.1");
-
-        let first = b.take_dirty(10_000);
-        assert_eq!(first.len(), 1);
-        assert_eq!(first[0].1.as_deref(), Some("999.1"), "1枚目は編集で締める");
-        assert!(
-            first[0].2.len() <= STICKY_BUDGET + 32,
-            "len={}",
-            first[0].2.len()
-        );
-
-        // The rest goes to **a new message**. The sealed page is never edited again, so it keeps no ts.
-        // It goes out right away without waiting for the throttle (1 second)
-        let second = b.take_dirty(10_100);
-        assert_eq!(second.len(), 1);
-        assert_eq!(second[0].1, None, "封じたページの続きは新規投稿");
-        assert!(!second[0].2.is_empty());
-        assert_ne!(first[0].2, second[0].2, "同じ内容を2度出さない");
+        b.tool("t1", "Bash", "cargo test", ToolStatus::Done);
+        b.tool("t2", "Bash", "cargo build", ToolStatus::Error);
+        b.tool("t3", "Bash", "rm -rf /tmp/x", ToolStatus::Deny);
+        let blocks = b.take_dirty(10_000).pop().unwrap().2;
+        let cards: Vec<&serde_json::Value> = blocks
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|b| b["type"] == "task_card")
+            .collect();
+        assert_eq!(cards.len(), 1, "{blocks}");
+        assert_eq!(cards[0]["status"], "complete");
+        let title = cards[0]["title"].as_str().unwrap();
+        assert!(title.contains("1 failed") && title.contains("1 denied"), "{title}");
+        let rows = text_of(&blocks);
+        assert!(rows.contains("•  cargo test"), "{rows}");
+        assert!(rows.contains("×  cargo build"), "{rows}");
+        assert!(rows.contains("🚫  rm -rf /tmp/x"), "{rows}");
     }
 
-    /// Even when a code block is split at a page boundary, both pages are self-contained.
+    /// A duplicate `task_id` makes Slack refuse the whole update, and the progress message then
+    /// freezes with nothing in the log to say why.
     #[test]
-    fn a_code_fence_split_by_a_page_boundary_is_closed_and_reopened() {
-        let lines: Vec<String> = vec![
-            "```".into(),
-            "a".repeat(3000),
-            "b".repeat(3000),
-            "```".into(),
-        ];
-        let (p1, next, open) = StickyBoard::page(&lines, 0, false);
-        assert!(open, "1ページ目はフェンスが開いたまま終わる");
-        assert!(
-            p1.ends_with("\n```"),
-            "封じる前に閉じる: {}",
-            &p1[p1.len() - 8..]
-        );
-        assert!(next < lines.len());
-
-        let (p2, end, still_open) = StickyBoard::page(&lines, next, open);
-        assert!(p2.starts_with("```diff\n"), "次のページで開き直す: {p2}");
-        assert_eq!(end, lines.len());
-        assert!(!still_open, "最後の ``` で閉じている");
+    fn every_task_id_in_one_message_is_unique() {
+        let mut b = StickyBoard::default();
+        let k = ThreadKey::parse("k");
+        b.tool("t1", "Read", "/a.rs", ToolStatus::Done);
+        b.push_narration(&k, "調べます");
+        b.tool("t2", "Read", "/b.rs", ToolStatus::Done);
+        b.push_narration(&k, "もう一度");
+        b.tool("t3", "Read", "/c.rs", ToolStatus::Done);
+        let blocks = b.take_dirty(10_000).pop().unwrap().2;
+        let mut ids: Vec<&str> = blocks
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|b| b["task_id"].as_str())
+            .collect();
+        assert_eq!(ids.len(), 3, "{blocks}");
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 3, "task_id が重複している: {blocks}");
     }
 
+    /// The running row must not be a card: a card folds shut, and what the agent is doing right
+    /// now has to stay readable.
     #[test]
-    fn an_over_budget_single_line_is_clipped_so_the_page_still_sends() {
-        // One 6000-byte narration. Dropping the whole line would hide everything after it, so it is truncated to its head
-        let mut items = vec![RenderItem::Narration {
-            text: "あ".repeat(2000),
-        }];
-        items.extend((0..3).map(|i| RenderItem::Tool {
-            id: format!("t{i}"),
-            name: "Edit".into(),
-            summary: "x".into(),
-            status: ToolStatus::Done,
-            agent: AgentRef::default(),
-            diff: None,
-        }));
-        let out = StickyBoard::page(&StickyBoard::lines_of(&items, false), 0, false).0;
-        assert!(out.len() <= STICKY_BUDGET + 32, "len={}", out.len());
-        assert!(
-            out.starts_with("● あああ"),
-            "頭出しされていない: {:?}",
-            &out[..20.min(out.len())]
-        );
-        assert!(
-            out.ends_with('…'),
-            "切ったことを示す: {:?}",
-            &out[out.len() - 8..]
-        );
-    }
-
-    /// The first row keeps its indent: Slack strips the leading whitespace of a message's first
-    /// line, so a zero-width space goes in front of it.
-    #[test]
-    fn the_top_row_keeps_its_indent() {
-        let items = vec![RenderItem::Tool {
-            id: "t1".into(),
-            name: "WebFetch".into(),
-            summary: "https://x".into(),
-            status: ToolStatus::Done,
-            agent: AgentRef::default(),
-            diff: None,
-        }];
-        let out = StickyBoard::page(&StickyBoard::lines_of(&items, false), 0, false).0;
-        assert!(out.starts_with(&format!("{INDENT_GUARD}{TOOL_INDENT}")), "{out:?}");
-
-        // A narration row starts flush left anyway — nothing to guard
-        let out = StickyBoard::page(
-            &StickyBoard::lines_of(&[RenderItem::Narration { text: "hi".into() }], false),
-            0,
-            false,
-        )
-        .0;
-        assert!(out.starts_with(NARR_GLYPH), "{out:?}");
+    fn the_running_row_is_a_section_not_a_card() {
+        let mut b = StickyBoard::default();
+        b.tool("t1", "Bash", "cargo test", ToolStatus::Pending);
+        let blocks = b.take_dirty(10_000).pop().unwrap().2;
+        let last = blocks.as_array().unwrap().last().unwrap();
+        assert_eq!(last["type"], "section", "{blocks}");
+        let text = last["text"]["text"].as_str().unwrap();
+        assert!(text.starts_with("*◌ Bash*"), "{text}");
+        assert!(text.contains("```\ncargo test\n```"), "{text}");
     }
 
     /// Work continuing after the answer goes to **a new progress message** (one under the answer).
@@ -1732,15 +1734,15 @@ mod tests {
         assert_eq!(dirty.len(), 1);
         assert_eq!(dirty[0].1, None, "返事の下に**新しく**出す(編集ではない)");
         assert!(
-            dirty[0].2.contains("● ついでに調べました"),
+            text_of(&dirty[0].2).contains("● ついでに調べました"),
             "{}",
-            dirty[0].2
+            text_of(&dirty[0].2)
         );
-        assert!(dirty[0].2.contains("Read"), "{}", dirty[0].2);
+        assert!(text_of(&dirty[0].2).contains("Read"), "{}", text_of(&dirty[0].2));
         assert!(
-            !dirty[0].2.contains("cargo test"),
+            !text_of(&dirty[0].2).contains("cargo test"),
             "前の付箋の行を持ち越さない: {}",
-            dirty[0].2
+            text_of(&dirty[0].2)
         );
 
         // The next turn starts from a new progress message again
@@ -1748,9 +1750,9 @@ mod tests {
         b.push_narration(&k, "次のターン");
         let dirty = b.take_dirty(100_000);
         assert_eq!(dirty.len(), 1);
-        assert!(dirty[0].2.contains("● 次のターン"), "{}", dirty[0].2);
+        assert!(text_of(&dirty[0].2).contains("● 次のターン"), "{}", text_of(&dirty[0].2));
         assert!(
-            !dirty[0].2.contains("ついでに"),
+            !text_of(&dirty[0].2).contains("ついでに"),
             "前ターンの遅刻分が混ざった"
         );
 
@@ -1796,7 +1798,7 @@ mod tests {
         let after = q.take_dirty(99_000);
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].1, None, "消した付箋を編集せず、新しく出す");
-        assert!(after[0].2.contains("Edit"), "{}", after[0].2);
+        assert!(text_of(&after[0].2).contains("Edit"), "{}", text_of(&after[0].2));
         assert!(q.take_final(&k).is_none());
     }
 
@@ -1832,7 +1834,7 @@ mod tests {
         b.push_narration(&k, "次のターン");
         let dirty = b.take_dirty(100_000);
         assert_eq!(dirty.len(), 1);
-        assert!(dirty[0].2.contains("● 次のターン"), "{}", dirty[0].2);
+        assert!(text_of(&dirty[0].2).contains("● 次のターン"), "{}", text_of(&dirty[0].2));
     }
 
     #[test]
@@ -1844,9 +1846,10 @@ mod tests {
         let dirty = b.take_dirty(10_000);
         assert_eq!(dirty.len(), 1);
         // Goes "under" the progress rows as its own paragraph after one blank line (not a replacement)
+        // Its own block under the running row — the blocks are the paragraphs now
         assert_eq!(
-            dirty[0].2,
-            "\u{200B}\u{A0}\u{A0}\u{A0}◌ Bash `x`\n\n└ `Interrupted by user.`"
+            text_of(&dirty[0].2),
+            format!("*◌ Bash*\n```\nx\n```\n{INTERRUPTED_NOTICE}")
         );
         // After settling, new rows stay silent (until the next on_turn_start)
         b.push_narration(&ThreadKey::parse("k"), "続き");
@@ -1861,7 +1864,7 @@ mod tests {
         let dirty = b.take_dirty(10_000);
         assert_eq!(dirty.len(), 1);
         // No blank line without preceding lines (the progress message never starts with a blank line)
-        assert_eq!(dirty[0].2, "└ `Interrupted by user.`");
+        assert_eq!(text_of(&dirty[0].2), "└ `Interrupted by user.`");
     }
 
     #[test]
@@ -1878,7 +1881,8 @@ mod tests {
         );
         let (ts, body) = b.take_final(&ThreadKey::parse("k")).expect("final draw");
         assert_eq!(ts, None);
-        assert!(body.contains("· Bash `cargo test`"), "{body}");
+        let body = text_of(&body);
+        assert!(body.contains("Ran 1 command") && body.contains("cargo test"), "{body}");
         assert!(
             b.take_final(&ThreadKey::parse("k")).is_none(),
             "2回目は返さない"

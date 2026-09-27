@@ -78,6 +78,53 @@ impl Api {
             .await
     }
 
+    /// Post a body the caller laid out itself. **Keep `text`** — it is the notification fallback,
+    /// and a blocks-only post gives an empty notification.
+    pub async fn post_blocks(
+        &self,
+        channel: &str,
+        text: &str,
+        blocks: serde_json::Value,
+        thread_ts: Option<&str>,
+    ) -> Result<String, String> {
+        let blocks: Vec<SlackBlock> = serde_json::from_value(blocks).map_err(|e| e.to_string())?;
+        let content = SlackMessageContent::new()
+            .with_text(text.to_string())
+            .with_blocks(blocks);
+        let mut req = SlackApiChatPostMessageRequest::new(channel.into(), content);
+        if let Some(ts) = thread_ts {
+            req = req.with_thread_ts(ts.into());
+        }
+        let res = self
+            .client
+            .open_session(&self.token)
+            .chat_post_message(&req)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(res.ts.to_string())
+    }
+
+    /// Rewrite a post made by `post_blocks`.
+    pub async fn update_blocks(
+        &self,
+        channel: &str,
+        ts: &str,
+        text: &str,
+        blocks: serde_json::Value,
+    ) -> Result<(), String> {
+        let blocks: Vec<SlackBlock> = serde_json::from_value(blocks).map_err(|e| e.to_string())?;
+        let content = SlackMessageContent::new()
+            .with_text(text.to_string())
+            .with_blocks(blocks);
+        let req = SlackApiChatUpdateRequest::new(channel.into(), content, ts.into());
+        self.client
+            .open_session(&self.token)
+            .chat_update(&req)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
     async fn post_with(
         &self,
         channel: &str,
@@ -1074,11 +1121,29 @@ impl crate::chat::Chat for Api {
     ) -> Result<String, String> {
         Api::post_markdown(self, channel, text, thread_ts).await
     }
+    async fn post_blocks(
+        &self,
+        channel: &str,
+        text: &str,
+        blocks: serde_json::Value,
+        thread_ts: Option<&str>,
+    ) -> Result<String, String> {
+        Api::post_blocks(self, channel, text, blocks, thread_ts).await
+    }
     async fn update_message(&self, channel: &str, ts: &str, text: &str) -> Result<(), String> {
         Api::update_message(self, channel, ts, text).await
     }
     async fn update_markdown(&self, channel: &str, ts: &str, text: &str) -> Result<(), String> {
         Api::update_markdown(self, channel, ts, text).await
+    }
+    async fn update_blocks(
+        &self,
+        channel: &str,
+        ts: &str,
+        text: &str,
+        blocks: serde_json::Value,
+    ) -> Result<(), String> {
+        Api::update_blocks(self, channel, ts, text, blocks).await
     }
     async fn delete_message(&self, channel: &str, ts: &str) -> Result<(), String> {
         Api::delete_message(self, channel, ts).await
