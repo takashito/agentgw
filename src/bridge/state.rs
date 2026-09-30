@@ -212,9 +212,16 @@ pub struct ThreadEntry {
     /// thread's messages somewhere that had never heard of it, and they were dropped as not
     /// addressed to anyone (measured 2026-09-23).
     ///
-    /// Absent means the thread started before this was recorded, or belongs to the gateway's own
-    /// channel. Then the channel's assignment decides, which is what every thread did before.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// **Only threads the bot is in are recorded** — a message addressed to it, or its own post. So
+    /// a record also answers "is this the bot's conversation" (what lets the gateway answer a
+    /// follow-up without a mention while the thread's machine is offline).
+    ///
+    /// Absent means the bot has not been in the thread, or it started before this was recorded.
+    /// Then the channel's assignment decides, which is what every thread did before.
+    ///
+    /// **On disk it is `machine`.** The earlier `bridge` key was written for every thread in a
+    /// channel, the bot's or not, so it cannot answer that question; [`Threads::load`] drops it.
+    #[serde(rename = "machine", skip_serializing_if = "Option::is_none")]
     pub bridge: Option<String>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -258,7 +265,7 @@ pub struct Threads {
 impl Threads {
     pub fn from_str(src: &str) -> serde_json::Result<Self> {
         Ok(Self {
-            entries: serde_json::from_str(src)?,
+            entries: Self::drop_old_routes(serde_json::from_str(src)?),
             path: None,
         })
     }
@@ -293,9 +300,20 @@ impl Threads {
             }
         };
         Self {
-            entries,
+            entries: Self::drop_old_routes(entries),
             path: Some(path),
         }
+    }
+
+    /// Forget the old `bridge` key: it was written for every thread in a channel, whether the bot
+    /// was in it or not (2026-09-30, user's decision to drop rather than keep). A row that held nothing
+    /// else goes with it. The file itself is rewritten on the next save.
+    fn drop_old_routes(mut entries: BTreeMap<String, ThreadEntry>) -> BTreeMap<String, ThreadEntry> {
+        for e in entries.values_mut() {
+            e.extra.remove("bridge");
+        }
+        entries.retain(|_, e| serde_json::to_value(&*e).is_ok_and(|v| v != serde_json::json!({})));
+        entries
     }
 
     pub fn to_string_pretty(&self) -> serde_json::Result<String> {

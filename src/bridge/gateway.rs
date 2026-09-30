@@ -920,8 +920,11 @@ impl<'a> Event<'a> {
         }
     }
 
+    /// Who wrote it. Edits sit one level down (`message.user`), like the text — reading only the top
+    /// level made an edit that added the mention look authorless, and the Owner check refused the Owner.
     pub fn user(&self) -> Option<&'a str> {
         self.str_at("user")
+            .or_else(|| self.raw.get("message")?.get("user")?.as_str())
     }
 
     /// What the person actually wrote. Edits sit one level down (`message.text`).
@@ -965,8 +968,11 @@ impl<'a> Event<'a> {
 
     /// Written by the bot itself — **including these very refusals**. Without this, a channel with no
     /// machine assigned keeps answering its own "no machine assigned" with "no machine assigned".
+    /// An edit of a bot's post carries the `bot_id` one level down, under `message`.
     pub fn from_a_bot(&self) -> bool {
-        self.raw.get("bot_id").is_some_and(|v| !v.is_null())
+        let has_bot_id = |m: &serde_json::Value| m.get("bot_id").is_some_and(|v| !v.is_null());
+        has_bot_id(self.raw)
+            || self.raw.get("message").is_some_and(has_bot_id)
             || self.str_at("subtype") == Some("bot_message")
     }
 
@@ -998,20 +1004,42 @@ impl<'a> Event<'a> {
         self.name == "message" && self.channel().is_some() && !self.speaks_as_a_bot(owner)
     }
 
+    /// **This message puts the bot in its thread**: a person addressing it (a mention, or a DM), or
+    /// the bot's own post. Only these threads get their machine recorded — a thread the bot was
+    /// never in has nothing to keep on a machine, and recording it would make "recorded" mean
+    /// nothing.
+    pub fn brings_in_the_bot(&self, bot_user_id: Option<&str>, owner: Option<&str>) -> bool {
+        if self.name != "message" || self.channel().is_none() || self.is_retraction() {
+            return false;
+        }
+        if self.speaks_as_a_bot(owner) {
+            return bot_user_id.is_some() && self.user() == bot_user_id;
+        }
+        let channel = self.channel().unwrap_or("");
+        crate::chat::slack::SlackId::is_dm(channel)
+            || crate::bridge::command::Message::new(self.text().unwrap_or(""), bot_user_id)
+                .mentions_bot()
+    }
+
     /// Whether the gateway may speak up about this event.
     ///
     /// Reactions and joins aren't addressed to anyone. Never answer a bot's words
     /// (infinite loop). In channels a mention is required — the gateway is **deliberately stricter** than the Bridge's gate:
     /// the Bridge also responds to "a follow-up in a running thread", but only that machine knows
     /// which threads are alive, and it can't be asked exactly when it's away.
-    pub fn may_answer(&self, bot_user_id: Option<&str>) -> bool {
+    ///
+    /// `in_bot_thread`: the thread is one the bot is in. **There a follow-up needs no mention**, as
+    /// it needs none on the machine — otherwise a follow-up sent while the machine is offline went
+    /// unanswered, and the person could not tell it had gone nowhere.
+    pub fn may_answer(&self, bot_user_id: Option<&str>, in_bot_thread: bool) -> bool {
         let Some(channel) = self.channel() else {
             return false;
         };
         if self.name != "message" || self.from_a_bot() || self.is_retraction() {
             return false;
         }
-        crate::chat::slack::SlackId::is_dm(channel)
+        in_bot_thread
+            || crate::chat::slack::SlackId::is_dm(channel)
             || crate::bridge::command::Message::new(self.text().unwrap_or(""), bot_user_id)
                 .mentions_bot()
     }
@@ -1185,6 +1213,8 @@ pub struct CommandCtx<'a> {
     pub owner_user_id: Option<&'a str>,
     /// `None` until the Relay resolves its own id ⇒ no channel command can succeed.
     pub bot_user_id: Option<&'a str>,
+    /// Typed inside a thread the bot is in (one the gateway has a machine recorded for).
+    pub in_bot_thread: bool,
 }
 
 impl CommandCtx<'_> {
@@ -1200,8 +1230,16 @@ impl CommandCtx<'_> {
     ///
     /// An unaddressed `pwd` / `route` **isn't even refused** — cutting into people's conversation over one word
     /// with "that's Owner-only" is barging into a conversation the bot isn't part of.
+    ///
+    /// **The Owner's follow-up in a thread the bot is in needs no mention either** — the machine
+    /// takes it that way, and a `cd` typed there while the machine is offline would otherwise
+    /// vanish without a word. Only the Owner's: these commands are theirs, and anyone else's
+    /// "cd …" in that thread is not the gateway's to answer.
     fn addressed(&self) -> bool {
-        self.is_dm() || self.msg().mentions_bot()
+        self.is_dm()
+            || self.msg().mentions_bot()
+            || (self.in_bot_thread
+                && matches!((self.user_id, self.owner_user_id), (Some(u), Some(o)) if u == o))
     }
 
     /// If the text is a command starting with `verb`, the words after it. `None` if not addressed.
@@ -2563,9 +2601,11 @@ impl Fleet {
         );
         // **Remember where it went, the moment it is decided.** A thread whose machine came from its
         // channel this time keeps that machine afterwards, so repointing the channel later leaves it
-        // alone. Only a thread we can name, and only when it is not already written down.
+        // alone. Only a thread we can name, only when it is not already written down, and **only
+        // once the bot is in it** — a thread the bot never joined has nothing to keep anywhere.
         if let Some(t) = thread.as_deref()
             && !thread_routes.contains_key(t)
+            && ev.brings_in_the_bot(bot_user_id.as_deref(), self.owner().as_deref())
             && let Some(id) = decision.bridge_id(&self.self_id)
         {
             let _ = self.remember.send((t.to_string(), id.clone())).await;
@@ -2632,7 +2672,11 @@ impl Fleet {
         let bot_user_id = self.bot_user_id.lock().await.clone();
         let Some(ch) = ev.channel() else { return };
         let name = ev.name;
-        if !ev.may_answer(bot_user_id.as_deref()) {
+        let in_bot_thread = match ev.thread() {
+            Some(t) => self.thread_routes.lock().await.contains_key(t),
+            None => false,
+        };
+        if !ev.may_answer(bot_user_id.as_deref(), in_bot_thread) {
             if ev.is_retraction() {
                 rlog(
                     "info",
@@ -2748,6 +2792,7 @@ impl Fleet {
             text,
             owner_user_id: owner.as_deref(),
             bot_user_id,
+            in_bot_thread: self.thread_routes.lock().await.contains_key(&thread),
         };
 
         // ── route — answered here and **never delivered** (the destination is the very thing being changed)
@@ -4613,6 +4658,13 @@ mod tests {
     }
 
     fn a_fleet_in(dir: StateDir) -> (Arc<Fleet>, tokio::sync::mpsc::Receiver<InboundMsg>) {
+        a_fleet_with(dir, Arc::new(crate::chat::fake::FakeChat::default()))
+    }
+
+    fn a_fleet_with(
+        dir: StateDir,
+        api: Arc<crate::chat::fake::FakeChat>,
+    ) -> (Arc<Fleet>, tokio::sync::mpsc::Receiver<InboundMsg>) {
         let (msg_tx, msg_rx) = tokio::sync::mpsc::channel(4);
         let (click_tx, _click_rx) = tokio::sync::mpsc::channel(4);
         let (reload, _reload_rx) = tokio::sync::mpsc::channel(4);
@@ -4622,7 +4674,7 @@ mod tests {
             token: "s3cret".to_string(),
             self_id: "parent".to_string(),
             bot_token: "xoxb-test".to_string(),
-            api: Arc::new(crate::chat::fake::FakeChat::default()),
+            api,
             dir,
             cooldown: Default::default(),
             presence: Default::default(),
@@ -4637,6 +4689,98 @@ mod tests {
             tunnels: Default::default(),
         });
         (fleet, msg_rx)
+    }
+
+    /// **Only a thread the bot is in gets its machine recorded**, and there a follow-up with no
+    /// mention is answered while the machine is offline. Before, every thread in a channel was
+    /// recorded, and a follow-up sent to an offline machine went unanswered: the Owner typed `cd`
+    /// with no mention, and nothing happened at all.
+    #[tokio::test]
+    async fn a_follow_up_in_the_bots_thread_is_answered_while_its_machine_is_offline() {
+        let dir = StateDir::at(
+            std::env::temp_dir().join(format!("agentgw-bot-thread-{}", std::process::id())),
+        );
+        let _ = std::fs::remove_dir_all(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let mut access = Access::default();
+        access.owner = "U_OWNER".into();
+        access.routes.entry("C1".to_string()).or_default().bridge = Some("mac".into());
+        access.routes.entry("C2".to_string()).or_default().bridge = Some("mac".into());
+        access.save(&dir).unwrap();
+        let api = Arc::new(crate::chat::fake::FakeChat::default());
+        let (fleet, _rx) = a_fleet_with(dir.clone(), api.clone());
+        *fleet.bot_user_id.lock().await = Some("U_BOT".into());
+        let say = |ch: &str, user: &str, text: &str| {
+            serde_json::json!({"channel": ch, "user": user, "text": text, "ts": "5.5", "thread_ts": "1.1"})
+        };
+
+        // People talking among themselves: not recorded, and the gateway keeps out of it
+        fleet.on_event("message", &say("C1", "U_OWNER", "lunch?")).await;
+        assert!(!fleet.thread_routes.lock().await.contains_key("1.1"));
+        assert!(api.calls.lock().unwrap().is_empty(), "{:?}", api.calls);
+
+        // The bot's own post in the other channel's thread puts it there
+        let mut own = say("C2", "U_BOT", "done");
+        own["bot_id"] = "B1".into();
+        fleet.on_event("message", &own).await;
+        assert_eq!(fleet.thread_routes.lock().await.get("1.1").map(String::as_str), Some("mac"));
+        assert!(api.calls.lock().unwrap().is_empty(), "never answers its own post");
+
+        // Now a follow-up with no mention is told the machine is away, instead of silence
+        fleet.on_event("message", &say("C2", "U_OWNER", "are you there")).await;
+        let calls = api.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(calls[0].starts_with("post C2 1.1 ") && calls[0].contains("*mac*"), "{calls:?}");
+    }
+
+    /// **The old records are dropped** (user's decision, 2026-09-30): they were written for every
+    /// thread, the bot's or not. A row left empty goes; a row with anything else keeps it.
+    #[test]
+    fn the_old_thread_records_are_dropped() {
+        let t = crate::bridge::state::Threads::from_str(
+            r#"{"1.1":{"bridge":"mac"},"2.2":{"bridge":"mac","session_id":"s"},"3.3":{"machine":"pve"}}"#,
+        )
+        .unwrap();
+        assert!(t.get("1.1").is_none());
+        assert!(t.get("2.2").is_some_and(|e| e.extra.get("bridge").is_none()));
+        assert_eq!(
+            t.bridges().into_iter().collect::<Vec<_>>(),
+            vec![("3.3".to_string(), "pve".to_string())]
+        );
+        assert!(t.to_string_pretty().unwrap().contains(r#""machine": "pve""#));
+    }
+
+    #[test]
+    fn what_brings_the_bot_into_a_thread() {
+        let owner = Some("U_OWNER");
+        let bring = |v: serde_json::Value| Event::new("message", &v).brings_in_the_bot(BOT, owner);
+        assert!(bring(said("<@U_BOT> hi")));
+        assert!(!bring(said("hi")));
+        assert!(bring(said_in("D1", "hi")));
+        assert!(bring(serde_json::json!({"channel": "C1", "user": "U_BOT", "bot_id": "B1", "text": "x"})));
+        assert!(!bring(serde_json::json!({"channel": "C1", "user": "U_OTHER", "bot_id": "B2", "text": "<@U_BOT> x"})));
+        // The Owner posting through the Web API is a person
+        assert!(bring(serde_json::json!({"channel": "C1", "user": "U_OWNER", "bot_id": "B3", "text": "<@U_BOT> x"})));
+        assert!(!bring(serde_json::json!({"channel": "C1", "subtype": "message_deleted"})));
+    }
+
+    /// In the bot's thread the Owner's `cd` needs no mention; someone else's "cd …" there is not a command.
+    #[test]
+    fn the_owners_cd_in_the_bots_thread_needs_no_mention() {
+        let in_thread = |user: &'static str, in_bot_thread: bool| CommandCtx {
+            in_bot_thread,
+            ..ctx("C1", "cd desktop:/srv", Some(user))
+        };
+        assert!(matches!(
+            CommandCtx::route(&in_thread(OWNER, true), &here()),
+            RouteOutcome::SetProject { for_thread: true, .. }
+        ));
+        assert_eq!(CommandCtx::route(&in_thread("U_STRANGER", true), &here()), RouteOutcome::NotACommand);
+        assert_eq!(CommandCtx::route(&in_thread(OWNER, false), &here()), RouteOutcome::NotACommand);
+        // And a person's follow-up there may be answered without a mention; a bot's never
+        assert!(Event::new("message", &said("hi")).may_answer(BOT, true));
+        let bot = serde_json::json!({"channel": "C1", "bot_id": "B1", "text": "hi"});
+        assert!(!Event::new("message", &bot).may_answer(BOT, true));
     }
 
     /// **A machine's handshake replays its own `routes`, and that must not take a channel back.**
@@ -4959,15 +5103,15 @@ mod tests {
 
     #[test]
     fn a_dm_is_always_addressed_to_the_bot() {
-        assert!(Event::new("message", &said_in("D1", "hello")).may_answer(BOT));
+        assert!(Event::new("message", &said_in("D1", "hello")).may_answer(BOT, false));
     }
 
     #[test]
     fn in_a_channel_only_a_mention_is_addressed_to_the_bot() {
-        assert!(Event::new("message", &said("<@U_BOT> hi")).may_answer(BOT));
-        assert!(!Event::new("message", &said("hi")).may_answer(BOT));
+        assert!(Event::new("message", &said("<@U_BOT> hi")).may_answer(BOT, false));
+        assert!(!Event::new("message", &said("hi")).may_answer(BOT, false));
         // Until we know our own id, nothing in a channel is addressed to us
-        assert!(!Event::new("message", &said("<@U_BOT> hi")).may_answer(None));
+        assert!(!Event::new("message", &said("<@U_BOT> hi")).may_answer(None, false));
     }
 
     /// **Without this, a channel with no machine assigned keeps answering its own refusals with refusals.**
@@ -4977,7 +5121,7 @@ mod tests {
             serde_json::json!({"channel": "D1", "text": "…", "bot_id": "B1"}),
             serde_json::json!({"channel": "D1", "text": "…", "subtype": "bot_message"}),
         ] {
-            assert!(!Event::new("message", &ev).may_answer(BOT), "{ev}");
+            assert!(!Event::new("message", &ev).may_answer(BOT, false), "{ev}");
         }
     }
 
@@ -4989,7 +5133,7 @@ mod tests {
             "member_joined_channel",
         ] {
             assert!(
-                !Event::new(name, &said_in("D1", "<@U_BOT>")).may_answer(BOT),
+                !Event::new(name, &said_in("D1", "<@U_BOT>")).may_answer(BOT, false),
                 "{name}"
             );
         }
@@ -5000,13 +5144,13 @@ mod tests {
     fn a_deletion_is_dropped_in_silence() {
         let ev = serde_json::json!({"channel": "D1", "subtype": "message_deleted"});
         assert!(Event::new("message", &ev).is_retraction());
-        assert!(!Event::new("message", &ev).may_answer(BOT));
+        assert!(!Event::new("message", &ev).may_answer(BOT, false));
     }
 
     #[test]
     fn an_event_with_no_readable_channel_is_never_answered() {
         let nowhere = serde_json::json!({"text": "hi", "user": "U1"});
-        assert!(!Event::new("message", &nowhere).may_answer(BOT));
+        assert!(!Event::new("message", &nowhere).may_answer(BOT, false));
     }
 
     #[test]
@@ -5021,6 +5165,32 @@ mod tests {
         assert_eq!(Event::new("message", &empty).text(), None);
     }
 
+    /// **The author of an edit is one level down too.** Adding a forgotten mention by editing is
+    /// how people fix a `cd`; reading only the top level refused the Owner as "nobody".
+    #[test]
+    fn an_edit_keeps_its_author_one_level_down() {
+        let edit = serde_json::json!({
+            "channel": "C1", "subtype": "message_changed", "ts": "999.9", "thread_ts": "111.1",
+            "message": {"user": OWNER, "ts": "222.2", "text": "<@U_BOT> cd desktop:/srv"}
+        });
+        let ev = Event::new("message", &edit);
+        assert_eq!(ev.user(), Some(OWNER));
+        assert!(ev.is_a_command_candidate(Some(OWNER)));
+        let got = CommandCtx::route(
+            &ctx("C1", ev.text().unwrap(), ev.user()),
+            &here(),
+        );
+        assert!(matches!(got, RouteOutcome::SetProject { for_thread: true, .. }));
+
+        // An edit of a bot's post is still a bot — it names a user now, so this must not slip through
+        let bot_edit = serde_json::json!({
+            "channel": "C1", "subtype": "message_changed",
+            "message": {"user": "U_BOT", "bot_id": "B1", "text": "<@U_BOT> cd desktop"}
+        });
+        assert!(Event::new("message", &bot_edit).from_a_bot());
+        assert!(!Event::new("message", &bot_edit).is_a_command_candidate(Some(OWNER)));
+    }
+
     // ── route / set-home ────────────────────────────────────────────────────
 
     const OWNER: &str = "U_OWNER";
@@ -5032,6 +5202,7 @@ mod tests {
             text,
             owner_user_id: Some(OWNER),
             bot_user_id: Some("U_BOT"),
+            in_bot_thread: false,
         }
     }
 
@@ -5327,6 +5498,7 @@ mod tests {
             text: "<@U_BOT> route desktop",
             owner_user_id: Some(OWNER),
             bot_user_id: None,
+            in_bot_thread: false,
         };
         assert_eq!(
             CommandCtx::route(&c, &here()),
