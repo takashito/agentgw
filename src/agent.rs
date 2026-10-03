@@ -367,6 +367,16 @@ pub struct ContextReport {
     pub categories: Vec<ContextCategory>,
 }
 
+/// What a failed turn died of, as the agent's own record tells it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedFailure {
+    /// In the same words as `error_type` (e.g. `authentication_failed`).
+    pub kind: String,
+    /// The error as the agent wrote it, for the person when the kind alone would mislead
+    /// (a model provider's own credentials expiring is not fixed by `login`).
+    pub said: String,
+}
+
 /// A record in which Claude Code itself wrote "hit the limit".
 #[derive(Debug, PartialEq, Eq)]
 pub struct LimitHit {
@@ -598,7 +608,7 @@ pub trait Agent: Send + Sync + 'static {
     /// What a turn that ended with no `error_type` actually failed on, read from the agent's
     /// own record — in the same words as `error_type` (e.g. `authentication_failed`).
     /// `None` = can't tell (no record, or an error this agent doesn't recognise).
-    fn failure_type(&self, remembered: Option<&str>, session_id: &str) -> Option<&'static str>;
+    fn failure_type(&self, remembered: Option<&str>, session_id: &str) -> Option<RecordedFailure>;
     fn model_alias(&self, model_id: &str) -> Option<&'static str>;
     /// The values `model` / `effort` / `mode` accept, in the order `help` lists them.
     fn models(&self) -> &'static [&'static str];
@@ -662,7 +672,7 @@ pub mod fake {
         /// Sessions whose conversation history exists (others can't be resumed).
         pub histories: Mutex<Vec<String>>,
         /// What `failure_type` answers (what the agent's own record says a failed turn died of).
-        pub failure_type: Mutex<Option<&'static str>>,
+        pub failure_type: Mutex<Option<RecordedFailure>>,
         /// What `signed_in` answers once set; unset means `Some(true)` (the usual case).
         pub signed_in: Mutex<Option<Option<bool>>>,
         /// Sign-in codes handed to `login_submit_code`.
@@ -876,8 +886,8 @@ pub mod fake {
         ) -> Option<std::io::Result<Option<LimitHit>>> {
             None
         }
-        fn failure_type(&self, _r: Option<&str>, _s: &str) -> Option<&'static str> {
-            *self.failure_type.lock().unwrap()
+        fn failure_type(&self, _r: Option<&str>, _s: &str) -> Option<RecordedFailure> {
+            self.failure_type.lock().unwrap().clone()
         }
         fn model_alias(&self, _m: &str) -> Option<&'static str> {
             None

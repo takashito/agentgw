@@ -3514,7 +3514,10 @@ mod tests {
         let (d, slack, agent, clock) = flow_deps("signed-out");
         let (mut b, _fx) = Bridge::for_test(d);
         let sid = running_thread(&mut b, &agent).await;
-        *agent.failure_type.lock().unwrap() = Some("authentication_failed");
+        *agent.failure_type.lock().unwrap() = Some(crate::agent::RecordedFailure {
+            kind: "authentication_failed".into(),
+            said: "Login expired · Please run /login".into(),
+        });
         let delivered_before = agent.delivered.lock().unwrap().len();
         b.on_hook(HookEvent {
             kind: "error".into(),
@@ -3560,6 +3563,35 @@ mod tests {
             "{:?}",
             slack.calls()
         );
+    }
+
+    /// A model provider's credentials expiring (Microsoft Foundry here) is not claude.ai's sign-in:
+    /// `login` would not fix it and re-sending can't either. Say what the agent was told.
+    #[tokio::test]
+    async fn a_providers_refused_sign_in_is_reported_with_its_own_words() {
+        let (d, slack, agent, _clock) = flow_deps("provider-auth");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let sid = running_thread(&mut b, &agent).await;
+        *agent.failure_type.lock().unwrap() = Some(crate::agent::RecordedFailure {
+            kind: "authentication_failed".into(),
+            said: "API Error: 401 Access token has expired".into(),
+        });
+        let delivered_before = agent.delivered.lock().unwrap().len();
+        b.on_hook(HookEvent {
+            kind: "error".into(),
+            session_id: sid,
+            payload: serde_json::json!({ "hook_event_name": "StopFailure", "error_type": null }),
+            respond: None,
+        })
+        .await;
+        settle().await;
+        assert_eq!(agent.delivered.lock().unwrap().len(), delivered_before, "no re-send");
+        let calls = slack.calls();
+        assert!(
+            calls.iter().any(|c| c.contains("model provider") && c.contains("Access token has expired")),
+            "{calls:?}"
+        );
+        assert!(!calls.iter().any(|c| c.contains("Send `login`")), "{calls:?}");
     }
 
     /// A failure that re-sending can fix, on an agent that isn't ready yet: the message stays

@@ -11,7 +11,7 @@ use super::SpawnOutcome;
 use super::screen::{Pane, SpawnScreen};
 use super::tmux::Tmux;
 use super::{Pid, Window, WindowRow};
-use super::{CompactOutcome, CompactProgress, LimitHit, LoginOutcome, ProbeErr, SpawnReq};
+use super::{CompactOutcome, CompactProgress, LimitHit, LoginOutcome, ProbeErr, RecordedFailure, SpawnReq};
 use crate::agent::WorkerState;
 use crate::log::LogCtx;
 use crate::state_dir::StateDir;
@@ -1502,7 +1502,7 @@ impl crate::agent::Agent for Claude {
         Transcript::locate(remembered, session_id).map(|t| t.limit_error(256 * 1024, now_ms))
     }
 
-    fn failure_type(&self, remembered: Option<&str>, session_id: &str) -> Option<&'static str> {
+    fn failure_type(&self, remembered: Option<&str>, session_id: &str) -> Option<RecordedFailure> {
         let tail = Transcript::locate(remembered, session_id)?.tail(256 * 1024).ok()?;
         Transcript::failure_type(&tail)
     }
@@ -1783,25 +1783,36 @@ impl Transcript {
     /// if even that has passed, the window has already reopened = mere history, so `None`.
     /// The `error_type` the **last** API error in `tail` stands for, when Claude Code wrote the
     /// error but sent no type with the turn failure. Only what we recognise; the rest is `None`.
-    pub fn failure_type(tail: &str) -> Option<&'static str> {
-        let text = tail
+    ///
+    /// **The record's own `error` field comes first** — Claude Code writes its kind there
+    /// (`"error":"authentication_failed"`), whichever provider failed. Matching the text only
+    /// knew claude.ai's wording, so a Microsoft Foundry credential that expired read as unknown
+    /// and was re-sent as if transient (seen 2026-10-03).
+    pub fn failure_type(tail: &str) -> Option<RecordedFailure> {
+        let rec = tail
             .lines()
             .filter(|l| l.contains("\"isApiErrorMessage\""))
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
             .filter(|rec| rec["isApiErrorMessage"] == serde_json::Value::Bool(true))
-            .map(|rec| match &rec["message"]["content"] {
-                serde_json::Value::Array(a) => a
-                    .iter()
-                    .filter_map(|c| c["text"].as_str())
-                    .collect::<Vec<_>>()
-                    .join(" "),
-                serde_json::Value::String(s) => s.clone(),
-                _ => String::new(),
-            })
             .last()?;
-        // Text seen on a real machine (2026-09-18): `Login expired · Please run /login`
-        (text.contains("Login expired") || text.contains("run /login"))
-            .then_some("authentication_failed")
+        let said = match &rec["message"]["content"] {
+            serde_json::Value::Array(a) => a
+                .iter()
+                .filter_map(|c| c["text"].as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+            serde_json::Value::String(s) => s.clone(),
+            _ => String::new(),
+        };
+        let kind = match rec["error"].as_str().filter(|k| !k.is_empty()) {
+            Some(k) => k.to_string(),
+            // Text seen on a real machine (2026-09-18): `Login expired · Please run /login`
+            None if said.contains("Login expired") || said.contains("run /login") => {
+                "authentication_failed".to_string()
+            }
+            None => return None,
+        };
+        Some(RecordedFailure { kind, said })
     }
 
     pub fn limit_hit(tail: &str, now_ms: u64) -> Option<LimitHit> {
@@ -2858,11 +2869,32 @@ mod tests {
             )
         };
         let login = line("Login expired · Please run /login");
-        assert_eq!(Transcript::failure_type(&login), Some("authentication_failed"));
+        let kind = |tail: &str| Transcript::failure_type(tail).map(|f| f.kind);
+        assert_eq!(kind(&login).as_deref(), Some("authentication_failed"));
         // Only the **last** error is looked at
         let later = format!("{login}{}", line("API Error: overloaded_error"));
-        assert_eq!(Transcript::failure_type(&later), None);
-        assert_eq!(Transcript::failure_type(""), None);
+        assert_eq!(kind(&later), None);
+        assert_eq!(kind(""), None);
+    }
+
+    /// Claude Code names the kind in the record's `error` field, whoever the provider is. A
+    /// Microsoft Foundry credential that expired says nothing about `/login`, and was read as
+    /// unknown (then re-sent as if transient) while only the text was matched.
+    #[test]
+    fn the_records_own_error_kind_wins_over_its_wording() {
+        let said = "API Error: 401 Unauthorized. Access token is missing, invalid, audience is incorrect, or have expired.";
+        let rec = format!(
+            "{}\n",
+            serde_json::json!({
+                "isApiErrorMessage": true,
+                "error": "authentication_failed",
+                "message": { "content": [{ "type": "text", "text": said }] },
+            })
+        );
+        assert_eq!(
+            Transcript::failure_type(&rec),
+            Some(RecordedFailure { kind: "authentication_failed".into(), said: said.into() })
+        );
     }
 
     /// LIMIT_MODAL_PROMPTS reduced to unanchored literals.

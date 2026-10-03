@@ -421,16 +421,29 @@ impl Bridge {
         } else {
             None
         };
-        let reason = recorded.unwrap_or(sent);
+        let reason = recorded.as_ref().map_or(sent, |r| r.kind.as_str());
         let (klass, mut text) = TurnFailureClass::of(reason);
         // An expired sign-in is about **this machine**. Say where to send it — this thread's messages reach
         // this machine, so `login` typed here signs this machine back in
         if reason.to_ascii_lowercase().contains("authentication_failed") {
             let machine = &self.machine_name;
-            text = crate::t!(
-                "Claude Code on *{machine}* is signed out, so no reply was written. Send `login` here to sign in again.",
-                "*{machine}* の Claude Code のサインインが切れていて、返信を書けませんでした。ここで `login` と送ると、サインインし直せます。"
-            );
+            // `login` is claude.ai's sign-in. When the agent's record says something else, the
+            // credentials that failed are a model provider's (Microsoft Foundry, Bedrock, an API
+            // key) and `login` would not touch them: pass on what the agent was told instead
+            let said = recorded
+                .as_ref()
+                .map(|r| r.said.trim())
+                .filter(|s| !s.is_empty() && !s.contains("/login"));
+            text = match said {
+                Some(said) => crate::t!(
+                    "Claude Code on *{machine}* was refused by its model provider's sign-in, so no reply was written. Sending it again won't help until those credentials are fixed. It said: `{said}`",
+                    "*{machine}* の Claude Code がモデルの提供元の認証で断られ、返信を書けませんでした。その認証情報を直すまで、送り直しても通りません。エラーの文面: `{said}`"
+                ),
+                None => crate::t!(
+                    "Claude Code on *{machine}* is signed out, so no reply was written. Send `login` here to sign in again.",
+                    "*{machine}* の Claude Code のサインインが切れていて、返信を書けませんでした。ここで `login` と送ると、サインインし直せます。"
+                ),
+            };
         }
         let raw = serde_json::json!({
             "hook_event_name": ev.payload["hook_event_name"],
@@ -442,9 +455,9 @@ impl Bridge {
             &format!(
                 "slack-events: disposition=turn_failure thread={} reason={} class={klass} raw={raw}",
                 key.map_or("?", ThreadKey::as_str),
-                match (sent.is_empty(), recorded) {
+                match (sent.is_empty(), &recorded) {
                     (false, _) => sent.to_string(),
-                    (true, Some(r)) => format!("{r} (none sent; read from the agent's record)"),
+                    (true, Some(r)) => format!("{} (none sent; read from the agent's record)", r.kind),
                     (true, None) => "(none sent)".to_string(),
                 },
             ),
