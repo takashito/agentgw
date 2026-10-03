@@ -1001,7 +1001,9 @@ impl Api {
 ///
 /// **Slack checks a session title the way it checks a channel name** (measured 2026-09-22:
 /// `:` `/` `@` `#` come back as `invalid_name`, while `?` `.` `,` `!` `(` `)` `-` `_`, spaces and
-/// Japanese all pass). Dropping the four is enough, and losing them from a topic costs nothing.
+/// Japanese all pass). Dropping the four is not enough: measured again 2026-10-03, Slack refuses
+/// most other marks too (Japanese punctuation, dashes, arrows, `+ * ~ % $ < > [ ] { } ;`). The
+/// agent is told the accepted set in `set_thread_title`'s description, so it writes clean titles.
 /// The limit is 200 characters, counted in chars so multi-byte text is not cut mid-character.
 pub fn session_title(topic: &str) -> Option<String> {
     let kept: String = without_markup(topic)

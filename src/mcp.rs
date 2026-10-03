@@ -144,7 +144,7 @@ impl Mcp {
                     "properties": {
                         "channel_id": { "type": "string", "description": "Channel or DM ID (C.../D.../G...) of the thread." },
                         "thread_ts": { "type": "string", "description": "Thread root timestamp — the thread being renamed." },
-                        "title": { "type": "string", "description": "The new name. A few words; the bridge trims it to what Slack accepts." },
+                        "title": { "type": "string", "description": "The new name, a few words (at most 200 characters). Slack rejects the whole title if it contains any character outside this set: letters and digits of any script (Japanese, full-width and emoji included), plain spaces, and the ASCII marks - _ . , ! ? ( ) & ' \" = |. Every other mark is refused — Japanese punctuation (、 。 「 」 ・ ： ／ ！ and the full-width space), dashes and arrows (– — → …), and ASCII : / @ # + * ~ % $ < > [ ] { } ; ` ^ \\. Write titles that need none of them: \"スレッド名が付かない件の調査\", not \"スレッド名、調査\"." },
                     },
                     "required": ["channel_id", "thread_ts", "title"],
                 },
@@ -278,7 +278,8 @@ impl ServerHandler for McpServer {
                  Events: <channel source=\"slack\" channel_id=... message_id=...>; attachments \
                  are pre-downloaded (`file_paths` = local files to Read, `file_errors` = \
                  failures). Use `download_attachment` only for a file from another \
-                 message/thread."
+                 message/thread. Name the thread with `set_thread_title` once its topic is \
+                 clear, and again whenever the topic moves on."
                     .into(),
             ),
             ..Default::default()
