@@ -7,6 +7,7 @@ use crate::agent::Window;
 use crate::agent::{Dialog, HookEvent, ProbeErr, SessionId};
 use crate::bridge::state as bridge;
 use crate::bridge::state::Disposition;
+use super::command::CmdFx;
 use crate::log::LogCtx;
 use crate::chat::{Chat, FetchedMsg, ThreadKey};
 use std::collections::{HashMap, HashSet};
@@ -2010,10 +2011,13 @@ impl Bridge {
             ctx.info("bridge", &format!("rename skipped — nothing usable in \"{asked}\""));
             return;
         };
-        let (api, ctx) = (self.deps.slack.clone(), ctx.clone());
+        let (api, cmd_tx, ctx) = (self.deps.slack.clone(), self.cmd_tx.clone(), ctx.clone());
         tokio::spawn(async move {
             match api.rename_session(&channel, &root, &title).await {
-                Ok(()) => ctx.info("bridge", &format!("session renamed \"{title}\"")),
+                Ok(()) => {
+                    ctx.info("bridge", &format!("session renamed \"{title}\""));
+                    let _ = cmd_tx.send(CmdFx::ThreadTitled { root_ts: root, title }).await;
+                }
                 Err(e) => ctx.info("bridge", &format!("session rename \"{title}\" failed: {e}")),
             }
         });

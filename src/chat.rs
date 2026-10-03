@@ -366,14 +366,8 @@ pub trait Chat: Send + Sync + 'static {
         thread_ts: &str,
         presence: Presence,
     ) -> Result<(), String>;
-    /// Register a thread as an agent session named `title` — what the `Agents & tools` sidebar lists.
-    async fn start_session(
-        &self,
-        channel: &str,
-        thread_ts: &str,
-        title: &str,
-    ) -> Result<(), String>;
-    /// Rename a session that already exists (the agent noticed the topic moved on).
+    /// Name a thread's session — what the `Agents & tools` sidebar lists. Only the agent names a
+    /// thread: it knows what the conversation is about, and when that moves on.
     async fn rename_session(
         &self,
         channel: &str,
@@ -652,9 +646,6 @@ pub mod fake {
         }
         async fn set_presence(&self, c: &str, th: &str, p: Presence) -> Result<(), String> {
             self.record(format!("status {c} {th} {}", p.word()))
-        }
-        async fn start_session(&self, c: &str, th: &str, title: &str) -> Result<(), String> {
-            self.record(format!("session {c} {th} {title}"))
         }
         async fn rename_session(&self, c: &str, th: &str, title: &str) -> Result<(), String> {
             self.record(format!("rename {c} {th} {title}"))

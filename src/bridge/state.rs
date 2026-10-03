@@ -164,6 +164,11 @@ pub struct ThreadEntry {
     /// **Their name wins from then on** — neither the opening message nor the agent overwrites it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title_locked: Option<bool>,
+    /// The name the thread's session carries now, as far as this Bridge knows: what the agent set
+    /// (written once Slack took it) or what a person renamed it to. Rides every delivery as
+    /// `thread_title`, so the agent can tell when the conversation has moved on from it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// The newest message this Bridge saw in the thread: its ts, and the first 60 characters.
     ///
     /// **`status` links to this, not to the root.** A permalink to the root opens the thread at its

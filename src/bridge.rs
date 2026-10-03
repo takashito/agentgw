@@ -2868,7 +2868,7 @@ mod tests {
         // Observed: the agent calls set_thread_title when the topic moves on, and the rename goes
         // out as a session rename. Once a person has named the thread in Slack, theirs stands.
         let (d, slack, agent, _clock) = flow_deps("rename");
-        let (mut b, _fx) = Bridge::for_test(d);
+        let ((mut b, mut fx), mut deliv) = Bridge::for_test_with_deliveries(d);
         let sid = running_thread(&mut b, &agent).await;
         let asked = |title: &str| bridge::Disposition {
             kind: "title",
@@ -2878,6 +2878,12 @@ mod tests {
             session_id: sid.clone(),
             title: Some(title.to_string()),
         };
+        // Nothing named it yet: the agent is told so, with an empty name
+        b.on_inbound(&in_thread("1782000000.000200", "first")).await;
+        settle_deliveries(&mut b, &mut deliv).await;
+        let last = || agent.delivered.lock().unwrap().last().unwrap().1.clone();
+        assert!(last().contains(r#" thread_title="""#), "{}", last());
+
         b.on_disposition(asked("the cache rewrite: <@U1>")).await;
         settle().await;
         // The mention and the `:` are gone — a name is read by a person, and Slack refuses both
@@ -2886,30 +2892,37 @@ mod tests {
             "{:?}",
             slack.calls()
         );
+        // Slack took it: the name is remembered, and the next delivery carries it
+        b.on_cmd_fx(fx.recv().await.expect("the rename reports back")).await;
+        b.on_inbound(&in_thread("1782000000.000300", "second")).await;
+        settle_deliveries(&mut b, &mut deliv).await;
+        assert!(last().contains(r#" thread_title="the cache rewrite""#), "{}", last());
 
-        // A person renames it in Slack — from then on the agent's asking changes nothing
+        // A person renames it in Slack — from then on the agent's asking changes nothing, and
+        // the agent is shown the person's name
         b.on_inbound(&renamed_by_hand(ROOT, "mine now")).await;
         let before = slack.calls().len();
         b.on_disposition(asked("something else")).await;
         settle().await;
         assert_eq!(slack.calls().len(), before, "{:?}", slack.calls());
+        b.on_inbound(&in_thread("1782000000.000400", "third")).await;
+        settle_deliveries(&mut b, &mut deliv).await;
+        assert!(last().contains(r#" thread_title="mine now""#), "{}", last());
     }
 
     #[tokio::test]
-    async fn a_new_thread_names_its_session() {
-        // Observed: Slack lists a thread in `Agents & tools` by its session name, and the name is
-        // asked for while the thread is being created — one setStatus call carries both.
+    async fn a_new_thread_is_left_for_the_agent_to_name() {
+        // The thread's opening line is often a mention and a pasted link, and says nothing of what
+        // the conversation turns out to be. The agent names it (set_thread_title); the Bridge doesn't.
         let (d, slack, agent, _clock) = flow_deps("session");
         let (mut b, _fx) = Bridge::for_test(d);
         running_thread(&mut b, &agent).await;
         settle().await;
-        let named: Vec<_> = slack
-            .calls()
-            .into_iter()
-            .filter(|c| c.starts_with(&format!("session C1 {ROOT} ")))
-            .collect();
-        assert_eq!(named.len(), 1, "{:?}", slack.calls());
-        assert!(named[0].ends_with("fix the tests"), "{named:?}");
+        assert!(
+            !slack.calls().iter().any(|c| c.starts_with(&format!("rename C1 {ROOT} "))),
+            "{:?}",
+            slack.calls()
+        );
     }
 
     #[tokio::test]
@@ -4007,7 +4020,7 @@ mod tests {
     /// would mean guessing the directory name it lives under, and tearing the agent down to do it.
     #[tokio::test]
     async fn cd_on_this_machine_moves_the_running_agent() {
-        let (d, slack, agent, _clock) = flow_deps("cd-here");
+        let (d, _slack, agent, _clock) = flow_deps("cd-here");
         let ((mut b, _fx), _deliv) = Bridge::for_test_with_deliveries(d);
         running_thread(&mut b, &agent).await;
         // The opening turn has been answered — `cd` waits for a busy agent, like every TUI command

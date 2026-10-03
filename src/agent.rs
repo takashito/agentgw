@@ -284,6 +284,10 @@ pub struct Envelope {
     /// A delivery the loop guard tripped on (`loop_guard="true"`). When present, it signals: don't answer
     /// that bot, **ask a person to decide**. `loop_notify` is who to call (the Owner's mention).
     pub loop_guard: Option<String>,
+    /// The thread's current name (`thread_title`), empty when it has none yet. `None` leaves the
+    /// attribute out. Without it the agent can't tell whether the name still fits the conversation,
+    /// which is the one thing `set_thread_title` asks it to judge.
+    pub thread_title: Option<String>,
 }
 
 /// The source Claude Code uses when drawing a push notification. Using the same value makes
@@ -303,6 +307,11 @@ impl Envelope {
             .thread_ts
             .as_deref()
             .map_or(String::new(), |t| format!(" thread_ts=\"{t}\""));
+        // A `"` would end the attribute early; a title is read, not parsed, so `'` does as well
+        let thread_title = e
+            .thread_title
+            .as_deref()
+            .map_or(String::new(), |t| format!(" thread_title=\"{}\"", t.replace('"', "'")));
         // Attachments were downloaded on receipt. Successes give
         // file_count/file_paths, failures give file_errors. Missing ones leave the attribute out entirely
         let files = if e.file_paths.is_empty() {
@@ -327,7 +336,7 @@ impl Envelope {
         };
         format!(
             "<channel source=\"{CHANNEL_SOURCE}\" channel_id=\"{}\" message_id=\"{}\" user=\"{}\" \
-             user_id=\"{}\" ts=\"{}\"{thread_ts}{files}{file_errors}{loop_guard}>\n{}\n</channel>",
+             user_id=\"{}\" ts=\"{}\"{thread_ts}{thread_title}{files}{file_errors}{loop_guard}>\n{}\n</channel>",
             e.channel_id, e.message_id, e.user, e.user, e.ts, e.text
         )
     }
@@ -994,6 +1003,7 @@ mod tests {
             file_paths: Vec::new(),
             file_errors: Vec::new(),
             loop_guard: None,
+            thread_title: None,
         };
         assert_eq!(
             e.render(),
@@ -1007,6 +1017,24 @@ mod tests {
             ..e
         };
         assert!(!bare.render().contains("thread_ts"));
+        // The thread's name follows thread_ts: empty while it has none, and a `"` can't end it early
+        let titled = |t: &str| {
+            Envelope {
+                channel_id: "C1".into(),
+                message_id: "171.002".into(),
+                user: "U1".into(),
+                ts: "2026-07-28T00:00:00.000Z".into(),
+                thread_ts: Some("171.001".into()),
+                text: "x".into(),
+                file_paths: Vec::new(),
+                file_errors: Vec::new(),
+                loop_guard: None,
+                thread_title: Some(t.into()),
+            }
+            .render()
+        };
+        assert!(titled("").contains(" thread_title=\"\">"), "{}", titled(""));
+        assert!(titled("the \"cache\" rewrite").contains(" thread_title=\"the 'cache' rewrite\">"));
         // Without attachments, the file_* attributes are left out entirely
         assert!(!bare.render().contains("file_"));
     }
@@ -1022,6 +1050,7 @@ mod tests {
             file_paths: paths,
             file_errors: errors,
             loop_guard: None,
+            thread_title: None,
         }
         .render()
     }
@@ -1040,6 +1069,7 @@ mod tests {
                 file_paths: Vec::new(),
                 file_errors: Vec::new(),
                 loop_guard: guard.map(str::to_string),
+                thread_title: None,
             }
             .render()
         };

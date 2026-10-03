@@ -1110,6 +1110,7 @@ impl Bridge {
     pub(in crate::bridge) async fn on_cmd_fx(&mut self, fx: CmdFx) {
         let ctx = LogCtx::default();
         match fx {
+            CmdFx::ThreadTitled { root_ts, title } => self.remember_thread_title(&root_ts, &title, &ctx),
             CmdFx::LoginFinished { channel, bound } => {
                 self.deps.agent.login_kill();
                 self.sign_in.pending.remove(&channel);

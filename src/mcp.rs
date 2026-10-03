@@ -138,7 +138,7 @@ impl Mcp {
             }),
             serde_json::json!({
                 "name": "set_thread_title",
-                "description": "Rename this thread's session so it can be found again by what it is about. Call it when the topic has clearly moved on from the name the thread carries — not for every message. Keep it short, a few words, in the language of the conversation. A name a person set by hand wins and this call is then quietly ignored, so do not tell anyone the thread was renamed. Do NOT narrate this tool: never write \"I should use set_thread_title\" / \"I will rename this thread\" or any similar preamble.",
+                "description": "Rename this thread's session so it can be found again by what it is about. Each delivered message carries the thread's current name as `thread_title` (empty = no name yet). Name it once the topic is clear, and again when the topic has clearly moved on from that name — not for every message. Keep it short, a few words, in the language of the conversation. A name a person set by hand wins and this call is then quietly ignored, so do not tell anyone the thread was renamed. Do NOT narrate this tool: never write \"I should use set_thread_title\" / \"I will rename this thread\" or any similar preamble.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -278,8 +278,9 @@ impl ServerHandler for McpServer {
                  Events: <channel source=\"slack\" channel_id=... message_id=...>; attachments \
                  are pre-downloaded (`file_paths` = local files to Read, `file_errors` = \
                  failures). Use `download_attachment` only for a file from another \
-                 message/thread. Name the thread with `set_thread_title` once its topic is \
-                 clear, and again whenever the topic moves on."
+                 message/thread. `thread_title` is the thread's current name (empty = none \
+                 yet): name it with `set_thread_title` once its topic is clear, and again \
+                 whenever the topic moves on."
                     .into(),
             ),
             ..Default::default()

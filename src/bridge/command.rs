@@ -600,6 +600,9 @@ pub(super) enum CmdFx {
         key: Option<ThreadKey>,
         session_id: String,
     },
+    /// Slack took the agent's rename. The name is remembered only now, so a refused one leaves the
+    /// thread's old name in place (the rename itself runs off the loop, like every Slack call).
+    ThreadTitled { root_ts: String, title: String },
 }
 
 impl Bridge {

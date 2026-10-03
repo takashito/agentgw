@@ -43,19 +43,22 @@ const DELIVERY_RETRY_WAIT_MS: u64 = 30_000;
 /// fine.
 const RECEIPT_GRACE_MS: u64 = 180_000;
 
-pub fn envelope(msg: &InboundMsg, root_ts: &str, now_ms: u64) -> String {
-    envelope_guarded(msg, root_ts, None, now_ms)
+/// `title` is the thread's current name (`None` = it has none yet, sent as an empty `thread_title`).
+pub fn envelope(msg: &InboundMsg, root_ts: &str, title: Option<&str>, now_ms: u64) -> String {
+    envelope_guarded(msg, root_ts, title, None, now_ms)
 }
 
 /// Only deliveries that tripped the loop guard carry `loop_guard` (empty = nobody to call).
 pub fn envelope_guarded(
     msg: &InboundMsg,
     root_ts: &str,
+    title: Option<&str>,
     loop_guard: Option<String>,
     now_ms: u64,
 ) -> String {
     Envelope {
         loop_guard,
+        thread_title: Some(title.unwrap_or_default().to_string()),
         channel_id: msg.channel.clone(),
         message_id: msg.ts.clone(),
         user: msg.user.clone().unwrap_or_else(|| "unknown".to_string()),
@@ -638,15 +641,6 @@ impl Bridge {
 
         let entry = self.threads.get(&root_ts).cloned();
         let is_new = entry.is_none();
-        if is_new {
-            // Name the session on the thread's first message, **whichever way it gets an agent**.
-            // A warm pool worker takes most threads (`pool: assigned` → `Dispatch::Deliver`), so
-            // naming from the cold-spawn branch missed nearly all of them
-            let (api, channel, ts) =
-                (self.deps.slack.clone(), msg.channel.clone(), root_ts.clone());
-            let topic: String = msg.text.trim().chars().take(60).collect();
-            tokio::spawn(async move { api.name_session(&channel, &ts, &topic).await });
-        }
         let sid = entry.as_ref().and_then(|e| e.agent_id.as_deref());
         // The window name depends only on session_id. A thread with no session yet has no
         // window; worker_state returns Absent without a sid, so an empty string is harmless
@@ -661,7 +655,13 @@ impl Bridge {
             .and_then(|sid| self.workers.warm(sid))
             .and_then(|h| h.window_id.clone())
             .unwrap_or_else(|| window.clone());
-        let envelope = envelope_guarded(msg, &root_ts, loop_guard, self.deps.clock.now_ms());
+        let envelope = envelope_guarded(
+            msg,
+            &root_ts,
+            self.thread_title(&root_ts),
+            loop_guard,
+            self.deps.clock.now_ms(),
+        );
         // Hold on to it: the hand-over reads it back, so the guard is not lost on the way
         self.pending_envelopes.insert(msg.ts.clone(), envelope.clone());
         // Needed to resend after a failed turn. `track` runs right after the ack (before the
@@ -896,7 +896,7 @@ impl Bridge {
                 }
             ),
         );
-        let envelope = envelope(&notice, root_ts, self.deps.clock.now_ms());
+        let envelope = envelope(&notice, root_ts, self.thread_title(root_ts), self.deps.clock.now_ms());
         // **Off the loop like every other delivery.** The edit stands whether or not the notice lands, so
         // the interrupt below no longer waits for it; a failure reports itself
         self.hand_notice(&target, key, &envelope);
@@ -1044,7 +1044,7 @@ impl Bridge {
         });
         match target {
             Some(w) => {
-                let envelope = envelope(msg, root_ts, self.deps.clock.now_ms());
+                let envelope = envelope(msg, root_ts, self.thread_title(root_ts), self.deps.clock.now_ms());
                 ctx.info(
                     "bridge",
                     &format!(
@@ -1308,6 +1308,27 @@ impl Bridge {
         }
     }
 
+    /// The name the thread's session carries now, as far as this Bridge knows.
+    fn thread_title(&self, root_ts: &str) -> Option<&str> {
+        self.threads.get(root_ts).and_then(|e| e.title.as_deref())
+    }
+
+    /// The agent's rename went through: remember the name, so the next delivery tells the agent
+    /// what the thread is called now. Written only once Slack took it, so a refused rename leaves
+    /// the old name — and the agent free to try again.
+    pub(super) fn remember_thread_title(&mut self, root_ts: &str, title: &str, ctx: &LogCtx) {
+        let Some(e) = self.threads.entries.get_mut(root_ts) else {
+            return;
+        };
+        if e.title_locked == Some(true) {
+            return; // a person named it while the rename was on its way
+        }
+        e.title = Some(title.to_string());
+        if let Err(err) = self.threads.save() {
+            ctx.error("bridge", &format!("threads.json save failed: {err}"));
+        }
+    }
+
     /// Remember that the thread's name is a person's doing, so nothing overwrites it later.
     /// A thread nobody has an entry for is left alone — there is nothing yet to protect.
     fn lock_thread_title(&mut self, msg: &InboundMsg, title: &str) {
@@ -1322,10 +1343,11 @@ impl Bridge {
             ctx.debug("bridge", &format!("session renamed by hand to \"{title}\" — no thread of ours"));
             return;
         };
-        if e.title_locked == Some(true) {
-            return; // already theirs; renaming again changes nothing here
+        if e.title_locked == Some(true) && e.title.as_deref() == Some(title) {
+            return; // already theirs, and already this name
         }
         e.title_locked = Some(true);
+        e.title = Some(title.to_string());
         self.threads.upsert(&root, e);
         if let Err(err) = self.threads.save() {
             ctx.error("bridge", &format!("threads.json save failed: {err}"));
@@ -1439,7 +1461,9 @@ impl Bridge {
             .pending_envelopes
             .get(&msg.ts)
             .cloned()
-            .unwrap_or_else(|| envelope(&msg, root_ts, self.deps.clock.now_ms()));
+            .unwrap_or_else(|| {
+                envelope(&msg, root_ts, self.thread_title(root_ts), self.deps.clock.now_ms())
+            });
         self.delivering.insert(
             window.to_string(),
             crate::bridge::DeliveryInFlight {

@@ -660,33 +660,9 @@ impl Api {
             .map_err(|e| e.to_string())
     }
 
-    /// Register this thread as an agent session, named `title`.
-    ///
-    /// **`setStatus` is what creates the session** — `rename` on its own answers `not_authorized`
-    /// (measured against a live channel thread), and it carries the title in the same call, so
-    /// naming a thread costs one round trip. Only an app declared as an agent (`agent_view` in
-    /// the manifest) has sessions at all; without that, every call here is `not_authorized`.
-    pub async fn start_session(
-        &self,
-        channel: &str,
-        thread_ts: &str,
-        title: &str,
-    ) -> Result<(), String> {
-        let req = SlackApiAgentsSessionsSetStatusRequest::new(SlackAgentSessionStatus::Active)
-            .with_channel_id(channel.into())
-            .with_thread_ts(thread_ts.into())
-            .with_title(title.to_string());
-        self.client
-            .open_session(&self.token)
-            .agents_sessions_set_status(&req)
-            .await
-            .map(|_| ())
-            .map_err(|e| e.to_string())
-    }
-
-    /// Rename a session that already exists. **Only a rename** — if no session has been created for
-    /// the thread yet this answers `not_authorized`, which is why naming a new thread goes through
-    /// `start_session` (setStatus creates it) instead.
+    /// Rename a thread's session. **Only a rename** — if no session has been created for the thread
+    /// yet this answers `not_authorized` (measured against a live channel thread). By the time an
+    /// agent asks, one exists: the turn's first `setStatus` creates it.
     pub async fn rename_session(
         &self,
         channel: &str,
@@ -999,39 +975,63 @@ impl Api {
 
 /// The name for a thread's agent session, or `None` when nothing usable is left.
 ///
-/// **Slack checks a session title the way it checks a channel name** (measured 2026-09-22:
-/// `:` `/` `@` `#` come back as `invalid_name`, while `?` `.` `,` `!` `(` `)` `-` `_`, spaces and
-/// Japanese all pass). Dropping the four is not enough: measured again 2026-10-03, Slack refuses
-/// most other marks too (Japanese punctuation, dashes, arrows, `+ * ~ % $ < > [ ] { } ;`). The
-/// agent is told the accepted set in `set_thread_title`'s description, so it writes clean titles.
+/// **Slack's reference gives no character set for a title** — only that `invalid_name` means
+/// "not valid for a channel name", and the channel-name rule (lowercase, digits, `-` `_`) is not
+/// what it does. Measured 2026-10-03, one rename per character: letters of any script, ASCII and
+/// full-width digits, plain spaces, emoji and `- _ . , ! ? ( ) & ' " = |` pass. Everything else is
+/// refused, and one refused character refuses the whole title: Japanese punctuation (`、` `。`
+/// `「」` `・`), the full-width space, dashes, arrows, `…`, `²`, and ASCII
+/// `: / @ # + * ~ % $ < > [ ] { } ; ` ^ \`.
+///
+/// So keep the accepted set and turn the rest into a space: `スレッド名、調査` reads as
+/// `スレッド名 調査` rather than running together. The agent is told the same set in
+/// `set_thread_title`'s description; this is for when it does not listen.
 /// The limit is 200 characters, counted in chars so multi-byte text is not cut mid-character.
 pub fn session_title(topic: &str) -> Option<String> {
-    let kept: String = without_markup(topic)
+    let spaced: String = without_markup(topic)
         .chars()
-        .filter(|c| !matches!(c, ':' | '/' | '@' | '#'))
+        .map(|c| if title_char(c) { c } else { ' ' })
         .collect();
-    let kept = kept.trim();
+    let kept = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
     (!kept.is_empty()).then(|| kept.chars().take(200).collect())
 }
 
-/// The text with Slack's `<@U…>` / `<#C…|name>` / `<!here>` spans taken out. A title is read by a
-/// person, and Slack does not resolve the markup there — the first thread named this way came out
-/// as `<U0B6P89FM4N> new session 2`, with even the `@` eaten.
+/// One character Slack takes in a session title (measured — see [`session_title`]).
+fn title_char(c: char) -> bool {
+    c.is_alphabetic()
+        || c.is_ascii_digit()
+        || ('０'..='９').contains(&c)
+        // Emoji. Only the block that was measured; symbols elsewhere (☆, ✓) are left out
+        || ('\u{1F000}'..='\u{1FAFF}').contains(&c)
+        || matches!(c, ' ' | '-' | '_' | '.' | ',' | '!' | '?' | '(' | ')' | '&' | '\'' | '"' | '=' | '|')
+}
+
+/// The text with Slack's `<@U…>` / `<#C…|name>` / `<!here>` spans taken out, and a link
+/// `<https://…|label>` reduced to its label (a bare `<https://…>` goes entirely). A title is read
+/// by a person, and Slack does not resolve the markup there — the first thread named this way came
+/// out as `<U0B6P89FM4N> new session 2`, with even the `@` eaten, and a pasted link as
+/// `<httpspersonal-bat1455.slack.comarchives`.
 fn without_markup(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(i) = rest.find('<') {
         let after = &rest[i + 1..];
-        match after.chars().next() {
-            Some('@' | '#' | '!') => match after.find('>') {
-                Some(end) => {
-                    out.push_str(&rest[..i]);
-                    rest = &after[end + 1..];
+        let markup = after.starts_with(['@', '#', '!'])
+            || after.starts_with("http://")
+            || after.starts_with("https://")
+            || after.starts_with("mailto:");
+        match after.find('>').filter(|_| markup) {
+            Some(end) => {
+                out.push_str(&rest[..i]);
+                if after.starts_with(['@', '#', '!']) {
+                    // A mention's label is not taken: `<#C…|name>` would put a channel in the title
+                } else if let Some((_, label)) = after[..end].split_once('|') {
+                    out.push_str(label);
                 }
-                // An unclosed `<@…` is not markup, it is just text
-                None => break,
-            },
-            _ => {
+                rest = &after[end + 1..];
+            }
+            // Not markup, or an unclosed `<@…`: just text
+            None => {
                 out.push_str(&rest[..i + 1]);
                 rest = after;
             }
@@ -1054,23 +1054,6 @@ impl dyn Chat {
         match self.set_presence(channel, thread_ts, presence).await {
             Ok(()) => ctx.debug("bridge", &format!("session {what}")),
             Err(e) => ctx.debug("bridge", &format!("session {what} failed: {e}")),
-        }
-    }
-
-    /// Name the thread's agent session, so it is findable in Slack's `Agents & tools` sidebar.
-    /// Best-effort and logged either way: a thread without a name still works.
-    /// Says nothing when the topic is only characters Slack rejects.
-    pub async fn name_session(&self, channel: &str, thread_ts: &str, topic: &str) {
-        let Some(title) = session_title(topic) else {
-            return;
-        };
-        let ctx = LogCtx {
-            session_id: None,
-            thread_key: Some(ThreadKey::new(channel, thread_ts)),
-        };
-        match self.start_session(channel, thread_ts, &title).await {
-            Ok(()) => ctx.debug("bridge", &format!("session named \"{title}\"")),
-            Err(e) => ctx.debug("bridge", &format!("session named \"{title}\" failed: {e}")),
         }
     }
 
@@ -1258,14 +1241,6 @@ impl crate::chat::Chat for Api {
         presence: crate::chat::Presence,
     ) -> Result<(), String> {
         Api::set_presence(self, channel, thread_ts, presence).await
-    }
-    async fn start_session(
-        &self,
-        channel: &str,
-        thread_ts: &str,
-        title: &str,
-    ) -> Result<(), String> {
-        Api::start_session(self, channel, thread_ts, title).await
     }
     async fn rename_session(
         &self,
@@ -2411,24 +2386,34 @@ mod tests {
     /// Slack checks a session title like a channel name — measured against the live API.
     #[test]
     fn a_session_title_drops_what_slack_rejects() {
+        let t = |s: &str| session_title(s);
+        assert_eq!(t("Slack thread titles: can we?").as_deref(), Some("Slack thread titles can we?"));
+        assert_eq!(t("@alice #general a/b").as_deref(), Some("alice general a b"));
         assert_eq!(
-            session_title("Slack thread titles: can we?").as_deref(),
-            Some("Slack thread titles can we?")
-        );
-        assert_eq!(session_title("@alice #general a/b").as_deref(), Some("alice general ab"));
-        assert_eq!(
-            session_title("<@U0B6P89FM4N> new session 2").as_deref(),
+            t("<@U0B6P89FM4N> new session 2").as_deref(),
             Some("new session 2"),
             "a mention is markup, not a word"
         );
         assert_eq!(
-            session_title("ask <#C1|team> and <!here> about x < y").as_deref(),
-            Some("ask  and  about x < y"),
-            "only the markup goes; a bare < stays"
+            t("ask <#C1|team> and <!here> about x < y").as_deref(),
+            Some("ask and about x y"),
+            "the markup goes, and a bare < is a refused mark like any other"
         );
-        assert_eq!(session_title("  ### "), None, "nothing usable is left");
-        assert_eq!(session_title("").as_deref(), None);
-        assert_eq!(session_title(&"あ".repeat(300)).unwrap().chars().count(), 200);
+        // Measured 2026-10-03: one refused mark refuses the whole title, so each becomes a space
+        assert_eq!(t("付箋を task card に、考え中の表示を理由で持つ").as_deref(), Some("付箋を task card に 考え中の表示を理由で持つ"));
+        assert_eq!(t("「名前付け」・調査 → 原因…").as_deref(), Some("名前付け 調査 原因"));
+        assert_eq!(t("a+b*c~d%e$f;g[h]{i}`j^k\\l–m—n²").as_deref(), Some("a b c d e f g h i j k l m n"));
+        assert_eq!(t("Ａ１ ｶﾀｶﾅ ー 한국어 café 😀").as_deref(), Some("Ａ１ ｶﾀｶﾅ ー 한국어 café 😀"));
+        assert_eq!(t("a&b 'c' \"d\" e=f g|h (i) j_k-l. m, n! o?").as_deref(), Some("a&b 'c' \"d\" e=f g|h (i) j_k-l. m, n! o?"));
+        assert_eq!(t("a　b").as_deref(), Some("a b"), "a full-width space is refused");
+        // A link keeps its label; a bare one goes
+        assert_eq!(
+            t("see <https://example.com/a?b=c|the doc> and <https://example.com/x>").as_deref(),
+            Some("see the doc and")
+        );
+        assert_eq!(t("  ### "), None, "nothing usable is left");
+        assert_eq!(t("").as_deref(), None);
+        assert_eq!(t(&"あ".repeat(300)).unwrap().chars().count(), 200);
     }
     /// **Up to two of our own is normal** (slack-morphism's default; confirmed in the startup log on a real machine).
     /// From the third on, another process is consuming the same app = an accident.
