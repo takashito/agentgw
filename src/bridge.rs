@@ -699,9 +699,14 @@ impl Bridge {
 
     /// Let go of a thread the gateway has given to another machine.
     ///
-    /// **The agent goes and the row goes**, the same ending a deleted thread gets: nothing will
-    /// arrive for it here again, and a row left behind would make this machine answer a conversation
+    /// **The agent goes, and the row keeps only where the thread went.** Nothing will arrive for it
+    /// here again, and a row still holding the agent would make this machine answer a conversation
     /// that is being answered somewhere else. The conversation is not lost — it carries on there.
+    ///
+    /// **The destination stays because on a gateway the row is also the forwarding table.** The
+    /// gateway writes the new machine into this same row, and a restart reads it back from here;
+    /// dropping the row sent the thread home to the gateway after the next restart, where every
+    /// follow-up was dropped as unaddressed and `exit` never reached the machine running it.
     async fn give_up_thread(&mut self, channel: &str, thread_ts: &str, to: &str, path: &str) {
         let key = ThreadKey::new(channel, thread_ts);
         let ctx = LogCtx {
@@ -722,7 +727,18 @@ impl Bridge {
         if !to.is_empty() {
             self.send_thread_after(channel, thread_ts, to, path).await;
         }
-        self.threads.entries.remove(thread_ts);
+        match to.is_empty() {
+            true => {
+                self.threads.entries.remove(thread_ts);
+            }
+            false => {
+                let left = crate::bridge::state::ThreadEntry {
+                    bridge: Some(to.to_string()),
+                    ..Default::default()
+                };
+                self.threads.entries.insert(thread_ts.to_string(), left);
+            }
+        }
         if let Err(e) = self.threads.save() {
             ctx.error("bridge", &format!("threads.json save failed: {e}"));
         }
@@ -3290,6 +3306,28 @@ mod tests {
             "the agent was left running, so both machines would answer"
         );
         assert!(b.threads.get(ROOT).is_none(), "the row stayed behind");
+    }
+
+    /// **A thread handed to a named machine keeps its destination on disk.** On a gateway this row is
+    /// also the forwarding table, and a restart reads it back; a dropped row sent the thread home to
+    /// the gateway, where follow-ups and `exit` were dropped as unaddressed.
+    #[tokio::test]
+    async fn a_thread_given_to_another_machine_keeps_where_it_went() {
+        let (d, _slack, agent, _clock) = flow_deps("thread-left-to");
+        let ((mut b, _fx), _deliv) = Bridge::for_test_with_deliveries(d);
+        let sid = running_thread(&mut b, &agent).await;
+
+        b.give_up_thread("C1", ROOT, "mac", "/Users/me/repo").await;
+
+        let name = crate::agent::SessionId::from(sid).window_name();
+        assert!(
+            crate::agent::Agent::pid_of(&*agent, None, &name).is_none(),
+            "the agent was left running, so both machines would answer"
+        );
+        let row = b.threads.get(ROOT).expect("the destination went with the row");
+        assert_eq!(row.agent_id, None, "the row still holds the agent that was let go");
+        let after_restart = crate::bridge::state::Threads::load(&b.deps.dir).bridges();
+        assert_eq!(after_restart.get(ROOT).map(String::as_str), Some("mac"));
     }
 
     /// **The worktree goes with the conversation that was using it.** Deleting the thread is a person
