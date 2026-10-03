@@ -178,6 +178,9 @@ pub enum Cmd {
     /// `update [version]` — the gateway, then every machine one at a time. `None` = the latest release.
     /// **The gateway runs it**; wherever it is typed, it is passed up.
     Update(Option<String>),
+    /// `rename-machine <from> <to>` — give a machine a new name. **The gateway runs it**: it holds
+    /// every record that names a machine. `None` = the arguments weren't two words (answer the usage).
+    RenameMachine(Option<(String, String)>),
     Owner(OwnerCmd),
 }
 
@@ -261,6 +264,13 @@ impl Cmd {
         }) {
             return Some(Cmd::Update(v));
         }
+        // The names are checked by the gateway, which can say which rule a name broke
+        if let Some(args) = msg.verb_args("rename-machine") {
+            return Some(Cmd::RenameMachine(match args.as_slice() {
+                [from, to] => Some((from.clone(), to.clone())),
+                _ => None,
+            }));
+        }
         Self::owner(msg).map(Cmd::Owner)
     }
 
@@ -287,6 +297,7 @@ impl Cmd {
             Cmd::Routes => "route",
             Cmd::Machines => "machines",
             Cmd::Update(_) => "update",
+            Cmd::RenameMachine(_) => "rename-machine",
             Cmd::Owner(oc) => return format!("owner-command '{}'", oc.verb),
         };
         format!("'{name}'")
@@ -959,6 +970,31 @@ impl Bridge {
                     self.post(&msg.channel, root_ts, text, key);
                 }
             }
+            // Same: only the gateway keeps the records that name machines
+            Cmd::RenameMachine(names) => {
+                ctx.info("bridge", &format!("slack-events: rename-machine command msg={}", msg.ts));
+                let Some((from, to)) = names else {
+                    let text = crate::t!(
+                        "Usage: `rename-machine <old name> <new name>`",
+                        "使い方: `rename-machine <今の名前> <新しい名前>`"
+                    );
+                    self.post(&msg.channel, root_ts, text, key);
+                    return true;
+                };
+                let ask = crate::bridge::gateway::link::LinkFrame::RenameMachine {
+                    channel: msg.channel.clone(),
+                    thread_ts: root_ts.to_string(),
+                    from,
+                    to,
+                };
+                if !self.ask_the_gateway(ask, &ctx) {
+                    let text = crate::t!(
+                        "This machine works on its own — there are no other machines.",
+                        "このマシンは単独で動いていて、ほかのマシンはありません。"
+                    );
+                    self.post(&msg.channel, root_ts, text, key);
+                }
+            }
             // Same: only the gateway knows every machine, and it is the one that goes first
             Cmd::Update(version) => {
                 ctx.info("bridge", &format!("slack-events: update command msg={}", msg.ts));
@@ -1279,6 +1315,22 @@ mod tests {
         assert_eq!(parse("update 0.56.0"), Some(Cmd::Update(Some("0.56.0".into()))));
         // A sentence goes to the agent
         assert_eq!(parse("update the docs"), None);
+    }
+
+    #[test]
+    fn rename_machine_takes_two_names() {
+        let agent = crate::agent::fake::FakeAgent::default();
+        let parse = |text: &str| Cmd::parse(&Message::new(text, None), &agent);
+        let parse_ours = |text: &str| Cmd::parse(&Message::new(text, Some("UBOT")), &agent);
+        assert_eq!(
+            parse_ours("<@UBOT> rename-machine tyo-mpv5l mac"),
+            Some(Cmd::RenameMachine(Some(("tyo-mpv5l".into(), "mac".into()))))
+        );
+        assert_eq!(parse("rename-machine Old New"), Some(Cmd::RenameMachine(Some(("Old".into(), "New".into())))));
+        // Anything but two names gets the usage
+        assert_eq!(parse("rename-machine"), Some(Cmd::RenameMachine(None)));
+        assert_eq!(parse("rename-machine mac"), Some(Cmd::RenameMachine(None)));
+        assert_eq!(parse("rename-machine a b c"), Some(Cmd::RenameMachine(None)));
     }
 
     #[test]

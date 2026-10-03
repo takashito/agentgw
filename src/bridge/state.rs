@@ -518,6 +518,19 @@ impl Threads {
             .bridge = Some(bridge_id.to_string());
     }
 
+    /// Every thread that went to machine `from` goes to `to` now. Nothing else on the rows changes.
+    /// Returns how many rows were rewritten.
+    pub fn rename_bridge(&mut self, from: &str, to: &str) -> usize {
+        let mut n = 0;
+        for e in self.entries.values_mut() {
+            if e.bridge.as_deref() == Some(from) {
+                e.bridge = Some(to.to_string());
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// Keeps only the keys that may be put back on the ledger at startup (`Bridge::restore_pending`).
     ///
     /// **Only threads whose agent is alive.** Nobody will answer a dead thread's pending replies,
@@ -2677,6 +2690,25 @@ mod tests {
         ] {
             assert_eq!(absolute_project_path(typed, "/home/me"), want, "{typed}");
         }
+    }
+
+    #[test]
+    fn renaming_a_machine_rewrites_only_its_threads() {
+        let mut t = Threads::default();
+        t.set_bridge("1.1", "old");
+        t.set_bridge("2.2", "old");
+        t.set_bridge("3.3", "pve");
+        t.entries.get_mut("1.1").unwrap().agent_id = Some("s1".into());
+        t.entries.insert("4.4".into(), ThreadEntry::default());
+
+        assert_eq!(t.rename_bridge("old", "mac"), 2);
+
+        let b = t.bridges();
+        assert_eq!(b.get("1.1").map(String::as_str), Some("mac"));
+        assert_eq!(b.get("2.2").map(String::as_str), Some("mac"));
+        assert_eq!(b.get("3.3").map(String::as_str), Some("pve"));
+        assert!(!b.contains_key("4.4"));
+        assert_eq!(t.get("1.1").unwrap().agent_id.as_deref(), Some("s1"), "the rest of the row stays");
     }
 
     #[test]

@@ -196,6 +196,18 @@ pub mod link {
         Update { version: String },
         /// machine → gateway: could not update (still running the version it had).
         UpdateFailed { version: String, why: String },
+        /// `rename-machine <from> <to>`, asked from wherever the Owner typed it — only the gateway
+        /// keeps the records that name machines.
+        RenameMachine {
+            channel: String,
+            thread_ts: String,
+            from: String,
+            to: String,
+        },
+        /// gateway → machine: you are called `to` from now on. Write it down and restart into it.
+        Rename { to: String },
+        /// machine → gateway: could not write the new name down (still running under the old one).
+        RenameFailed { why: String },
         /// `machines`, asked from a machine — same reason as [`LinkFrame::Routes`].
         Machines { channel: String, thread_ts: String },
         /// `route`, asked from a machine. **The gateway only sees messages that mention the bot**, and a
@@ -644,6 +656,18 @@ use std::sync::{Arc, Mutex};
 /// Channel id → name of the machine in charge. Built from `routes[ch].bridge` in access.json
 /// ([`crate::bridge::state::Access::bridges`]).
 pub type Routes = BTreeMap<String, String>;
+
+/// How long a renamed machine has to come back under its new name before the gateway says so.
+const RENAME_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What the gateway asks the Bridge to write into threads.json — the Bridge is its only writer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RouteNote {
+    /// One thread goes to this machine.
+    Thread { thread_ts: String, machine: String },
+    /// Every thread that went to `from` goes to `to` (a machine was renamed).
+    Renamed { from: String, to: String },
+}
 
 /// One-line logs for this section. The component is fixed at `relay` — fleet events are gathered here.
 pub(super) fn rlog(level: &str, message: &str) {
@@ -2229,14 +2253,26 @@ pub struct Fleet {
     /// is asked of the Bridge over [`Self::remember`], because the Bridge is the one process that
     /// writes threads.json — a second writer would save a whole file built from its own older copy.
     pub thread_routes: AsyncMutex<Routes>,
-    /// Asks the Bridge to write a thread's machine into threads.json. `(thread_ts, machine)`.
-    pub remember: Sender<(String, String)>,
+    /// Asks the Bridge to write threads' machines into threads.json.
+    pub remember: Sender<RouteNote>,
     /// Frames for **this machine's own Bridge**. The gateway is a machine too — it serves its own
     /// channels — and without this a frame addressed to itself would be sent down a link that does
     /// not exist and silently vanish.
     pub to_self: Sender<crate::bridge::machine::FromRelay>,
     /// The ssh tunnels we keep open (to show the route in `status`).
     pub tunnels: std::sync::Mutex<Tunnels>,
+    /// A `rename-machine` under way. **Memory only**: the gateway is not the one restarting, so
+    /// nothing has to outlive this process.
+    pub renaming: AsyncMutex<Option<Renaming>>,
+}
+
+/// A rename under way: the machine's old link is still to go down and its new name to come up.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Renaming {
+    pub from: String,
+    pub to: String,
+    pub channel: String,
+    pub thread_ts: String,
 }
 
 impl Fleet {
@@ -2501,7 +2537,14 @@ impl Fleet {
     /// A link dropped. **A displaced old link doesn't ring presence**
     /// (`unregister` tells by "am I still the registered one").
     async fn detach(&self, bridge_id: &str, conn: &Conn) {
-        if self.links.unregister(bridge_id, conn) {
+        // A machine going down to come back under its new name has not gone away
+        let renamed = self
+            .renaming
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|r| r.from == bridge_id);
+        if self.links.unregister(bridge_id, conn) && !renamed {
             self.presence
                 .lock()
                 .await
@@ -2608,7 +2651,11 @@ impl Fleet {
             && ev.brings_in_the_bot(bot_user_id.as_deref(), self.owner().as_deref())
             && let Some(id) = decision.bridge_id(&self.self_id)
         {
-            let _ = self.remember.send((t.to_string(), id.clone())).await;
+            let note = RouteNote::Thread {
+                thread_ts: t.to_string(),
+                machine: id.clone(),
+            };
+            let _ = self.remember.send(note).await;
             self.thread_routes.lock().await.insert(t.to_string(), id);
         }
         match decision {
@@ -2962,7 +3009,10 @@ impl Fleet {
             .insert(thread_ts.to_string(), bridge_id.to_string());
         let _ = self
             .remember
-            .send((thread_ts.to_string(), bridge_id.to_string()))
+            .send(RouteNote::Thread {
+                thread_ts: thread_ts.to_string(),
+                machine: bridge_id.to_string(),
+            })
             .await;
         // The machine that had it drops its record, or it would answer a thread that is no longer its
         // own the next time one of its own messages arrives
@@ -3103,6 +3153,13 @@ impl Fleet {
                 thread_ts,
                 version,
             } => self.start_update(&channel, &thread_ts, version).await,
+            link::LinkFrame::RenameMachine {
+                channel,
+                thread_ts,
+                from,
+                to,
+            } => self.rename_machine(&channel, &thread_ts, &from, &to).await,
+            link::LinkFrame::RenameFailed { why } => self.rename_failed(bridge_id, &why).await,
             link::LinkFrame::UpdateFailed { version, why } => {
                 rlog("error", &format!("{bridge_id}: could not update to {version}: {why}"));
                 let id = bridge_id.to_string();
@@ -3188,6 +3245,196 @@ impl Fleet {
         }
         rlog("info", &format!("update: starting a rollout to v{}", r.target));
         self.edit_access(|a| a.update = Some(r)).await;
+    }
+
+    /// `rename-machine <from> <to>`: give a connected machine a new name.
+    ///
+    /// **The records go first, then the machine is told.** Told first, it would come back under the
+    /// new name while every channel and thread still pointed at the old one, and what arrived in
+    /// between would be answered as "offline". This way the gap is only the machine's restart.
+    pub(crate) async fn rename_machine(self: &Arc<Self>, channel: &str, thread_ts: &str, from: &str, to: &str) {
+        let thread = (!thread_ts.is_empty()).then_some(thread_ts);
+        let mut renaming = self.renaming.lock().await;
+        if renaming.is_some() {
+            let text = crate::t!("A rename is already under way.", "改名がすでに進んでいます。");
+            self.post(channel, thread, &text).await;
+            return;
+        }
+        if let Err(why) = self.may_rename(from, to).await {
+            rlog("info", &format!("rename: {from} → {to} refused: {why}"));
+            self.post(channel, thread, &why).await;
+            return;
+        }
+        let (channels, threads) = self.rename_records(from, to).await;
+        if !self.links.send_to(from, &link::LinkFrame::Rename { to: to.to_string() }) {
+            self.rename_records(to, from).await;
+            let text = crate::t!(
+                "`{from}` went offline just now — nothing was renamed.",
+                "`{from}` がたった今オフラインになったので、何も変えていません。"
+            );
+            self.post(channel, thread, &text).await;
+            return;
+        }
+        rlog(
+            "info",
+            &format!("rename: {from} → {to} ({channels} channel(s), {threads} thread(s)); told {from}"),
+        );
+        *renaming = Some(Renaming {
+            from: from.to_string(),
+            to: to.to_string(),
+            channel: channel.to_string(),
+            thread_ts: thread_ts.to_string(),
+        });
+        drop(renaming);
+        let fleet = self.clone();
+        let mine = Renaming {
+            from: from.to_string(),
+            to: to.to_string(),
+            channel: channel.to_string(),
+            thread_ts: thread_ts.to_string(),
+        };
+        tokio::spawn(async move {
+            let back = fleet.wait_for(&mine.to, RENAME_WAIT).await;
+            // A refusal from the machine has already answered and put everything back
+            {
+                let mut r = fleet.renaming.lock().await;
+                if r.as_ref() != Some(&mine) {
+                    return;
+                }
+                *r = None;
+            }
+            let Renaming { from, to, channel, thread_ts } = mine;
+            let text = match back {
+                true => crate::t!(
+                    "Renamed `{from}` to `{to}`. {channels} channel(s) and {threads} thread(s) go to `{to}` now.",
+                    "`{from}` を `{to}` に改名しました。チャンネル {channels} 個とスレッド {threads} 本は `{to}` に届きます。"
+                ),
+                false => crate::t!(
+                    "`{to}` hasn't connected yet. Its channels and threads already go to `{to}`; they are answered once that machine is back.",
+                    "`{to}` がまだつながってきません。チャンネルとスレッドはもう `{to}` に向けてあるので、そのマシンが戻れば返事が来ます。"
+                ),
+            };
+            rlog("info", &format!("rename: {from} → {to} {}", if back { "done" } else { "not back yet" }));
+            fleet.post(&channel, (!thread_ts.is_empty()).then_some(&thread_ts), &text).await;
+        });
+    }
+
+    /// Whether `from` may be called `to`. `Err` is the sentence to answer with; nothing is changed.
+    async fn may_rename(&self, from: &str, to: &str) -> Result<(), String> {
+        let access = self.access();
+        let connected = self.links.connected();
+        let threads = self.thread_routes.lock().await.clone();
+        let named = |id: &str| {
+            access.machines.contains_key(id)
+                || access.routes.values().any(|r| r.bridge.as_deref() == Some(id))
+                || threads.values().any(|m| m == id)
+                || connected.iter().any(|c| c == id)
+        };
+        if from == self.self_id {
+            return Err(crate::t!(
+                "The gateway can't be renamed this way — only the machines linked to it.",
+                "ゲートウェイの名前はこの方法では変えられません。変えられるのは、つながっているマシンだけです。"
+            ));
+        }
+        if !named(from) {
+            return Err(crate::t!("No machine is called `{from}`.", "`{from}` という名前のマシンはありません。"));
+        }
+        if !crate::bridge::state::is_machine_name(to) {
+            return Err(crate::t!(
+                "`{to}` can't be a machine's name: start with a letter or digit, then letters, digits, `-`, `_` or `.`.",
+                "`{to}` はマシンの名前に使えません。英数字で始めて、続きは英数字と `-` `_` `.` だけにしてください。"
+            ));
+        }
+        if to == self.self_id || named(to) {
+            return Err(crate::t!("`{to}` is already a machine's name.", "`{to}` はすでにマシンの名前です。"));
+        }
+        if !connected.iter().any(|c| c == from) {
+            return Err(crate::t!(
+                "`{from}` is offline — it has to be connected to learn its new name.",
+                "`{from}` はオフラインです。新しい名前を伝えるには、つながっている必要があります。"
+            ));
+        }
+        if access.update.is_some() {
+            return Err(crate::t!(
+                "An update is under way — rename once it finishes.",
+                "update が進んでいます。終わってから改名してください。"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Point every record of ours that names `from` at `to`. Returns (channels, threads) moved.
+    ///
+    /// The thread rows on disk are the Bridge's to write, so they are asked of it.
+    async fn rename_records(&self, from: &str, to: &str) -> (usize, usize) {
+        let mut channels = 0;
+        self.edit_access(|a| {
+            for r in a.routes.values_mut() {
+                if r.bridge.as_deref() == Some(from) {
+                    r.bridge = Some(to.to_string());
+                    channels += 1;
+                }
+            }
+            if let Some(link) = a.machines.remove(from) {
+                a.machines.insert(to.to_string(), link);
+            }
+        })
+        .await;
+        let mut threads = 0;
+        for m in self.thread_routes.lock().await.values_mut() {
+            if m == from {
+                *m = to.to_string();
+                threads += 1;
+            }
+        }
+        {
+            let mut homes = self.homes.lock().await;
+            if let Some(home) = homes.remove(from) {
+                homes.insert(to.to_string(), home);
+            }
+        }
+        let note = RouteNote::Renamed {
+            from: from.to_string(),
+            to: to.to_string(),
+        };
+        let _ = self.remember.send(note).await;
+        (channels, threads)
+    }
+
+    /// The machine could not write its new name down. It is still running under the old one, so
+    /// every record goes back to that.
+    async fn rename_failed(&self, bridge_id: &str, why: &str) {
+        let r = {
+            let mut renaming = self.renaming.lock().await;
+            match renaming.as_ref() {
+                Some(r) if r.from == bridge_id => renaming.take(),
+                _ => None,
+            }
+        };
+        rlog("error", &format!("rename: {bridge_id} could not take its new name: {why}"));
+        let Some(Renaming { from, to, channel, thread_ts }) = r else {
+            return;
+        };
+        self.rename_records(&to, &from).await;
+        let text = crate::t!(
+            "`{from}` couldn't take the name `{to}` ({why}). Nothing was renamed.",
+            "`{from}` は `{to}` という名前を書き込めませんでした({why})。何も変えていません。"
+        );
+        self.post(&channel, (!thread_ts.is_empty()).then_some(&thread_ts), &text).await;
+    }
+
+    /// Whether `id` is connected within `limit`.
+    async fn wait_for(&self, id: &str, limit: std::time::Duration) -> bool {
+        let start = std::time::Instant::now();
+        loop {
+            if self.links.connected().iter().any(|c| c == id) {
+                return true;
+            }
+            if start.elapsed() >= limit {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
     }
 
     /// Carries an `update` through, one machine at a time. **The only clock the rollout has** — it
@@ -4687,8 +4934,155 @@ mod tests {
             remember: tokio::sync::mpsc::channel(4).0,
             to_self: tokio::sync::mpsc::channel(4).0,
             tunnels: Default::default(),
+            renaming: Default::default(),
         });
         (fleet, msg_rx)
+    }
+
+    // ── rename-machine ──────────────────────────────────────────────────────────
+
+    /// A gateway with `old` (connected, one channel, one thread) and `pve` (offline, one channel).
+    async fn a_fleet_to_rename(
+        name: &str,
+    ) -> (Arc<Fleet>, Arc<crate::chat::fake::FakeChat>, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        let dir = StateDir::at(
+            std::env::temp_dir().join(format!("agentgw-rename-{name}-{}", std::process::id())),
+        );
+        let _ = std::fs::remove_dir_all(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let mut access = Access::default();
+        access.owner = "U_OWNER".into();
+        access.routes.entry("C1".to_string()).or_default().bridge = Some("old".into());
+        access.routes.entry("C2".to_string()).or_default().bridge = Some("pve".into());
+        access.machines.entry("old".to_string()).or_default().version = "0.62.5".into();
+        access.machines.entry("pve".to_string()).or_default().version = "0.62.5".into();
+        access.save(&dir).unwrap();
+        let api = Arc::new(crate::chat::fake::FakeChat::default());
+        let (fleet, _rx) = a_fleet_with(dir, api.clone());
+        let (c, frames) = conn();
+        fleet.links.register("old", c);
+        {
+            let mut t = fleet.thread_routes.lock().await;
+            t.insert("1.1".into(), "old".into());
+            t.insert("2.2".into(), "pve".into());
+        }
+        fleet.homes.lock().await.insert("old".into(), "/home/me".into());
+        (fleet, api, frames)
+    }
+
+    fn posts(api: &crate::chat::fake::FakeChat) -> String {
+        api.calls.lock().unwrap().join("\n")
+    }
+
+    /// **Every record that names the machine follows it, and then it is told.** Once it is back
+    /// under the new name, the thread that asked hears so.
+    #[tokio::test]
+    async fn renaming_a_machine_moves_its_records_and_tells_it() {
+        let (fleet, api, mut frames) = a_fleet_to_rename("ok").await;
+
+        fleet.rename_machine("C9", "9.9", "old", "mac").await;
+
+        let access = fleet.access();
+        assert_eq!(access.routes["C1"].bridge.as_deref(), Some("mac"));
+        assert_eq!(access.routes["C2"].bridge.as_deref(), Some("pve"));
+        assert!(!access.machines.contains_key("old"));
+        assert_eq!(access.machines["mac"].version, "0.62.5", "the record moves, not a fresh one");
+        let threads = fleet.thread_routes.lock().await.clone();
+        assert_eq!(threads["1.1"], "mac");
+        assert_eq!(threads["2.2"], "pve");
+        assert_eq!(fleet.homes.lock().await.get("mac").map(String::as_str), Some("/home/me"));
+        let told = link::decode(&frames.try_recv().expect("the machine was told")).unwrap();
+        assert_eq!(told, link::LinkFrame::Rename { to: "mac".into() });
+        assert!(posts(&api).is_empty(), "nothing to say until it is back: {}", posts(&api));
+
+        // It restarts and dials in under the new name
+        let (c, _f) = conn();
+        fleet.links.register("mac", c);
+        for _ in 0..40 {
+            if !posts(&api).is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let said = posts(&api);
+        assert!(said.contains("C9") && said.contains("9.9"), "{said}");
+        assert!(said.contains("1 channel(s) and 1 thread(s)"), "{said}");
+        assert!(fleet.renaming.lock().await.is_none(), "the rename is over");
+    }
+
+    /// Each refusal changes nothing and tells nobody but the person who asked.
+    #[tokio::test]
+    async fn a_refused_rename_changes_nothing() {
+        let cases = [
+            ("parent", "mac", "gateway"),
+            ("nobody", "mac", "No machine"),
+            ("old", "a/b", "can't be a machine's name"),
+            ("old", "pve", "already a machine's name"),
+            ("old", "parent", "already a machine's name"),
+            ("pve", "mac", "offline"),
+        ];
+        for (i, (from, to, says)) in cases.into_iter().enumerate() {
+            let (fleet, api, mut frames) = a_fleet_to_rename(&format!("no{i}")).await;
+            let before = std::fs::read_to_string(fleet.dir.join("access.json")).unwrap();
+
+            fleet.rename_machine("C9", "9.9", from, to).await;
+
+            assert!(posts(&api).contains(says), "{from} → {to}: {}", posts(&api));
+            assert_eq!(std::fs::read_to_string(fleet.dir.join("access.json")).unwrap(), before);
+            assert_eq!(fleet.thread_routes.lock().await["1.1"], "old");
+            assert!(frames.try_recv().is_err(), "{from} → {to}: the machine was told");
+            assert!(fleet.renaming.lock().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn no_rename_while_an_update_runs() {
+        let (fleet, api, mut frames) = a_fleet_to_rename("update").await;
+        fleet
+            .edit_access(|a| a.update = Some(crate::bridge::state::Rollout::default()))
+            .await;
+
+        fleet.rename_machine("C9", "9.9", "old", "mac").await;
+
+        assert!(posts(&api).contains("update"), "{}", posts(&api));
+        assert_eq!(fleet.access().routes["C1"].bridge.as_deref(), Some("old"));
+        assert!(frames.try_recv().is_err());
+    }
+
+    /// The machine could not write its new name down: it still runs under the old one, so every
+    /// record goes back.
+    #[tokio::test]
+    async fn a_machine_that_cannot_take_the_name_puts_everything_back() {
+        let (fleet, api, _frames) = a_fleet_to_rename("failed").await;
+        fleet.rename_machine("C9", "9.9", "old", "mac").await;
+        assert_eq!(fleet.access().routes["C1"].bridge.as_deref(), Some("mac"));
+
+        fleet
+            .on_machine_frame("old", link::LinkFrame::RenameFailed { why: "read-only".into() })
+            .await;
+
+        let access = fleet.access();
+        assert_eq!(access.routes["C1"].bridge.as_deref(), Some("old"));
+        assert!(access.machines.contains_key("old") && !access.machines.contains_key("mac"));
+        assert_eq!(fleet.thread_routes.lock().await["1.1"], "old");
+        assert!(posts(&api).contains("read-only"), "{}", posts(&api));
+        assert!(fleet.renaming.lock().await.is_none());
+    }
+
+    #[test]
+    fn the_rename_frames_survive_the_wire() {
+        for f in [
+            link::LinkFrame::RenameMachine {
+                channel: "C1".into(),
+                thread_ts: "1.1".into(),
+                from: "old".into(),
+                to: "mac".into(),
+            },
+            link::LinkFrame::Rename { to: "mac".into() },
+            link::LinkFrame::RenameFailed { why: "no".into() },
+        ] {
+            assert_eq!(link::decode(&link::encode(&f)).unwrap(), f, "{f:?}");
+        }
     }
 
     /// **Only a thread the bot is in gets its machine recorded**, and there a follow-up with no

@@ -750,6 +750,25 @@ impl Bridge {
     /// Nothing else about the row is touched, and a row that says something else already is left
     /// alone — the gateway only asks about threads it has not written down yet, and an answer that
     /// arrived late must not undo a move made since.
+    fn note_thread_routes(&mut self, note: crate::bridge::gateway::RouteNote) {
+        use crate::bridge::gateway::RouteNote;
+        match note {
+            RouteNote::Thread { thread_ts, machine } => self.remember_thread_route(&thread_ts, &machine),
+            RouteNote::Renamed { from, to } => self.rename_thread_routes(&from, &to),
+        }
+    }
+
+    /// A machine was renamed: every thread it had goes to the new name. **The rest of each row stays**.
+    fn rename_thread_routes(&mut self, from: &str, to: &str) {
+        let n = self.threads.rename_bridge(from, to);
+        LogCtx::default().info("bridge", &format!("rename: {n} thread(s) moved from {from} to {to}"));
+        if n > 0
+            && let Err(e) = self.threads.save()
+        {
+            LogCtx::default().error("bridge", &format!("threads.json save failed: {e}"));
+        }
+    }
+
     fn remember_thread_route(&mut self, thread_ts: &str, machine: &str) {
         if self.threads.get(thread_ts).and_then(|e| e.bridge.as_deref()) == Some(machine) {
             return;
@@ -896,7 +915,7 @@ impl Bridge {
         let (reload_tx, mut reload_rx) = mpsc::channel(4);
         // The gateway asking for a thread's machine to be written down. **Only this loop writes
         // threads.json**, so the gateway hands the pair over instead of saving the file itself.
-        let (remember_tx, mut remember_rx) = mpsc::channel::<(String, String)>(64);
+        let (remember_tx, mut remember_rx) = mpsc::channel::<crate::bridge::gateway::RouteNote>(64);
         // Threads this machine has been relieved of (the gateway gave them to someone else).
         let (left_tx, mut left_rx) = mpsc::channel::<(String, String, String, String)>(16);
         // Conversations on their way here. One slice per message; the last one puts it in place
@@ -954,6 +973,7 @@ impl Bridge {
                 remember: remember_tx.clone(),
                 to_self: down_tx.clone(),
                 tunnels: Default::default(),
+                renaming: Default::default(),
             });
             // One listener per address: loopback for whatever terminates TLS in front, the LAN address
             // for machines on the same network
@@ -1220,7 +1240,7 @@ impl Bridge {
                 Some(()) = reload_rx.recv() => b.reload_from_disk(),
                 // The gateway decided which machine a thread belongs to. Writing it is this loop's
                 // job alone — see `Threads::set_bridge`
-                Some((thread_ts, machine)) = remember_rx.recv() => b.remember_thread_route(&thread_ts, &machine),
+                Some(note) = remember_rx.recv() => b.note_thread_routes(note),
                 // This thread is another machine's now: let go of it before it answers twice
                 Some((channel, thread_ts, to, path)) = left_rx.recv() => b.give_up_thread(&channel, &thread_ts, &to, &path).await,
                 // A slice of a conversation being moved here
@@ -1681,7 +1701,30 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
                 }
             });
         }
+        // The gateway's `rename-machine`: it has already pointed its records at the new name. Write it
+        // down and restart into it — the name is read once, at start-up. Agents keep running
+        machine::FromRelay::Rename { to } => match take_new_name(dir, &to) {
+            Ok(()) => {
+                LogCtx::default().info("bridge", &format!("rename: this machine is {to} now"));
+                let _ = updated.send(format!("rename to {to}")).await;
+            }
+            Err(why) => {
+                LogCtx::default().error("bridge", &format!("rename to {to} failed: {why}"));
+                let _ = up.send(crate::bridge::gateway::link::LinkFrame::RenameFailed { why });
+            }
+        },
     }
+}
+
+/// Write this machine's new name into `.env`, leaving every other line as it was.
+fn take_new_name(dir: &crate::state_dir::StateDir, to: &str) -> Result<(), String> {
+    if !crate::bridge::state::is_machine_name(to) {
+        return Err(format!("`{to}` is not a machine name"));
+    }
+    let path = dir.join(".env");
+    let before = std::fs::read_to_string(&path).map_err(|e| format!("could not read .env: {e}"))?;
+    let after = crate::state_dir::set_env_keys(&before, &[("AGENTGW_BRIDGE_ID", to.to_string())]);
+    crate::state_dir::write_atomic_mode(&path, &after, Some(0o600)).map_err(|e| format!("could not write .env: {e}"))
 }
 
 
@@ -3319,6 +3362,47 @@ mod tests {
             "the agent was left running, so both machines would answer"
         );
         assert!(b.threads.get(ROOT).is_none(), "the row stayed behind");
+    }
+
+    /// A renamed machine's threads follow it in threads.json, and nothing else on them changes.
+    #[tokio::test]
+    async fn a_renamed_machine_takes_its_threads_along() {
+        let (d, _slack, agent, _clock) = flow_deps("rename-threads");
+        let ((mut b, _fx), _deliv) = Bridge::for_test_with_deliveries(d);
+        let sid = running_thread(&mut b, &agent).await;
+        b.threads.set_bridge(ROOT, "old");
+        b.threads.set_bridge("2.2", "pve");
+
+        b.note_thread_routes(crate::bridge::gateway::RouteNote::Renamed {
+            from: "old".into(),
+            to: "mac".into(),
+        });
+
+        let on_disk = crate::bridge::state::Threads::load(&b.deps.dir);
+        assert_eq!(on_disk.bridges().get(ROOT).map(String::as_str), Some("mac"));
+        assert_eq!(on_disk.bridges().get("2.2").map(String::as_str), Some("pve"));
+        assert_eq!(on_disk.get(ROOT).and_then(|e| e.agent_id.clone()), Some(sid));
+    }
+
+    /// A machine told its new name writes it into `.env` and leaves every other line alone.
+    #[test]
+    fn a_machine_writes_its_new_name_down() {
+        let dir = crate::state_dir::StateDir::at(
+            std::env::temp_dir().join(format!("agentgw-new-name-{}", std::process::id())),
+        );
+        let _ = std::fs::remove_dir_all(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(
+            dir.join(".env"),
+            "AGENTGW_RELAY_URL=wss://hub\nAGENTGW_BRIDGE_ID=tyo-mpv5l\nAGENTGW_RELAY_TOKEN=k\n",
+        )
+        .unwrap();
+
+        take_new_name(&dir, "mac").unwrap();
+
+        let env = std::fs::read_to_string(dir.join(".env")).unwrap();
+        assert_eq!(env, "AGENTGW_RELAY_URL=wss://hub\nAGENTGW_BRIDGE_ID=mac\nAGENTGW_RELAY_TOKEN=k\n");
+        assert!(take_new_name(&dir, "a/b").is_err(), "a name the gateway would never send");
     }
 
     /// **A thread handed to a named machine keeps its destination on disk.** On a gateway this row is

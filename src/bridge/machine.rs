@@ -159,6 +159,8 @@ pub enum FromRelay {
     },
     /// Replace this machine's agentgw with this release, then restart.
     Update { version: String },
+    /// This machine is called `to` from now on: write it into `.env`, then restart into it.
+    Rename { to: String },
     /// A refusal that talking won't fix. **No retry.**
     Fatal(Fatal),
 }
@@ -259,6 +261,7 @@ impl FromRelay {
             },
             F::Home { channel } => FromRelay::Home { channel },
             F::Update { version } => FromRelay::Update { version },
+            F::Rename { to } => FromRelay::Rename { to },
             // Answers and asks only ever go the other way
             F::ProjectSet { .. }
             | F::Routes { .. }
@@ -269,6 +272,8 @@ impl FromRelay {
             | F::MachineVersion { .. }
             | F::StartUpdate { .. }
             | F::UpdateFailed { .. }
+            | F::RenameMachine { .. }
+            | F::RenameFailed { .. }
             | F::Machines { .. } => {
                 return None;
             }
