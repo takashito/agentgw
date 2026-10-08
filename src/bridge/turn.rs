@@ -898,6 +898,11 @@ impl Bridge {
         // watch is dropped the moment a thread settles, so keying off it looked at exactly the
         // threads with something in flight and never at an idle worker -- which is the one this
         // is for: nobody is waiting on it, so nobody would notice it stop.
+        // **Only the agents that actually have a window.** One tmux call for the list, then one
+        // screen read each — the old shape read a screen per *recorded* thread, which on a real
+        // machine was 60 tmux spawns at 0.27s for 4 live agents: 16s with the main loop held, so
+        // every delivery queued behind it (measured 2026-10-08).
+        let live = self.live_windows();
         let candidates: Vec<(ThreadKey, String)> = self
             .threads
             .entries
@@ -905,7 +910,8 @@ impl Bridge {
             .filter_map(|(thread_ts, e)| {
                 let session = e.agent_id.clone()?;
                 let channel = e.channel_id.clone()?;
-                Some((ThreadKey::new(&channel, thread_ts), session))
+                live.contains_key(&session)
+                    .then(|| (ThreadKey::new(&channel, thread_ts), session))
             })
             .collect();
         for (key, session) in candidates {

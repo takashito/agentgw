@@ -33,6 +33,8 @@ pub(crate) fn target(window: &str) -> String {
 }
 
 const SETTLE_BEFORE_ENTER: std::time::Duration = std::time::Duration::from_millis(200);
+/// Tells one delivery's paste buffer from another's. Only uniqueness matters, so it never resets.
+static DELIVERY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Injection point for running tmux. Tests use a fake, real runs the real thing.
 pub struct Tmux {
@@ -68,10 +70,15 @@ impl Tmux {
     /// right after it submits (measured 2026-09-27: 11KB, macOS and Linux, every time).
     ///
     /// The paste goes through a tmux buffer of its own, never the OS clipboard, and `-d` deletes it
-    /// once pasted. One buffer per window, so two deliveries at once cannot paste each other's text.
+    /// once pasted. **A buffer per delivery, not per window**: deliveries run off the main loop, so
+    /// two can overlap on the same window (a retry while the first is still in flight), and with one
+    /// shared name the first paste's `-d` deleted the buffer the second was about to paste — the
+    /// second then failed outright with `no buffer …` and the message was never handed over
+    /// (seen on a real machine 2026-10-08).
     pub fn deliver(&self, w: &Window, text: &str) -> Result<(), String> {
         let t = w.as_str();
-        let buffer = format!("agentgw-deliver-{t}");
+        let n = DELIVERY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let buffer = format!("agentgw-deliver-{t}-{n}");
         // `--` guards against text starting with `-`
         (self.run)(&["set-buffer", "-b", &buffer, "--", text])?;
         (self.run)(&["paste-buffer", "-p", "-d", "-b", &buffer, "-t", t])?;
@@ -241,13 +248,15 @@ mod tests {
         tmux.deliver(&Window::of("1-1"), "-hello").unwrap();
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 3, "buffer, paste, Enter: {calls:?}");
-        let buffer = "agentgw-deliver-agentgw-workers:1-1";
+        let prefix = "agentgw-deliver-agentgw-workers:1-1-";
+        let buffer = calls[0][2].clone();
+        assert!(buffer.starts_with(prefix), "buffer name {buffer}");
         // `--` so text starting with `-` still passes as an argument
-        assert_eq!(calls[0], ["set-buffer", "-b", buffer, "--", "-hello"]);
+        assert_eq!(calls[0], ["set-buffer", "-b", &buffer, "--", "-hello"]);
         // `-p` bracketed, `-d` the buffer is gone once pasted
         assert_eq!(
             calls[1],
-            ["paste-buffer", "-p", "-d", "-b", buffer, "-t", "agentgw-workers:1-1"]
+            ["paste-buffer", "-p", "-d", "-b", &buffer, "-t", "agentgw-workers:1-1"]
         );
         assert_eq!(
             calls[2],

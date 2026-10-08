@@ -1016,6 +1016,23 @@ impl Bridge {
         !owned.is_empty() || !rows.iter().any(|r| r.session_id().is_some())
     }
 
+    /// session_id → window_id for **the agents that actually have a window**, from one tmux call.
+    ///
+    /// **The list is the authority** (same reasoning as [`Self::reap_stray_windows`]), and asking it
+    /// once is the point: a tmux call costs a process spawn, and the periodic checks used to make one
+    /// *per recorded thread*. Measured on a real machine: 60 records, 4 live windows, 0.27s a call —
+    /// 16s of the main loop per round, twice over, which is what held deliveries for tens of seconds.
+    /// Husks where claude is gone and only the shell is left do not count as alive.
+    pub(super) fn live_windows(&self) -> HashMap<String, String> {
+        self.deps
+            .agent
+            .windows()
+            .into_iter()
+            .filter(|r| !r.is_empty_shell())
+            .filter_map(|r| r.session_id().map(|s| (s.to_string(), r.id.clone())))
+            .collect()
+    }
+
     async fn reap_stray_windows(&mut self) {
         // session_ids held by threads and the pool = windows that have an owner
         let owned: HashSet<String> = self
@@ -1124,21 +1141,18 @@ impl Bridge {
             .values()
             .map(|p| ThreadKey::new(&p.channel, &p.thread_ts))
             .collect();
+        // Liveness comes from the real thing, not memory (same approach as status) — but from
+        // **one** window list, not a tmux call per thread
+        let live = self.live_windows();
         for (tts, e) in &self.threads.entries {
             let (Some(channel_id), Some(sid)) = (e.channel_id.as_deref(), e.agent_id.as_deref())
             else {
                 continue;
             };
-            // The tmux pid is the only answer for liveness (the real thing, not memory — same approach as status)
-            let h = self.workers.warm(sid);
-            let window = SessionId::from(sid.to_string()).window_name();
-            if self
-                .deps.agent
-                .pid_of(h.and_then(|h| h.window_id.as_deref()), &window)
-                .is_none()
-            {
+            if !live.contains_key(sid) {
                 continue;
             }
+            let h = self.workers.warm(sid);
             let key = ThreadKey::new(channel_id, tts);
             // Idle is measured from the transcript's mtime = when it last **actually worked**. Broader than
             // narration or reply times; it also updates while thinking silently or running a long tool

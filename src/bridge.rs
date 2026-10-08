@@ -2192,6 +2192,36 @@ mod tests {
         (deps, slack, agent, clock)
     }
 
+    /// The periodic checks look at **agents that have a window**, not at every record. Each one asks
+    /// tmux, and a tmux call is a process spawn: with 60 records against 4 live windows that was 16
+    /// seconds of the main loop every round, twice over, and every delivery waited behind it
+    /// (measured on a real machine 2026-10-08).
+    #[tokio::test]
+    async fn the_periodic_checks_only_look_at_agents_that_have_a_window() {
+        let (d, _slack, agent, _clock) = flow_deps("live-windows");
+        let (b, _fx) = Bridge::for_test(d);
+        let live_sid = "sid-live";
+        crate::agent::Agent::spawn(
+            &*agent,
+            &crate::agent::SpawnReq {
+                session_id: crate::agent::SessionId::from(live_sid.to_string()),
+                cwd: Host::home(),
+                prompt: None,
+                resume_from: None,
+                window: crate::agent::SessionId::from(live_sid.to_string()).window_name(),
+                state: crate::agent::WorkerState::Absent,
+                hooks_file: String::new(),
+                mcp_config: String::new(),
+                moved_from: None,
+            },
+        )
+        .unwrap();
+        let live = b.live_windows();
+        assert_eq!(live.keys().collect::<Vec<_>>(), [live_sid], "{live:?}");
+        // A record whose window is gone is not in the list, so nothing asks tmux about it
+        assert!(!live.contains_key("sid-gone"));
+    }
+
     /// The agent's `--settings` file is written on **every** spawn, not once at start-up. It lives in
     /// a temp area that gets swept, and `claude` exits within a second when the path points at
     /// nothing ("Settings file not found") — measured on a real machine after a Bridge had been up
