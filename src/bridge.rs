@@ -92,6 +92,8 @@ pub struct Bridge {
     deliv_tx: mpsc::Sender<DeliveryDone>,
     /// Where a finished screen reading reports back (see [`DialogScan`]).
     dialog_tx: mpsc::Sender<DialogScan>,
+    /// Where a finished probe reports back (see [`ProbeDone`]).
+    probe_tx: mpsc::Sender<ProbeDone>,
     lifecycle: bridge::Lifecycle,
     ledger: bridge::Ledger,
     sticky: slack::StickyBoard,
@@ -179,6 +181,8 @@ struct Config {
     deliv_tx: mpsc::Sender<DeliveryDone>,
     /// Where a finished screen reading reports back (see [`DialogScan`]).
     dialog_tx: mpsc::Sender<DialogScan>,
+    /// Where a finished probe reports back (see [`ProbeDone`]).
+    probe_tx: mpsc::Sender<ProbeDone>,
     ask_gateway: Option<mpsc::UnboundedSender<crate::bridge::gateway::link::LinkFrame>>,
     /// Set on a machine: the gateway it is linked to (`status` says so).
     link: Option<LinkStatus>,
@@ -212,6 +216,18 @@ pub struct DialogScan {
     pub candidates: Vec<(ThreadKey, String)>,
     /// session_id → what its screen held.
     pub screens: HashMap<String, Option<crate::agent::Dialog>>,
+}
+
+/// What a probe that ran off the loop came back with. **The one way a probe's answer enters the loop.**
+///
+/// Both probes start a `claude`, which takes seconds; on the loop that was seconds in which nothing
+/// else moved. The deciding stays on the loop, in [`Bridge::on_usage_probe`] and
+/// [`Bridge::on_sign_in_probe`].
+pub enum ProbeDone {
+    /// `/usage` output, or why it could not be read.
+    Usage(Result<String, crate::agent::ProbeErr>),
+    /// Whether this machine's agent is signed in. `None` = the question could not be answered.
+    SignIn(Option<bool>),
 }
 
 /// A dialog offered to a thread as buttons, waiting for someone to press one.
@@ -293,6 +309,7 @@ impl Bridge {
             delivery_trouble: HashMap::new(),
             deliv_tx: config.deliv_tx,
             dialog_tx: config.dialog_tx,
+            probe_tx: config.probe_tx,
             lifecycle: bridge::Lifecycle::new(),
             sticky: slack::StickyBoard::default(),
             perm_pending: HashMap::new(),
@@ -345,8 +362,10 @@ impl Bridge {
             machine_name: "test-machine".into(),
             cmd_tx,
             deliv_tx,
-            // Tests drive a whole round through `dialog_tick`, so nothing ever comes back this way
+            // Tests drive a whole round through `dialog_tick` / `usage_tick`, so nothing ever
+            // comes back this way
             dialog_tx: mpsc::channel(1).0,
+            probe_tx: mpsc::channel(1).0,
             ask_gateway: None,
             link: None,
             machines_now: None,
@@ -941,6 +960,7 @@ impl Bridge {
         let (deliv_tx, mut deliv_rx) = mpsc::channel::<DeliveryDone>(64);
         // One round of screen readings at a time is plenty: the watch fires every 10s
         let (dialog_tx, mut dialog_rx) = mpsc::channel::<DialogScan>(4);
+        let (probe_tx, mut probe_rx) = mpsc::channel::<ProbeDone>(4);
         let (reload_tx, mut reload_rx) = mpsc::channel(4);
         // The gateway asking for a thread's machine to be written down. **Only this loop writes
         // threads.json**, so the gateway hands the pair over instead of saving the file itself.
@@ -1186,6 +1206,7 @@ impl Bridge {
                 machine_name: machine_name.clone(),
                 deliv_tx,
                 dialog_tx,
+                probe_tx,
                 cmd_tx,
                 ask_gateway: (fleet.is_some() || up_is_linked).then(|| up_tx.clone()),
                 link: up_is_linked.then(|| LinkStatus {
@@ -1260,6 +1281,11 @@ impl Bridge {
                 Some(d) = deliv_rx.recv() => b.on_delivery_done(d).await,
                 // A round of screen readings came back from off the loop
                 Some(scan) = dialog_rx.recv() => b.decide_dialogs(scan).await,
+                // A probe that ran off the loop came back
+                Some(p) = probe_rx.recv() => match p {
+                    ProbeDone::Usage(out) => b.on_usage_probe(out).await,
+                    ProbeDone::SignIn(v) => b.on_sign_in_probe(v).await,
+                },
                 Some(c) = click_rx.recv() => b.on_perm_click(c).await,
                 _ = flush.tick() => {
                     // **Every branch of this loop is one task.** While a step here runs, inbound
@@ -1281,8 +1307,8 @@ impl Bridge {
                     timed!(slow, "stale-pools", b.give_up_stale_pools(&LogCtx::default()).await);
                     timed!(slow, "sweep-pools", b.sweep_pools(&LogCtx::default()));
                     timed!(slow, "worker-cleanup", b.cleanup_workers().await);
-                    timed!(slow, "usage", b.usage_tick().await);
-                    timed!(slow, "sign-in", b.sign_in_tick().await);
+                    timed!(slow, "usage", b.usage_kick());
+                    timed!(slow, "sign-in", b.sign_in_kick());
                     if !slow.is_empty() {
                         LogCtx::default().info(
                             "bridge",

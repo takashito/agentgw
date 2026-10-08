@@ -2,7 +2,7 @@
 //! failure of a turn, the usage-limit watch, the silence watch, tool permission prompts,
 //! and writing the progress message.
 
-use super::{Bridge, DialogPending, DialogScan, Host};
+use super::{Bridge, DialogPending, DialogScan, Host, ProbeDone};
 use crate::agent::Window;
 use crate::agent::{Dialog, HookEvent, ProbeErr, SessionId};
 use crate::bridge::state as bridge;
@@ -680,6 +680,35 @@ impl Bridge {
     /// - **raise the gate if any window has hit its limit**. All windows are checked, and the latest
     ///   reset time wins (the weekly wall applies even when the session is low)
     /// - on newly crossing 80% / 90%, warn each live thread once
+    /// Starts the `/usage` probe **off the loop** and returns at once. It runs a `claude`, which
+    /// takes seconds, and the loop holds nothing while it does. The answer comes back as
+    /// [`ProbeDone::Usage`] and is read in [`Self::on_usage_probe`].
+    pub(super) fn usage_kick(&mut self) {
+        let now = self.deps.clock.now_ms();
+        let due = self.usage_polled_at_ms
+            + if self.usage_at_risk {
+                crate::bridge::command::UsageWatch::POLL_AT_RISK_MS
+            } else {
+                crate::bridge::command::UsageWatch::POLL_MS
+            };
+        // Wait a bit right after start-up (don't hit start-up with a probe)
+        if self.usage_polled_at_ms == 0 {
+            self.usage_polled_at_ms = self.started_at_ms + USAGE_MONITOR_STARTUP_DELAY_MS;
+            return;
+        }
+        if now < due || self.access.owner.is_empty() {
+            return;
+        }
+        self.usage_polled_at_ms = now;
+        let (agent, tx) = (self.deps.agent.clone(), self.probe_tx.clone());
+        tokio::spawn(async move {
+            let argv = agent.usage_argv();
+            let out = agent.probe(argv, Host::home()).await;
+            let _ = tx.send(ProbeDone::Usage(out)).await;
+        });
+    }
+
+    #[cfg(test)]
     pub(super) async fn usage_tick(&mut self) {
         let now = self.deps.clock.now_ms();
         let due = self.usage_polled_at_ms
@@ -708,6 +737,20 @@ impl Bridge {
                     "bridge",
                     &format!("usage-monitor: /usage probe failed: {m}"),
                 );
+                return;
+            }
+        };
+        self.on_usage_probe(Ok(raw)).await;
+    }
+
+    /// What the `/usage` probe came back with. **Reading only** — the probe already ran elsewhere.
+    pub(super) async fn on_usage_probe(&mut self, out: Result<String, ProbeErr>) {
+        let ctx = LogCtx::default();
+        let now = self.deps.clock.now_ms();
+        let raw = match out {
+            Ok(raw) => raw,
+            Err(ProbeErr::Failed(m) | ProbeErr::Errored(m)) => {
+                ctx.error("bridge", &format!("usage-monitor: /usage probe failed: {m}"));
                 return;
             }
         };

@@ -1081,15 +1081,44 @@ impl Bridge {
     /// notify the notification target **once, at the moment it is found expired**. Nothing is said when it comes back. If it
     /// couldn't be checked (`None`), the state is left alone. Not watched while there is no Owner yet (before first setup) —
     /// being signed out is expected then, and there is nobody to tell
-    pub(in crate::bridge) async fn sign_in_tick(&mut self) {
+    /// Starts the sign-in check **off the loop** and returns at once: it runs a `claude`, which
+    /// takes seconds. The answer comes back as [`crate::bridge::ProbeDone::SignIn`].
+    pub(in crate::bridge) fn sign_in_kick(&mut self) {
+        if !self.sign_in_due() {
+            return;
+        }
+        let (agent, tx) = (self.deps.agent.clone(), self.probe_tx.clone());
+        tokio::spawn(async move {
+            let answer = agent.signed_in().await;
+            let _ = tx.send(crate::bridge::ProbeDone::SignIn(answer)).await;
+        });
+    }
+
+    /// Whether this round should ask, **and marks it asked**. Every 12 hours, owner permitting.
+    fn sign_in_due(&mut self) -> bool {
         const EVERY_MS: u64 = 12 * 60 * 60 * 1000;
         let now = self.deps.clock.now_ms();
         let due = self.sign_in.checked_at_ms == 0 || now >= self.sign_in.checked_at_ms + EVERY_MS;
         if !due || self.access.owner.is_empty() {
-            return;
+            return false;
         }
         self.sign_in.checked_at_ms = now;
-        let Some(signed_in) = self.deps.agent.signed_in().await else {
+        true
+    }
+
+    /// Asks and acts in one go. **The loop never calls this** — it kicks the asking off itself.
+    #[cfg(test)]
+    pub(in crate::bridge) async fn sign_in_tick(&mut self) {
+        if !self.sign_in_due() {
+            return;
+        }
+        let answer = self.deps.agent.signed_in().await;
+        self.on_sign_in_probe(answer).await;
+    }
+
+    /// What the sign-in check came back with. `None` = unanswerable, so nothing changes.
+    pub(in crate::bridge) async fn on_sign_in_probe(&mut self, answer: Option<bool>) {
+        let Some(signed_in) = answer else {
             return;
         };
         let was = self.sign_in.last_known.replace(signed_in);
