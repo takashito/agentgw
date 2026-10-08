@@ -2,7 +2,7 @@
 //! failure of a turn, the usage-limit watch, the silence watch, tool permission prompts,
 //! and writing the progress message.
 
-use super::{Bridge, DialogPending, Host};
+use super::{Bridge, DialogPending, DialogScan, Host};
 use crate::agent::Window;
 use crate::agent::{Dialog, HookEvent, ProbeErr, SessionId};
 use crate::bridge::state as bridge;
@@ -888,10 +888,41 @@ impl Bridge {
     ///
     /// It costs one `capture-pane` per quiet thread per round. Threads already waiting on a
     /// prompt are skipped, so a modal is offered once, not every round.
+    /// Reads every watched screen and acts on what it finds, in one go. **The loop never calls this**
+    /// — it kicks the reading off itself ([`Self::dialog_kick`]) and acts on the answer when it comes
+    /// back. Tests drive the whole round through here.
+    #[cfg(test)]
     pub(super) async fn dialog_tick(&mut self) {
+        let Some(reads) = self.read_dialog_screens() else {
+            return;
+        };
+        let scan = reads.await;
+        self.decide_dialogs(scan).await;
+    }
+
+    /// Starts the reading **off the loop** and returns at once. The result comes back as a
+    /// [`DialogScan`] on the channel, and the loop acts on it in [`Self::decide_dialogs`].
+    ///
+    /// Reading is the slow half: each screen is a process spawn, measured at 0.17-0.43s on a busy
+    /// machine, and while the loop holds it every delivery and hook waits.
+    pub(super) fn dialog_kick(&mut self) {
+        let tx = self.dialog_tx.clone();
+        let Some(reads) = self.read_dialog_screens() else {
+            return;
+        };
+        tokio::spawn(async move {
+            let _ = tx.send(reads.await).await;
+        });
+    }
+
+    /// The watched screens, read side by side. `None` = not due, or nobody to look at.
+    /// **The decision of whether to look is made here, on the loop**; only the reading is handed out.
+    fn read_dialog_screens(
+        &mut self,
+    ) -> Option<impl std::future::Future<Output = DialogScan> + 'static> {
         let now = self.deps.clock.now_ms();
         if now < self.dialog_watch_at_ms {
-            return;
+            return None;
         }
         self.dialog_watch_at_ms = now + DIALOG_WATCH_EVERY_MS;
         // **Every thread with an agent, not only the ones being watched for silence.** That
@@ -914,23 +945,35 @@ impl Bridge {
                     .then(|| (ThreadKey::new(&channel, thread_ts), session))
             })
             .collect();
-        // **The reads happen together, not one after another.** Each one spawns a process, and
-        // spawning on a busy machine was measured at 0.17-0.43s — walking them in turn put the sum
-        // on the main loop, where every delivery and hook waits behind it. Side by side the cost is
-        // the slowest single read instead
-        let screens: HashMap<String, Option<Dialog>> = {
-            let reads = candidates.iter().map(|(_, session)| {
+        if candidates.is_empty() {
+            return None;
+        }
+        // **Side by side, not one after another** — the cost is then the slowest single read
+        let reads: Vec<_> = candidates
+            .iter()
+            .map(|(_, session)| {
                 let agent = self.deps.agent.clone();
                 let window = self.workers.window_for(session);
                 let session = session.clone();
                 tokio::task::spawn_blocking(move || (session, agent.dialog(&Window::of(&window))))
-            });
-            futures_util::future::join_all(reads)
-                .await
-                .into_iter()
-                .flatten()
-                .collect()
-        };
+            })
+            .collect();
+        Some(async move {
+            DialogScan {
+                now,
+                candidates,
+                screens: futures_util::future::join_all(reads)
+                    .await
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+            }
+        })
+    }
+
+    /// Acts on what the screens held: retire a prompt the screen has moved past, offer a new modal.
+    pub(super) async fn decide_dialogs(&mut self, scan: DialogScan) {
+        let DialogScan { now, candidates, screens } = scan;
         for (key, session) in candidates {
             let (channel, Some(thread_ts)) = key.split() else {
                 continue;

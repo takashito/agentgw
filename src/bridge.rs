@@ -90,6 +90,8 @@ pub struct Bridge {
     /// plain one, which is what the queued path always did.
     pending_envelopes: HashMap<String, String>,
     deliv_tx: mpsc::Sender<DeliveryDone>,
+    /// Where a finished screen reading reports back (see [`DialogScan`]).
+    dialog_tx: mpsc::Sender<DialogScan>,
     lifecycle: bridge::Lifecycle,
     ledger: bridge::Ledger,
     sticky: slack::StickyBoard,
@@ -175,6 +177,8 @@ struct Config {
     machine_name: String,
     cmd_tx: mpsc::Sender<CmdFx>,
     deliv_tx: mpsc::Sender<DeliveryDone>,
+    /// Where a finished screen reading reports back (see [`DialogScan`]).
+    dialog_tx: mpsc::Sender<DialogScan>,
     ask_gateway: Option<mpsc::UnboundedSender<crate::bridge::gateway::link::LinkFrame>>,
     /// Set on a machine: the gateway it is linked to (`status` says so).
     link: Option<LinkStatus>,
@@ -194,6 +198,20 @@ pub struct DeliveryDone {
     /// The message that was handed over, so the queue can drop exactly it.
     pub msg_ts: String,
     pub result: Result<(), String>,
+}
+
+/// What the modal watch found on the agents' screens. **The one way a screen reading enters the loop.**
+///
+/// Reading a screen is a process spawn each (0.17-0.43s on a busy machine), so the reading happens
+/// off the loop and only the decision — retire a stale prompt, offer a new modal — runs on it, in
+/// [`Bridge::decide_dialogs`].
+pub struct DialogScan {
+    /// When the round was decided on, for the quiet-window check.
+    pub now: u64,
+    /// The agents looked at: their thread and session.
+    pub candidates: Vec<(ThreadKey, String)>,
+    /// session_id → what its screen held.
+    pub screens: HashMap<String, Option<crate::agent::Dialog>>,
 }
 
 /// A dialog offered to a thread as buttons, waiting for someone to press one.
@@ -274,6 +292,7 @@ impl Bridge {
             pending_envelopes: HashMap::new(),
             delivery_trouble: HashMap::new(),
             deliv_tx: config.deliv_tx,
+            dialog_tx: config.dialog_tx,
             lifecycle: bridge::Lifecycle::new(),
             sticky: slack::StickyBoard::default(),
             perm_pending: HashMap::new(),
@@ -326,6 +345,8 @@ impl Bridge {
             machine_name: "test-machine".into(),
             cmd_tx,
             deliv_tx,
+            // Tests drive a whole round through `dialog_tick`, so nothing ever comes back this way
+            dialog_tx: mpsc::channel(1).0,
             ask_gateway: None,
             link: None,
             machines_now: None,
@@ -918,6 +939,8 @@ impl Bridge {
         let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
         // Deliveries run off the loop and report back here. 64 is plenty: one per window in flight
         let (deliv_tx, mut deliv_rx) = mpsc::channel::<DeliveryDone>(64);
+        // One round of screen readings at a time is plenty: the watch fires every 10s
+        let (dialog_tx, mut dialog_rx) = mpsc::channel::<DialogScan>(4);
         let (reload_tx, mut reload_rx) = mpsc::channel(4);
         // The gateway asking for a thread's machine to be written down. **Only this loop writes
         // threads.json**, so the gateway hands the pair over instead of saving the file itself.
@@ -1162,6 +1185,7 @@ impl Bridge {
                 fleet: fleet.is_some(),
                 machine_name: machine_name.clone(),
                 deliv_tx,
+                dialog_tx,
                 cmd_tx,
                 ask_gateway: (fleet.is_some() || up_is_linked).then(|| up_tx.clone()),
                 link: up_is_linked.then(|| LinkStatus {
@@ -1234,6 +1258,8 @@ impl Bridge {
                 Some(fx) = cmd_rx.recv() => b.on_cmd_fx(fx).await,
                 // A delivery finished off the loop. Everything that used to follow the call happens here
                 Some(d) = deliv_rx.recv() => b.on_delivery_done(d).await,
+                // A round of screen readings came back from off the loop
+                Some(scan) = dialog_rx.recv() => b.decide_dialogs(scan).await,
                 Some(c) = click_rx.recv() => b.on_perm_click(c).await,
                 _ = flush.tick() => {
                     // **Every branch of this loop is one task.** While a step here runs, inbound
@@ -1248,7 +1274,7 @@ impl Bridge {
                     timed!(slow, "drains", b.run_drains().await);
                     timed!(slow, "stickies", b.flush_stickies().await);
                     timed!(slow, "perm-expiry", b.expire_perm_prompts().await);
-                    timed!(slow, "dialogs", b.dialog_tick().await);
+                    timed!(slow, "dialogs", b.dialog_kick());
                     timed!(slow, "retries", b.retry_pending(&LogCtx::default()));
                     timed!(slow, "unreceived", b.warn_unreceived(&LogCtx::default()));
                     timed!(slow, "stuck-deliveries", b.give_up_stuck_deliveries(&LogCtx::default()));
