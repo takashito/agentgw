@@ -1383,16 +1383,18 @@ impl Bridge {
     /// answer to the 18-minute silence of 2026-08-18.
     pub(super) fn retry_pending(&mut self, ctx: &LogCtx) {
         let roots: Vec<String> = self.pending.keys().cloned().collect();
+        if roots.is_empty() {
+            return;
+        }
+        // One window list for the whole round, not a tmux call per waiting thread
+        let live = self.live_windows();
         for root_ts in roots {
             let entry = self.threads.get(&root_ts).cloned();
             let Some(sid) = entry.as_ref().and_then(|e| e.agent_id.clone()) else {
                 continue;
             };
-            let window = SessionId::from(sid.clone()).window_name();
             // Push only to agents that can hear. For Starting ones, the user_prompt path still flushes
-            if self.workers.state_of(entry.as_ref(), &window, self.deps.agent.as_ref())
-                != crate::agent::WorkerState::Ready
-            {
+            if self.workers.state_in(entry.as_ref(), &live) != crate::agent::WorkerState::Ready {
                 continue;
             }
             let key = entry

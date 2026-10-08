@@ -2,7 +2,7 @@
 //! failure of a turn, the usage-limit watch, the silence watch, tool permission prompts,
 //! and writing the progress message.
 
-use super::{Bridge, DialogPending, DialogScan, Host, ProbeDone};
+use super::{Bridge, DialogPending, DialogScan, Host, ProbeDone, StickyPosted};
 use crate::agent::Window;
 use crate::agent::{Dialog, HookEvent, ProbeErr, SessionId};
 use crate::bridge::state as bridge;
@@ -2167,15 +2167,38 @@ impl Bridge {
                     }
                 });
             }
-            None => match self
-                .deps
-                .slack
-                .post_blocks(&channel, &alt, blocks, root.as_deref())
-                .await
-            {
-                Ok(ts) => self.sticky.set_posted(key, &ts),
-                Err(e) => ctx.error("bridge", &format!("sticky post failed: {e}")),
-            },
+            // **Off the loop like the update, even though the answer matters.** The ts comes back
+            // as a `StickyPosted` and the board is marked then; until it does, the board refuses to
+            // post this thread again (`posting`), so there is never a second progress message
+            None => {
+                let (api, tx, key) = (self.deps.slack.clone(), self.sticky_tx.clone(), key.clone());
+                tokio::spawn(async move {
+                    let out = api
+                        .post_blocks(&channel, &alt, blocks, root.as_deref())
+                        .await;
+                    if let Err(e) = &out {
+                        ctx.error("bridge", &format!("sticky post failed: {e}"));
+                    }
+                    let _ = tx.send(StickyPosted { key, ts: out.ok() }).await;
+                });
+            }
+        }
+    }
+}
+
+impl Bridge {
+    /// Where the first post's ts lands. Without it the board would keep refusing to touch that
+    /// progress message (see [`StickyPosted`]).
+    pub(super) async fn on_sticky_posted(&mut self, done: StickyPosted) {
+        let Some(ts) = done.ts else {
+            self.sticky.post_failed(&done.key);
+            return;
+        };
+        self.sticky.set_posted(&done.key, &ts);
+        // The turn may have ended while the post was out, and the board held the last render back
+        // rather than open a second message. Draw it now, as an update
+        if let Some((posted, blocks)) = self.sticky.take_final(&done.key) {
+            self.flush_sticky(&done.key, posted, blocks).await;
         }
     }
 }

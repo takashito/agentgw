@@ -94,6 +94,8 @@ pub struct Bridge {
     dialog_tx: mpsc::Sender<DialogScan>,
     /// Where a finished probe reports back (see [`ProbeDone`]).
     probe_tx: mpsc::Sender<ProbeDone>,
+    /// Where a progress message's first post reports its ts (see [`StickyPosted`]).
+    sticky_tx: mpsc::Sender<StickyPosted>,
     lifecycle: bridge::Lifecycle,
     ledger: bridge::Ledger,
     sticky: slack::StickyBoard,
@@ -183,6 +185,8 @@ struct Config {
     dialog_tx: mpsc::Sender<DialogScan>,
     /// Where a finished probe reports back (see [`ProbeDone`]).
     probe_tx: mpsc::Sender<ProbeDone>,
+    /// Where a progress message's first post reports its ts (see [`StickyPosted`]).
+    sticky_tx: mpsc::Sender<StickyPosted>,
     ask_gateway: Option<mpsc::UnboundedSender<crate::bridge::gateway::link::LinkFrame>>,
     /// Set on a machine: the gateway it is linked to (`status` says so).
     link: Option<LinkStatus>,
@@ -228,6 +232,15 @@ pub enum ProbeDone {
     Usage(Result<String, crate::agent::ProbeErr>),
     /// Whether this machine's agent is signed in. `None` = the question could not be answered.
     SignIn(Option<bool>),
+}
+
+/// Where a progress message's **first** post reports its ts. `None` = it did not land.
+///
+/// The post happens off the loop like every other Slack call, but its answer has to be kept, so it
+/// comes back here and [`Bridge::on_sticky_posted`] writes it down.
+pub struct StickyPosted {
+    pub key: ThreadKey,
+    pub ts: Option<String>,
 }
 
 /// A dialog offered to a thread as buttons, waiting for someone to press one.
@@ -310,6 +323,7 @@ impl Bridge {
             deliv_tx: config.deliv_tx,
             dialog_tx: config.dialog_tx,
             probe_tx: config.probe_tx,
+            sticky_tx: config.sticky_tx,
             lifecycle: bridge::Lifecycle::new(),
             sticky: slack::StickyBoard::default(),
             perm_pending: HashMap::new(),
@@ -366,6 +380,7 @@ impl Bridge {
             // comes back this way
             dialog_tx: mpsc::channel(1).0,
             probe_tx: mpsc::channel(1).0,
+            sticky_tx: mpsc::channel(8).0,
             ask_gateway: None,
             link: None,
             machines_now: None,
@@ -961,6 +976,7 @@ impl Bridge {
         // One round of screen readings at a time is plenty: the watch fires every 10s
         let (dialog_tx, mut dialog_rx) = mpsc::channel::<DialogScan>(4);
         let (probe_tx, mut probe_rx) = mpsc::channel::<ProbeDone>(4);
+        let (sticky_tx, mut sticky_rx) = mpsc::channel::<StickyPosted>(64);
         let (reload_tx, mut reload_rx) = mpsc::channel(4);
         // The gateway asking for a thread's machine to be written down. **Only this loop writes
         // threads.json**, so the gateway hands the pair over instead of saving the file itself.
@@ -1207,6 +1223,7 @@ impl Bridge {
                 deliv_tx,
                 dialog_tx,
                 probe_tx,
+                sticky_tx,
                 cmd_tx,
                 ask_gateway: (fleet.is_some() || up_is_linked).then(|| up_tx.clone()),
                 link: up_is_linked.then(|| LinkStatus {
@@ -1282,6 +1299,8 @@ impl Bridge {
                 // A round of screen readings came back from off the loop
                 Some(scan) = dialog_rx.recv() => b.decide_dialogs(scan).await,
                 // A probe that ran off the loop came back
+                // A progress message's first post came back with its ts
+                Some(done) = sticky_rx.recv() => b.on_sticky_posted(done).await,
                 Some(p) = probe_rx.recv() => match p {
                     ProbeDone::Usage(out) => b.on_usage_probe(out).await,
                     ProbeDone::SignIn(v) => b.on_sign_in_probe(v).await,

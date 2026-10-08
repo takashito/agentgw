@@ -211,6 +211,27 @@ impl Workers {
         })
     }
 
+    /// The same answer as [`Self::state_of`], from a window list already in hand. **For callers that
+    /// look at several threads in a row**: `state_of` asks tmux once per thread, and a tmux call is a
+    /// process spawn (0.17-0.43s on a busy machine), so a round over N threads put N spawns on the
+    /// main loop.
+    pub fn state_in(
+        &self,
+        entry: Option<&ThreadEntry>,
+        live: &HashMap<String, String>,
+    ) -> WorkerState {
+        let Some(sid) = entry.and_then(|e| e.agent_id.as_deref()) else {
+            return WorkerState::Absent;
+        };
+        let h = self.hooked.get(sid);
+        Self::state_from(&WorkerFacts {
+            // A window in the list is a live agent; the list itself drops husks
+            pid: live.get(sid).map(|_| 0),
+            starting: self.is_starting(sid),
+            ended: h.is_some_and(|h| h.ended),
+        })
+    }
+
     /// Whether it is alive. The order is the priority — **an ended session is gone even if its pid remains**
     /// (making it Starting makes `Action::decide` return Queue, and the queue grows forever
     /// without a respawn).
@@ -998,8 +1019,10 @@ impl Bridge {
         if !self.workers.cleanup_due(self.deps.clock.now_ms()) {
             return;
         }
+        // One list for both halves — each used to fetch its own
+        let live = self.live_windows();
         self.reap_stray_windows().await;
-        self.evict_idle_worker().await;
+        self.evict_idle_worker(&live).await;
     }
 
     /// Closes windows that belong to nobody (empty and orphaned windows).
@@ -1133,7 +1156,7 @@ impl Bridge {
     }
 
     /// Tears down one cold thread agent.
-    async fn evict_idle_worker(&mut self) {
+    async fn evict_idle_worker(&mut self, live: &HashMap<String, String>) {
         let now = self.deps.clock.now_ms();
         let mut snaps: Vec<worker::IdleSnapshot> = Vec::new();
         let mut sid_of: HashMap<ThreadKey, String> = HashMap::new();
@@ -1143,9 +1166,6 @@ impl Bridge {
             .values()
             .map(|p| ThreadKey::new(&p.channel, &p.thread_ts))
             .collect();
-        // Liveness comes from the real thing, not memory (same approach as status) — but from
-        // **one** window list, not a tmux call per thread
-        let live = self.live_windows();
         for (tts, e) in &self.threads.entries {
             let (Some(channel_id), Some(sid)) = (e.channel_id.as_deref(), e.agent_id.as_deref())
             else {

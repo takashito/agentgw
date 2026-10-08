@@ -299,6 +299,10 @@ pub enum StickyAction {
 struct Sticky {
     items: Vec<RenderItem>,
     posted_ts: Option<String>,
+    /// A first post is out and its ts has not come back yet. **Nothing else may post this one**:
+    /// the post happens off the loop, and without this a second flush one second later would open a
+    /// second progress message in the same thread.
+    posting: bool,
     dirty: bool,
     last_flush_ms: Option<u64>,
     /// A permission wait expired. The note stays until the next round.
@@ -539,6 +543,15 @@ impl StickyBoard {
     pub fn set_posted(&mut self, key: &ThreadKey, ts: &str) {
         let s = self.stickies.entry(key.clone()).or_default();
         s.posted_ts = Some(ts.to_string());
+        s.posting = false;
+    }
+
+    /// The first post did not land. Let the next flush try again.
+    pub fn post_failed(&mut self, key: &ThreadKey) {
+        if let Some(s) = self.stickies.get_mut(key) {
+            s.posting = false;
+            s.dirty = true;
+        }
     }
 
     /// ts of the **progress message currently shown** in this thread. Used to tell whether
@@ -553,12 +566,14 @@ impl StickyBoard {
         let mut out = Vec::new();
         for (key, s) in self.stickies.iter_mut() {
             if !s.dirty
+                || s.posting
                 || s.last_flush_ms
                     .is_some_and(|t| now_ms.saturating_sub(t) < 1000)
             {
                 continue;
             }
             s.dirty = false;
+            s.posting = s.posted_ts.is_none();
             s.last_flush_ms = Some(now_ms);
             out.push((
                 key.clone(),
@@ -574,6 +589,11 @@ impl StickyBoard {
     pub fn take_final(&mut self, key: &ThreadKey) -> Option<(Option<String>, serde_json::Value)> {
         let s = self.stickies.get_mut(key)?;
         if !s.dirty {
+            return None;
+        }
+        // A first post is still out. Posting now would open a second message, so leave it dirty:
+        // the flush that follows the ts coming back draws this same final state as an update
+        if s.posting {
             return None;
         }
         s.dirty = false;
@@ -1677,6 +1697,8 @@ mod tests {
         let dirty = b.take_dirty(10_000);
         assert_eq!(dirty.len(), 1);
         assert!(text_of(&dirty[0].2).contains("cargo test") && text_of(&dirty[0].2).contains("● ビルド"));
+        // The first post's ts comes back before anything else may touch it
+        b.set_posted(&ThreadKey::parse("k"), "999.0");
         // A re-flush within 1 second is held back by the rate guard
         b.push_narration(&ThreadKey::parse("k"), "続き");
         assert!(b.take_dirty(10_500).is_empty());
@@ -1736,7 +1758,8 @@ mod tests {
             .unwrap();
         assert_eq!(card["status"], "in_progress", "{blocks}");
 
-        // and settles to complete once the last row is done
+        // and settles to complete once the last row is done (the first post's ts is back by then)
+        b.set_posted(&ThreadKey::parse("k"), "999.0");
         b.tool("t2", "Bash", "cargo test", ToolStatus::Done);
         let blocks = b.take_dirty(20_000).pop().unwrap().2;
         let card = blocks
@@ -1936,12 +1959,39 @@ mod tests {
         assert_eq!(text_of(&dirty[0].2), "└ `Interrupted by user.`");
     }
 
+    /// A first post is out and its ts has not come back. **Nothing else may post this thread** —
+    /// the post happens off the loop, so a flush one second later would otherwise open a second
+    /// progress message in the same thread. A post that fails re-arms the next flush.
+    #[test]
+    fn a_thread_waiting_for_its_first_post_is_never_posted_twice() {
+        let k = ThreadKey::parse("k");
+        let mut b = StickyBoard::default();
+        b.on_turn_start(&k);
+        b.tool("t1", "Bash", "cargo test", ToolStatus::Pending);
+        assert_eq!(b.take_dirty(10_000).len(), 1, "the first post goes out");
+        b.tool("t2", "Read", "/x", ToolStatus::Done);
+        assert!(b.take_dirty(11_100).is_empty(), "held while the post is out");
+        assert!(b.take_final(&k).is_none(), "the final render waits as well");
+        b.set_posted(&k, "999.0");
+        let (ts, _) = b.take_final(&k).expect("drawn once the ts is known");
+        assert_eq!(ts.as_deref(), Some("999.0"), "and as an update, not a post");
+
+        // A post that did not land leaves the thread ready to try again
+        let mut b = StickyBoard::default();
+        b.on_turn_start(&k);
+        b.tool("t1", "Bash", "cargo test", ToolStatus::Pending);
+        assert_eq!(b.take_dirty(10_000).len(), 1);
+        b.post_failed(&k);
+        assert_eq!(b.take_dirty(11_100).len(), 1, "the next flush posts again");
+    }
+
     #[test]
     fn final_flush_ignores_the_throttle() {
         let mut b = StickyBoard::default();
         b.on_turn_start(&ThreadKey::parse("k"));
         b.tool("t1", "Bash", "cargo test", ToolStatus::Pending);
         assert_eq!(b.take_dirty(10_000).len(), 1);
+        b.set_posted(&ThreadKey::parse("k"), "999.0");
         b.tool("t1", "Bash", "cargo test", ToolStatus::Done);
         // Even within the throttle, the final render right before settling goes out (it does not freeze at ◌)
         assert!(
@@ -1949,7 +1999,7 @@ mod tests {
             "通常 flush はスロットルで出ない"
         );
         let (ts, body) = b.take_final(&ThreadKey::parse("k")).expect("final draw");
-        assert_eq!(ts, None);
+        assert_eq!(ts.as_deref(), Some("999.0"));
         let body = text_of(&body);
         assert!(body.contains("Ran 1 command") && body.contains("cargo test"), "{body}");
         assert!(
