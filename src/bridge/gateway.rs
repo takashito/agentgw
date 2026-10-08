@@ -1024,8 +1024,27 @@ impl<'a> Event<'a> {
     ///
     /// Only "a person's message whose channel could be read" qualifies. Reactions and joins
     /// can't be commands.
+    ///
+    /// **A change that leaves the text as it was is not a message.** Slack re-sends a thread's
+    /// first post as `message_changed` when replies land under it (its reply count changed), and
+    /// an unfurl does the same. Read as a command, a thread opened with `route` printed the table
+    /// again on a later reply — and one opened with `cd` would move again. The machines' own
+    /// reading drops these the same way.
     pub fn is_a_command_candidate(&self, owner: Option<&str>) -> bool {
-        self.name == "message" && self.channel().is_some() && !self.speaks_as_a_bot(owner)
+        self.name == "message"
+            && self.channel().is_some()
+            && !self.speaks_as_a_bot(owner)
+            && !self.text_unchanged()
+    }
+
+    /// A `message_changed` whose text is the same before and after.
+    fn text_unchanged(&self) -> bool {
+        self.str_at("subtype") == Some("message_changed")
+            && self.text()
+                == self
+                    .raw
+                    .get("previous_message")
+                    .and_then(|p| p.get("text")?.as_str())
     }
 
     /// **This message puts the bot in its thread**: a person addressing it (a mention, or a DM), or
@@ -5583,6 +5602,18 @@ mod tests {
         });
         assert!(Event::new("message", &bot_edit).from_a_bot());
         assert!(!Event::new("message", &bot_edit).is_a_command_candidate(Some(OWNER)));
+    }
+
+    /// **A reply re-sends the thread's first post with its text unchanged.** That is not the Owner
+    /// typing `route` again — answering it printed the table a second time after a `cd`.
+    #[test]
+    fn a_thread_first_post_resent_unchanged_is_not_a_command() {
+        let first = serde_json::json!({"user": OWNER, "ts": "111.1", "text": "<@U_BOT> route"});
+        let resent = serde_json::json!({
+            "channel": "C1", "subtype": "message_changed", "ts": "999.9",
+            "message": first, "previous_message": first
+        });
+        assert!(!Event::new("message", &resent).is_a_command_candidate(Some(OWNER)));
     }
 
     // ── route / set-home ────────────────────────────────────────────────────
