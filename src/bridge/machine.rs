@@ -386,14 +386,7 @@ impl RelayLink {
                     }
                     continue;
                 }
-                Wake::Beat(Beat::Text(t)) => {
-                    // The moment a frame came off the wire. With the gateway's write line and the
-                    // handling line that follows, the three timestamps split the path into
-                    // queue → wire → this process
-                    LogCtx::default()
-                        .debug("bridge", &format!("remote link: read {}B off the link", t.len()));
-                    t
-                }
+                Wake::Beat(Beat::Text(t)) => t,
                 Wake::Beat(Beat::Alive) => continue,
                 Wake::Beat(Beat::Ping) => {
                     if socket.send(M::Ping(Default::default())).await.is_err() {
