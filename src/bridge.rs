@@ -34,6 +34,10 @@ use tokio::sync::mpsc;
 
 /// How often progress messages are pushed to Slack. The board also throttles to once a second per thread on its own.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(500);
+/// A flush-tick step that holds the loop this long is worth a line: at 500ms it has already eaten
+/// a whole tick, and everything waiting on the loop (an inbound Slack message, a hook, a tool call)
+/// waited with it.
+const SLOW_STEP_MS: u64 = 500;
 
 /// The note left in threads with unanswered messages.
 ///
@@ -1208,6 +1212,18 @@ impl Bridge {
         let mut sighup = signal(SignalKind::hangup())?;
         let mut sigusr1 = signal(SignalKind::user_defined1())?;
         let mut flush = tokio::time::interval(FLUSH_INTERVAL);
+        /// One step of the flush tick, timed. Over [`SLOW_STEP_MS`] it adds its name to `$slow`.
+        /// `$slow` is passed in because a macro body cannot see the caller's locals.
+        macro_rules! timed {
+            ($slow:ident, $name:literal, $call:expr) => {{
+                let started = std::time::Instant::now();
+                $call;
+                let ms = started.elapsed().as_millis();
+                if ms >= u128::from(SLOW_STEP_MS) {
+                    $slow.push(format!(concat!($name, "={}ms"), ms));
+                }
+            }};
+        }
 
         loop {
             tokio::select! {
@@ -1220,20 +1236,37 @@ impl Bridge {
                 Some(d) = deliv_rx.recv() => b.on_delivery_done(d).await,
                 Some(c) = click_rx.recv() => b.on_perm_click(c).await,
                 _ = flush.tick() => {
-                    b.scan_transcripts();
-                    b.stall_tick();
-                    b.run_drains().await;
-                    b.flush_stickies().await;
-                    b.expire_perm_prompts().await;
-                    b.dialog_tick().await;
-                    b.retry_pending(&LogCtx::default());
-                    b.warn_unreceived(&LogCtx::default());
-                    b.give_up_stuck_deliveries(&LogCtx::default());
-                    b.give_up_stale_pools(&LogCtx::default()).await;
-                    b.sweep_pools(&LogCtx::default());
-                    b.cleanup_workers().await;
-                    b.usage_tick().await;
-                    b.sign_in_tick().await;
+                    // **Every branch of this loop is one task.** While a step here runs, inbound
+                    // messages, hooks and dispositions all wait — and most steps log nothing when
+                    // they succeed, so a slow one is invisible. Any step over the budget names
+                    // itself (measured: deliveries arriving tens of seconds late with the Bridge
+                    // apparently idle)
+                    let mut slow: Vec<String> = Vec::new();
+                    let tick = std::time::Instant::now();
+                    timed!(slow, "transcripts", b.scan_transcripts());
+                    timed!(slow, "stall", b.stall_tick());
+                    timed!(slow, "drains", b.run_drains().await);
+                    timed!(slow, "stickies", b.flush_stickies().await);
+                    timed!(slow, "perm-expiry", b.expire_perm_prompts().await);
+                    timed!(slow, "dialogs", b.dialog_tick().await);
+                    timed!(slow, "retries", b.retry_pending(&LogCtx::default()));
+                    timed!(slow, "unreceived", b.warn_unreceived(&LogCtx::default()));
+                    timed!(slow, "stuck-deliveries", b.give_up_stuck_deliveries(&LogCtx::default()));
+                    timed!(slow, "stale-pools", b.give_up_stale_pools(&LogCtx::default()).await);
+                    timed!(slow, "sweep-pools", b.sweep_pools(&LogCtx::default()));
+                    timed!(slow, "worker-cleanup", b.cleanup_workers().await);
+                    timed!(slow, "usage", b.usage_tick().await);
+                    timed!(slow, "sign-in", b.sign_in_tick().await);
+                    if !slow.is_empty() {
+                        LogCtx::default().info(
+                            "bridge",
+                            &format!(
+                                "flush tick held the loop for {}ms — {}",
+                                tick.elapsed().as_millis(),
+                                slow.join(" ")
+                            ),
+                        );
+                    }
                 }
                 _ = sigterm.recv() => b.shutdown("signal:SIGTERM").await,
                 _ = sigint.recv() => b.shutdown("signal:SIGINT").await,

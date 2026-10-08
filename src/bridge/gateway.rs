@@ -3880,9 +3880,20 @@ async fn on_socket(fleet: Arc<Fleet>, bridge_id: String, mut socket: WebSocket) 
             outgoing = rx.recv() => match outgoing {
                 Some(text) => {
                     watch.on_traffic();
+                    // Timed because a frame can only wait in two places: this task (one task both
+                    // sends and receives, so a slow receive holds a send) or the wire. The queueing log
+                    // above says when it was queued; this one says when it actually left
+                    let (n, started) = (text.len(), std::time::Instant::now());
                     if socket.send(Message::Text(text.into())).await.is_err() {
                         break;
                     }
+                    rlog(
+                        "debug",
+                        &format!(
+                            "{bridge_id}: wrote {n}B to the link in {}ms",
+                            started.elapsed().as_millis()
+                        ),
+                    );
                 }
                 None => break,
             },
