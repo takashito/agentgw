@@ -1106,12 +1106,14 @@ impl Bridge {
     pub(super) fn forget_unresumable_threads(&mut self, ctx: &LogCtx) {
         let before = self.threads.entries.len();
         let agent = self.deps.agent.clone();
+        // One window list for the whole sweep. Asking tmux per record cost a process spawn each,
+        // which on a real machine was 60 spawns at 0.27s — 16s added to every start-up
+        let live = self.live_windows();
         self.threads.entries.retain(|_, e| {
             let Some(sid) = e.agent_id.as_deref() else {
                 return true; // no agent yet — the thread is waiting for one
             };
-            let window = SessionId::from(sid.to_string()).window_name();
-            agent.session_history_exists(None, sid) || agent.pid_of(None, &window).is_some()
+            agent.session_history_exists(None, sid) || live.contains_key(sid)
         });
         let dropped = before - self.threads.entries.len();
         if dropped == 0 {

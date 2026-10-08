@@ -914,6 +914,23 @@ impl Bridge {
                     .then(|| (ThreadKey::new(&channel, thread_ts), session))
             })
             .collect();
+        // **The reads happen together, not one after another.** Each one spawns a process, and
+        // spawning on a busy machine was measured at 0.17-0.43s — walking them in turn put the sum
+        // on the main loop, where every delivery and hook waits behind it. Side by side the cost is
+        // the slowest single read instead
+        let screens: HashMap<String, Option<Dialog>> = {
+            let reads = candidates.iter().map(|(_, session)| {
+                let agent = self.deps.agent.clone();
+                let window = self.workers.window_for(session);
+                let session = session.clone();
+                tokio::task::spawn_blocking(move || (session, agent.dialog(&Window::of(&window))))
+            });
+            futures_util::future::join_all(reads)
+                .await
+                .into_iter()
+                .flatten()
+                .collect()
+        };
         for (key, session) in candidates {
             let (channel, Some(thread_ts)) = key.split() else {
                 continue;
@@ -934,7 +951,7 @@ impl Bridge {
                 thread_key: Some(key.clone()),
             };
             let window = self.workers.window_for(&session);
-            let on_screen = self.deps.agent.dialog(&Window::of(&window));
+            let on_screen = screens.get(&session).cloned().flatten();
             // A prompt already up for this window holds the place **only while it still matches
             // the screen**. Skipping on its mere existence meant one nobody ever clicked blocked
             // the window for good: the dialog it named was long gone, and the next one -- and
