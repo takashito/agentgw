@@ -747,7 +747,7 @@ impl Bridge {
                 if let Err(err) = self.threads.save() {
                     ctx(Some(&sid)).error("bridge", &format!("threads.json save failed: {err}"));
                 }
-                let Some(mcp) = self.write_mcp(&sid, &ctx(Some(&sid))) else {
+                let Some((hooks_file, mcp)) = self.write_agent_files(&sid, &ctx(Some(&sid))) else {
                     return;
                 };
                 let req = SpawnReq {
@@ -758,7 +758,7 @@ impl Bridge {
                     // The window name comes from the session_id **just chosen** (the thread has no window name yet)
                     window: SessionId::from(sid.clone()).window_name(),
                     state,
-                    hooks_file: self.hooks_file.clone(),
+                    hooks_file,
                     mcp_config: mcp,
                     // A conversation starting here has no record from anywhere else
                     moved_from: None,
@@ -766,7 +766,7 @@ impl Bridge {
                 self.spawn_worker(&req, &key, &ctx(Some(&sid)), &sid);
             }
             Dispatch::SpawnResume(sid) => {
-                let Some(mcp) = self.write_mcp(&sid, &ctx(Some(&sid))) else {
+                let Some((hooks_file, mcp)) = self.write_agent_files(&sid, &ctx(Some(&sid))) else {
                     return;
                 };
                 let req = SpawnReq {
@@ -777,7 +777,7 @@ impl Bridge {
                     resume_from: Some(sid.clone().into()),
                     window: SessionId::from(sid.clone()).window_name(),
                     state,
-                    hooks_file: self.hooks_file.clone(),
+                    hooks_file,
                     mcp_config: mcp,
                     // **Said once, on the waking that follows the move.** Cleared below, so the rest
                     // of the conversation is not prefaced with it again

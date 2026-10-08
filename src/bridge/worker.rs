@@ -574,9 +574,28 @@ impl Bridge {
         }
     }
 
-    pub(super) fn write_mcp(&self, sid: &str, ctx: &LogCtx) -> Option<String> {
+    /// Writes the two files an agent is started with, and returns their paths: the hooks settings
+    /// (`--settings`) and its own MCP config (`--mcp-config`).
+    ///
+    /// **Both are written on every spawn**, even though the hooks settings are the same for every
+    /// agent (the session comes from `${AGENTGW_SESSION_ID}` at runtime, not from the file). They
+    /// live in a temp area that gets swept, and `claude` refuses to start at all when `--settings`
+    /// points at nothing (`Settings file not found`) — a path kept since Bridge start was measured
+    /// outliving its file on a real machine, and every spawn after that died within a second.
+    pub(super) fn write_agent_files(&self, sid: &str, ctx: &LogCtx) -> Option<(String, String)> {
+        let hooks = match self
+            .deps
+            .dir
+            .write_runtime_json("worker-hooks.json", &self.hooks_settings)
+        {
+            Ok(p) => p.to_string_lossy().to_string(),
+            Err(e) => {
+                ctx.error("bridge", &format!("hooks settings write failed: {e}"));
+                return None;
+            }
+        };
         match mcp::Mcp::write_config(&self.deps.dir, self.mcp_port, sid, &self.mcp_token) {
-            Ok(p) => Some(p.to_string_lossy().to_string()),
+            Ok(p) => Some((hooks, p.to_string_lossy().to_string())),
             Err(e) => {
                 ctx.error("bridge", &format!("mcp config write failed: {e}"));
                 None
@@ -743,7 +762,7 @@ impl Bridge {
                 session_id: Some(sid.clone()),
                 thread_key: None,
             };
-            let Some(mcp) = self.write_mcp(&sid, &ctx) else {
+            let Some((hooks_file, mcp)) = self.write_agent_files(&sid, &ctx) else {
                 continue;
             };
             // Pool and assigned agents follow the same window-name rule — no rename on claim
@@ -758,7 +777,7 @@ impl Bridge {
                 window: SessionId::from(sid.clone()).window_name(),
                 // Reaching here means no pool entry = no window either
                 state: crate::agent::WorkerState::Absent,
-                hooks_file: self.hooks_file.clone(),
+                hooks_file,
                 mcp_config: mcp,
             }) {
                 Ok(window) => {

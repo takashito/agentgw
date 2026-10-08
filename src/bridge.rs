@@ -99,7 +99,9 @@ pub struct Bridge {
     dialog_pending: HashMap<String, DialogPending>,
     /// `thread_key\0message_id` → narration fragments whose final hasn't arrived yet.
     narration: HashMap<String, String>,
-    hooks_file: String,
+    /// The hooks settings handed to every agent, rendered once at start-up and **written out on
+    /// every spawn** (see `write_agent_files`): the temp area it lives in gets swept.
+    hooks_settings: serde_json::Value,
     mcp_port: u16,
     mcp_token: String,
     /// Our own Slack user id. Text commands are checked after stripping our own mention.
@@ -157,7 +159,9 @@ pub struct Deps {
 
 /// Values fixed at start-up (the result of the wiring).
 struct Config {
-    hooks_file: String,
+    /// The hooks settings handed to every agent, rendered once at start-up and **written out on
+    /// every spawn** (see `write_agent_files`): the temp area it lives in gets swept.
+    hooks_settings: serde_json::Value,
     mcp_port: u16,
     mcp_token: String,
     bot_user_id: Option<String>,
@@ -272,7 +276,7 @@ impl Bridge {
             dialog_watch_at_ms: 0,
             dialog_pending: HashMap::new(),
             narration: HashMap::new(),
-            hooks_file: config.hooks_file,
+            hooks_settings: config.hooks_settings,
             mcp_port: config.mcp_port,
             mcp_token: config.mcp_token,
             bot_user_id: config.bot_user_id,
@@ -309,7 +313,7 @@ impl Bridge {
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
         let (deliv_tx, deliv_rx) = mpsc::channel(64);
         let config = Config {
-            hooks_file: String::new(),
+            hooks_settings: serde_json::Value::Null,
             mcp_port: 0,
             mcp_token: String::new(),
             bot_user_id: Some("U_BOT".into()),
@@ -907,8 +911,6 @@ impl Bridge {
             hook_tx,
         )
         .await?;
-        let hooks_file = HookIntake::write_settings(&dir, hook_port, &hook_token)?;
-        let hooks_file = hooks_file.to_string_lossy().to_string();
         let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
         // Deliveries run off the loop and report back here. 64 is plenty: one per window in flight
         let (deliv_tx, mut deliv_rx) = mpsc::channel::<DeliveryDone>(64);
@@ -1148,7 +1150,7 @@ impl Bridge {
                 dir,
             },
             Config {
-                hooks_file,
+                hooks_settings: HookIntake::settings_json(hook_port, &hook_token),
                 mcp_port,
                 mcp_token,
                 bot_user_id,
@@ -2155,6 +2157,28 @@ mod tests {
             dir: crate::state_dir::StateDir::at(path),
         };
         (deps, slack, agent, clock)
+    }
+
+    /// The agent's `--settings` file is written on **every** spawn, not once at start-up. It lives in
+    /// a temp area that gets swept, and `claude` exits within a second when the path points at
+    /// nothing ("Settings file not found") — measured on a real machine after a Bridge had been up
+    /// for three days.
+    #[tokio::test]
+    async fn every_spawn_writes_the_hooks_settings_file() {
+        let (d, _slack, _agent, _clock) = flow_deps("hooks-rewrite");
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.hooks_settings = serde_json::json!({ "hooks": { "Stop": "declared" } });
+        let (hooks, mcp) = b.write_agent_files("sid-1", &LogCtx::default()).unwrap();
+        assert!(std::path::Path::new(&mcp).exists(), "no mcp config at {mcp}");
+        assert!(std::path::Path::new(&hooks).exists(), "no settings at {hooks}");
+        // What the sweep does to it
+        std::fs::remove_file(&hooks).unwrap();
+        let (again, _) = b.write_agent_files("sid-1", &LogCtx::default()).unwrap();
+        assert_eq!(again, hooks, "the second spawn used a different path");
+        assert!(
+            std::fs::read_to_string(&hooks).unwrap().contains("declared"),
+            "the settings were not written again"
+        );
     }
 
     /// Rereading access.json writes nothing: on a gateway the fleet writes the same file, and a save
