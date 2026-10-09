@@ -238,7 +238,7 @@ impl Bridge {
                 c.name = names[&c.channel_id].clone();
             }
             let report = StatusReport {
-                bridge_version: env!("CARGO_PKG_VERSION").to_string(),
+                bridge_version: crate::build_label::LABEL.to_string(),
                 machine,
                 role,
                 now_ms: clock.now_ms(),

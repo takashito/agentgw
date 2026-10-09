@@ -38,7 +38,9 @@ pub fn tag_from_redirect(location: &str) -> Option<String> {
 }
 
 fn parse(v: &str) -> Option<(u64, u64, u64)> {
-    let mut it = version_of(v).split('.').map(|p| p.parse::<u64>().ok());
+    // A build label (`0.65.0+e1a48c9`) is the version it was cut from
+    let v = crate::build_label::version_of_label(version_of(v));
+    let mut it = v.split('.').map(|p| p.parse::<u64>().ok());
     let v = (it.next()??, it.next()??, it.next()??);
     it.next().is_none().then_some(v)
 }
@@ -97,7 +99,14 @@ pub fn running_binary() -> Result<PathBuf, String> {
 
 /// Check `new` and put it at `target`. **Everything before the rename can fail without touching
 /// `target`.** `want` is the version (`0.56.0`) the new file must say it is.
-pub fn put_in_place(new: &Path, sum_text: &str, target: &Path, want: &str) -> Result<(), String> {
+/// What a new binary has to say it is: a release's version (`--version`), or a build's label
+/// (`--build`). **`--version` stays the bare version** — older machines compare it word for word.
+pub enum Want<'a> {
+    Version(&'a str),
+    Build(&'a str),
+}
+
+pub fn put_in_place(new: &Path, sum_text: &str, target: &Path, want: Want) -> Result<(), String> {
     let result = check_and_rename(new, sum_text, target, want);
     if result.is_err() {
         let _ = std::fs::remove_file(new);
@@ -105,7 +114,7 @@ pub fn put_in_place(new: &Path, sum_text: &str, target: &Path, want: &str) -> Re
     result
 }
 
-fn check_and_rename(new: &Path, sum_text: &str, target: &Path, want: &str) -> Result<(), String> {
+fn check_and_rename(new: &Path, sum_text: &str, target: &Path, want: Want) -> Result<(), String> {
     let expected = expected_sum(sum_text)
         .ok_or_else(|| "the release's .sha256 does not hold a checksum".to_string())?;
     let bytes = std::fs::read(new).map_err(|e| format!("cannot read the download: {e}"))?;
@@ -119,8 +128,12 @@ fn check_and_rename(new: &Path, sum_text: &str, target: &Path, want: &str) -> Re
             .map_err(|e| format!("cannot make the download executable: {e}"))?;
     }
     sign(new);
+    let (flag, want) = match want {
+        Want::Version(v) => ("--version", v),
+        Want::Build(b) => ("--build", b),
+    };
     let out = std::process::Command::new(new)
-        .arg("--version")
+        .arg(flag)
         .output()
         .map_err(|e| format!("the download does not run: {e}"))?;
     let said = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -192,12 +205,13 @@ pub async fn update_alone(named: Option<&str>) -> Result<Option<String>, String>
     if version_of(&tag) == me || (named.is_none() && older(version_of(&tag), me)) {
         return Ok(None);
     }
-    self_replace(&tag).await?;
+    self_replace(&tag, "").await?;
     Ok(Some(tag))
 }
 
-/// Fetch `tag` and put it in place of the running binary. Does **not** restart.
-pub async fn self_replace(tag: &str) -> Result<(), String> {
+/// Fetch `tag` and put it in place of the running binary. Does **not** restart. `build` is the
+/// release's label when known (checked with `--build`); empty checks the version (`--version`).
+pub async fn self_replace(tag: &str, build: &str) -> Result<(), String> {
     let target = running_binary()?;
     let triple = this_triple().ok_or("no release is built for this kind of machine")?;
     let (bin_url, sum_url) = asset_urls(tag, triple);
@@ -206,9 +220,13 @@ pub async fn self_replace(tag: &str) -> Result<(), String> {
     let new = target.with_file_name("agentgw.new");
     let new_s = new.to_string_lossy().to_string();
     curl(&["-fsSL", "--max-time", "600", "-o", &new_s, &bin_url]).await?;
-    let want = version_of(tag).to_string();
+    let version = version_of(tag).to_string();
+    let build = build.to_string();
     let sum = String::from_utf8_lossy(&sum).to_string();
-    tokio::task::spawn_blocking(move || put_in_place(&new, &sum, &target, &want))
+    tokio::task::spawn_blocking(move || {
+        let want = if build.is_empty() { Want::Version(&version) } else { Want::Build(&build) };
+        put_in_place(&new, &sum, &target, want)
+    })
         .await
         .map_err(|e| format!("the update stopped: {e}"))?
 }
@@ -226,8 +244,15 @@ mod tests {
 
     /// A stand-in binary that answers `--version` like agentgw does.
     fn fake_binary(dir: &Path, name: &str, version: &str) -> (PathBuf, String) {
+        fake_binary_with_label(dir, name, version, &format!("{version}+fake"))
+    }
+
+    /// The same, answering `--build` with `label` too.
+    fn fake_binary_with_label(dir: &Path, name: &str, version: &str, label: &str) -> (PathBuf, String) {
         let p = dir.join(name);
-        let body = format!("#!/bin/sh\necho \"agentgw {version}\"\n");
+        let body = format!(
+            "#!/bin/sh\ncase \"$1\" in --build) echo \"agentgw {label}\";; *) echo \"agentgw {version}\";; esac\n"
+        );
         std::fs::write(&p, &body).unwrap();
         (p, sha256_hex(body.as_bytes()))
     }
@@ -252,6 +277,10 @@ mod tests {
         // Unreadable is never older
         assert!(!older("", "0.56.0"));
         assert!(!older("0.56", "0.57.0"));
+        // A build label is the version it was cut from
+        assert!(older("0.64.9+e1a48c9", "0.65.0"));
+        assert!(!older("0.65.0+e1a48c9", "0.65.0"));
+        assert!(!older("0.65.0", "0.65.0+e1a48c9"));
     }
 
     #[test]
@@ -281,7 +310,7 @@ mod tests {
         let d = scratch("good");
         let (target, _) = fake_binary(&d, "agentgw", "0.55.0");
         let (new, sum) = fake_binary(&d, "agentgw.new", "0.56.0");
-        put_in_place(&new, &sum, &target, "0.56.0").unwrap();
+        put_in_place(&new, &sum, &target, Want::Version("0.56.0")).unwrap();
         assert!(std::fs::read_to_string(&target).unwrap().contains("0.56.0"));
         assert!(std::fs::read_to_string(d.join("agentgw.prev")).unwrap().contains("0.55.0"));
         assert!(!new.exists());
@@ -292,7 +321,7 @@ mod tests {
         let d = scratch("sum");
         let (target, _) = fake_binary(&d, "agentgw", "0.55.0");
         let (new, _) = fake_binary(&d, "agentgw.new", "0.56.0");
-        let err = put_in_place(&new, &"0".repeat(64), &target, "0.56.0").unwrap_err();
+        let err = put_in_place(&new, &"0".repeat(64), &target, Want::Version("0.56.0")).unwrap_err();
         assert!(err.contains("checksum"), "{err}");
         assert!(std::fs::read_to_string(&target).unwrap().contains("0.55.0"));
         assert!(!d.join("agentgw.prev").exists());
@@ -304,8 +333,21 @@ mod tests {
         let d = scratch("ver");
         let (target, _) = fake_binary(&d, "agentgw", "0.55.0");
         let (new, sum) = fake_binary(&d, "agentgw.new", "0.55.9");
-        let err = put_in_place(&new, &sum, &target, "0.56.0").unwrap_err();
+        let err = put_in_place(&new, &sum, &target, Want::Version("0.56.0")).unwrap_err();
         assert!(err.contains("0.55.9"), "{err}");
         assert!(std::fs::read_to_string(&target).unwrap().contains("0.55.0"));
+    }
+
+    #[test]
+    fn a_build_is_checked_by_its_label() {
+        let d = scratch("label");
+        let (target, _) = fake_binary(&d, "agentgw", "0.64.9");
+        let (new, sum) = fake_binary_with_label(&d, "agentgw.new", "0.65.0", "0.65.0+aaa");
+        let err = put_in_place(&new, &sum, &target, Want::Build("0.65.0+bbb")).unwrap_err();
+        assert!(err.contains("0.65.0+aaa"), "{err}");
+        assert!(std::fs::read_to_string(&target).unwrap().contains("0.64.9"));
+        let (new, sum) = fake_binary_with_label(&d, "agentgw.new", "0.65.0", "0.65.0+aaa");
+        put_in_place(&new, &sum, &target, Want::Build("0.65.0+aaa")).unwrap();
+        assert!(std::fs::read_to_string(&target).unwrap().contains("0.65.0+aaa"));
     }
 }

@@ -36,7 +36,7 @@ fn refuse_other_bots_state_dir() {
 #[tokio::main]
 async fn main() {
     let cmd = std::env::args().nth(1).unwrap_or_default();
-    if !matches!(cmd.as_str(), "--version" | "-V" | "version" | "") {
+    if !matches!(cmd.as_str(), "--version" | "-V" | "version" | "--build" | "") {
         refuse_other_bots_state_dir();
     }
     match cmd.as_str() {
@@ -86,6 +86,11 @@ async fn main() {
         // to check the version on a machine becomes a wall of usage (and exits with code 2)
         "--version" | "-V" | "version" => {
             println!("agentgw {}", env!("CARGO_PKG_VERSION"));
+        }
+        // Which build: the version and the commit. Kept apart from --version, which older machines
+        // compare word for word
+        "--build" => {
+            println!("agentgw {}", agentgw::build_label::LABEL);
         }
         _ => {
             // A line users read. **Don't show internals (implementation language, issue

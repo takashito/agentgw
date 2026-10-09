@@ -730,6 +730,12 @@ pub struct Link {
     /// old to say — `update` can't reach those, so they are installed by hand once.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub version: String,
+    /// Its build label (`0.65.0+e1a48c9`). Empty for a machine too old to say.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub build: String,
+    /// What it runs on (`x86_64-unknown-linux-musl`). Empty for a machine too old to say.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub triple: String,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }

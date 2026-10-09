@@ -182,7 +182,15 @@ pub mod link {
         },
         /// The agentgw version this machine runs. Sent on connecting, beside [`LinkFrame::MachineHost`],
         /// so `machines` can show it and `update` can tell when a machine came back on the new one.
-        MachineVersion { version: String },
+        MachineVersion {
+            version: String,
+            /// The build label (`0.65.0+e1a48c9`). Absent from a machine too old to say.
+            #[serde(default, skip_serializing_if = "String::is_empty")]
+            build: String,
+            /// What it runs on (`aarch64-apple-darwin`) — which build `update local` sends it.
+            #[serde(default, skip_serializing_if = "String::is_empty")]
+            triple: String,
+        },
         /// `update [version]`, asked from wherever the Owner typed it — only the gateway knows every
         /// machine. `None` = the latest release.
         StartUpdate {
@@ -193,7 +201,13 @@ pub mod link {
         },
         /// gateway → machine: replace yourself with this release and restart. A machine too old to
         /// know this frame drops it, and the gateway gives up on it after a while.
-        Update { version: String },
+        Update {
+            version: String,
+            /// The release's build label, when the release says it. A machine whose label differs
+            /// takes the release even on the same version (it is running a local build).
+            #[serde(default, skip_serializing_if = "String::is_empty")]
+            build: String,
+        },
         /// machine → gateway: could not update (still running the version it had).
         UpdateFailed { version: String, why: String },
         /// `rename-machine <from> <to>`, asked from wherever the Owner typed it — only the gateway
@@ -3159,12 +3173,22 @@ impl Fleet {
                 self.assign_project(&channel, &thread_ts, &machine, path, thread_only)
                     .await
             }
-            link::LinkFrame::MachineVersion { version } => {
+            link::LinkFrame::MachineVersion { version, build, triple } => {
                 let id = bridge_id.to_string();
-                let known = self.access().machines.get(&id).map(|l| l.version.clone());
-                if known.as_deref() != Some(version.as_str()) {
-                    self.edit_access(|a| a.machines.entry(id).or_default().version = version)
-                        .await;
+                let known = self
+                    .access()
+                    .machines
+                    .get(&id)
+                    .map(|l| (l.version.clone(), l.build.clone(), l.triple.clone()));
+                // **An old machine says no build** — written as empty, which is the truth for it
+                if known != Some((version.clone(), build.clone(), triple.clone())) {
+                    self.edit_access(|a| {
+                        let l = a.machines.entry(id).or_default();
+                        l.version = version;
+                        l.build = build;
+                        l.triple = triple;
+                    })
+                    .await;
                 }
             }
             link::LinkFrame::StartUpdate {
@@ -3500,7 +3524,7 @@ impl Fleet {
             }
             if let RolloutNext::Send(id) = &next {
                 rlog("info", &format!("update: telling {id} to update to v{}", r.target));
-                let frame = link::LinkFrame::Update { version: r.target.clone() };
+                let frame = link::LinkFrame::Update { version: r.target.clone(), build: String::new() };
                 if !self.send_frame(id, &frame).await {
                     let why = crate::t!("could not reach it", "届きませんでした");
                     r.failed(id, &why);
@@ -5249,7 +5273,7 @@ mod tests {
             .map(|id| {
                 let (fleet, id) = (fleet.clone(), id.clone());
                 tokio::spawn(async move {
-                    let frame = link::LinkFrame::MachineVersion { version: "0.57.0".into() };
+                    let frame = link::LinkFrame::MachineVersion { version: "0.57.0".into(), build: String::new(), triple: String::new() };
                     fleet.on_machine_frame(&id, frame).await;
                 })
             })
@@ -6329,12 +6353,55 @@ mod tests {
         assert!(rollout_text(&r, "dock", true).starts_with("*Update to v0.56.0 finished*"));
     }
 
+    /// A machine too old to say its build still reads, and an old gateway reads ours
+    #[test]
+    fn version_frames_from_older_peers_still_read() {
+        assert_eq!(
+            link::decode(r#"{"t":"machine_version","version":"0.64.9"}"#),
+            Some(link::LinkFrame::MachineVersion {
+                version: "0.64.9".into(),
+                build: String::new(),
+                triple: String::new()
+            })
+        );
+        assert_eq!(
+            link::decode(r#"{"t":"update","version":"0.65.0"}"#),
+            Some(link::LinkFrame::Update { version: "0.65.0".into(), build: String::new() })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_machine_s_build_and_kind_are_written_down() {
+        let dir = StateDir::at(std::env::temp_dir().join(format!("agentgw-mv-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let (fleet, _rx) = a_fleet_in(dir.clone());
+        let frame = link::LinkFrame::MachineVersion {
+            version: "0.65.0".into(),
+            build: "0.65.0+e1a48c9".into(),
+            triple: "x86_64-unknown-linux-musl".into(),
+        };
+        fleet.on_machine_frame("pve", frame).await;
+        let l = Access::load(&dir).machines.get("pve").cloned().unwrap();
+        assert_eq!(
+            (l.version.as_str(), l.build.as_str(), l.triple.as_str()),
+            ("0.65.0", "0.65.0+e1a48c9", "x86_64-unknown-linux-musl")
+        );
+        let _ = std::fs::remove_dir_all(dir.path());
+    }
+
     #[test]
     fn the_update_frames_round_trip() {
         for f in [
-            link::LinkFrame::Update { version: "0.56.0".into() },
+            link::LinkFrame::Update { version: "0.56.0".into(), build: String::new() },
+            link::LinkFrame::Update { version: "0.65.0".into(), build: "0.65.0+aaa".into() },
             link::LinkFrame::UpdateFailed { version: "0.56.0".into(), why: "404".into() },
-            link::LinkFrame::MachineVersion { version: "0.55.0".into() },
+            link::LinkFrame::MachineVersion { version: "0.55.0".into(), build: String::new(), triple: String::new() },
+            link::LinkFrame::MachineVersion {
+                version: "0.65.0".into(),
+                build: "0.65.0+aaa".into(),
+                triple: "aarch64-apple-darwin".into(),
+            },
             link::LinkFrame::StartUpdate { channel: "D1".into(), thread_ts: "1.0".into(), version: None },
         ] {
             assert_eq!(link::decode(&link::encode(&f)).unwrap(), f, "{f:?}");

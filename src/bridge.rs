@@ -395,7 +395,7 @@ impl Bridge {
     async fn announce_online(&mut self) {
         let pools: Vec<String> = self.access.pool_targets(&Host::home(), &self.machine_name, self.link.is_none());
         // The machine's own name — the one `route`, `status` and `pwd <machine>` all use
-        let text = online_notice(&self.machine_name, env!("CARGO_PKG_VERSION"), &pools, 0);
+        let text = online_notice(&self.machine_name, crate::build_label::LABEL, &pools, 0);
         self.post_notice(&text, &LogCtx::default()).await;
     }
 
@@ -512,7 +512,7 @@ impl Bridge {
             }
         }
         // (d) Tell home once that we're going down (the successor posts the online notice)
-        let offline = offline_notice(&Host::name().await, env!("CARGO_PKG_VERSION"), "restart");
+        let offline = offline_notice(&Host::name().await, crate::build_label::LABEL, "restart");
         self.post_notice(&offline, ctx).await;
         // (e) Mark up to "stop the Bridge" as done before going down. The list freezes for the few seconds until the successor connects
         if let (Some((channel, _)), Some(ts)) = (req, &progress_ts) {
@@ -600,7 +600,7 @@ impl Bridge {
         });
         // Post offline **before tearing down**. Teardown takes seconds, so leaving it for later
         // gets the notice eaten by the hard exit above
-        let offline = offline_notice(&Host::name().await, env!("CARGO_PKG_VERSION"), reason);
+        let offline = offline_notice(&Host::name().await, crate::build_label::LABEL, reason);
         self.post_notice(&offline, &ctx).await;
         self.teardown_all_workers("shutdown", "", &ctx).await;
         ctx.info("bridge", &format!("shutdown complete ({reason})"));
@@ -1576,9 +1576,7 @@ fn report_folders(
         ip,
         url: gateway_url.unwrap_or_default().to_string(),
     });
-    let _ = up.send(crate::bridge::gateway::link::LinkFrame::MachineVersion {
-        version: env!("CARGO_PKG_VERSION").to_string(),
-    });
+    let _ = up.send(version_frame());
     for (channel, route) in bridge::Access::load(dir).routes {
         let Some(path) = route.repo_path.filter(|p| !p.is_empty()) else {
             continue;
@@ -1589,6 +1587,15 @@ fn report_folders(
             result: Ok(path),
             thread_only: false,
         });
+    }
+}
+
+/// What this machine runs, as it tells the gateway: the version, the build, and what it runs on.
+fn version_frame() -> crate::bridge::gateway::link::LinkFrame {
+    crate::bridge::gateway::link::LinkFrame::MachineVersion {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        build: crate::build_label::LABEL.to_string(),
+        triple: crate::setup::update::this_triple().unwrap_or_default().to_string(),
     }
 }
 
@@ -1780,20 +1787,24 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
         }
         // The gateway's `update`: replace this binary, then restart into it. **Off this task** — the
         // download takes a while, and Slack events keep flowing meanwhile
-        machine::FromRelay::Update { version } => {
+        machine::FromRelay::Update { version, build } => {
             let (up, updated) = (up.clone(), updated.clone());
             tokio::spawn(async move {
                 let me = env!("CARGO_PKG_VERSION");
-                // Already there (a repeated ask): say so, and the gateway counts it done
-                if crate::setup::update::version_of(&version) == me {
-                    let _ = up.send(crate::bridge::gateway::link::LinkFrame::MachineVersion {
-                        version: me.to_string(),
-                    });
+                // Already there (a repeated ask): say so, and the gateway counts it done. **By the
+                // label when the release says one** — a local build of the same version is not there
+                let here = if build.is_empty() {
+                    crate::setup::update::version_of(&version) == me
+                } else {
+                    build == crate::build_label::LABEL
+                };
+                if here {
+                    let _ = up.send(version_frame());
                     return;
                 }
                 let tag = crate::setup::update::tag_of(&version);
                 LogCtx::default().info("bridge", &format!("update: {me} → {tag}"));
-                match crate::setup::update::self_replace(&tag).await {
+                match crate::setup::update::self_replace(&tag, &build).await {
                     Ok(()) => {
                         let _ = updated.send(format!("update to {tag}")).await;
                     }
@@ -4075,7 +4086,7 @@ mod tests {
         // …and what it runs, so `machines` can show it and `update` can tell when it came back
         assert_eq!(
             up_rx.try_recv(),
-            Ok(LinkFrame::MachineVersion { version: env!("CARGO_PKG_VERSION").into() })
+            Ok(version_frame())
         );
         assert_eq!(
             up_rx.try_recv(),

@@ -92,7 +92,7 @@ pub async fn update_after_refusal() -> bool {
         return false;
     }
     ctx.info("bridge", &format!("remote link: refused as too old — updating {me} → {latest}"));
-    match crate::setup::update::self_replace(&latest).await {
+    match crate::setup::update::self_replace(&latest, "").await {
         Ok(()) => true,
         Err(e) => {
             ctx.error("bridge", &format!("remote link: could not update to {latest}: {e}"));
@@ -158,7 +158,7 @@ pub enum FromRelay {
         data: String,
     },
     /// Replace this machine's agentgw with this release, then restart.
-    Update { version: String },
+    Update { version: String, build: String },
     /// This machine is called `to` from now on: write it into `.env`, then restart into it.
     Rename { to: String },
     /// A refusal that talking won't fix. **No retry.**
@@ -260,7 +260,7 @@ impl FromRelay {
                 data,
             },
             F::Home { channel } => FromRelay::Home { channel },
-            F::Update { version } => FromRelay::Update { version },
+            F::Update { version, build } => FromRelay::Update { version, build },
             F::Rename { to } => FromRelay::Rename { to },
             // Answers and asks only ever go the other way
             F::ProjectSet { .. }

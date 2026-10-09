@@ -45,6 +45,24 @@ fn version_names_the_binary() {
 }
 
 #[test]
+fn version_stays_the_bare_version() {
+    // Every machine running today checks a download's --version for exactly this
+    let (_, text) = agentgw(&["--version"]);
+    assert_eq!(text.trim(), format!("agentgw {}", env!("CARGO_PKG_VERSION")));
+}
+
+#[test]
+fn build_names_the_version_and_the_commit() {
+    let (code, text) = agentgw(&["--build"]);
+    assert_eq!(code, 0, "{text}");
+    let label = text.trim().strip_prefix("agentgw ").expect(&text).to_string();
+    assert!(label.starts_with(&format!("{}+", env!("CARGO_PKG_VERSION"))), "{label}");
+    // The label is readable out of the file itself — how the gateway reads a build it can't run
+    let read = agentgw::build_label::read_label(std::path::Path::new(env!("CARGO_BIN_EXE_agentgw")));
+    assert_eq!(read.as_deref(), Some(label.as_str()));
+}
+
+#[test]
 fn unknown_commands_fall_to_the_overall_usage() {
     let (code, text) = agentgw(&["invite"]);
     assert_eq!(code, 2, "invite は畳んだ: {text}");
