@@ -2062,6 +2062,73 @@ pub fn update_target(
     Ok(Some((format!("http://127.0.0.1:{port}/update"), t.clone())))
 }
 
+/// The `cargo dist` output under `root`, one per kind of machine, all of one build: the label and
+/// `triple` → file. `target/release` and `target/debug` have no triple, so they are never taken
+/// (nothing says which machine they are for).
+pub fn local_builds(root: &std::path::Path) -> Result<(String, BTreeMap<String, std::path::PathBuf>), String> {
+    let mut found = BTreeMap::new();
+    if let Ok(dir) = std::fs::read_dir(root.join("target")) {
+        for d in dir.flatten() {
+            let triple = d.file_name().to_string_lossy().to_string();
+            let bin = d.path().join("release").join("agentgw");
+            if triple != "release" && triple != "debug" && bin.is_file() {
+                found.insert(triple, bin);
+            }
+        }
+    }
+    if found.is_empty() {
+        return Err(crate::t!(
+            "Nothing to hand out here. Run `cargo dist` in the repository folder first.",
+            "ここには配る物がありません。リポのフォルダで `cargo dist` してから打ってください。"
+        ));
+    }
+    let labels: BTreeMap<&String, Option<String>> = found
+        .iter()
+        .map(|(t, p)| (t, crate::build_label::read_label(p)))
+        .collect();
+    let distinct: std::collections::BTreeSet<&Option<String>> = labels.values().collect();
+    if distinct.len() != 1 || labels.values().any(Option::is_none) {
+        let list = labels
+            .iter()
+            .map(|(t, l)| format!("{t}: {}", l.as_deref().unwrap_or("?")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(crate::t!(
+            "The builds are not all one build ({list}). Run `cargo dist` again.",
+            "ビルドが揃っていません({list})。もう一度 `cargo dist` してください。"
+        ));
+    }
+    let label = labels.into_values().next().flatten().unwrap_or_default();
+    Ok((label, found))
+}
+
+/// What is missing for every machine to get its kind of build, as lines to show. Empty = all there.
+pub fn missing_triples(
+    access: &Access,
+    self_triple: &str,
+    have: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if !have.contains(self_triple) {
+        out.push(crate::t!(
+            "the gateway's ({self_triple}) is missing",
+            "ゲートウェイの分({self_triple})がありません"
+        ));
+    }
+    for (id, l) in &access.machines {
+        if l.triple.is_empty() {
+            out.push(crate::t!(
+                "{id} is too old to say what it runs on — update it to a release first (`update`)",
+                "{id} は古い版なので local では上げられません(先に `update` で release に上げてください)"
+            ));
+        } else if !have.contains(&l.triple) {
+            let t = &l.triple;
+            out.push(crate::t!("{id}'s ({t}) is missing", "{id} の分({t})がありません"));
+        }
+    }
+    out
+}
+
 /// Held while the gateway reads, changes and writes access.json — see `Fleet::edit_access`.
 static EDITING: Mutex<()> = Mutex::new(());
 
@@ -3528,6 +3595,40 @@ impl Fleet {
         }
     }
 
+    /// Whether `update local` can start: every id held, each one the named build for the kind it is
+    /// filed under, and a build for the gateway and every machine. The reasons, one per line, if not.
+    pub(crate) fn check_local(&self, build: &str, files: &BTreeMap<String, String>) -> Result<(), Vec<String>> {
+        let store = crate::files::Store::at(&self.dir);
+        let mut why = Vec::new();
+        for (triple, id) in files {
+            match store.get(id) {
+                None => why.push(crate::t!(
+                    "the {triple} build ({id}) is not at the gateway",
+                    "{triple} 用のビルド({id})がゲートウェイにありません"
+                )),
+                Some((e, _)) => {
+                    let named = e.meta["build"].as_str().unwrap_or("");
+                    let kind = e.meta["triple"].as_str().unwrap_or("");
+                    if e.kind != crate::files::BUILD || named != build || kind != triple {
+                        why.push(crate::t!(
+                            "{id} is not the {triple} build of {build}",
+                            "{id} は {build} の {triple} 用ではありません"
+                        ));
+                    }
+                }
+            }
+        }
+        let have = files.keys().cloned().collect();
+        let me = crate::setup::update::this_triple().unwrap_or_default();
+        // **Only the machines that are here** — an offline one is skipped by the rollout anyway, and
+        // must not stop everyone else
+        let mut present = self.access();
+        let connected = self.links.connected();
+        present.machines.retain(|id, _| connected.contains(id));
+        why.extend(missing_triples(&present, me, &have));
+        if why.is_empty() { Ok(()) } else { Err(why) }
+    }
+
     /// Clear `files/` of what nobody needs. **A rollout in progress keeps its builds** — the gateway
     /// restarts halfway through one, and the machines after it still need theirs.
     fn sweep_files(&self) {
@@ -4079,6 +4180,49 @@ async fn on_start_update(
     (StatusCode::ACCEPTED, "accepted").into_response()
 }
 
+/// `POST /update/local`: start handing out builds already uploaded to `files/`. Body:
+/// `{"build": "<label>", "files": {"<triple>": "<id>"}}`. **Checked before anything starts** — a
+/// refusal names every reason and leaves every machine as it was.
+async fn on_start_update_local(
+    State(fleet): State<Arc<Fleet>>,
+    headers: HeaderMap,
+    body: String,
+) -> axum::response::Response {
+    if !secret_eq(&header(&headers, "x-api-token"), &fleet.token) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    let Some(home) = fleet.access().home_channel else {
+        return (
+            StatusCode::CONFLICT,
+            crate::t!(
+                "no notice channel to report in yet",
+                "報告先の通知チャンネルがまだありません"
+            ),
+        )
+            .into_response();
+    };
+    #[derive(serde::Deserialize)]
+    struct Ask {
+        build: String,
+        files: BTreeMap<String, String>,
+    }
+    let Ok(ask) = serde_json::from_str::<Ask>(&body) else {
+        return (StatusCode::BAD_REQUEST, "bad request").into_response();
+    };
+    if let Err(lines) = fleet.check_local(&ask.build, &ask.files) {
+        return (StatusCode::BAD_REQUEST, lines.join("\n")).into_response();
+    }
+    let r = crate::bridge::state::Rollout {
+        source: crate::bridge::state::Rollout::LOCAL.to_string(),
+        target: crate::build_label::version_of_label(&ask.build).to_string(),
+        build: ask.build,
+        files: ask.files,
+        ..Default::default()
+    };
+    tokio::spawn(async move { fleet.begin_rollout(&home, "", r).await });
+    (StatusCode::ACCEPTED, "accepted").into_response()
+}
+
 fn header(headers: &HeaderMap, name: &str) -> String {
     headers
         .get(name)
@@ -4201,6 +4345,7 @@ async fn serve_children_on(fleet: Arc<Fleet>, listener: tokio::net::TcpListener)
     let app = Router::new()
         .route("/status", get(on_status))
         .route("/update", axum::routing::post(on_start_update))
+        .route("/update/local", axum::routing::post(on_start_update_local))
         // **No size limit**: the body streams to disk, so axum's 2MB guard for bodies read into memory
         // has nothing to guard here
         .route(
@@ -4551,6 +4696,9 @@ impl Cli {
 
     /// `agentgw update [version]`: ask the running gateway to start one.
     pub async fn update(dir: &StateDir, args: &[String]) -> i32 {
+        if args.first().map(String::as_str) == Some("local") {
+            return Self::update_local(dir).await;
+        }
         let version = args.first().cloned().unwrap_or_default();
         let named = (!version.is_empty()).then_some(version.as_str());
         let env = Self::env_of(dir);
@@ -4626,6 +4774,127 @@ impl Cli {
 
     /// Replace this agentgw with the release and restart the service — for a gateway with no
     /// machines, and for a machine that can't reach its gateway.
+    /// `agentgw update local`: hand the `cargo dist` output in this folder to the gateway and every
+    /// machine, without a release. Typed on a machine, the builds go up to the gateway first.
+    async fn update_local(dir: &StateDir) -> i32 {
+        let here = std::env::current_dir().unwrap_or_default();
+        let (label, builds) = match local_builds(&here) {
+            Ok(b) => b,
+            Err(why) => {
+                eprintln!("{why}");
+                return 1;
+            }
+        };
+        let env = Self::env_of(dir);
+        let access = Access::load(dir);
+        match update_target(&env, &access) {
+            // A gateway with no machines is the whole fleet: put its own build in place and restart
+            Ok(None) => return Self::update_this_one_from(&label, &builds),
+            Ok(Some(_)) => {}
+            Err(why) => {
+                eprintln!("{why}");
+                return 2;
+            }
+        }
+        let Some((base, token)) = crate::files::base_of(&env, &access) else {
+            eprintln!(
+                "{}",
+                crate::t!("Cannot tell where the gateway is.", "ゲートウェイの場所が分かりません。")
+            );
+            return 1;
+        };
+        let from = env.get("AGENTGW_BRIDGE_ID").cloned().unwrap_or_default();
+        let mut files = BTreeMap::new();
+        for (triple, bin) in &builds {
+            let head = crate::files::Head {
+                kind: crate::files::BUILD.into(),
+                from: from.clone(),
+                meta: serde_json::json!({"triple": triple, "build": label}),
+                ..Default::default()
+            };
+            match crate::files::upload(&base, &token, bin, &head).await {
+                Ok(id) => {
+                    println!("  {triple}  →  {id}");
+                    files.insert(triple.clone(), id);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "{}",
+                        crate::t!(
+                            "Could not send the {triple} build: {e}",
+                            "{triple} 用を送れませんでした: {e}"
+                        )
+                    );
+                    return 1;
+                }
+            }
+        }
+        let body = serde_json::json!({"build": label, "files": files}).to_string();
+        let out = tokio::process::Command::new("curl")
+            .args([
+                "-s",
+                "--max-time",
+                "10",
+                "-w",
+                "\n%{http_code}",
+                "-H",
+                &format!("x-api-token: {token}"),
+                "--data-raw",
+                &body,
+                &format!("{base}/update/local"),
+            ])
+            .output()
+            .await;
+        let text = out.map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+        let (said, code) = text.rsplit_once('\n').unwrap_or(("", ""));
+        if code == "202" {
+            println!(
+                "{}",
+                crate::t!(
+                    "The gateway is handing out {label}. Progress is posted in the notice channel.",
+                    "ゲートウェイが {label} を配り始めました。進み具合は通知チャンネルに出ます。"
+                )
+            );
+            0
+        } else {
+            let why = if said.trim().is_empty() { code } else { said.trim() };
+            eprintln!("{why}");
+            1
+        }
+    }
+
+    /// The whole fleet is this one gateway: put its own kind's build in place, then restart.
+    fn update_this_one_from(label: &str, builds: &BTreeMap<String, std::path::PathBuf>) -> i32 {
+        use crate::setup::update;
+        let me = update::this_triple().unwrap_or_default();
+        let Some(bin) = builds.get(me) else {
+            eprintln!(
+                "{}",
+                crate::t!(
+                    "There is no build for this machine ({me}).",
+                    "このマシン用のビルド({me})がありません。"
+                )
+            );
+            return 1;
+        };
+        if label == crate::build_label::LABEL {
+            println!("{}", crate::t!("Already on {label}.", "すでに {label} です。"));
+            return 0;
+        }
+        let result = update::running_binary().and_then(|target| {
+            let new = target.with_file_name("agentgw.new");
+            std::fs::copy(bin, &new).map_err(|e| format!("cannot copy {}: {e}", bin.display()))?;
+            let sum = update::sha256_hex(&std::fs::read(&new).map_err(|e| e.to_string())?);
+            update::put_in_place(&new, &sum, &target, update::Want::Build(label))
+        });
+        if let Err(e) = result {
+            eprintln!("{}", crate::t!("Cannot update: {e}", "update できません: {e}"));
+            return 1;
+        }
+        println!("{}", crate::t!("Updated to {label}.", "{label} に上げました。"));
+        crate::service::Service::run("restart", &[])
+    }
+
     async fn update_this_one(named: Option<&str>) -> i32 {
         match crate::setup::update::update_alone(named).await {
             Ok(None) => {
@@ -6795,6 +7064,108 @@ mod tests {
         // Finishing it lets the builds go
         fleet.end_update(&r).await;
         assert!(store.get(&e.id).is_none());
+        let _ = std::fs::remove_dir_all(dir.path());
+    }
+
+    #[test]
+    fn local_builds_must_exist_and_agree() {
+        let root = std::env::temp_dir().join(format!("agentgw-local-builds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // Nothing built
+        assert!(local_builds(&root).unwrap_err().contains("cargo dist"));
+        // Two builds of different commits: refused, naming both
+        for (triple, label) in [("aarch64-apple-darwin", "0.65.0+aaa"), ("x86_64-unknown-linux-musl", "0.65.0+bbb")] {
+            let d = root.join("target").join(triple).join("release");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("agentgw"), format!("junk agentgw-build:{label}\0junk")).unwrap();
+        }
+        let err = local_builds(&root).unwrap_err();
+        assert!(err.contains("0.65.0+aaa") && err.contains("0.65.0+bbb"), "{err}");
+        // Same commit: both found. target/release (no triple) is never taken
+        std::fs::write(root.join("target/x86_64-unknown-linux-musl/release/agentgw"), "agentgw-build:0.65.0+aaa\0").unwrap();
+        std::fs::create_dir_all(root.join("target/release")).unwrap();
+        std::fs::write(root.join("target/release/agentgw"), "agentgw-build:0.65.0+zzz\0").unwrap();
+        let (label, found) = local_builds(&root).unwrap();
+        assert_eq!(label, "0.65.0+aaa");
+        assert_eq!(
+            found.keys().cloned().collect::<Vec<_>>(),
+            ["aarch64-apple-darwin", "x86_64-unknown-linux-musl"]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn every_machine_needs_its_kind_of_build() {
+        let mut access = Access::default();
+        access.machines.insert(
+            "pve".into(),
+            crate::bridge::state::Link { triple: "x86_64-unknown-linux-musl".into(), ..Default::default() },
+        );
+        access.machines.insert(
+            "old".into(),
+            crate::bridge::state::Link { version: "0.64.9".into(), ..Default::default() },
+        );
+        let have: std::collections::BTreeSet<String> = ["aarch64-apple-darwin".to_string()].into();
+        let lines = missing_triples(&access, "aarch64-apple-darwin", &have);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("pve") && l.contains("x86_64-unknown-linux-musl")));
+        assert!(lines.iter().any(|l| l.contains("old")));
+        // The gateway's own kind counts too
+        assert_eq!(missing_triples(&Access::default(), "x86_64-unknown-linux-musl", &have).len(), 1);
+        assert!(missing_triples(&Access::default(), "aarch64-apple-darwin", &have).is_empty());
+    }
+
+    /// `/update/local` refuses before starting anything when a build is missing, and starts when all
+    /// is there. An offline machine does not stop it
+    #[tokio::test]
+    async fn update_local_starts_only_when_every_build_is_there() {
+        let (fleet, dir, addr) = a_fleet_serving("update-local").await;
+        fleet.edit_access(|a| a.home_channel = Some("C_HOME".into())).await;
+        let me = crate::setup::update::this_triple().unwrap().to_string();
+        fleet
+            .edit_access(|a| {
+                a.machines.insert("pve".into(), crate::bridge::state::Link { triple: "riscv64gc-unknown-linux-musl".into(), ..Default::default() });
+                a.machines.insert("gone".into(), crate::bridge::state::Link { version: "0.60.0".into(), ..Default::default() });
+            })
+            .await;
+        let (_conn, _rx) = fleet.attach("pve").await;
+        let put = |triple: &str| {
+            let head = crate::files::Head {
+                kind: crate::files::BUILD.into(),
+                meta: serde_json::json!({"triple": triple, "build": "0.65.0+aaa"}),
+                sha256: crate::setup::update::sha256_hex(b"b"),
+                ..Default::default()
+            };
+            let store = crate::files::Store::at(&dir);
+            async move {
+                let body = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"b"))]);
+                store.put(head, body).await.unwrap().id
+            }
+        };
+        let mine = put(&me).await;
+        let ask = |files: serde_json::Value| serde_json::json!({"build": "0.65.0+aaa", "files": files}).to_string();
+        // pve's kind is missing: refused, and no rollout
+        let (status, body) = http(addr, "POST", "/update/local", &[("x-api-token", "s3cret")], ask(serde_json::json!({ me.clone(): mine })).as_bytes()).await;
+        assert!(status.contains("400"), "{status}");
+        assert!(String::from_utf8_lossy(&body).contains("pve"), "{}", String::from_utf8_lossy(&body));
+        assert!(Access::load(&dir).update.is_none());
+        // All there (the offline, too-old `gone` doesn't count): started
+        let theirs = put("riscv64gc-unknown-linux-musl").await;
+        let files = serde_json::json!({ me.clone(): mine, "riscv64gc-unknown-linux-musl": theirs });
+        let (status, _) = http(addr, "POST", "/update/local", &[("x-api-token", "s3cret")], ask(files).as_bytes()).await;
+        assert!(status.contains("202"), "{status}");
+        let mut started = None;
+        for _ in 0..50 {
+            started = Access::load(&dir).update;
+            if started.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let r = started.expect("a rollout was written down");
+        assert_eq!((r.source.as_str(), r.build.as_str(), r.target.as_str()), ("local", "0.65.0+aaa", "0.65.0"));
+        assert_eq!(r.files.len(), 2);
         let _ = std::fs::remove_dir_all(dir.path());
     }
 

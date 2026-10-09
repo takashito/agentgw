@@ -87,3 +87,19 @@ fn install_reaches_setup() {
     assert_eq!(out.status.code(), Some(1), "{text}");
     assert!(text.starts_with("install: "), "{text}");
 }
+
+#[test]
+fn update_local_stops_where_there_is_nothing_built() {
+    let empty = std::env::temp_dir().join(format!("agentgw-cli-local-{}", std::process::id()));
+    std::fs::create_dir_all(&empty).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_agentgw"))
+        .args(["update", "local"])
+        .current_dir(&empty)
+        .env("AGENTGW_STATE_DIR", empty.join("state"))
+        .output()
+        .unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert_ne!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("cargo dist"), "{text}");
+    let _ = std::fs::remove_dir_all(&empty);
+}
