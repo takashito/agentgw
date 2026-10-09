@@ -794,8 +794,45 @@ pub struct Rollout {
     /// In the order they go. The gateway is first.
     #[serde(default)]
     pub machines: Vec<RolloutStep>,
+    /// Where the binaries come from: [`Rollout::RELEASE`] (GitHub) or [`Rollout::LOCAL`] (builds
+    /// uploaded to the gateway's `files/`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    /// The build label everything is going to, when known (`0.65.0+e1a48c9`). Empty for a release
+    /// made before there were labels — then the version alone decides.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub build: String,
+    /// `local` only: the build for each kind of machine, as a `files/` id (`triple` → id).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub files: BTreeMap<String, String>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Rollout {
+    pub const RELEASE: &'static str = "";
+    pub const LOCAL: &'static str = "local";
+
+    /// What the rollout is going to, as people read it: the build when known, else the version.
+    pub fn goal(&self) -> &str {
+        if self.build.is_empty() { &self.target } else { &self.build }
+    }
+
+    /// Whether a machine running `runs` is there. `runs` is its build when it says one and the
+    /// rollout knows its own, otherwise its version — so a machine too old to say a build is
+    /// judged on the version as before, and one on a local build of the same version is not.
+    pub fn done_on(&self, runs: &str) -> bool {
+        runs == self.target || (!self.build.is_empty() && runs == self.build)
+    }
+
+    /// What to compare for a machine that runs `version` and says `build` (see [`Self::done_on`]).
+    pub fn runs(&self, version: &str, build: &str) -> String {
+        if self.build.is_empty() || build.is_empty() {
+            version.to_string()
+        } else {
+            build.to_string()
+        }
+    }
 }
 
 /// One machine's part in a [`Rollout`].
@@ -870,12 +907,15 @@ impl Rollout {
         version_of: impl Fn(&str) -> String,
         now_ms: u64,
     ) -> RolloutNext {
-        let target = self.target.clone();
+        let target = self.goal().to_string();
+        let (version, build) = (self.target.clone(), self.build.clone());
+        // The same rule as `done_on` — `self` is borrowed by the loop
+        let there = |runs: &str| runs == version || (!build.is_empty() && runs == build);
         for step in self.machines.iter_mut().filter(|s| s.open()) {
             let is_me = step.id == me;
             let here = is_me || connected.iter().any(|c| c == &step.id);
             let runs = if is_me { my_version.to_string() } else { version_of(&step.id) };
-            if here && runs == target {
+            if here && there(&runs) {
                 step.state = RolloutStep::DONE.to_string();
                 continue;
             }
@@ -1743,6 +1783,69 @@ mod tests {
         let ask = |id: &str| v.get(id).unwrap_or(&"").to_string();
         assert_eq!(r.advance("gw", "0.56.0", &all, ask, T0 + 40), RolloutNext::Finished);
         assert_eq!(states(&r), ["done", "done", "done"]);
+    }
+
+    #[test]
+    fn a_machine_on_a_local_build_of_the_same_version_is_updated_again() {
+        let mut r = rollout(&[("gw", "0.65.0+rel"), ("a", "0.65.0+mine")]);
+        r.target = "0.65.0".into();
+        r.build = "0.65.0+rel".into();
+        let all = ["a".to_string()];
+        let runs = |_: &str| r_runs("0.65.0", "0.65.0+mine");
+        assert_eq!(r.advance("gw", "0.65.0+rel", &all, runs, T0), RolloutNext::Send("a".into()));
+    }
+
+    /// What the gateway passes for a machine (see `Rollout::runs`), with `build` known to the rollout
+    fn r_runs(version: &str, build: &str) -> String {
+        Rollout { build: "x".into(), ..Default::default() }.runs(version, build)
+    }
+
+    #[test]
+    fn an_old_machine_without_a_build_is_done_on_the_version() {
+        let mut r = rollout(&[("gw", "0.65.0+rel"), ("a", "0.65.0")]);
+        r.target = "0.65.0".into();
+        r.build = "0.65.0+rel".into();
+        let all = ["a".to_string()];
+        let runs = |_: &str| r_runs("0.65.0", "");
+        assert_eq!(r.advance("gw", "0.65.0+rel", &all, runs, T0), RolloutNext::Finished);
+    }
+
+    #[test]
+    fn a_release_without_a_known_build_goes_by_the_version_as_before() {
+        let mut r = rollout(&[("gw", "0.65.0"), ("a", "0.65.0")]);
+        r.target = "0.65.0".into();
+        // The rollout knows no label: the machine's label is not even looked at
+        assert_eq!(r.runs("0.65.0", "0.65.0+mine"), "0.65.0");
+        let all = ["a".to_string()];
+        assert_eq!(r.advance("gw", "0.65.0", &all, |_: &str| "0.65.0".to_string(), T0), RolloutNext::Finished);
+    }
+
+    #[test]
+    fn a_local_rollout_waits_for_the_label() {
+        let mut r = rollout(&[("gw", "0.65.0+old"), ("a", "0.65.0+old")]);
+        r.source = Rollout::LOCAL.into();
+        r.target = "0.65.0".into();
+        r.build = "0.65.0+new".into();
+        let all = ["a".to_string()];
+        let old = |_: &str| "0.65.0+old".to_string();
+        assert_eq!(r.advance("gw", "0.65.0+old", &all, old, T0), RolloutNext::Send("gw".into()));
+        assert_eq!(r.advance("gw", "0.65.0+new", &all, old, T0 + 10), RolloutNext::Send("a".into()));
+        let new = |_: &str| "0.65.0+new".to_string();
+        assert_eq!(r.advance("gw", "0.65.0+new", &all, new, T0 + 20), RolloutNext::Finished);
+    }
+
+    #[test]
+    fn a_rollout_with_files_survives_a_round_trip() {
+        let mut r = rollout(&[("gw", "0.65.0+a")]);
+        r.source = Rollout::LOCAL.into();
+        r.build = "0.65.0+b".into();
+        r.files.insert("x86_64-unknown-linux-musl".into(), "ab12".into());
+        let back: Rollout = serde_json::from_value(serde_json::to_value(&r).unwrap()).unwrap();
+        assert_eq!(back, r);
+        // An old rollout on disk reads as a release one
+        let old: Rollout = serde_json::from_str(r#"{"target":"0.64.9"}"#).unwrap();
+        assert_eq!((old.source.as_str(), old.build.as_str()), ("", ""));
+        assert!(old.files.is_empty());
     }
 
     #[test]

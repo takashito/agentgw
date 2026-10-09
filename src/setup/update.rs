@@ -206,6 +206,22 @@ pub fn replace_with(downloaded: &Path, sha256: &str, build: &str) -> Result<(), 
     put_in_place(downloaded, sha256, &target, Want::Build(build))
 }
 
+/// The build label a release was cut from, as `release.sh` uploads it beside the binaries
+/// (`agentgw.build`). Empty for a release made before there were labels.
+pub async fn release_build(tag: &str) -> String {
+    let url = format!(
+        "https://github.com/{}/releases/download/{tag}/agentgw.build",
+        crate::setup::add_machine::REPO
+    );
+    match curl(&["-fsSL", "--max-time", "20", &url]).await {
+        Ok(out) => {
+            let s = String::from_utf8_lossy(&out).trim().to_string();
+            if s.contains('+') { s } else { String::new() }
+        }
+        Err(_) => String::new(),
+    }
+}
+
 /// The latest release's tag. **Public repository: no gh, no sign-in.**
 pub async fn latest_tag() -> Result<String, String> {
     let url = format!("https://github.com/{}/releases/latest", crate::setup::add_machine::REPO);
@@ -223,10 +239,21 @@ pub async fn update_alone(named: Option<&str>) -> Result<Option<String>, String>
         None => latest_tag().await?,
     };
     let me = env!("CARGO_PKG_VERSION");
-    if version_of(&tag) == me || (named.is_none() && older(version_of(&tag), me)) {
+    if named.is_none() && older(version_of(&tag), me) {
         return Ok(None);
     }
-    self_replace(&tag, "").await?;
+    // There already: by the label when the release says one (a local build of the same version
+    // is not there), by the version otherwise
+    let build = release_build(&tag).await;
+    let here = if build.is_empty() {
+        version_of(&tag) == me
+    } else {
+        build == crate::build_label::LABEL
+    };
+    if here {
+        return Ok(None);
+    }
+    self_replace(&tag, &build).await?;
     Ok(Some(tag))
 }
 

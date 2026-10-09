@@ -2069,7 +2069,9 @@ static EDITING: Mutex<()> = Mutex::new(());
 /// finishes draws the same message the one that started did). **Pure function.**
 pub fn rollout_text(r: &crate::bridge::state::Rollout, me: &str, finished: bool) -> String {
     use crate::bridge::state::RolloutStep as S;
-    let t = &r.target;
+    // The build when the rollout knows it — a local one has no other name
+    let goal = r.goal().to_string();
+    let t = &goal;
     let mut out = vec![if finished {
         crate::t!("*Update to v{t} finished*", "*v{t} への update が終わりました*")
     } else {
@@ -2354,7 +2356,12 @@ impl Fleet {
 
     /// The rollout is over: **remove** it from access.json. `edit_access` can't — a save leaves out
     /// an empty field, and leaving it out leaves the old value on disk.
-    async fn end_update(&self) {
+    async fn end_update(&self, r: &crate::bridge::state::Rollout) {
+        // The builds it handed out are nobody's now
+        let store = crate::files::Store::at(&self.dir);
+        for id in r.files.values() {
+            store.remove(id);
+        }
         let cleared = {
             let _one = EDITING.lock().unwrap_or_else(|e| e.into_inner());
             self.dir.patch_json("access.json", "update", serde_json::Value::Null)
@@ -3233,7 +3240,7 @@ impl Fleet {
     /// [`Self::drive_updates`] does the rest — **including after the gateway has replaced itself**,
     /// which is why the plan lives in access.json and not here.
     pub(crate) async fn start_update(self: &Arc<Self>, channel: &str, thread_ts: &str, named: Option<String>) {
-        use crate::bridge::state::{Rollout, RolloutStep};
+        use crate::bridge::state::Rollout;
         use crate::setup::update;
         // Asked from the terminal: no thread, the message goes to the channel itself
         let thread = (!thread_ts.is_empty()).then_some(thread_ts);
@@ -3268,6 +3275,32 @@ impl Fleet {
             self.post(channel, thread, &text).await;
             return;
         }
+        // **The label too, when the release says it** — a machine on a local build of the same
+        // version then takes the release instead of counting as there
+        let build = update::release_build(&tag).await;
+        let r = Rollout { target, build, ..Default::default() };
+        self.begin_rollout(channel, thread_ts, r).await;
+    }
+
+    /// Write a rollout down (every machine in order, the gateway first) and post the message that
+    /// follows it. Shared by `update` and `update local`: only where the binaries come from differs.
+    pub(crate) async fn begin_rollout(
+        self: &Arc<Self>,
+        channel: &str,
+        thread_ts: &str,
+        mut r: crate::bridge::state::Rollout,
+    ) {
+        use crate::bridge::state::RolloutStep;
+        let thread = (!thread_ts.is_empty()).then_some(thread_ts);
+        if let Some(on) = self.access().update {
+            let t = on.goal();
+            let text = crate::t!(
+                "An update to v{t} is already under way.",
+                "v{t} への update がすでに進んでいます。"
+            );
+            self.post(channel, thread, &text).await;
+            return;
+        }
         let access = self.access();
         let mut ids: Vec<String> = access
             .machines
@@ -3278,18 +3311,21 @@ impl Fleet {
             .collect();
         ids.sort();
         ids.dedup();
-        let mut machines = vec![RolloutStep::new(&self.self_id, me)];
+        let mut machines = vec![RolloutStep::new(
+            &self.self_id,
+            &r.runs(env!("CARGO_PKG_VERSION"), crate::build_label::LABEL),
+        )];
         for id in ids {
-            let from = access.machines.get(&id).map(|l| l.version.clone()).unwrap_or_default();
+            let from = access
+                .machines
+                .get(&id)
+                .map(|l| r.runs(&l.version, &l.build))
+                .unwrap_or_default();
             machines.push(RolloutStep::new(&id, &from));
         }
-        let mut r = Rollout {
-            target,
-            channel: channel.to_string(),
-            thread_ts: thread_ts.to_string(),
-            machines,
-            ..Default::default()
-        };
+        r.channel = channel.to_string();
+        r.thread_ts = thread_ts.to_string();
+        r.machines = machines;
         match self
             .api
             .post_message_no_unfurl(channel, &rollout_text(&r, &self.self_id, false), thread)
@@ -3298,7 +3334,7 @@ impl Fleet {
             Ok(ts) => r.progress_ts = ts,
             Err(e) => rlog("error", &format!("update: could not post the progress message: {e}")),
         }
-        rlog("info", &format!("update: starting a rollout to v{}", r.target));
+        rlog("info", &format!("update: starting a rollout to v{}", r.goal()));
         self.edit_access(|a| a.update = Some(r)).await;
     }
 
@@ -3492,6 +3528,39 @@ impl Fleet {
         }
     }
 
+    /// Clear `files/` of what nobody needs. **A rollout in progress keeps its builds** — the gateway
+    /// restarts halfway through one, and the machines after it still need theirs.
+    fn sweep_files(&self) {
+        let keep: Vec<String> = self
+            .access()
+            .update
+            .map(|r| r.files.into_values().collect())
+            .unwrap_or_default();
+        crate::files::Store::at(&self.dir).sweep(now_ms(), &keep);
+    }
+
+    /// What tells `id` to update: fetch the release (`Update`), or fetch its build from `files/`
+    /// (`FileReady`). `None` = a local rollout holds no build for that kind of machine.
+    fn update_frame(&self, r: &crate::bridge::state::Rollout, id: &str, access: &Access) -> Option<link::LinkFrame> {
+        if r.source != crate::bridge::state::Rollout::LOCAL {
+            return Some(link::LinkFrame::Update { version: r.target.clone(), build: r.build.clone() });
+        }
+        let triple = if id == self.self_id {
+            crate::setup::update::this_triple().unwrap_or_default().to_string()
+        } else {
+            access.machines.get(id).map(|l| l.triple.clone()).unwrap_or_default()
+        };
+        let (e, _) = crate::files::Store::at(&self.dir).get(r.files.get(&triple)?)?;
+        Some(link::LinkFrame::FileReady {
+            id: e.id,
+            from: e.from,
+            kind: e.kind,
+            meta: e.meta,
+            size: e.size,
+            sha256: e.sha256,
+        })
+    }
+
     /// Carries an `update` through, one machine at a time. **The only clock the rollout has** — it
     /// looks every 2 seconds, and a process that starts with a rollout in access.json picks it up
     /// (the gateway restarts halfway through its own rollout).
@@ -3500,8 +3569,15 @@ impl Fleet {
         let born = std::time::Instant::now();
         let mut shown = String::new();
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+        let mut swept_at = std::time::Instant::now();
+        // Leftovers of the last process: half uploads, and files nobody is handing out any more
+        self.sweep_files();
         loop {
             tick.tick().await;
+            if swept_at.elapsed() >= std::time::Duration::from_secs(600) {
+                swept_at = std::time::Instant::now();
+                self.sweep_files();
+            }
             let access = self.access();
             let Some(mut r) = access.update.clone() else {
                 shown.clear();
@@ -3518,25 +3594,38 @@ impl Fleet {
                 continue;
             }
             let before = r.clone();
+            let mine = r.runs(env!("CARGO_PKG_VERSION"), crate::build_label::LABEL);
             let next = r.advance(
                 &self.self_id,
-                env!("CARGO_PKG_VERSION"),
+                &mine,
                 &connected,
-                |id| access.machines.get(id).map(|l| l.version.clone()).unwrap_or_default(),
+                |id| {
+                    access
+                        .machines
+                        .get(id)
+                        .map(|l| before.runs(&l.version, &l.build))
+                        .unwrap_or_default()
+                },
                 now_ms(),
             );
             let finished = next == RolloutNext::Finished;
             // **Written down before the machine is told** — telling the gateway itself restarts it
             if finished {
-                self.end_update().await;
-                rlog("info", &format!("update: rollout to v{} finished", r.target));
+                self.end_update(&r).await;
+                rlog("info", &format!("update: rollout to v{} finished", r.goal()));
             } else if r != before {
                 let saved = r.clone();
                 self.edit_access(|a| a.update = Some(saved)).await;
             }
             if let RolloutNext::Send(id) = &next {
-                rlog("info", &format!("update: telling {id} to update to v{}", r.target));
-                let frame = link::LinkFrame::Update { version: r.target.clone(), build: String::new() };
+                rlog("info", &format!("update: telling {id} to update to v{}", r.goal()));
+                let Some(frame) = self.update_frame(&r, id, &access) else {
+                    let why = crate::t!("no build for its kind of machine", "このマシン用のビルドがありません");
+                    r.failed(id, &why);
+                    let saved = r.clone();
+                    self.edit_access(|a| a.update = Some(saved)).await;
+                    continue;
+                };
                 if !self.send_frame(id, &frame).await {
                     let why = crate::t!("could not reach it", "届きませんでした");
                     r.failed(id, &why);
@@ -5439,7 +5528,7 @@ mod tests {
         let r = crate::bridge::state::Rollout { target: "0.57.2".into(), ..Default::default() };
         fleet.edit_access(|a| a.update = Some(r)).await;
         assert!(Access::load(&dir).update.is_some());
-        fleet.end_update().await;
+        fleet.end_update(&Access::load(&dir).update.unwrap()).await;
         assert_eq!(Access::load(&dir).update, None);
         let _ = std::fs::remove_dir_all(dir.path());
     }
@@ -6647,6 +6736,65 @@ mod tests {
             (l.version.as_str(), l.build.as_str(), l.triple.as_str()),
             ("0.65.0", "0.65.0+e1a48c9", "x86_64-unknown-linux-musl")
         );
+        let _ = std::fs::remove_dir_all(dir.path());
+    }
+
+    #[test]
+    fn a_local_rollout_is_titled_by_its_build() {
+        let r = crate::bridge::state::Rollout {
+            source: "local".into(),
+            target: "0.65.0".into(),
+            build: "0.65.0+e1a48c9".into(),
+            machines: vec![crate::bridge::state::RolloutStep::new("gw", "0.65.0+aaa")],
+            ..Default::default()
+        };
+        let text = rollout_text(&r, "gw", false);
+        assert!(text.lines().next().unwrap().contains("0.65.0+e1a48c9"), "{text}");
+        assert!(text.contains("0.65.0+aaa → 0.65.0+e1a48c9"), "{text}");
+    }
+
+    /// A local rollout tells each machine to fetch the build for its kind; one with no build for its
+    /// kind gets nothing (the rollout marks it failed and goes on)
+    #[tokio::test]
+    async fn a_local_rollout_hands_each_machine_its_own_build() {
+        let dir = StateDir::at(std::env::temp_dir().join(format!("agentgw-local-frame-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let (fleet, _rx) = a_fleet_in(dir.clone());
+        let store = crate::files::Store::at(&dir);
+        let sum = crate::setup::update::sha256_hex(b"linux");
+        let head = crate::files::Head {
+            kind: crate::files::BUILD.into(),
+            meta: serde_json::json!({"triple": "x86_64-unknown-linux-musl", "build": "0.65.0+aaa"}),
+            sha256: sum,
+            ..Default::default()
+        };
+        let body = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"linux"))]);
+        let e = store.put(head, body).await.unwrap();
+        let mut access = Access::default();
+        access.machines.insert("pve".into(), crate::bridge::state::Link { triple: "x86_64-unknown-linux-musl".into(), ..Default::default() });
+        access.machines.insert("mac".into(), crate::bridge::state::Link { triple: "aarch64-apple-darwin".into(), ..Default::default() });
+        let mut r = crate::bridge::state::Rollout {
+            source: "local".into(),
+            target: "0.65.0".into(),
+            build: "0.65.0+aaa".into(),
+            ..Default::default()
+        };
+        r.files.insert("x86_64-unknown-linux-musl".into(), e.id.clone());
+        match fleet.update_frame(&r, "pve", &access) {
+            Some(link::LinkFrame::FileReady { id, size, .. }) => assert_eq!((id.as_str(), size), (e.id.as_str(), 5)),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(fleet.update_frame(&r, "mac", &access), None);
+        // A release rollout names the release and its label
+        let rel = crate::bridge::state::Rollout { target: "0.65.0".into(), build: "0.65.0+rel".into(), ..Default::default() };
+        assert_eq!(
+            fleet.update_frame(&rel, "mac", &access),
+            Some(link::LinkFrame::Update { version: "0.65.0".into(), build: "0.65.0+rel".into() })
+        );
+        // Finishing it lets the builds go
+        fleet.end_update(&r).await;
+        assert!(store.get(&e.id).is_none());
         let _ = std::fs::remove_dir_all(dir.path());
     }
 
