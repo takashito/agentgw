@@ -1820,6 +1820,9 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
         }
         // The gateway's `rename-machine`: it has already pointed its records at the new name. Write it
         // down and restart into it — the name is read once, at start-up. Agents keep running
+        machine::FromRelay::FileReady { id, kind, from, .. } => {
+            LogCtx::default().info("bridge", &format!("files: {id} ({kind}) from {from} is waiting at the gateway"));
+        }
         machine::FromRelay::Rename { to } => match take_new_name(dir, &to) {
             Ok(()) => {
                 LogCtx::default().info("bridge", &format!("rename: this machine is {to} now"));

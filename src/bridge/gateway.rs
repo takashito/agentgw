@@ -222,6 +222,18 @@ pub mod link {
         Rename { to: String },
         /// machine → gateway: could not write the new name down (still running under the old one).
         RenameFailed { why: String },
+        /// gateway → machine: a file is waiting at `GET /files/<id>`. **Only the notice rides the
+        /// link** — the content goes over HTTP, so it never holds up the events behind it.
+        FileReady {
+            id: String,
+            #[serde(default)]
+            from: String,
+            kind: String,
+            #[serde(default)]
+            meta: serde_json::Value,
+            size: u64,
+            sha256: String,
+        },
         /// `machines`, asked from a machine — same reason as [`LinkFrame::Routes`].
         Machines { channel: String, thread_ts: String },
         /// `route`, asked from a machine. **The gateway only sees messages that mention the bot**, and a
@@ -3978,6 +3990,94 @@ async fn on_start_update(
     (StatusCode::ACCEPTED, "accepted").into_response()
 }
 
+fn header(headers: &HeaderMap, name: &str) -> String {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+/// `POST /files`: take a file in. For a machine, tell it to come and fetch it.
+/// **Runs on its own connection** — the link's tasks never wait on an upload.
+async fn on_put_file(
+    State(fleet): State<Arc<Fleet>>,
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> axum::response::Response {
+    if !secret_eq(&header(&headers, "x-api-token"), &fleet.token) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    let head = crate::files::Head {
+        kind: header(&headers, "x-agentgw-kind"),
+        from: header(&headers, "x-agentgw-from"),
+        to: header(&headers, "x-agentgw-to"),
+        meta: serde_json::from_str(&header(&headers, "x-agentgw-meta")).unwrap_or(serde_json::Value::Null),
+        sha256: header(&headers, "x-agentgw-sha256"),
+    };
+    let for_a_machine = !head.to.is_empty() && head.to != fleet.self_id;
+    // **Not kept for later**: an offline machine is told so at once, before a byte is read
+    if for_a_machine && !fleet.links.connected().contains(&head.to) {
+        let to = &head.to;
+        return (
+            StatusCode::CONFLICT,
+            crate::t!("{to} is offline", "{to} はオフラインです"),
+        )
+            .into_response();
+    }
+    let entry = match crate::files::Store::at(&fleet.dir)
+        .put(head, body.into_data_stream())
+        .await
+    {
+        Ok(e) => e,
+        Err(why) => return (StatusCode::BAD_REQUEST, why).into_response(),
+    };
+    rlog(
+        "info",
+        &format!(
+            "files: took in {} ({}, {}B) from {} for {}",
+            entry.id,
+            entry.kind,
+            entry.size,
+            if entry.from.is_empty() { "?" } else { &entry.from },
+            if entry.to.is_empty() { "the gateway" } else { &entry.to }
+        ),
+    );
+    if for_a_machine {
+        let frame = link::LinkFrame::FileReady {
+            id: entry.id.clone(),
+            from: entry.from.clone(),
+            kind: entry.kind.clone(),
+            meta: entry.meta.clone(),
+            size: entry.size,
+            sha256: entry.sha256.clone(),
+        };
+        fleet.send_frame(&entry.to, &frame).await;
+    }
+    (StatusCode::CREATED, axum::Json(serde_json::json!({ "id": entry.id }))).into_response()
+}
+
+/// `GET /files/<id>`: hand a held file out.
+async fn on_get_file(
+    State(fleet): State<Arc<Fleet>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    if !secret_eq(&header(&headers, "x-api-token"), &fleet.token) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    let Some((_, path)) = crate::files::Store::at(&fleet.dir).get(&id) else {
+        return (StatusCode::NOT_FOUND, "no such file").into_response();
+    };
+    // Read whole: an agentgw build is a few tens of MB. Streaming it (tokio-util's ReaderStream)
+    // would mean declaring one more crate
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => (StatusCode::OK, bytes).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 /// Open the endpoint that accepts machines. **Never returns.**
 ///
 /// A bind failure doesn't stop the Bridge — its own agents keep running. But no machine can
@@ -4012,6 +4112,13 @@ async fn serve_children_on(fleet: Arc<Fleet>, listener: tokio::net::TcpListener)
     let app = Router::new()
         .route("/status", get(on_status))
         .route("/update", axum::routing::post(on_start_update))
+        // **No size limit**: the body streams to disk, so axum's 2MB guard for bodies read into memory
+        // has nothing to guard here
+        .route(
+            "/files",
+            axum::routing::post(on_put_file).layer(axum::extract::DefaultBodyLimit::disable()),
+        )
+        .route("/files/{id}", get(on_get_file))
         .route(link::PROBE_PATH, get(on_upgrade))
         .route("/bridge/{id}", get(on_upgrade))
         .with_state(fleet);
@@ -5356,6 +5463,132 @@ mod tests {
             .to_string()
     }
 
+    /// One raw HTTP request with a body. Returns the status line and the body.
+    async fn http(
+        addr: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> (String, Vec<u8>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut req = format!(
+            "{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: {}\r\n",
+            body.len()
+        );
+        for (k, v) in headers {
+            req.push_str(&format!("{k}: {v}\r\n"));
+        }
+        req.push_str("\r\n");
+        s.write_all(req.as_bytes()).await.unwrap();
+        s.write_all(body).await.unwrap();
+        let mut buf = Vec::new();
+        let _ = s.read_to_end(&mut buf).await;
+        let split = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let status = String::from_utf8_lossy(&buf[..split])
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        (status, buf[split + 4..].to_vec())
+    }
+
+    async fn a_fleet_serving(name: &str) -> (Arc<Fleet>, StateDir, std::net::SocketAddr) {
+        let dir = StateDir::at(std::env::temp_dir().join(format!("agentgw-http-{name}-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let (fleet, _rx) = a_fleet_in(dir.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_children_on(fleet.clone(), listener));
+        (fleet, dir, addr)
+    }
+
+    #[tokio::test]
+    async fn a_file_goes_up_and_comes_back_down() {
+        let (_fleet, dir, addr) = a_fleet_serving("files").await;
+        // Bigger than axum's default 2MB, which this route lifts
+        let data = vec![7u8; 3 * 1024 * 1024];
+        let sum = crate::setup::update::sha256_hex(&data);
+        let head = [
+            ("x-api-token", "s3cret"),
+            ("x-agentgw-kind", crate::files::BUILD),
+            ("x-agentgw-from", "mac"),
+            ("x-agentgw-meta", "{}"),
+            ("x-agentgw-sha256", sum.as_str()),
+        ];
+        let (status, body) = http(addr, "POST", "/files", &head, &data).await;
+        assert!(status.contains("201"), "{status} {}", String::from_utf8_lossy(&body));
+        let id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, got) = http(addr, "GET", &format!("/files/{id}"), &[("x-api-token", "s3cret")], b"").await;
+        assert!(status.contains("200"), "{status}");
+        assert_eq!(got.len(), data.len());
+        assert!(got == data);
+        // No key, no file — up or down
+        let (status, _) = http(addr, "GET", &format!("/files/{id}"), &[], b"").await;
+        assert!(status.contains("401"), "{status}");
+        let (status, _) = http(addr, "POST", "/files", &head[1..], b"x").await;
+        assert!(status.contains("401"), "{status}");
+        // An id that isn't ours
+        let (status, _) = http(addr, "GET", "/files/nothere", &[("x-api-token", "s3cret")], b"").await;
+        assert!(status.contains("404"), "{status}");
+        let _ = std::fs::remove_dir_all(dir.path());
+    }
+
+    #[tokio::test]
+    async fn a_file_for_an_offline_machine_is_refused_at_once() {
+        let (_fleet, dir, addr) = a_fleet_serving("offline").await;
+        let sum = crate::setup::update::sha256_hex(b"x");
+        let head = [
+            ("x-api-token", "s3cret"),
+            ("x-agentgw-kind", crate::files::BUILD),
+            ("x-agentgw-to", "pve"),
+            ("x-agentgw-sha256", sum.as_str()),
+        ];
+        let (status, _) = http(addr, "POST", "/files", &head, b"x").await;
+        assert!(status.contains("409"), "{status}");
+        assert_eq!(std::fs::read_dir(dir.join("files")).map(|d| d.count()).unwrap_or(0), 0);
+        let _ = std::fs::remove_dir_all(dir.path());
+    }
+
+    /// A file for a connected machine is announced to it on the link — and only the notice goes there
+    #[tokio::test]
+    async fn a_machine_is_told_to_come_and_fetch_its_file() {
+        let (fleet, dir, addr) = a_fleet_serving("ready").await;
+        let (_conn, mut rx) = fleet.attach("pve").await;
+        let sum = crate::setup::update::sha256_hex(b"abc");
+        let head = [
+            ("x-api-token", "s3cret"),
+            ("x-agentgw-kind", crate::files::BUILD),
+            ("x-agentgw-from", "mac"),
+            ("x-agentgw-to", "pve"),
+            ("x-agentgw-meta", r#"{"triple":"x86_64-unknown-linux-musl"}"#),
+            ("x-agentgw-sha256", sum.as_str()),
+        ];
+        let (status, _) = http(addr, "POST", "/files", &head, b"abc").await;
+        assert!(status.contains("201"), "{status}");
+        // Attaching sends `Ready` (and the like) first; the notice comes after
+        let sent = loop {
+            let f = link::decode(&rx.recv().await.unwrap()).unwrap();
+            if matches!(f, link::LinkFrame::FileReady { .. }) {
+                break f;
+            }
+        };
+        match sent {
+            link::LinkFrame::FileReady { from, kind, size, sha256, meta, .. } => {
+                assert_eq!((from.as_str(), kind.as_str(), size), ("mac", crate::files::BUILD, 3));
+                assert_eq!(sha256, sum);
+                assert_eq!(meta["triple"], "x86_64-unknown-linux-musl");
+            }
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(dir.path());
+    }
+
     /// **Only the three link routes live on the machines' port.**
     /// The hook intake and MCP are on a different port (loopback + token), while this one is **exposed** through
     /// a front proxy — the day they share a port, hooks and MCP can be hit from outside.
@@ -6403,6 +6636,14 @@ mod tests {
                 triple: "aarch64-apple-darwin".into(),
             },
             link::LinkFrame::StartUpdate { channel: "D1".into(), thread_ts: "1.0".into(), version: None },
+            link::LinkFrame::FileReady {
+                id: "ab12".into(),
+                from: "mac".into(),
+                kind: "agentgw-build".into(),
+                meta: serde_json::json!({"triple": "x86_64-unknown-linux-musl", "build": "0.65.0+aaa"}),
+                size: 3,
+                sha256: "0".repeat(64),
+            },
         ] {
             assert_eq!(link::decode(&link::encode(&f)).unwrap(), f, "{f:?}");
         }

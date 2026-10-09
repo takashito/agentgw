@@ -161,6 +161,15 @@ pub enum FromRelay {
     Update { version: String, build: String },
     /// This machine is called `to` from now on: write it into `.env`, then restart into it.
     Rename { to: String },
+    /// A file is waiting at the gateway's `GET /files/<id>`.
+    FileReady {
+        id: String,
+        from: String,
+        kind: String,
+        meta: serde_json::Value,
+        size: u64,
+        sha256: String,
+    },
     /// A refusal that talking won't fix. **No retry.**
     Fatal(Fatal),
 }
@@ -262,6 +271,21 @@ impl FromRelay {
             F::Home { channel } => FromRelay::Home { channel },
             F::Update { version, build } => FromRelay::Update { version, build },
             F::Rename { to } => FromRelay::Rename { to },
+            F::FileReady {
+                id,
+                from,
+                kind,
+                meta,
+                size,
+                sha256,
+            } => FromRelay::FileReady {
+                id,
+                from,
+                kind,
+                meta,
+                size,
+                sha256,
+            },
             // Answers and asks only ever go the other way
             F::ProjectSet { .. }
             | F::Routes { .. }

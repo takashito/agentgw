@@ -6,6 +6,7 @@ pub mod i18n;
 pub mod mcp;
 pub mod chat;
 pub mod clock;
+pub mod files;
 pub mod log;
 pub mod state_dir;
 pub mod service;
