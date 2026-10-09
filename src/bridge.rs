@@ -1590,6 +1590,42 @@ fn report_folders(
     }
 }
 
+/// Fetch a build the gateway holds and put it in place of this binary. `Ok(None)` = already on it;
+/// `Ok(Some(label))` = in place, restart into it. An error names the build it was for.
+async fn take_build(
+    dir: &crate::state_dir::StateDir,
+    id: &str,
+    meta: &serde_json::Value,
+    sha256: &str,
+) -> Result<Option<String>, (String, String)> {
+    let named = meta["build"].as_str().unwrap_or("?").to_string();
+    let build = crate::setup::update::build_for_this_machine(meta).map_err(|why| (named, why))?;
+    if build == crate::build_label::LABEL {
+        return Ok(None);
+    }
+    let fail = |why: String| (build.clone(), why);
+    let env: HashMap<String, String> = dir.load_env().unwrap_or_default().into_iter().collect();
+    let (base, token) = crate::files::base_of(&env, &bridge::Access::load(dir))
+        .ok_or_else(|| fail("cannot tell where the gateway is".into()))?;
+    let target = crate::setup::update::running_binary().map_err(fail)?;
+    // Next to the target, so the rename stays on one filesystem
+    let new = target.with_file_name("agentgw.new");
+    LogCtx::default().info(
+        "bridge",
+        &format!("update: {} → {build} (from the gateway)", crate::build_label::LABEL),
+    );
+    if let Err(why) = crate::files::download(&base, &token, id, &new).await {
+        let _ = std::fs::remove_file(&new);
+        return Err(fail(why));
+    }
+    let (sum, b) = (sha256.to_string(), build.clone());
+    tokio::task::spawn_blocking(move || crate::setup::update::replace_with(&new, &sum, &b))
+        .await
+        .map_err(|e| fail(e.to_string()))?
+        .map_err(fail)?;
+    Ok(Some(build))
+}
+
 /// What this machine runs, as it tells the gateway: the version, the build, and what it runs on.
 fn version_frame() -> crate::bridge::gateway::link::LinkFrame {
     crate::bridge::gateway::link::LinkFrame::MachineVersion {
@@ -1820,8 +1856,43 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
         }
         // The gateway's `rename-machine`: it has already pointed its records at the new name. Write it
         // down and restart into it — the name is read once, at start-up. Agents keep running
-        machine::FromRelay::FileReady { id, kind, from, .. } => {
-            LogCtx::default().info("bridge", &format!("files: {id} ({kind}) from {from} is waiting at the gateway"));
+        // A file waiting at the gateway. **Off this task**: fetching, hashing and running the new
+        // binary take a while, and Slack events keep flowing meanwhile. The gateway's own builds
+        // come this way too (`send_frame` to itself)
+        machine::FromRelay::FileReady {
+            id,
+            from,
+            kind,
+            meta,
+            sha256,
+            ..
+        } => {
+            let (up, updated, dir) = (up.clone(), updated.clone(), dir.clone());
+            tokio::spawn(async move {
+                if kind != crate::files::BUILD {
+                    LogCtx::default().info(
+                        "bridge",
+                        &format!("files: {id} from {from} is a {kind:?}, which this machine does not take"),
+                    );
+                    return;
+                }
+                match take_build(&dir, &id, &meta, &sha256).await {
+                    Ok(Some(build)) => {
+                        let _ = updated.send(format!("update to {build} (from {from})")).await;
+                    }
+                    // Already on it: say so, and the gateway counts it done
+                    Ok(None) => {
+                        let _ = up.send(version_frame());
+                    }
+                    Err((build, why)) => {
+                        LogCtx::default().error("bridge", &format!("update to {build} failed: {why}"));
+                        let _ = up.send(crate::bridge::gateway::link::LinkFrame::UpdateFailed {
+                            version: build,
+                            why,
+                        });
+                    }
+                }
+            });
         }
         machine::FromRelay::Rename { to } => match take_new_name(dir, &to) {
             Ok(()) => {

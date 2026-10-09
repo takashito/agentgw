@@ -5555,6 +5555,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir.path());
     }
 
+    /// The client side (curl) against the real routes: what goes up comes down the same
+    #[tokio::test]
+    async fn upload_and_download_meet_in_the_middle() {
+        let (_fleet, dir, addr) = a_fleet_serving("curl").await;
+        let src = dir.join("build");
+        let data: Vec<u8> = (0..2_500_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&src, &data).unwrap();
+        let base = format!("http://{addr}");
+        let head = crate::files::Head {
+            kind: crate::files::BUILD.into(),
+            from: "mac".into(),
+            meta: serde_json::json!({"triple": "aarch64-apple-darwin", "build": "0.65.0+aaa"}),
+            ..Default::default()
+        };
+        let id = crate::files::upload(&base, "s3cret", &src, &head).await.unwrap();
+        let (entry, _) = crate::files::Store::at(&dir).get(&id).unwrap();
+        assert_eq!(entry.meta["build"], "0.65.0+aaa");
+        let out = dir.join("fetched");
+        crate::files::download(&base, "s3cret", &id, &out).await.unwrap();
+        assert!(std::fs::read(&out).unwrap() == data);
+        // A wrong key is an error, not an empty file taken for the build
+        assert!(crate::files::download(&base, "nope", &id, &dir.join("x")).await.is_err());
+        let err = crate::files::upload(&base, "nope", &src, &head).await.unwrap_err();
+        assert!(err.contains("unauthorized"), "{err}");
+        let _ = std::fs::remove_dir_all(dir.path());
+    }
+
     /// A file for a connected machine is announced to it on the link — and only the notice goes there
     #[tokio::test]
     async fn a_machine_is_told_to_come_and_fetch_its_file() {

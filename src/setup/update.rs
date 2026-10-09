@@ -185,6 +185,27 @@ async fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
     Ok(out.stdout)
 }
 
+/// The build label in a `FileReady`'s meta, if the build is for this kind of machine.
+pub fn build_for_this_machine(meta: &serde_json::Value) -> Result<String, String> {
+    let triple = meta["triple"].as_str().unwrap_or("");
+    let me = this_triple().unwrap_or("");
+    if triple != me {
+        return Err(format!("this build is for {triple}, and this machine is {me}"));
+    }
+    meta["build"]
+        .as_str()
+        .filter(|b| !b.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "the build does not say which build it is".to_string())
+}
+
+/// Put a build fetched from the gateway in place of the running binary. The same checks as a
+/// release (`put_in_place`); does **not** restart.
+pub fn replace_with(downloaded: &Path, sha256: &str, build: &str) -> Result<(), String> {
+    let target = running_binary()?;
+    put_in_place(downloaded, sha256, &target, Want::Build(build))
+}
+
 /// The latest release's tag. **Public repository: no gh, no sign-in.**
 pub async fn latest_tag() -> Result<String, String> {
     let url = format!("https://github.com/{}/releases/latest", crate::setup::add_machine::REPO);
@@ -349,5 +370,16 @@ mod tests {
         let (new, sum) = fake_binary_with_label(&d, "agentgw.new", "0.65.0", "0.65.0+aaa");
         put_in_place(&new, &sum, &target, Want::Build("0.65.0+aaa")).unwrap();
         assert!(std::fs::read_to_string(&target).unwrap().contains("0.65.0+aaa"));
+    }
+
+    #[test]
+    fn a_build_for_another_kind_of_machine_is_refused() {
+        let other = serde_json::json!({"triple": "riscv64gc-unknown-linux-musl", "build": "0.65.0+aaa"});
+        let err = build_for_this_machine(&other).unwrap_err();
+        assert!(err.contains("riscv64gc"), "{err}");
+        let ok = serde_json::json!({"triple": this_triple().unwrap(), "build": "0.65.0+aaa"});
+        assert_eq!(build_for_this_machine(&ok).unwrap(), "0.65.0+aaa");
+        let unnamed = serde_json::json!({"triple": this_triple().unwrap()});
+        assert!(build_for_this_machine(&unnamed).is_err());
     }
 }
