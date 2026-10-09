@@ -51,6 +51,20 @@ if [ "$found" = 0 ]; then
   exit 1
 fi
 
+# Which build this release is. `update` compares it with what a machine runs, so a machine on a
+# local build of the same version still takes the release. Read out of the files, since not every
+# one of them runs here — and they must all be one build
+labels="$(for f in "$staging"/agentgw-*; do
+  case "$f" in *.sha256) ;; *) LC_ALL=C grep -a -o 'agentgw-build:[0-9.]*+[0-9a-z.]*' "$f" | head -1 ;; esac
+done | sort -u)"
+if [ "$(printf '%s\n' "$labels" | grep -c .)" != 1 ]; then
+  echo "Stopped. The builds are not all one build:" >&2
+  printf '  %s\n' $labels >&2
+  exit 1
+fi
+printf '%s\n' "${labels#agentgw-build:}" > "$staging/agentgw.build"
+echo "  agentgw.build (${labels#agentgw-build:})"
+
 echo "==> Uploading $found asset(s) to $tag"
 if gh release view "$tag" >/dev/null 2>&1; then
   # **Whose commit is that tag on?** Two branches bumping to the same version is the one way
