@@ -9,8 +9,9 @@ pub const TMUX_SESSION: &str = "agentgw-workers";
 
 /// The size of every agent window (columns, rows). The session is never attached, so without
 /// this tmux keeps it at `default-size` (80x24) and the agent's text wraps at about 60 columns.
-/// 200 columns keeps tables and diffs on one line; 50 rows keeps dialogs on the captured screen.
-const WINDOW_SIZE: (&str, &str) = ("200", "50");
+/// 150 columns keeps most tables on one line and still reads in a preview pane; 50 rows is fine
+/// because previews scroll.
+const WINDOW_SIZE: (&str, &str) = ("150", "50");
 
 /// The pause between typing the text and sending Enter. **Do not shorten it**.
 ///
@@ -299,7 +300,7 @@ mod tests {
             calls.lock().unwrap().clone(),
             [
                 "has-session -t agentgw-workers",
-                "new-session -d -s agentgw-workers -x 200 -y 50 -n w1 -c /repo -P -F #{window_id} claude",
+                "new-session -d -s agentgw-workers -x 150 -y 50 -n w1 -c /repo -P -F #{window_id} claude",
                 "set-option -t agentgw-workers window-size manual",
                 "set-option -w -t @7 automatic-rename off",
                 "set-option -w -t @7 allow-rename off",
@@ -319,7 +320,7 @@ mod tests {
             [
                 "has-session -t agentgw-workers",
                 "set-option -t agentgw-workers window-size manual",
-                "set-option -t agentgw-workers default-size 200x50",
+                "set-option -t agentgw-workers default-size 150x50",
                 "new-window -d -t agentgw-workers -n w2 -c /repo -P -F #{window_id} claude",
                 "set-option -w -t @7 automatic-rename off",
                 "set-option -w -t @7 allow-rename off",
