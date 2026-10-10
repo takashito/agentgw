@@ -305,9 +305,40 @@ impl Threads {
             }
         };
         Self {
-            entries: Self::drop_old_routes(entries),
+            entries: Self::drop_shared_agents(Self::drop_old_routes(entries)),
             path: Some(path),
         }
+    }
+
+    /// **One agent belongs to one thread.** When two rows name the same session, the newest thread keeps
+    /// it and the older ones let go: an agent is only ever handed on to a thread that started later.
+    /// Left shared, every hook resolved to the older thread, so the newer one never saw its messages
+    /// taken in and warned they never arrived (a stale pool designation once handed one agent to two).
+    fn drop_shared_agents(mut entries: BTreeMap<String, ThreadEntry>) -> BTreeMap<String, ThreadEntry> {
+        let ts = |k: &str| k.parse::<f64>().unwrap_or(0.0);
+        let mut owner: BTreeMap<String, String> = BTreeMap::new();
+        for (k, e) in &entries {
+            if let Some(sid) = &e.agent_id {
+                let newer = owner.get(sid).is_none_or(|o| ts(k) > ts(o));
+                if newer {
+                    owner.insert(sid.clone(), k.clone());
+                }
+            }
+        }
+        for (k, e) in entries.iter_mut() {
+            let Some(sid) = e.agent_id.clone() else { continue };
+            if owner.get(&sid) != Some(k) {
+                LogCtx::default().info(
+                    "bridge",
+                    &format!(
+                        "thread {k} let go of session {sid} — thread {} holds it too and is newer",
+                        owner[&sid]
+                    ),
+                );
+                e.agent_id = None;
+            }
+        }
+        entries
     }
 
     /// Forget the old `bridge` key: it was written for every thread in a channel, whether the bot
@@ -2096,6 +2127,26 @@ mod tests {
             t.upsert("2.0", e);
             assert!(!t.is_active("2.0"), "{status} は動いていない");
         }
+    }
+
+    /// Two rows naming one agent: the newer thread keeps it, so its hooks resolve to it.
+    #[test]
+    fn a_shared_agent_stays_with_the_newer_thread() {
+        let dir = StateDir::at(std::env::temp_dir().join("scrs-threads-shared-agent-test"));
+        std::fs::create_dir_all(dir.join("")).unwrap();
+        std::fs::write(
+            dir.join("threads.json"),
+            r#"{"9.1":{"session_id":"s1","channel_id":"C1"},
+                "10.2":{"session_id":"s1","channel_id":"C1"},
+                "8.0":{"session_id":"s2","channel_id":"C1"}}"#,
+        )
+        .unwrap();
+        let t = Threads::load(&dir);
+        assert_eq!(t.find_by_session("s1").map(|(k, _)| k.as_str()), Some("10.2"));
+        assert_eq!(t.get("9.1").unwrap().agent_id, None);
+        assert_eq!(t.get("9.1").unwrap().channel_id.as_deref(), Some("C1"));
+        assert_eq!(t.find_by_session("s2").map(|(k, _)| k.as_str()), Some("8.0"));
+        let _ = std::fs::remove_file(dir.join("threads.json"));
     }
 
     /// access.json has several owners. **The side writing settings must not erase keys only the
