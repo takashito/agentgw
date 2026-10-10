@@ -7,6 +7,11 @@ use super::{Pid, Window, WindowRow};
 /// full name by hand too (`-t agentgw` hits `agentgw-workers`).
 pub const TMUX_SESSION: &str = "agentgw-workers";
 
+/// The size of every agent window (columns, rows). The session is never attached, so without
+/// this tmux keeps it at `default-size` (80x24) and the agent's text wraps at about 60 columns.
+/// 200 columns keeps tables and diffs on one line; 50 rows keeps dialogs on the captured screen.
+const WINDOW_SIZE: (&str, &str) = ("200", "50");
+
 /// The pause between typing the text and sending Enter. **Do not shorten it**.
 ///
 /// Sent right away, Enter (CR) lands in the same read as the tail of the text, and the TUI
@@ -140,12 +145,17 @@ impl Tmux {
     /// The window name gets renamed to the screen title of the program inside, so don't rely on it.
     pub fn spawn(&self, window: &str, cwd: &str, line: &str) -> Result<Window, String> {
         // Create the session first if missing (has-session returns non-zero for "missing", so ignore the Err)
+        let (x, y) = WINDOW_SIZE;
         let id = if (self.run)(&["has-session", "-t", TMUX_SESSION]).is_err() {
-            (self.run)(&[
+            let id = (self.run)(&[
                 "new-session",
                 "-d",
                 "-s",
                 TMUX_SESSION,
+                "-x",
+                x,
+                "-y",
+                y,
                 "-n",
                 window,
                 "-c",
@@ -154,8 +164,14 @@ impl Tmux {
                 "-F",
                 "#{window_id}",
                 line,
-            ])?
+            ])?;
+            self.pin_session_size(&[("window-size", "manual")]);
+            id
         } else {
+            // A session made before the size was set stays 80x24. Setting these never resizes the
+            // windows already there (no reflow under a working agent) — only new windows get the size.
+            let size = format!("{x}x{y}");
+            self.pin_session_size(&[("window-size", "manual"), ("default-size", &size)]);
             (self.run)(&[
                 "new-window",
                 "-d",
@@ -180,6 +196,18 @@ impl Tmux {
             }
         }
         Ok(Window::of(&id))
+    }
+
+    /// Session options that hold the window size. `window-size manual` stops an attached
+    /// terminal from shrinking the windows to its own width (and leaving them that way).
+    /// A failure is logged and the spawn goes on — a small window still works.
+    fn pin_session_size(&self, opts: &[(&str, &str)]) {
+        for (opt, value) in opts {
+            if let Err(e) = (self.run)(&["set-option", "-t", TMUX_SESSION, opt, value]) {
+                crate::log::LogCtx::default()
+                    .error("worker", &format!("could not set {opt} on {TMUX_SESSION}: {e}"));
+            }
+        }
     }
 
     /// Inventory of windows. **tmux is the only authority** — the Bridge's memory is lost on restart, windows stay.
@@ -240,6 +268,64 @@ mod tests {
             }),
         };
         (calls, tmux)
+    }
+
+    /// Records each call as one string. `has-session` answers as if the session `exists`;
+    /// `new-session` / `new-window` hand back window `@7`.
+    fn spawning(exists: bool) -> (std::sync::Arc<std::sync::Mutex<Vec<String>>>, Tmux) {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = calls.clone();
+        let tmux = Tmux {
+            run: Box::new(move |args| {
+                sink.lock().unwrap().push(args.join(" "));
+                match args[0] {
+                    "has-session" if !exists => Err("can't find session".to_string()),
+                    "new-session" | "new-window" => Ok("@7\n".to_string()),
+                    _ => Ok(String::new()),
+                }
+            }),
+        };
+        (calls, tmux)
+    }
+
+    /// A detached session stays at tmux's default 80x24 unless told otherwise, and the agent's
+    /// text wraps at about 60 columns. The first window sets the size and pins it.
+    #[test]
+    fn spawn_creates_the_session_at_a_fixed_size() {
+        let (calls, tmux) = spawning(false);
+        let w = tmux.spawn("w1", "/repo", "claude").unwrap();
+        assert_eq!(w.as_str(), "@7");
+        assert_eq!(
+            calls.lock().unwrap().clone(),
+            [
+                "has-session -t agentgw-workers",
+                "new-session -d -s agentgw-workers -x 200 -y 50 -n w1 -c /repo -P -F #{window_id} claude",
+                "set-option -t agentgw-workers window-size manual",
+                "set-option -w -t @7 automatic-rename off",
+                "set-option -w -t @7 allow-rename off",
+            ]
+        );
+    }
+
+    /// A session made before the size existed: set the size for new windows only — never
+    /// resize the ones already there (that would reflow a working agent's screen).
+    #[test]
+    fn spawn_sizes_new_windows_in_an_existing_session() {
+        let (calls, tmux) = spawning(true);
+        tmux.spawn("w2", "/repo", "claude").unwrap();
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            [
+                "has-session -t agentgw-workers",
+                "set-option -t agentgw-workers window-size manual",
+                "set-option -t agentgw-workers default-size 200x50",
+                "new-window -d -t agentgw-workers -n w2 -c /repo -P -F #{window_id} claude",
+                "set-option -w -t @7 automatic-rename off",
+                "set-option -w -t @7 allow-rename off",
+            ]
+        );
+        assert!(!calls.iter().any(|c| c.starts_with("resize-window")));
     }
 
     #[test]
