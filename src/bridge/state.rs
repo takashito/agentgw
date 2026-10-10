@@ -1057,13 +1057,17 @@ impl Access {
 
     /// **Never overwrite the whole file** — lay only the keys we own over what is on disk.
     /// The same file also holds keys only the Bridge touches (`endpoints` / `pools`), so
-    /// the side writing the settings must not wipe them.
+    /// the side writing the settings must not wipe them — **nor write them back**: they ride along in
+    /// `extra` as they were when this copy was read, and laying that over a newer value revives it.
     pub fn save(&self, dir: &StateDir) -> std::io::Result<()> {
         let mut root = dir.read_json_or("access.json", serde_json::json!({}));
         let mine = serde_json::to_value(self)?;
         match (root.as_object_mut(), mine.as_object()) {
             (Some(root), Some(mine)) => {
                 for (k, v) in mine {
+                    if matches!(k.as_str(), "endpoints" | "pools") {
+                        continue;
+                    }
                     root.insert(k.clone(), v.clone());
                 }
             }
@@ -2130,6 +2134,31 @@ mod tests {
         assert_eq!(Access::load(&dir).owner, "U1");
         assert_eq!(Pools::load(&dir).session_of("/repo"), Some("sid-2"));
 
+        let _ = std::fs::remove_file(dir.join("access.json"));
+    }
+
+    /// A copy of the settings read **before** the Bridge dropped a designation must not bring it back.
+    /// It did: the copy carried `pools` in its unknown fields, so saving a permission re-reserved a session
+    /// a thread already owned, and the pool handed that one agent to a second thread.
+    #[test]
+    fn an_old_copy_of_the_settings_does_not_bring_back_a_dropped_designation() {
+        let dir = StateDir::at(std::env::temp_dir().join("scrs-access-stale-pools-test"));
+        let _ = std::fs::remove_file(dir.join("access.json"));
+        let mut pools = Pools::load(&dir);
+        pools.nominate("/repo", "sid-1");
+        pools.save().unwrap();
+
+        let mut access = Access::load(&dir); // read while sid-1 is still designated
+        let mut pools = Pools::load(&dir);
+        pools.release("/repo"); // sid-1 graduates to a thread
+        pools.nominate("/repo", "sid-2");
+        pools.save().unwrap();
+
+        access.owner = "U1".into();
+        access.save(&dir).unwrap();
+
+        assert_eq!(Access::load(&dir).owner, "U1");
+        assert_eq!(Pools::load(&dir).session_of("/repo"), Some("sid-2"));
         let _ = std::fs::remove_file(dir.join("access.json"));
     }
 
