@@ -1913,7 +1913,11 @@ impl Bridge {
                 .unwrap_or(false),
             &result_text,
         );
-        let summary = slack::StickyBoard::summarize(name, &p["tool_input"]);
+        let mut summary = slack::StickyBoard::summarize(name, &p["tool_input"]);
+        if name == "Bash" {
+            let cwd = p["cwd"].as_str().unwrap_or_default();
+            summary = slack::StickyBoard::strip_cd_cwd(&summary, cwd).to_string();
+        }
         // Without an id every tool overwrites the same line — use name + arguments instead
         let id = match p["tool_use_id"].as_str().unwrap_or_default() {
             "" => format!("{name}:{summary}"),

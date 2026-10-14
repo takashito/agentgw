@@ -281,7 +281,7 @@ fn perm_timeout_line() -> String {
 
 /// Where a **folded card's row** is cut. The row running now is not cut at all — its box shows
 /// the command whole, and Slack folds what does not fit behind Show more.
-const SUMMARY_MAX: usize = 100;
+const SUMMARY_MAX: usize = 200;
 /// Closing line for a round cut off by stop. It goes **under**
 /// the progress so far — it shows the interruption while keeping "how far it got".
 const INTERRUPTED_NOTICE: &str = "└ `Interrupted by user.`";
@@ -688,6 +688,35 @@ impl StickyBoard {
         raw.unwrap_or_default().to_string()
     }
 
+    /// A Bash command with a leading `cd <cwd> &&` (or `;`) dropped when `<cwd>` is the folder the
+    /// session already runs in — agents prefix nearly every command with it, and it says nothing.
+    /// A `cd` anywhere else is kept: there it is the point.
+    pub fn strip_cd_cwd<'a>(command: &'a str, cwd: &str) -> &'a str {
+        let cwd = cwd.trim_end_matches('/');
+        let Some(rest) = command.trim_start().strip_prefix("cd") else {
+            return command;
+        };
+        let after = rest.trim_start();
+        if cwd.is_empty() || after.len() == rest.len() {
+            return command;
+        }
+        let (dir, tail) = match after.chars().next() {
+            Some(q @ ('"' | '\'')) => match after[1..].find(q) {
+                Some(end) => (&after[1..1 + end], &after[2 + end..]),
+                None => return command,
+            },
+            _ => after.split_at(after.find(char::is_whitespace).unwrap_or(after.len())),
+        };
+        if dir.trim_end_matches('/') != cwd {
+            return command;
+        }
+        let tail = tail.trim_start();
+        match tail.strip_prefix("&&").or_else(|| tail.strip_prefix(';')) {
+            Some(cmd) if !cmd.trim().is_empty() => cmd.trim_start(),
+            _ => command,
+        }
+    }
+
     /// Whether the tool may be folded (Read / Grep / Glob / Bash).
     pub fn is_foldable(name: &str) -> bool {
         FOLD_READ.contains(&name) || FOLD_SEARCH.contains(&name) || name == "Bash"
@@ -819,14 +848,20 @@ impl StickyBoard {
         json!({"type": "rich_text", "elements": [{"type": "rich_text_section", "elements": els}]})
     }
 
-    /// One row of a folded card: the summary's **first line**, cut if even that is long.
-    /// A chip that spans lines breaks into one chip per line and the column stops lining up, and a
-    /// heredoc's first line can still run for hundreds of characters.
+    /// One row of a folded card: the summary's lines **joined with a space**, then cut.
+    /// A chip that spans lines breaks into one chip per line and the column stops lining up, so the
+    /// lines are joined — keeping only the first would show nothing of a command that opens with a
+    /// short line (`cd dir &&`, `python3 - <<'EOF'`).
     fn one_line(summary: &str) -> String {
-        let head = summary.lines().next().unwrap_or(summary);
-        let cut = head.chars().count() > SUMMARY_MAX;
-        let mut out: String = head.chars().take(SUMMARY_MAX).collect();
-        if cut || head.len() < summary.len() {
+        let joined = summary
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let cut = joined.chars().count() > SUMMARY_MAX;
+        let mut out: String = joined.chars().take(SUMMARY_MAX).collect();
+        if cut {
             out.push_str(" …");
         }
         out
@@ -1633,6 +1668,25 @@ mod tests {
     }
 
     #[test]
+    fn strip_cd_cwd_drops_only_the_session_folder() {
+        for (cmd, want) in [
+            ("cd /mnt/dev/x && cargo test", "cargo test"),
+            ("cd /mnt/dev/x/ && cargo test", "cargo test"),
+            ("cd \"/mnt/dev/x\" ; ls", "ls"),
+            ("cd '/mnt/dev/x'&&ls", "ls"),
+            ("cd /mnt/dev/y && cargo test", "cd /mnt/dev/y && cargo test"),
+            ("cd /mnt/dev/x/src && ls", "cd /mnt/dev/x/src && ls"),
+            ("cd /mnt/dev/x", "cd /mnt/dev/x"),
+            ("cd /mnt/dev/x && ", "cd /mnt/dev/x && "),
+            ("cdx /mnt/dev/x && ls", "cdx /mnt/dev/x && ls"),
+            ("cd /mnt/dev/x || exit", "cd /mnt/dev/x || exit"),
+        ] {
+            assert_eq!(StickyBoard::strip_cd_cwd(cmd, "/mnt/dev/x"), want, "{cmd}");
+        }
+        assert_eq!(StickyBoard::strip_cd_cwd("cd / && ls", ""), "cd / && ls");
+    }
+
+    #[test]
     fn summarize_picks_salient_arg() {
         for (name, input, want) in [
             ("Bash", serde_json::json!({"command": "cargo test"}), "cargo test"),
@@ -1653,6 +1707,11 @@ mod tests {
             StickyBoard::one_line(&"x".repeat(SUMMARY_MAX + 20)).chars().count(),
             SUMMARY_MAX + 2,
             "畳んだカードの行は切る"
+        );
+        assert_eq!(
+            StickyBoard::one_line("cd /a &&\n  python3 - <<'EOF'\n\nprint(1)\nEOF"),
+            "cd /a && python3 - <<'EOF' print(1) EOF",
+            "lines are joined, not dropped"
         );
     }
 
