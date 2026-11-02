@@ -112,11 +112,7 @@ impl Bridge {
                         .get(&channel_id)
                         .and_then(|r| r.warm)
                         .unwrap_or(false),
-                    warm: waiting
-                        .iter()
-                        .filter(|(cwd, _)| *cwd == folder)
-                        .map(|(_, idle)| *idle)
-                        .collect(),
+                    warm: vec![], // filled in once every channel is known (see `seat_waiting`)
                     threads: mine,
                     folder,
                     name: None,
@@ -134,11 +130,6 @@ impl Bridge {
             .map(|(ch, _)| ch.clone())
             .collect();
         let home_channel = self.access.home_channel.clone();
-        let waiting_home: Vec<u64> = waiting
-            .iter()
-            .filter(|(cwd, _)| *cwd == agent_home)
-            .map(|(_, idle)| *idle)
-            .collect();
         // Busy channels first, then by id — the same shape every time it is asked
         channels.sort_by(|a, b| {
             b.threads
@@ -203,7 +194,7 @@ impl Bridge {
                                 folder: agent_home.clone(),
                                 warm_on: false,
                                 threads: vec![],
-                                warm: waiting_home.clone(),
+                                warm: vec![],
                                 notices: false,
                             });
                         }
@@ -214,6 +205,7 @@ impl Bridge {
             for c in &mut channels {
                 c.notices = home_channel.as_deref() == Some(c.channel_id.as_str());
             }
+            seat_waiting(&mut channels, &waiting);
             let mut names: HashMap<String, Option<String>> = HashMap::new();
             for c in &mut channels {
                 for t in &mut c.threads {
@@ -432,8 +424,8 @@ impl Bridge {
                 let Some(channel) = ch else {
                     let usage = if dm && oc.args.len() < 2 {
                         crate::t!(
-                            "The agent for DMs is always started ahead of time. Name a channel: `warm on|off <#channel>`",
-                            "DM のエージェントは常に先に起動しています。チャンネルを指定してください: `warm on|off <#channel>`"
+                            "DMs use the agent of the home folder. Name a channel: `warm on|off <#channel>`",
+                            "DM はホームのフォルダのエージェントを使います。チャンネルを指定してください: `warm on|off <#channel>`"
                         )
                     } else {
                         crate::t!("Usage: `warm on|off [<#channel>]`", "使い方: `warm on|off [<#channel>]`")
@@ -675,6 +667,22 @@ pub struct StatusReport {
     pub home: String,
     /// The channels this machine handles, each with its folder and what is running in it.
     pub channels: Vec<StatusChannel>,
+}
+
+/// Put each waiting agent under **one** channel. They are per folder, not per channel, so listing one
+/// under every channel in its folder showed the same agent several times (three `~` channels made one
+/// home agent look like three). It goes under a channel that asked for it (`warm on`), else the first in
+/// the list; an agent no listed channel works in is left out.
+fn seat_waiting(channels: &mut [StatusChannel], waiting: &[(String, u64)]) {
+    for (cwd, idle) in waiting {
+        let pick = channels
+            .iter()
+            .position(|c| c.folder == *cwd && c.warm_on)
+            .or_else(|| channels.iter().position(|c| c.folder == *cwd));
+        if let Some(i) = pick {
+            channels[i].warm.push(*idle);
+        }
+    }
 }
 
 /// One channel this machine handles.
@@ -1058,6 +1066,40 @@ fn cd_refused(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One home agent under three `~` channels showed up three times in `status`. Each agent is listed
+    /// once, under the channel that asked for it when one did.
+    #[test]
+    fn status_lists_each_waiting_agent_once() {
+        let ch = |id: &str, folder: &str, warm_on: bool| StatusChannel {
+            channel_id: id.into(),
+            name: None,
+            folder: folder.into(),
+            warm_on,
+            threads: vec![],
+            warm: vec![],
+            notices: false,
+        };
+        let mut channels = vec![
+            ch("C1", "/home", false),
+            ch("C2", "/home", true),
+            ch("C3", "/home", false),
+            ch("C4", "/repo", false),
+            ch("C5", "/repo", false),
+        ];
+        let waiting = vec![
+            ("/home".to_string(), 5),
+            ("/repo".to_string(), 7),
+            ("/nowhere".to_string(), 9),
+        ];
+        seat_waiting(&mut channels, &waiting);
+        let seats: Vec<(&str, Vec<u64>)> =
+            channels.iter().map(|c| (c.channel_id.as_str(), c.warm.clone())).collect();
+        assert_eq!(
+            seats,
+            vec![("C1", vec![]), ("C2", vec![5]), ("C3", vec![]), ("C4", vec![7]), ("C5", vec![])]
+        );
+    }
 
     #[test]
     fn idle_and_paths() {

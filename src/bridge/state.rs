@@ -1234,46 +1234,30 @@ impl Access {
     /// The set of pools to keep stocked = **the cwds that should have a pool agent waiting** (fixed when agents start).
     /// A pure function of access alone.
     /// - Empty if owner is unset (serving nobody, pre-starting is pure waste)
-    /// - Always one HOME pool (the next new DM / channel without a repo. Can't opt out)
-    /// - Then one per **distinct repo_path** in routes. The flag is per channel
-    ///   but pools are per repo, so if even one channel pointing at the repo opts in (`warm != Some(false)`,
-    ///   unset counts as opt-in) it gets stocked (OR). Opted-out channels still claim that pool if it exists.
+    /// - **Only channels that said `warm on` get one.** Unset means off: every `route` used to add an
+    ///   agent that sat idle for weeks, and `status` gave no hint that an unset channel counted as on.
+    /// - One per **distinct folder** — a channel without a folder of its own warms the home folder. The flag
+    ///   is per channel but pools are per folder, so one opted-in channel is enough (OR), and the other
+    ///   channels in that folder still claim the agent when it is there.
+    /// - DMs have no route, so they never warm one of their own; they take the home agent if a channel
+    ///   keeps one, and start cold otherwise.
     /// `me` is this machine's name: **a folder on another machine is not ours to warm**. The gateway keeps
     /// a copy of every channel's folder (for `route`), and without this check it started warming
     /// agents in folders that only exist on the machines it hands those channels to.
-    /// `serves_home` = this Bridge answers places that have no folder of their own — DMs and unassigned
-    /// channels. True on the gateway and on a lone Bridge; false on a machine behind a gateway, which only
-    /// ever sees the channels it was handed. **Such a machine keeps no home agent unless one of its own
-    /// channels has no folder**: it was starting one nobody could use, invisible in `status` because no
-    /// channel pointed at it.
-    pub fn pool_targets(&self, home_dir: &str, me: &str, serves_home: bool) -> Vec<String> {
+    pub fn pool_targets(&self, home_dir: &str, me: &str) -> Vec<String> {
         if self.owner.is_empty() {
             return Vec::new();
         }
-        let mine_without_folder = self
-            .routes
-            .values()
-            .filter(|r| r.bridge.as_deref().is_none_or(|b| b == me))
-            .any(|r| r.repo_path.as_deref().is_none_or(str::is_empty));
-        let mut targets = match serves_home || mine_without_folder {
-            true => vec![home_dir.to_string()],
-            false => Vec::new(),
-        };
+        let mut targets: Vec<String> = Vec::new();
         for cfg in self.routes.values() {
-            if cfg.bridge.as_deref().is_some_and(|b| b != me) {
+            if cfg.bridge.as_deref().is_some_and(|b| b != me) || cfg.warm != Some(true) {
                 continue;
             }
-            let repo = match cfg.repo_path.as_deref().filter(|p| !p.is_empty()) {
-                // ponytail: linear search — pool count is repo count (a few at most). Switch to a HashSet if it grows.
-                Some(r) if !targets.iter().any(|cwd| cwd == r) => r,
-                _ => continue,
-            };
-            // Opting out only means "no reason to start that pool". It isn't taken here, so
-            // another route to the same repo that opts in adopts it later.
-            if cfg.warm == Some(false) {
-                continue;
+            let folder = cfg.repo_path.as_deref().filter(|p| !p.is_empty()).unwrap_or(home_dir);
+            // ponytail: linear search — pool count is folder count (a few at most). Switch to a HashSet if it grows.
+            if !targets.iter().any(|cwd| cwd == folder) {
+                targets.push(folder.to_string());
             }
-            targets.push(repo.to_string());
         }
         targets
     }
@@ -2371,66 +2355,42 @@ mod tests {
     fn pool_targets_empty_without_owner() {
         let mut a = Access::default();
         a.owner = String::new();
-        assert!(a.pool_targets("/home", "me", true).is_empty());
+        a.routes.insert("C1".into(), Route { warm: Some(true), ..Default::default() });
+        assert!(a.pool_targets("/home", "me").is_empty());
     }
 
-    #[test]
-    fn pool_targets_always_includes_home_plus_distinct_repos() {
-        let mut a = Access::default();
-        a.owner = "U1".to_string();
-        a.routes.insert(
-            "C1".into(),
-            Route {
-                repo_path: Some("/repo/a".into()),
-                warm: None,
-                ..Default::default()
-            },
-        );
-        a.routes.insert(
-            "C2".into(),
-            Route {
-                repo_path: Some("/repo/a".into()),
-                warm: Some(false),
-                ..Default::default()
-            },
-        );
-        a.routes.insert(
-            "C3".into(),
-            Route {
-                repo_path: Some("/repo/b".into()),
-                warm: Some(true),
-                ..Default::default()
-            },
-        );
-        let pools = a.pool_targets("/home", "me", true);
-        let cwds: Vec<&str> = pools.iter().map(|p| p.as_str()).collect();
-        assert!(cwds.contains(&"/home"));
-        assert!(
-            cwds.contains(&"/repo/a"),
-            "opt-in on C1 stocks the pool even though C2 opted out"
-        );
-        assert!(cwds.contains(&"/repo/b"));
-        assert_eq!(
-            cwds.len(),
-            3,
-            "distinct repo_path collapses C1/C2 into one pool"
-        );
+    fn route(repo: Option<&str>, warm: Option<bool>) -> Route {
+        Route { repo_path: repo.map(Into::into), warm, ..Default::default() }
     }
 
+    /// **Unset is off.** Every `route` used to add an agent nobody asked for (four sat idle on a real
+    /// gateway for up to 38 days), so only a channel that said `warm on` keeps one.
     #[test]
-    fn pool_targets_excludes_repo_when_every_route_opts_out() {
+    fn pool_targets_warm_only_channels_that_opted_in() {
         let mut a = Access::default();
         a.owner = "U1".to_string();
-        a.routes.insert(
-            "C1".into(),
-            Route {
-                repo_path: Some("/repo/c".into()),
-                warm: Some(false),
-                ..Default::default()
-            },
-        );
-        let pools = a.pool_targets("/home", "me", true);
-        assert!(!pools.iter().any(|p| p == "/repo/c"));
+        a.routes.insert("C_UNSET".into(), route(Some("/repo/unset"), None));
+        a.routes.insert("C_OFF".into(), route(Some("/repo/off"), Some(false)));
+        a.routes.insert("C_BARE".into(), route(None, None));
+        assert!(a.pool_targets("/home", "me").is_empty(), "nothing opted in, so not even home");
+        a.routes.insert("C_ON".into(), route(Some("/repo/on"), Some(true)));
+        assert_eq!(a.pool_targets("/home", "me"), vec!["/repo/on".to_string()]);
+    }
+
+    /// Pools are per folder: one opted-in channel stocks it even if another in the same folder opted out,
+    /// and two channels in one folder share one agent. A channel without a folder warms home.
+    #[test]
+    fn pool_targets_one_per_distinct_folder() {
+        let mut a = Access::default();
+        a.owner = "U1".to_string();
+        a.routes.insert("C1".into(), route(Some("/repo/a"), Some(true)));
+        a.routes.insert("C2".into(), route(Some("/repo/a"), Some(false)));
+        a.routes.insert("C3".into(), route(Some("/repo/a"), Some(true)));
+        a.routes.insert("C4".into(), route(None, Some(true)));
+        a.routes.insert("C5".into(), route(Some(""), Some(true)));
+        let mut pools = a.pool_targets("/home", "me");
+        pools.sort();
+        assert_eq!(pools, vec!["/home".to_string(), "/repo/a".to_string()]);
     }
 
     /// The gateway keeps a copy of every channel's folder so `route` can show it. Those folders live
@@ -2440,40 +2400,17 @@ mod tests {
     fn pool_targets_skip_folders_that_belong_to_another_machine() {
         let mut a = Access::default();
         a.owner = "U1".to_string();
-        a.routes.insert(
-            "C_MINE".into(),
-            Route { repo_path: Some("/repo/mine".into()), ..Default::default() },
-        );
+        a.routes.insert("C_MINE".into(), route(Some("/repo/mine"), Some(true)));
         a.routes.insert(
             "C_THEIRS".into(),
             Route {
                 repo_path: Some("/repo/theirs".into()),
+                warm: Some(true),
                 bridge: Some("other".into()),
                 ..Default::default()
             },
         );
-        let pools = a.pool_targets("/home", "me", true);
-        assert!(pools.iter().any(|p| p == "/repo/mine"), "{pools:?}");
-        assert!(!pools.iter().any(|p| p == "/repo/theirs"), "{pools:?}");
-    }
-
-    /// A machine behind a gateway only sees the channels it was handed. If they all have folders, the
-    /// home agent it used to keep was one nobody could ever use — and `status` showed nothing about it.
-    #[test]
-    fn a_machine_keeps_a_home_agent_only_when_a_channel_needs_one() {
-        let mut a = Access::default();
-        a.owner = "U1".to_string();
-        a.routes.insert(
-            "C_MINE".into(),
-            Route { repo_path: Some("/repo/mine".into()), ..Default::default() },
-        );
-        // On the gateway (and on a lone Bridge) home serves DMs and unassigned channels
-        assert!(a.pool_targets("/home", "me", true).iter().any(|p| p == "/home"));
-        // Behind a gateway, with every channel pointing somewhere else
-        assert!(!a.pool_targets("/home", "me", false).iter().any(|p| p == "/home"));
-        // …until one of its channels has no folder of its own
-        a.routes.insert("C_BARE".into(), Route::default());
-        assert!(a.pool_targets("/home", "me", false).iter().any(|p| p == "/home"));
+        assert_eq!(a.pool_targets("/home", "me"), vec!["/repo/mine".to_string()]);
     }
 
     /// A grant is written **only when a person clicks the button**. Pins that it round-trips under

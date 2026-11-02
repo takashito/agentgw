@@ -41,7 +41,7 @@ One place for every agent on every machine, so there's no juggling terminals wit
 
 ### ⚡ Agents that are ready, and tidy up after themselves
 
-A warm agent waits for each project, so a new thread gets an answer right away. Agents that sit idle are put away on their own.
+Turn on `warm` in a channel and an agent waits in its project ahead of time, so a new thread gets an answer right away (off by default — otherwise the agent starts when the thread does). Agents that sit idle are put away on their own.
 
 ## Features
 
@@ -263,7 +263,7 @@ Mention the bot (`@agentgw <command>`), or type in a thread it's working in.
 | `pwd` | Show where this thread works |
 | `cd <path>` · `cd <machine>[:<path>]` | Move **this thread** to that folder, or to that machine — conversation and all |
 | `route <path>` · `route <machine>[:<path>]` | Set **this channel's** folder and machine, which decides where the threads it starts next begin |
-| `warm on\|off` | Keep an agent started ahead of time for this channel |
+| `warm on\|off` | Keep an agent started ahead of time for this channel (off by default) |
 | `set-home` | Send notices (online, offline, errors) to this channel |
 | `allow-bot @bot` · `remove-bot @bot` | Let another bot's messages start work |
 | `login` · `logout` | Sign Claude Code in to your account (by DM) · sign out and stop all agents |

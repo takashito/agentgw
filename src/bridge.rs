@@ -393,7 +393,7 @@ impl Bridge {
     /// Posts "online" to home. Used both **at start-up and when the link to the gateway is re-established**
     /// (for a machine this one line is the only way to tell a person "connected" — the gateway's presence only reports 🔴).
     async fn announce_online(&mut self) {
-        let pools: Vec<String> = self.access.pool_targets(&Host::home(), &self.machine_name, self.link.is_none());
+        let pools: Vec<String> = self.access.pool_targets(&Host::home(), &self.machine_name);
         // The machine's own name — the one `route`, `status` and `pwd <machine>` all use
         let text = online_notice(&self.machine_name, crate::build_label::LABEL, &pools, 0);
         self.post_notice(&text, &LogCtx::default()).await;
@@ -3853,6 +3853,13 @@ mod tests {
         assert!(!out.contains("unfinished"));
     }
 
+    /// Warming is opt-in: a channel without a folder of its own says `warm on`, so home keeps an agent.
+    fn warm_home(b: &mut Bridge) {
+        b.access
+            .routes
+            .insert("C_HOME".into(), bridge::Route { warm: Some(true), ..Default::default() });
+    }
+
     /// A warm-pool nomination whose conversation was never saved can't be resumed: `claude
     /// --resume` exits at once ("No conversation found"). Seen on a machine where that exit
     /// and the re-launch 5 s later repeated for weeks. Start a fresh session and nominate it.
@@ -3861,6 +3868,7 @@ mod tests {
         let (d, _slack, agent, _clock) = flow_deps("pool-nohistory");
         let (mut b, _fx) = Bridge::for_test(d);
         let home = Host::home();
+        warm_home(&mut b);
         b.pools.nominate(&home, "gone-sid");
         b.start_missing_pool_workers(&LogCtx::default());
         let spawned = agent.spawned.lock().unwrap();
@@ -3877,6 +3885,7 @@ mod tests {
         agent.histories.lock().unwrap().push("kept-sid".to_string());
         let (mut b, _fx) = Bridge::for_test(d);
         let home = Host::home();
+        warm_home(&mut b);
         b.pools.nominate(&home, "kept-sid");
         b.start_missing_pool_workers(&LogCtx::default());
         let spawned = agent.spawned.lock().unwrap();
