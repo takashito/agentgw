@@ -1586,6 +1586,8 @@ fn report_folders(
             thread_ts: String::new(),
             result: Ok(path),
             thread_only: false,
+            missing: None,
+            created: false,
         });
     }
 }
@@ -1778,10 +1780,14 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
             thread_ts,
             path,
             thread_only,
+            create,
         } => {
             let abs = bridge::absolute_project_path(&path, &Host::home());
-            let result = if !std::path::Path::new(&abs).is_dir() {
-                Err(bridge::no_such_folder(&abs, machine))
+            let folder = bridge::ensure_folder(&abs, machine, create);
+            // Not offered again once the Owner said yes: then it's a real failure, and says why
+            let missing = (folder.is_err() && !create).then(|| abs.clone());
+            let result = if let Err(why) = folder {
+                Err(why)
             } else if thread_only {
                 // One thread is moving here, not the channel. **Leave the channel's folder alone** —
                 // it decides where this channel's *other* threads start, and they are not moving
@@ -1811,6 +1817,8 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
                 thread_ts,
                 result,
                 thread_only,
+                missing,
+                created: create,
             });
         }
         // Getting here means the link has been given up. **Don't touch the agents** — running ones
@@ -2202,6 +2210,7 @@ mod tests {
             channel: "C1".into(),
             thread_ts: "1.1".into(),
             thread_only: false,
+            create: false,
             path: path.into(),
         };
         let proj = base.join("proj").to_string_lossy().to_string();
@@ -2681,6 +2690,8 @@ mod tests {
             action: "allow".into(),
             by: "U_OWNER".into(),
             state: serde_json::Value::Null,
+            value: String::new(),
+            message_ts: String::new(),
         })
         .await;
         let answer = rx.await.unwrap();
@@ -2808,6 +2819,8 @@ mod tests {
             action: "dlg-1".into(),
             by: "U_OWNER".into(),
             state: serde_json::Value::Null,
+            value: String::new(),
+            message_ts: String::new(),
         })
         .await;
         assert_eq!(
@@ -2959,6 +2972,8 @@ mod tests {
             action: "dlg-0".into(),
             by: "U_OWNER".into(),
             state: serde_json::Value::Null,
+            value: String::new(),
+            message_ts: String::new(),
         })
         .await;
         settle().await;
@@ -3140,6 +3155,8 @@ mod tests {
             state: serde_json::json!({"values": {"q0": {"qa0": {
                 "type": "radio_buttons", "selected_option": {"value": "1"}
             }}}}),
+            value: String::new(),
+            message_ts: String::new(),
         })
         .await;
         assert_eq!(
@@ -3333,6 +3350,8 @@ mod tests {
             action: "dlg-1".into(),
             by: "U_OWNER".into(),
             state: serde_json::Value::Null,
+            value: String::new(),
+            message_ts: String::new(),
         })
         .await;
         assert_eq!(*agent.answered.lock().unwrap(), vec![Some(1)]);
@@ -4178,6 +4197,8 @@ mod tests {
                 thread_ts: String::new(),
                 result: Ok("/srv/app".into()),
                 thread_only: false,
+                missing: None,
+                created: false,
             })
         );
         assert_eq!(up_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty), "nothing to say for a channel with no folder");
@@ -4201,6 +4222,8 @@ mod tests {
                 thread_ts: String::new(),
                 result: Ok("/work/app".into()),
                 thread_only: false,
+                missing: None,
+                created: false,
             })
         );
     }
@@ -4349,6 +4372,160 @@ mod tests {
         let (mut b, _fx) = Bridge::for_test(d);
         b.start_missing_pool_workers(&LogCtx::default());
         assert!(agent.spawned.lock().unwrap().is_empty());
+    }
+
+    /// The press on a folder offer, as it arrives from Slack.
+    fn folder_click(action: &str, by: &str, channel: &str, thread: &str, path: &str, for_thread: bool) -> slack::PermClick {
+        slack::PermClick {
+            req_id: "folder".into(),
+            action: action.into(),
+            by: by.into(),
+            state: serde_json::Value::Null,
+            value: bridge::FolderOffer {
+                channel: channel.into(),
+                thread_ts: thread.into(),
+                path: path.into(),
+                for_thread,
+                machine: None,
+            }
+            .encode(),
+            message_ts: "9.9".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_folder_is_offered_with_buttons_and_changes_nothing_yet() {
+        let (d, slack, agent, _clock) = flow_deps("offer");
+        agent.missing_dirs.lock().unwrap().push("/nope/proj".into());
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "<@U_BOT> route /nope/proj")).await;
+        settle().await;
+        let calls = slack.calls();
+        assert!(
+            calls.iter().any(|c| c.starts_with("post_blocks") && c.contains("perm:mkdir-yes:folder") && c.contains("perm:mkdir-no:folder")),
+            "{calls:?}"
+        );
+        assert!(!crate::agent::Agent::workdir_exists(&*agent, "/nope/proj"), "nothing is made before the answer");
+        assert!(b.access.repo_path("C1", "/home").1, "nothing registered");
+    }
+
+    /// A DM has no route, so it mustn't be offered a folder it couldn't use.
+    #[tokio::test]
+    async fn route_in_a_dm_is_refused_before_any_offer() {
+        let (d, slack, agent, _clock) = flow_deps("offer-dm");
+        agent.missing_dirs.lock().unwrap().push("/nope/proj".into());
+        let (mut b, _fx) = Bridge::for_test(d);
+        let mut msg = channel_msg("1782000001.000100", "U_OWNER", "route /nope/proj");
+        msg.channel = "D1".into();
+        msg.channel_kind = crate::chat::ChannelKind::Dm;
+        b.on_inbound(&msg).await;
+        settle().await;
+        assert!(!slack.calls().iter().any(|c| c.contains("mkdir-yes")), "{:?}", slack.calls());
+    }
+
+    #[tokio::test]
+    async fn yes_makes_the_folder_and_routes_the_channel_with_no_agent_to_move() {
+        let (d, slack, agent, _clock) = flow_deps("offer-yes");
+        agent.missing_dirs.lock().unwrap().push("/new/proj".into());
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.on_perm_click(folder_click(slack::FOLDER_YES, "U_OWNER", "C1", ROOT, "/new/proj", false)).await;
+        settle().await;
+        assert!(crate::agent::Agent::workdir_exists(&*agent, "/new/proj"), "the folder was made");
+        assert_eq!(b.access.repo_path("C1", "/home").0, "/new/proj");
+        assert!(agent.cd_to.lock().unwrap().is_empty(), "no agent, nothing to move");
+        assert!(slack.calls().iter().any(|c| c.starts_with("update_md C1 9.9")), "{:?}", slack.calls());
+    }
+
+    #[tokio::test]
+    async fn yes_on_route_also_moves_the_session_running_in_this_thread() {
+        let (d, _slack, agent, _clock) = flow_deps("offer-yes-move");
+        let ((mut b, _fx), _deliv) = Bridge::for_test_with_deliveries(d);
+        running_thread(&mut b, &agent).await;
+        b.ledger.disposed(&ThreadKey::new("C1", ROOT), &[ROOT.to_string()]);
+        agent.missing_dirs.lock().unwrap().push("/new/proj".into());
+
+        b.on_perm_click(folder_click(slack::FOLDER_YES, "U_OWNER", "C1", ROOT, "/new/proj", false)).await;
+        settle().await;
+
+        assert_eq!(b.access.repo_path("C1", "/home").0, "/new/proj");
+        assert_eq!(*agent.cd_to.lock().unwrap(), vec!["/new/proj".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn yes_on_cd_moves_the_thread_and_leaves_the_channel_alone() {
+        let (d, _slack, agent, _clock) = flow_deps("offer-yes-cd");
+        let ((mut b, _fx), _deliv) = Bridge::for_test_with_deliveries(d);
+        running_thread(&mut b, &agent).await;
+        b.ledger.disposed(&ThreadKey::new("C1", ROOT), &[ROOT.to_string()]);
+        agent.missing_dirs.lock().unwrap().push("/new/proj".into());
+
+        b.on_perm_click(folder_click(slack::FOLDER_YES, "U_OWNER", "C1", ROOT, "/new/proj", true)).await;
+        settle().await;
+
+        assert_eq!(*agent.cd_to.lock().unwrap(), vec!["/new/proj".to_string()]);
+        assert!(b.access.repo_path("C1", "/home").1, "the channel's folder is untouched");
+    }
+
+    #[tokio::test]
+    async fn no_changes_nothing_and_says_so() {
+        let (d, slack, agent, _clock) = flow_deps("offer-no");
+        agent.missing_dirs.lock().unwrap().push("/new/proj".into());
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.on_perm_click(folder_click(slack::FOLDER_NO, "U_OWNER", "C1", ROOT, "/new/proj", false)).await;
+        settle().await;
+        assert!(!crate::agent::Agent::workdir_exists(&*agent, "/new/proj"));
+        assert!(b.access.repo_path("C1", "/home").1);
+        assert!(slack.calls().iter().any(|c| c.starts_with("update_md C1 9.9") && c.contains("not created")), "{:?}", slack.calls());
+    }
+
+    #[tokio::test]
+    async fn only_the_owners_press_counts() {
+        let (d, slack, agent, _clock) = flow_deps("offer-stranger");
+        agent.missing_dirs.lock().unwrap().push("/new/proj".into());
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.on_perm_click(folder_click(slack::FOLDER_YES, "U_OTHER", "C1", ROOT, "/new/proj", false)).await;
+        settle().await;
+        assert!(!crate::agent::Agent::workdir_exists(&*agent, "/new/proj"));
+        assert!(b.access.repo_path("C1", "/home").1);
+        assert!(!slack.calls().iter().any(|c| c.starts_with("update_md")), "{:?}", slack.calls());
+    }
+
+    /// The machine named in `route <machine>:<path>` makes the folder once the Owner has agreed, and
+    /// says whether the refusal was only a missing folder so the gateway knows to offer.
+    #[tokio::test]
+    async fn a_machine_offers_up_a_missing_folder_and_makes_it_when_told_to() {
+        let base = std::env::temp_dir().join(format!("sc-setproject-create-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = crate::state_dir::StateDir::at(base.join("state"));
+        let (up, mut up_rx) = mpsc::unbounded_channel();
+        let sinks = RelaySinks { msg_tx: mpsc::channel(4).0, click_tx: mpsc::channel(4).0, dir: dir.clone(), reload: mpsc::channel(4).0, relink: mpsc::channel(4).0, up, machine: "desk".into(), gateway_url: String::new(), left: mpsc::channel(4).0, arriving: mpsc::channel(4).0, updated: mpsc::channel(4).0 };
+        let target = base.join("a/b").to_string_lossy().to_string();
+        let ask = |create| machine::FromRelay::SetProject {
+            channel: "C1".into(),
+            thread_ts: "1.1".into(),
+            path: target.clone(),
+            thread_only: true,
+            create,
+        };
+
+        pump_relay(ask(false), &sinks).await;
+        let crate::bridge::gateway::link::LinkFrame::ProjectSet { result, missing, created, .. } = up_rx.try_recv().unwrap() else {
+            panic!("an answer goes up")
+        };
+        assert!(result.is_err());
+        assert_eq!(missing.as_deref(), Some(target.as_str()));
+        assert!(!created);
+        assert!(!std::path::Path::new(&target).exists(), "not before the Owner says so");
+
+        pump_relay(ask(true), &sinks).await;
+        let crate::bridge::gateway::link::LinkFrame::ProjectSet { result, missing, created, .. } = up_rx.try_recv().unwrap() else {
+            panic!("an answer goes up")
+        };
+        assert_eq!(result, Ok(target.clone()));
+        assert_eq!(missing, None);
+        assert!(created);
+        assert!(std::path::Path::new(&target).is_dir());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// **`cd` within one machine asks the agent to move itself.** Claude Code's `/cd` keeps the

@@ -1375,6 +1375,69 @@ pub fn no_such_folder(path: &str, machine: &str) -> String {
     )
 }
 
+/// Check that `abs` is a folder on this machine, making it first when `create` is set.
+pub fn ensure_folder(abs: &str, machine: &str, create: bool) -> Result<(), String> {
+    if create && let Err(e) = std::fs::create_dir_all(abs) {
+        return Err(could_not_create_folder(abs, machine, &e.to_string()));
+    }
+    if std::path::Path::new(abs).is_dir() {
+        Ok(())
+    } else {
+        Err(no_such_folder(abs, machine))
+    }
+}
+
+pub fn could_not_create_folder(path: &str, machine: &str, why: &str) -> String {
+    crate::t!(
+        "Couldn't create `{path}` on *{machine}*: {why}. Nothing was changed.",
+        "*{machine}* に `{path}` を作れませんでした: {why}。何も変えていません。"
+    )
+}
+
+/// What the offer turns into when the Owner answers No.
+pub fn folder_not_created(path: &str) -> String {
+    crate::t!(
+        "`{path}` was not created. Nothing was changed.",
+        "`{path}` は作りませんでした。何も変えていません。"
+    )
+}
+
+/// The offer to create a folder that `route` or `cd` could not find.
+///
+/// **It travels inside the button**, so nothing has to be remembered while the question is open and
+/// the answer still works after a restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderOffer {
+    pub channel: String,
+    pub thread_ts: String,
+    /// Absolute, as resolved on the machine that looked for it.
+    pub path: String,
+    /// `cd` (this thread) rather than `route` (this channel).
+    pub for_thread: bool,
+    /// The machine the command named, which makes the answer the gateway's: it alone can hand a
+    /// channel over. `None` = the machine running this thread answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+}
+
+impl FolderOffer {
+    pub fn encode(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    pub fn decode(value: &str) -> Option<Self> {
+        serde_json::from_str(value).ok()
+    }
+
+    pub fn question(&self, machine: &str) -> String {
+        let path = &self.path;
+        crate::t!(
+            "There's no folder `{path}` on **{machine}**. Create it?",
+            "**{machine}** に `{path}` というフォルダがありません。作りますか?"
+        )
+    }
+}
+
 // ─── decisions: dedup → gate → decide ────────────────────────────────────────────
 
 /// Loop-breaker threshold — once this many bot posts in a row land in one thread,
@@ -1756,6 +1819,31 @@ pub const STOP_BLOCK_REASON: &str = "You ended your turn without delivering. You
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ensure_folder_makes_it_only_when_asked() {
+        let base = std::env::temp_dir().join(format!("sc-ensure-folder-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let target = base.join("a/b").to_string_lossy().to_string();
+        assert!(ensure_folder(&target, "m", false).is_err());
+        assert!(!base.exists(), "a plain check touches nothing");
+        assert_eq!(ensure_folder(&target, "m", true), Ok(()));
+        assert_eq!(ensure_folder(&target, "m", true), Ok(()), "already there is fine");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_folder_offer_survives_the_button() {
+        let offer = FolderOffer {
+            channel: "C1".into(),
+            thread_ts: "1.1".into(),
+            path: "/a b/c".into(),
+            for_thread: true,
+            machine: None,
+        };
+        assert_eq!(FolderOffer::decode(&offer.encode()), Some(offer));
+        assert_eq!(FolderOffer::decode(""), None);
+    }
+
 
     use super::*;
     use crate::chat::deletion_notice;

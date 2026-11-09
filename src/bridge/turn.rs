@@ -1638,6 +1638,10 @@ impl Bridge {
     /// An approval button was clicked. **Answer the agent the moment it's clicked** — then redraw the prompt
     /// to show the result (the agent doesn't wait even if rewriting the post is slow).
     pub(super) async fn on_perm_click(&mut self, click: slack::PermClick) {
+        if click.action == slack::FOLDER_YES || click.action == slack::FOLDER_NO {
+            self.on_folder_answer(click).await;
+            return;
+        }
         // Dialog buttons ride the same wiring as the permission ones -- same action id shape, same
         // relay hop, same channel -- and are told apart here by which table holds the id
         if let Some(p) = self.dialog_pending.remove(&click.req_id) {

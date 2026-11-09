@@ -135,6 +135,8 @@ pub enum FromRelay {
         path: String,
         /// Asked inside a thread: only that conversation moves, not the channel.
         thread_only: bool,
+        /// The Owner agreed to have the folder made.
+        create: bool,
     },
     /// This thread is another machine's now — drop it, so two agents never answer one conversation.
     /// `to`/`path` say where it went, so the conversation can be sent after it.
@@ -227,11 +229,13 @@ impl FromRelay {
                 thread_ts,
                 path,
                 thread_only,
+                create,
             } => FromRelay::SetProject {
                 channel,
                 thread_ts,
                 path,
                 thread_only,
+                create,
             },
             F::ThreadLeft {
                 channel,
@@ -1150,6 +1154,14 @@ mod tests {
         assert_eq!(click.req_id, "req-7");
         assert_eq!(click.action, "allow-channel");
         assert_eq!(click.by, "U_OWNER");
+        assert_eq!(click.value, "");
+
+        let click = crate::chat::slack::perm_click_from_relay(
+            &serde_json::json!({"action_id": "perm:mkdir-yes:folder", "value": "v"}),
+            &serde_json::json!({"container": {"message_ts": "9.9"}}),
+        )
+        .expect("a button with a value");
+        assert_eq!((click.value.as_str(), click.message_ts.as_str()), ("v", "9.9"));
 
         for other in ["something_else", "perm", "perm:allow"] {
             assert!(

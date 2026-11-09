@@ -312,6 +312,8 @@ impl Bridge {
     ///
     /// A path with no machine in it is this machine's own business, and the two verbs part company
     /// here: `route` writes the channel's folder, `cd` moves this thread into it.
+    ///
+    /// `None` = the answer is already in the thread: the offer to create a missing folder.
     pub(super) async fn set_target(
         &mut self,
         msg: &InboundMsg,
@@ -321,19 +323,31 @@ impl Bridge {
         key: &ThreadKey,
         root_ts: &str,
         ctx: &LogCtx,
-    ) -> String {
+    ) -> Option<String> {
         let typed = match target {
-            Target::Usage => return if for_thread { cd_usage() } else { route_usage() },
+            Target::Usage => return Some(if for_thread { cd_usage() } else { route_usage() }),
             // Only the gateway knows the machines and answers these. Reaching a Bridge means there is
             // no gateway, or no such machine behind it
             Target::Machine { machine, .. } => {
-                return crate::t!(
+                return Some(crate::t!(
                     "No machine named `{machine}` is connected. This machine works on its own.",
                     "`{machine}` という名前のマシンはつながっていません。このマシンは単独で動いています。"
-                );
+                ));
             }
             Target::Path(typed) => typed,
         };
+        // A DM has no route (its agent always starts at Home), so say so instead of silently
+        // recording it. **Before the folder check**, or a DM would be offered a folder it can't use
+        if !for_thread && (dm || !crate::chat::slack::SlackId::is_channel(&msg.channel)) {
+            ctx.info(
+                "bridge",
+                &format!(
+                    "slack-events: route refused — not a channel (dm={dm}) msg={}",
+                    msg.ts
+                ),
+            );
+            return Some(route_dm_refusal());
+        }
         // No shell ever sees this path (tmux gets it as is), so `~` and relative paths are
         // resolved here, on the machine that runs this channel's agents
         let path = &bridge::absolute_project_path(&typed, &Host::home());
@@ -342,26 +356,56 @@ impl Bridge {
                 "bridge",
                 &format!("slack-events: no folder {path} here msg={}", msg.ts),
             );
-            return bridge::no_such_folder(path, &self.machine_name);
+            let offer = bridge::FolderOffer {
+                channel: msg.channel.clone(),
+                thread_ts: root_ts.to_string(),
+                path: path.clone(),
+                for_thread,
+                machine: None,
+            };
+            return self.offer_folder(&offer, ctx).await;
         }
-        if for_thread {
-            return self.cd_here(key, root_ts, path, ctx).await;
+        Some(if for_thread {
+            self.cd_here(key, root_ts, path, ctx).await
+        } else {
+            match self.set_channel_folder(&msg.channel, path, &msg.ts, root_ts, ctx) {
+                Ok(said) | Err(said) => said,
+            }
+        })
+    }
+
+    /// Ask whether to create a folder that isn't here. `None` once the question is in the thread; if it
+    /// couldn't be posted, the plain "no such folder" so the person still hears something.
+    async fn offer_folder(&self, offer: &bridge::FolderOffer, ctx: &LogCtx) -> Option<String> {
+        let question = offer.question(&self.machine_name);
+        let blocks = crate::chat::slack::folder_offer_blocks(&question, &offer.encode());
+        match self
+            .deps
+            .slack
+            .post_blocks(&offer.channel, &question, blocks, Some(&offer.thread_ts))
+            .await
+        {
+            Ok(_) => None,
+            Err(e) => {
+                ctx.error("bridge", &format!("could not post the folder offer: {e}"));
+                Some(bridge::no_such_folder(&offer.path, &self.machine_name))
+            }
         }
-        // A DM has no route (its agent always starts at Home), so say so
-        // instead of silently recording it
-        if dm || !crate::chat::slack::SlackId::is_channel(&msg.channel) {
-            ctx.info(
-                "bridge",
-                &format!(
-                    "slack-events: route refused — not a channel (dm={dm}) msg={}",
-                    msg.ts
-                ),
-            );
-            return route_dm_refusal();
-        }
+    }
+
+    /// `route <path>` with the folder known to exist. `Err` carries the text for the Owner too —
+    /// the difference is only whether anything changed.
+    fn set_channel_folder(
+        &mut self,
+        channel: &str,
+        path: &str,
+        msg_ts: &str,
+        root_ts: &str,
+        ctx: &LogCtx,
+    ) -> Result<String, String> {
         let op = bridge::AccessOp::SetRepo {
-            channel: msg.channel.clone(),
-            path: path.clone(),
+            channel: channel.to_string(),
+            path: path.to_string(),
         };
         match self.access.apply(op) {
             Ok((access, message, warnings)) => {
@@ -369,30 +413,88 @@ impl Bridge {
                 // No thread = nothing to say, just keep the gateway's copy current (`route`)
                 self.ask_the_gateway(
                     crate::bridge::gateway::link::LinkFrame::ProjectSet {
-                        channel: msg.channel.clone(),
+                        channel: channel.to_string(),
                         thread_ts: String::new(),
-                        result: Ok(path.clone()),
+                        result: Ok(path.to_string()),
                         thread_only: false,
+                        missing: None,
+                        created: false,
                     },
                     ctx,
                 );
                 ctx.info(
                     "bridge",
-                    &format!(
-                        "slack-events: route channel={} path={path} msg={}",
-                        msg.channel, msg.ts
-                    ),
+                    &format!("slack-events: route channel={channel} path={path} msg={msg_ts}"),
                 );
-                with_warnings(&message, &warnings)
+                Ok(with_warnings(&message, &warnings))
             }
             // For a path that fails validation, the error text itself is what the Owner reads
             Err(e) => {
                 ctx.error(
                     "bridge",
-                    &format!("slack-events: route failed for {}:{root_ts}: {e}", msg.channel),
+                    &format!("slack-events: route failed for {channel}:{root_ts}: {e}"),
                 );
-                e
+                Err(e)
             }
+        }
+    }
+
+    /// Whether this thread has an agent running right now. A thread keeps its session id after the
+    /// agent is gone, so the record alone doesn't say.
+    fn thread_has_agent(&self, root_ts: &str) -> bool {
+        let Some(sid) = self.threads.get(root_ts).and_then(|e| e.agent_id.clone()) else {
+            return false;
+        };
+        let name = crate::agent::SessionId::from(sid.clone()).window_name();
+        let window_id = self.workers.window_of(&sid);
+        self.deps.agent.pid_of(window_id.as_deref(), &name).is_some()
+    }
+
+    /// A press on the buttons of a [`bridge::FolderOffer`].
+    ///
+    /// Also how the gateway asks this machine to move a thread into a folder here: then there is no
+    /// message to rewrite (`message_ts` is empty) and the outcome is posted instead.
+    pub(in crate::bridge) async fn on_folder_answer(&mut self, click: crate::chat::slack::PermClick) {
+        let Some(offer) = bridge::FolderOffer::decode(&click.value) else {
+            LogCtx::default().error("bridge", "folder offer: unreadable button value");
+            return;
+        };
+        let key = ThreadKey::new(&offer.channel, &offer.thread_ts);
+        let ctx = LogCtx {
+            session_id: None,
+            thread_key: Some(key.clone()),
+        };
+        // Same rule as typing the command. The buttons stay for the Owner
+        if click.by != self.access.owner {
+            ctx.info("bridge", &format!("folder offer: ignored a press by {}", click.by));
+            return;
+        }
+        let path = offer.path.as_str();
+        let root_ts = offer.thread_ts.as_str();
+        let out = if click.action == crate::chat::slack::FOLDER_NO {
+            bridge::folder_not_created(path)
+        } else if let Err(e) = self.deps.agent.create_workdir(path) {
+            ctx.error("bridge", &format!("folder offer: could not create {path}: {e}"));
+            bridge::could_not_create_folder(path, &self.machine_name, &e)
+        } else if offer.for_thread {
+            self.cd_here(&key, root_ts, path, &ctx).await
+        } else {
+            match self.set_channel_folder(&offer.channel, path, &click.message_ts, root_ts, &ctx) {
+                Ok(said) if self.thread_has_agent(root_ts) => {
+                    format!("{said}\n{}", self.cd_here(&key, root_ts, path, &ctx).await)
+                }
+                Ok(said) | Err(said) => said,
+            }
+        };
+        if click.message_ts.is_empty() {
+            self.post(&offer.channel, root_ts, out, &key);
+        } else if let Err(e) = self
+            .deps
+            .slack
+            .update_markdown(&offer.channel, &click.message_ts, &out)
+            .await
+        {
+            ctx.error("bridge", &format!("folder offer: could not update the message: {e}"));
         }
     }
 

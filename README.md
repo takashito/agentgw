@@ -261,8 +261,8 @@ Mention the bot (`@agentgw <command>`), or type in a thread it's working in.
 | `rename-machine <old> <new>` | Give a machine a new name: its channels and threads follow it. The machine has to be connected |
 | `update [version]` | Install the latest release on the gateway, then on each machine in turn (`agentgw update` from the gateway's terminal does the same). To try a build without releasing it, run `agentgw update local` in the repository folder after `cargo dist`, on the gateway or any machine |
 | `pwd` | Show where this thread works |
-| `cd <path>` · `cd <machine>[:<path>]` | Move **this thread** to that folder, or to that machine — conversation and all |
-| `route <path>` · `route <machine>[:<path>]` | Set **this channel's** folder and machine, which decides where the threads it starts next begin |
+| `cd <path>` · `cd <machine>[:<path>]` | Move **this thread** to that folder, or to that machine — conversation and all. If the folder doesn't exist, buttons offer to create it |
+| `route <path>` · `route <machine>[:<path>]` | Set **this channel's** folder and machine, which decides where the threads it starts next begin. If the folder doesn't exist, buttons offer to create it, and a Yes also moves the session running in this thread |
 | `warm on\|off` | Keep an agent started ahead of time for this channel (off by default) |
 | `set-home` | Send notices (online, offline, errors) to this channel |
 | `allow-bot @bot` · `remove-bot @bot` | Let another bot's messages start work |

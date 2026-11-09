@@ -590,6 +590,8 @@ pub trait Agent: Send + Sync + 'static {
     /// Whether `path` is a folder an agent can start in on this machine. tmux doesn't say when it
     /// isn't — it quietly starts in the home directory instead.
     fn workdir_exists(&self, path: &str) -> bool;
+    /// Make `path`, and any folders above it that are missing. A folder already there is not an error.
+    fn create_workdir(&self, path: &str) -> Result<(), String>;
     /// Take down the worktree an agent was working in, once its conversation is gone for good.
     ///
     /// **`None` means `path` is not a worktree** — the checkout itself, or no checkout at all — and
@@ -863,6 +865,10 @@ pub mod fake {
         }
         fn workdir_exists(&self, path: &str) -> bool {
             !self.missing_dirs.lock().unwrap().iter().any(|d| d == path)
+        }
+        fn create_workdir(&self, path: &str) -> Result<(), String> {
+            self.missing_dirs.lock().unwrap().retain(|d| d != path);
+            Ok(())
         }
         fn read_session(&self, session_id: &str) -> Option<String> {
             self.sessions.lock().unwrap().get(session_id).cloned()

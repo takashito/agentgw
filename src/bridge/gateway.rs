@@ -124,6 +124,10 @@ pub mod link {
             /// Default false so a machine too old to send it still means what it used to.
             #[serde(default, skip_serializing_if = "std::ops::Not::not")]
             thread_only: bool,
+            /// The Owner agreed to have the folder made. A machine too old to read this answers
+            /// "no such folder", which changes nothing.
+            #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+            create: bool,
         },
         /// This thread belongs to another machine now: let go of it.
         ///
@@ -264,6 +268,13 @@ pub mod link {
             /// no table of what it asked for.
             #[serde(default, skip_serializing_if = "std::ops::Not::not")]
             thread_only: bool,
+            /// The refusal was only that the folder isn't there: its absolute path, so the gateway
+            /// can offer to create it.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            missing: Option<String>,
+            /// Echoes `create`: the folder was just made at the Owner's say-so.
+            #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+            created: bool,
         },
     }
 
@@ -449,12 +460,14 @@ pub mod link {
                     thread_ts: "1700000000.000100".into(),
                     path: "~/dev/x".into(),
                     thread_only: false,
+                    create: false,
                 },
                 LinkFrame::SetProject {
                     channel: "C1".into(),
                     thread_ts: "1700000000.000100".into(),
                     path: "~/dev/x".into(),
                     thread_only: true,
+                    create: false,
                 },
                 LinkFrame::ThreadLeft {
                     channel: "C1".into(),
@@ -480,12 +493,16 @@ pub mod link {
                     thread_ts: "1700000000.000100".into(),
                     result: Ok("/home/me/dev/x".into()),
                     thread_only: false,
+                    missing: None,
+                    created: false,
                 },
                 LinkFrame::ProjectSet {
                     channel: "C1".into(),
                     thread_ts: "1700000000.000100".into(),
                     result: Err("no folder".into()),
                     thread_only: true,
+                    missing: None,
+                    created: false,
                 },
             ]
         }
@@ -2966,7 +2983,7 @@ impl Fleet {
             RouteOutcome::NotACommand => {}
             // The folder can only be checked where it is. Here: now. Elsewhere: ask, and bind on the answer
             RouteOutcome::SetProject { bridge_id, path, for_thread } => {
-                self.assign_project(channel, &thread, &bridge_id, Some(path), for_thread)
+                self.assign_project(channel, &thread, &bridge_id, Some(path), for_thread, false)
                     .await;
                 return true;
             }
@@ -3014,10 +3031,13 @@ impl Fleet {
         thread_ts: &str,
         path: &str,
         thread_only: bool,
+        create: bool,
     ) {
         let abs = crate::bridge::state::absolute_project_path(path, &StateDir::home());
-        let result = if !std::path::Path::new(&abs).is_dir() {
-            Err(crate::bridge::state::no_such_folder(&abs, &self.self_id))
+        let folder = crate::bridge::state::ensure_folder(&abs, &self.self_id, create);
+        let missing = (folder.is_err() && !create).then(|| abs.clone());
+        let result = if let Err(why) = folder {
+            Err(why)
         } else if thread_only {
             // Only one thread is coming here; the channel's folder is not ours to change
             Ok(abs)
@@ -3035,7 +3055,7 @@ impl Fleet {
             }
         };
         let me = self.self_id.clone();
-        self.on_project_set(&me, channel, thread_ts, result, thread_only)
+        self.on_project_set(&me, channel, thread_ts, result, thread_only, missing, create)
             .await;
     }
 
@@ -3048,6 +3068,8 @@ impl Fleet {
         thread_ts: &str,
         result: Result<String, String>,
         thread_only: bool,
+        missing: Option<String>,
+        created: bool,
     ) {
         if thread_ts.is_empty() {
             // A folder set on the machine itself: record it so `route` shows where the work happens
@@ -3094,11 +3116,114 @@ impl Fleet {
                 reply.push_str(&crate::t!("Project folder: `{abs}`", "作業ディレクトリ: `{abs}`"));
                 self.bind_and_link(bridge_id, channel, thread_ts).await;
                 self.post(channel, Some(thread_ts), &reply).await;
+                // The Owner made a new folder for this: a conversation already in this thread goes
+                // with it. A thread with no row has nothing to move
+                if created && self.thread_routes.lock().await.contains_key(thread_ts) {
+                    self.move_thread(bridge_id, channel, thread_ts, &abs).await;
+                }
             }
             Err(why) => {
                 rlog("info", &format!("pwd on {bridge_id} for {channel} refused: {why}"));
+                if let Some(path) = missing {
+                    let offer = crate::bridge::state::FolderOffer {
+                        channel: channel.to_string(),
+                        thread_ts: thread_ts.to_string(),
+                        path,
+                        for_thread: thread_only,
+                        machine: Some(bridge_id.to_string()),
+                    };
+                    let question = offer.question(bridge_id);
+                    let blocks =
+                        crate::chat::slack::folder_offer_blocks(&question, &offer.encode());
+                    match self
+                        .api
+                        .post_blocks(channel, &question, blocks, Some(thread_ts))
+                        .await
+                    {
+                        Ok(_) => return,
+                        Err(e) => rlog("error", &format!("could not post the folder offer: {e}")),
+                    }
+                }
                 self.post(channel, Some(thread_ts), &why).await;
             }
+        }
+    }
+
+    /// The Owner answered an offer to create a folder on a machine the command named.
+    async fn on_named_folder_answer(
+        self: &Arc<Self>,
+        click: PermClick,
+        offer: crate::bridge::state::FolderOffer,
+        machine: String,
+    ) {
+        if self.owner().as_deref() != Some(click.by.as_str()) {
+            rlog("info", &format!("folder offer: ignored a press by {}", click.by));
+            return;
+        }
+        let path = &offer.path;
+        let (out, create) = if click.action == crate::chat::slack::FOLDER_NO {
+            (crate::bridge::state::folder_not_created(path), false)
+        } else {
+            let text = crate::t!(
+                "Creating `{path}` on **{machine}**…",
+                "**{machine}** に `{path}` を作っています…"
+            );
+            (text, true)
+        };
+        if let Err(e) = self.api.update_markdown(&offer.channel, &click.message_ts, &out).await {
+            rlog("error", &format!("folder offer: could not update the message: {e}"));
+        }
+        if create {
+            self.assign_project(
+                &offer.channel,
+                &offer.thread_ts,
+                &machine,
+                Some(path.clone()),
+                offer.for_thread,
+                true,
+            )
+            .await;
+        }
+    }
+
+    /// Have the machine already running a thread move it into a folder there. Only that machine can
+    /// type into the agent, so this is the same press a Yes on its own offer would be.
+    async fn cd_on_machine(
+        self: &Arc<Self>,
+        machine: &str,
+        channel: &str,
+        thread_ts: &str,
+        path: &str,
+    ) {
+        let value = crate::bridge::state::FolderOffer {
+            channel: channel.to_string(),
+            thread_ts: thread_ts.to_string(),
+            path: path.to_string(),
+            for_thread: true,
+            machine: None,
+        }
+        .encode();
+        let owner = self.owner().unwrap_or_default();
+        if machine == self.self_id {
+            let click = PermClick {
+                req_id: "folder".into(),
+                action: crate::chat::slack::FOLDER_YES.into(),
+                by: owner,
+                state: serde_json::Value::Null,
+                value,
+                message_ts: String::new(),
+            };
+            let _ = self.click_tx.send(click).await;
+            return;
+        }
+        let action = serde_json::json!({
+            "action_id": format!("perm:{}:folder", crate::chat::slack::FOLDER_YES),
+            "value": value,
+        });
+        let body = serde_json::json!({"user": {"id": owner}});
+        if !self.links.send_to(machine, &link::LinkFrame::Action { action, body }) {
+            let notice = Delivery::offline_notice(machine, &self.links.connected());
+            self.post(channel, Some(thread_ts), &notice).await;
         }
     }
 
@@ -3112,14 +3237,9 @@ impl Fleet {
     /// folder. Saying so is the point of the reply.
     async fn move_thread(self: &Arc<Self>, bridge_id: &str, channel: &str, thread_ts: &str, abs: &str) {
         let was = self.thread_routes.lock().await.get(thread_ts).cloned();
+        // Same machine: nothing to hand over, but the agent still has to change folder
         if was.as_deref() == Some(bridge_id) {
-            let already = crate::t!(
-                "This thread is already on `{}`, in `{}`.",
-                "このスレッドはすでに `{}` の `{}` にいます。",
-                bridge_id,
-                abs,
-            );
-            self.post(channel, Some(thread_ts), &already).await;
+            self.cd_on_machine(bridge_id, channel, thread_ts, abs).await;
             return;
         }
         self.thread_routes
@@ -3177,8 +3297,10 @@ impl Fleet {
                 thread_ts,
                 result,
                 thread_only,
+                missing,
+                created,
             } => {
-                self.on_project_set(bridge_id, &channel, &thread_ts, result, thread_only)
+                self.on_project_set(bridge_id, &channel, &thread_ts, result, thread_only, missing, created)
                     .await
             }
             link::LinkFrame::Routes {
@@ -3256,7 +3378,7 @@ impl Fleet {
                 path,
                 thread_only,
             } => {
-                self.assign_project(&channel, &thread_ts, &machine, path, thread_only)
+                self.assign_project(&channel, &thread_ts, &machine, path, thread_only, false)
                     .await
             }
             link::LinkFrame::MachineVersion { version, build, triple } => {
@@ -3775,6 +3897,7 @@ impl Fleet {
         machine: &str,
         path: Option<String>,
         thread_only: bool,
+        create: bool,
     ) {
         let connected = self.machines();
         if !connected.iter().any(|m| m == machine) {
@@ -3784,7 +3907,7 @@ impl Fleet {
         }
         let path = path.unwrap_or_else(|| "~".to_string());
         if machine == self.self_id {
-            self.set_project_here(channel, thread_ts, &path, thread_only).await;
+            self.set_project_here(channel, thread_ts, &path, thread_only, create).await;
         } else if !self.links.send_to(
             machine,
             &link::LinkFrame::SetProject {
@@ -3792,6 +3915,7 @@ impl Fleet {
                 thread_ts: thread_ts.to_string(),
                 path,
                 thread_only,
+                create,
             },
         ) {
             let notice = Delivery::offline_notice(machine, &self.links.connected());
@@ -3838,6 +3962,15 @@ impl Fleet {
     }
 
     async fn on_click(self: &Arc<Self>, action: serde_json::Value, body: serde_json::Value) {
+        // An offer from a command that named a machine stays here: only the gateway can hand a
+        // channel over, and the machine that has this thread may not be the one named
+        if let Some(click) = crate::chat::slack::perm_click_from_relay(&action, &body)
+            && let Some(offer) = crate::bridge::state::FolderOffer::decode(&click.value)
+            && let Some(machine) = offer.machine.clone()
+        {
+            self.on_named_folder_answer(click, offer, machine).await;
+            return;
+        }
         let channel = Click(&body).channel().map(str::to_string);
         let thread = Click(&body).thread().map(str::to_string);
         let (routes, connected) = (self.access().bridges(), self.links.connected());
@@ -5404,6 +5537,120 @@ mod tests {
         assert_eq!(Click(&serde_json::json!({"channel": {"id": "C9"}})).thread(), None);
     }
 
+    // ── Offering to create a folder on a named machine ──────────────────────────
+
+    fn fleet_with_owner(name: &str) -> (Arc<Fleet>, Arc<crate::chat::fake::FakeChat>) {
+        let dir = StateDir::at(
+            std::env::temp_dir().join(format!("slack-relay-offer-{name}-{}", std::process::id())),
+        );
+        let _ = std::fs::remove_dir_all(dir.path());
+        let mut access = Access::load(&dir);
+        access.owner = "U_OWNER".into();
+        access.save(&dir).unwrap();
+        let api = Arc::new(crate::chat::fake::FakeChat::default());
+        let (fleet, _rx) = a_fleet_with(dir, api.clone());
+        (fleet, api)
+    }
+
+    fn named_offer_press(action: &str, by: &str) -> (serde_json::Value, serde_json::Value) {
+        let value = crate::bridge::state::FolderOffer {
+            channel: "C1".into(),
+            thread_ts: "1.1".into(),
+            path: "/new/x".into(),
+            for_thread: false,
+            machine: Some("mac".into()),
+        }
+        .encode();
+        (
+            serde_json::json!({"action_id": format!("perm:{action}:folder"), "value": value}),
+            serde_json::json!({"user": {"id": by}, "container": {"message_ts": "9.9"}}),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_machines_missing_folder_becomes_an_offer_not_a_refusal() {
+        let (fleet, api) = fleet_with_owner("missing");
+        fleet
+            .on_machine_frame(
+                "mac",
+                link::LinkFrame::ProjectSet {
+                    channel: "C1".into(),
+                    thread_ts: "1.1".into(),
+                    result: Err("no such folder".into()),
+                    thread_only: false,
+                    missing: Some("/new/x".into()),
+                    created: false,
+                },
+            )
+            .await;
+        let said = posts(&api);
+        assert!(said.contains("perm:mkdir-yes:folder") && said.contains("mac"), "{said}");
+        assert!(!said.contains("no such folder"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn yes_on_a_named_machine_asks_that_machine_to_make_it() {
+        let (fleet, api) = fleet_with_owner("yes");
+        let (c, mut frames) = conn();
+        fleet.links.register("mac", c);
+
+        let (action, body) = named_offer_press("mkdir-yes", "U_OWNER");
+        fleet.on_click(action, body).await;
+
+        let told = link::decode(&frames.try_recv().expect("the machine was told")).unwrap();
+        assert!(
+            matches!(&told, link::LinkFrame::SetProject { path, create: true, .. } if path == "/new/x"),
+            "{told:?}"
+        );
+        assert!(posts(&api).contains("update_md C1 9.9"), "{}", posts(&api));
+    }
+
+    #[tokio::test]
+    async fn only_the_owner_can_answer_for_a_named_machine() {
+        let (fleet, api) = fleet_with_owner("stranger");
+        let (c, mut frames) = conn();
+        fleet.links.register("mac", c);
+
+        let (action, body) = named_offer_press("mkdir-yes", "U_OTHER");
+        fleet.on_click(action, body).await;
+
+        assert!(frames.try_recv().is_err(), "the machine was not told");
+        assert!(posts(&api).is_empty(), "{}", posts(&api));
+    }
+
+    /// `cd <machine>:<path>` on the machine a thread is already on: it has to really change folder.
+    #[tokio::test]
+    async fn a_thread_on_the_named_machine_is_told_to_change_folder() {
+        let (fleet, _api) = fleet_with_owner("same-machine");
+        let (c, mut frames) = conn();
+        fleet.links.register("mac", c);
+        fleet.thread_routes.lock().await.insert("1.1".into(), "mac".into());
+
+        fleet
+            .on_machine_frame(
+                "mac",
+                link::LinkFrame::ProjectSet {
+                    channel: "C1".into(),
+                    thread_ts: "1.1".into(),
+                    result: Ok("/new/x".into()),
+                    thread_only: true,
+                    missing: None,
+                    created: true,
+                },
+            )
+            .await;
+
+        let told = link::decode(&frames.try_recv().expect("the machine was told")).unwrap();
+        let link::LinkFrame::Action { action, body } = told else {
+            panic!("{told:?}")
+        };
+        let click = crate::chat::slack::perm_click_from_relay(&action, &body).unwrap();
+        assert_eq!(click.action, crate::chat::slack::FOLDER_YES);
+        assert_eq!(click.by, "U_OWNER");
+        let offer = crate::bridge::state::FolderOffer::decode(&click.value).unwrap();
+        assert!(offer.for_thread && offer.path == "/new/x" && offer.machine.is_none());
+    }
+
     // ── Gateway endpoints, key, order ──────────────────────────
 
     fn a_fleet() -> (Arc<Fleet>, tokio::sync::mpsc::Receiver<InboundMsg>) {
@@ -5711,6 +5958,8 @@ mod tests {
                     thread_ts: String::new(),
                     result: Ok("/Users/t/x".into()),
                     thread_only: false,
+                    missing: None,
+                    created: false,
                 },
             )
             .await;

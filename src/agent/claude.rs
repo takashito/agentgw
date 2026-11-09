@@ -1426,6 +1426,11 @@ impl crate::agent::Agent for Claude {
     fn workdir_exists(&self, path: &str) -> bool {
         std::path::Path::new(path).is_dir()
     }
+
+    fn create_workdir(&self, path: &str) -> Result<(), String> {
+        std::fs::create_dir_all(path).map_err(|e| e.to_string())
+    }
+
     fn remove_worktree(&self, path: &str) -> Option<Result<(), String>> {
         let git = |args: &[&str]| {
             let out = std::process::Command::new("git")

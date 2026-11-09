@@ -1303,6 +1303,37 @@ pub struct PermClick {
     /// What the message's inputs held when it was pressed (Slack's `state`) — the question
     /// form's radio buttons, checkboxes and text boxes. `Null` for a plain button.
     pub state: serde_json::Value,
+    /// The button's own `value`. Empty when it has none.
+    pub value: String,
+    /// The message the button sits on. Empty for a press that didn't come from a message.
+    pub message_ts: String,
+}
+
+/// The `action` of the two answers to a [`FolderOffer`](crate::bridge::state::FolderOffer).
+pub const FOLDER_YES: &str = "mkdir-yes";
+pub const FOLDER_NO: &str = "mkdir-no";
+
+/// The question and its two buttons. `value` is the encoded offer.
+pub fn folder_offer_blocks(question: &str, value: &str) -> serde_json::Value {
+    let button = |label: String, action: &str, style: Option<&str>| {
+        let mut b = serde_json::json!({
+            "type": "button",
+            "action_id": format!("perm:{action}:folder"),
+            "text": {"type": "plain_text", "text": label},
+            "value": value,
+        });
+        if let Some(s) = style {
+            b["style"] = s.into();
+        }
+        b
+    };
+    serde_json::json!([
+        {"type": "markdown", "text": question},
+        {"type": "actions", "elements": [
+            button(crate::t!("Yes, create it", "はい、作ります"), FOLDER_YES, Some("primary")),
+            button(crate::t!("No", "いいえ"), FOLDER_NO, None),
+        ]},
+    ])
 }
 
 /// Block Kit buttons. Only **the fact that it was pressed** is passed to the main loop; no decision is made here
@@ -1385,21 +1416,11 @@ async fn on_interaction_event(
             actions.len()
         ),
     );
+    let body = serde_json::to_value(&ev).unwrap_or(serde_json::Value::Null);
     for a in actions {
-        let id = a.action_id.to_string();
-        // `perm:<action>:<reqId>` — reqId itself contains no `:`, so splitting into 3 is enough
-        let mut parts = id.splitn(3, ':');
-        if parts.next() != Some("perm") {
+        let action = serde_json::to_value(&a).unwrap_or(serde_json::Value::Null);
+        let Some(click) = perm_click_from_relay(&action, &body) else {
             continue;
-        }
-        let (Some(action), Some(req_id)) = (parts.next(), parts.next()) else {
-            continue;
-        };
-        let click = PermClick {
-            req_id: req_id.to_string(),
-            action: action.to_string(),
-            by: by.clone(),
-            state: serde_json::to_value(&ev.state).unwrap_or(serde_json::Value::Null),
         };
         let guard = state.read().await;
         match guard.get_user_state::<tokio::sync::mpsc::Sender<PermClick>>() {
@@ -2096,6 +2117,17 @@ pub fn perm_click_from_relay(
             .unwrap_or_default()
             .to_string(),
         state: body.get("state").cloned().unwrap_or(serde_json::Value::Null),
+        value: action
+            .get("value")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        message_ts: body
+            .get("container")
+            .and_then(|c| c.get("message_ts"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
     })
 }
 
@@ -2294,6 +2326,17 @@ mod tests {
 
     /// The form is written as JSON and read into the crate's types; a shape the crate cannot
     /// read would only show at run time, as a question that never reaches the thread.
+    /// `post_blocks` reads the JSON into Slack's types, so a shape they refuse never reaches Slack.
+    #[test]
+    fn the_folder_offer_is_blocks_slack_accepts() {
+        let blocks = folder_offer_blocks("Create it?", "{\"path\":\"/a\"}");
+        let parsed: Vec<SlackBlock> = serde_json::from_value(blocks.clone()).expect("valid blocks");
+        assert_eq!(parsed.len(), 2);
+        let again = serde_json::to_string(&parsed).unwrap();
+        assert!(again.contains("perm:mkdir-yes:folder") && again.contains("perm:mkdir-no:folder"), "{again}");
+        assert!(again.contains("\\\"path\\\""), "the offer rides in the button: {again}");
+    }
+
     #[test]
     fn the_question_form_reads_into_blocks_for_every_shape() {
         let qs = [q("One?", false), q("Several?", true)];

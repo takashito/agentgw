@@ -928,10 +928,12 @@ impl Bridge {
                 {
                     return true;
                 }
-                let out = self
+                if let Some(out) = self
                     .set_target(msg, target, for_thread, dm, key, root_ts, &ctx)
-                    .await;
-                self.post(&msg.channel, root_ts, out, key);
+                    .await
+                {
+                    self.post(&msg.channel, root_ts, out, key);
+                }
             }
             // Same: only the gateway knows the machines
             Cmd::Machines => {
