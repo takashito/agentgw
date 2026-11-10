@@ -2459,6 +2459,8 @@ pub struct Fleet {
     /// Asked thread ts → (its channel, where it was asked from). **The one place asks are decided**;
     /// seeded from threads.json and written back through [`Self::remember`], like `thread_routes`.
     pub asks: AsyncMutex<HashMap<String, (String, crate::bridge::state::AskedFrom)>>,
+    /// `list_channels` waiting for a machine to read a folder's notes (req_id → the answer).
+    pub reads: std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>,
 }
 
 /// A rename under way: the machine's old link is still to go down and its new name to come up.
@@ -3488,6 +3490,21 @@ impl Fleet {
             } => self.on_agent_reply(&channel, &thread_ts, &ts, text, needs_human, &outcome).await,
             link::LinkFrame::AskEnded { channel, thread_ts } => self.on_ask_ended(&channel, &thread_ts).await,
             link::LinkFrame::NeedsHuman { channel, thread_ts, ts } => self.on_needs_human(&channel, &thread_ts, &ts).await,
+            link::LinkFrame::SetConfirmAsks { channel, thread_ts, on } => {
+                self.edit_access(|a| a.routes.entry(channel.clone()).or_default().confirm_asks = Some(on)).await;
+                self.post(&channel, Some(&thread_ts), &crate::bridge::asks::confirm_asks_said(&channel, on)).await;
+            }
+            link::LinkFrame::ProjectRead { req_id, text } => {
+                if let Some(tx) = self.reads.lock().unwrap_or_else(|e| e.into_inner()).remove(&req_id) {
+                    let _ = tx.send(text);
+                }
+            }
+            link::LinkFrame::ListChannels { req_id, channel_id } => {
+                let result = self.list_channels(channel_id.as_deref()).await;
+                if !self.send_frame(bridge_id, &link::LinkFrame::AskAnswer { req_id, result }).await {
+                    rlog("info", &format!("{bridge_id}: could not return the channel list (link dropped)"));
+                }
+            }
             link::LinkFrame::AskChannel {
                 req_id,
                 from_channel,
@@ -4560,6 +4577,65 @@ impl Fleet {
             rlog("info", &format!("ask: the asker {}:{} is away ({e}); counted for later", row.channel, row.thread_ts));
             self.edit_ask(channel, thread, |r| r.missed += 1).await;
         }
+    }
+
+    /// The channels an agent may ask: every channel the bot is in, with the machine and folder that
+    /// handle it, and its Slack topic and purpose. With `only`, that one channel and its project notes.
+    pub(crate) async fn list_channels(&self, only: Option<&str>) -> Result<serde_json::Value, String> {
+        let access = self.access();
+        let connected = self.links.connected();
+        let homes = self.homes.lock().await.clone();
+        let mut out = Vec::new();
+        for (id, name) in self.api.bot_channels().await? {
+            if only.is_some_and(|o| o != id) {
+                continue;
+            }
+            let machine = access.routes.get(&id).and_then(|r| r.bridge.clone()).unwrap_or_else(|| self.self_id.clone());
+            let online = machine == self.self_id || connected.contains(&machine);
+            let home = if machine == self.self_id {
+                crate::bridge::Host::home()
+            } else {
+                homes.get(&machine).cloned().unwrap_or_default()
+            };
+            let folder = access.repo_path(&id, &home).0;
+            let (_, topic, purpose) = self.api.channel_info(&id).await.unwrap_or_default();
+            let mut row = serde_json::json!({
+                "id": id, "name": name, "machine": machine, "online": online,
+                "folder": folder, "topic": topic, "purpose": purpose,
+            });
+            if only.is_some() {
+                let project = if !online {
+                    None
+                } else if machine == self.self_id {
+                    Some(crate::bridge::asks::read_project(std::path::Path::new(&folder)))
+                } else {
+                    self.read_project_on(&machine, &id).await
+                };
+                row["project"] = project.clone().unwrap_or_default().into();
+                if project.is_none() {
+                    row["note"] = if online { "the machine did not answer in time" } else { "machine offline" }.into();
+                }
+            }
+            out.push(row);
+        }
+        if let Some(o) = only
+            && out.is_empty()
+        {
+            return Err(format!("the bot is not in {o}"));
+        }
+        Ok(serde_json::json!({"channels": out}))
+    }
+
+    /// Ask `machine` for the notes of `channel`'s folder; `None` if it does not answer within 5s.
+    async fn read_project_on(&self, machine: &str, channel: &str) -> Option<String> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let req_id = format!("read-{}-{}", now_ms(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.reads.lock().unwrap_or_else(|e| e.into_inner()).insert(req_id.clone(), tx);
+        let sent = self.links.send_to(machine, &link::LinkFrame::ReadProject { req_id: req_id.clone(), channel: channel.to_string() });
+        let got = if sent { tokio::time::timeout(std::time::Duration::from_secs(5), rx).await.ok().and_then(Result::ok) } else { None };
+        self.reads.lock().unwrap_or_else(|e| e.into_inner()).remove(&req_id);
+        got
     }
 
     /// A person is needed in an asked thread: a link to the thread that asked, and to the top of the
@@ -6216,6 +6292,7 @@ mod tests {
             tunnels: Default::default(),
             renaming: Default::default(),
             asks: Default::default(),
+            reads: Default::default(),
         });
         (fleet, msg_rx)
     }
@@ -8219,6 +8296,7 @@ mod ask_tests {
             to_self: tokio::sync::mpsc::channel(4).0,
             tunnels: Default::default(),
             renaming: Default::default(),
+            reads: Default::default(),
         });
         Rig { fleet, api, msgs, notes }
     }
@@ -8481,6 +8559,49 @@ mod ask_tests {
         assert!(!to("C1", "1.1")[0].contains("<@U_OWNER>"));
         assert_eq!(to("C0", "0.1").len(), 1, "{said:?}");
         assert!(to("C0", "0.1")[0].contains("<@U_OWNER>"));
+    }
+
+    #[tokio::test]
+    async fn the_gateway_sets_confirm_asks_for_a_channel() {
+        let r = rig("confirm", FakeChat::default(), &[]);
+        r.fleet
+            .on_machine_frame("mac", link::LinkFrame::SetConfirmAsks { channel: "C2".into(), thread_ts: "2.1".into(), on: false })
+            .await;
+        assert!(!Access::load(&r.fleet.dir).confirms_asks("C2"));
+        assert!(calls(&r.api).iter().any(|c| c.contains(" C2 2.1 ") && c.contains("at once")), "{:?}", calls(&r.api));
+    }
+
+    #[tokio::test]
+    async fn the_gateway_lists_channels_with_their_machine_and_folder() {
+        let r = rig("list", FakeChat::in_channels(&[("C1", "cos"), ("C2", "pve-root")]), &[]);
+        {
+            let mut a = Access::load(&r.fleet.dir);
+            a.set_bridge("C2", "pve");
+            a.routes.get_mut("C2").unwrap().repo_path = Some("/root".into());
+            a.save(&r.fleet.dir).unwrap();
+        }
+        let out = r.fleet.list_channels(None).await.unwrap();
+        let list = out["channels"].as_array().unwrap();
+        let c2 = list.iter().find(|c| c["id"] == "C2").unwrap();
+        assert_eq!((c2["name"].as_str(), c2["machine"].as_str(), c2["folder"].as_str()), (Some("pve-root"), Some("pve"), Some("/root")));
+        assert_eq!(c2["online"], false);
+        assert_eq!(c2["purpose"], "purpose of C2");
+        let c1 = list.iter().find(|c| c["id"] == "C1").unwrap();
+        assert_eq!((c1["machine"].as_str(), c1["online"].as_bool()), (Some("parent"), Some(true)));
+    }
+
+    #[tokio::test]
+    async fn project_detail_from_an_offline_machine_is_empty_with_a_note() {
+        let r = rig("detail", FakeChat::in_channels(&[("C2", "pve-root")]), &[]);
+        {
+            let mut a = Access::load(&r.fleet.dir);
+            a.set_bridge("C2", "pve");
+            a.save(&r.fleet.dir).unwrap();
+        }
+        let out = r.fleet.list_channels(Some("C2")).await.unwrap();
+        let c2 = &out["channels"][0];
+        assert_eq!(c2["project"], "");
+        assert!(c2["note"].as_str().unwrap_or_default().contains("offline"));
     }
 
     #[tokio::test]

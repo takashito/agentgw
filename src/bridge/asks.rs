@@ -173,6 +173,35 @@ pub fn dead_end_line(outcome: &str, detail: &str) -> String {
     }
 }
 
+/// What `confirm-asks on|off` answers.
+pub fn confirm_asks_said(channel: &str, on: bool) -> String {
+    if on {
+        crate::t!("Asks into <#{channel}> now wait for Run.", "<#{channel}> への依頼は「実行」を押すまで止まります。")
+    } else {
+        crate::t!("Asks into <#{channel}> now start at once.", "<#{channel}> への依頼は確認なしで始まります。")
+    }
+}
+
+/// How much of a project's notes `list_channels` shows.
+pub const PROJECT_NOTES_BYTES: usize = 4096;
+
+/// The project notes of a folder: its `CLAUDE.md`, else its `README.md`, cut to
+/// [`PROJECT_NOTES_BYTES`] on a character boundary. Empty when there are none.
+pub fn read_project(dir: &std::path::Path) -> String {
+    let text = ["CLAUDE.md", "README.md"]
+        .iter()
+        .find_map(|f| std::fs::read_to_string(dir.join(f)).ok())
+        .unwrap_or_default();
+    if text.len() <= PROJECT_NOTES_BYTES {
+        return text;
+    }
+    let mut end = PROJECT_NOTES_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
 #[cfg(test)]
 mod frame_tests {
     use crate::bridge::gateway::link::{decode, encode, LinkFrame};
@@ -313,5 +342,39 @@ mod decision_tests {
         };
         assert_eq!(AskOffer::decode(&o.encode()), Some(o.clone()));
         assert!(crate::bridge::state::FolderOffer::decode(&o.encode()).is_none(), "not mistaken for a folder offer");
+    }
+}
+
+#[cfg(test)]
+mod project_tests {
+    use super::read_project;
+
+    fn dir_with(name: &str, file: &str, body: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("agentgw-project-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        if !file.is_empty() {
+            std::fs::write(d.join(file), body).unwrap();
+        }
+        d
+    }
+
+    #[test]
+    fn project_text_is_cut_at_4096_bytes_on_a_char_boundary() {
+        let d = dir_with("cut", "CLAUDE.md", &"あ".repeat(3000)); // 9000 bytes
+        let t = read_project(&d);
+        assert!(t.len() <= 4096 && t.len() > 4000, "{}", t.len());
+        assert!(t.chars().all(|c| c == 'あ'));
+    }
+
+    #[test]
+    fn readme_is_read_when_there_is_no_claude_md() {
+        let d = dir_with("readme", "README.md", "# hello");
+        assert_eq!(read_project(&d), "# hello");
+    }
+
+    #[test]
+    fn a_folder_without_notes_reads_empty() {
+        assert_eq!(read_project(&dir_with("none", "", "")), "");
     }
 }

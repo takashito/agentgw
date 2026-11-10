@@ -1240,6 +1240,10 @@ impl Access {
                 // (not the raw internal id).
                 crate::t!("<#{channel}> now uses the project directory `{path}`.", "<#{channel}> をプロジェクト `{path}` に紐付けました。")
             }
+            AccessOp::SetConfirmAsks { channel, on } => {
+                access.routes.entry(channel.clone()).or_default().confirm_asks = Some(on);
+                crate::bridge::asks::confirm_asks_said(&channel, on)
+            }
             AccessOp::SetWarm { channel, on } => {
                 // Warm pool keys are cwds, so this only means something for channels with a repo
                 // (channels without one are served by the resident Home pool). Keep the flag, but say so.
@@ -1341,6 +1345,7 @@ pub enum AccessOp {
     SetRepo { channel: String, path: String },
     SetWarm { channel: String, on: bool },
     SetHome(String),
+    SetConfirmAsks { channel: String, on: bool },
 }
 
 

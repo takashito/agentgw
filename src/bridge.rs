@@ -1052,6 +1052,7 @@ impl Bridge {
                 tunnels: Default::default(),
                 renaming: Default::default(),
                 asks: tokio::sync::Mutex::new(crate::bridge::state::Threads::load(&dir).asked()),
+                reads: Default::default(),
             });
             // One listener per address: loopback for whatever terminates TLS in front, the LAN address
             // for machines on the same network
@@ -1850,8 +1851,11 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
                 return;
             }
         }
-        machine::FromRelay::ReadProject { req_id, .. } => {
-            LogCtx::default().debug("bridge", &format!("read-project {req_id} dropped"));
+        // The gateway asks for a channel's project notes (`list_channels`): only this machine sees the folder
+        machine::FromRelay::ReadProject { req_id, channel } => {
+            let (folder, _) = bridge::Access::load(dir).repo_path(&channel, &Host::home());
+            let text = crate::bridge::asks::read_project(std::path::Path::new(&folder));
+            let _ = up.send(crate::bridge::gateway::link::LinkFrame::ProjectRead { req_id, text });
         }
         // Getting here means the link has been given up. **Don't touch the agents** — running ones
         // keep running. New Slack messages just stop coming until a person fixes the config and restarts
@@ -2551,6 +2555,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_machine_reads_project_notes_for_the_gateway() {
+        let base = std::env::temp_dir().join(format!("agentgw-pump-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let proj = base.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("CLAUDE.md"), "# the project").unwrap();
+        let dir = crate::state_dir::StateDir::at(base.join("state"));
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let mut a = bridge::Access::load(&dir);
+        a.routes.entry("C1".into()).or_default().repo_path = Some(proj.to_string_lossy().to_string());
+        a.save(&dir).unwrap();
+        let (up, mut up_rx) = mpsc::unbounded_channel();
+        let sinks = RelaySinks { msg_tx: mpsc::channel(4).0, click_tx: mpsc::channel(4).0, dir, reload: mpsc::channel(4).0, relink: mpsc::channel(4).0, up, machine: "desk".into(), gateway_url: String::new(), left: mpsc::channel(4).0, arriving: mpsc::channel(4).0, updated: mpsc::channel(4).0, asker: None };
+        pump_relay(machine::FromRelay::ReadProject { req_id: "r9".into(), channel: "C1".into() }, &sinks).await;
+        match up_rx.try_recv() {
+            Ok(crate::bridge::gateway::link::LinkFrame::ProjectRead { req_id, text }) => {
+                assert_eq!((req_id.as_str(), text.as_str()), ("r9", "# the project"));
+            }
+            other => panic!("no notes went up: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn an_ask_that_reads_like_a_command_is_delivered_as_text() {
         let (d, _slack, agent, _clock) = flow_deps("ask-exit");
         let (mut b, _fx) = Bridge::for_test(d);
@@ -2741,6 +2768,21 @@ mod tests {
         let frames: Vec<_> = std::iter::from_fn(|| up.try_recv().ok()).collect();
         assert!(frames.iter().any(|f| matches!(f, crate::bridge::gateway::link::LinkFrame::AgentReply { needs_human: true, .. })));
         assert!(frames.iter().any(|f| matches!(f, crate::bridge::gateway::link::LinkFrame::NeedsHuman { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_machine_forwards_confirm_asks_to_the_gateway() {
+        let (d, _slack, _agent, _clock) = flow_deps("confirm-asks");
+        let dir = d.dir.clone();
+        let (mut b, _fx) = Bridge::for_test(d);
+        let (tx, mut up) = mpsc::unbounded_channel();
+        b.ask_gateway = Some(tx);
+        b.on_inbound(&channel_msg("1782000000.000700", "U_OWNER", "<@U_BOT> confirm-asks off")).await;
+        let sent = std::iter::from_fn(|| up.try_recv().ok()).any(|f| {
+            matches!(f, crate::bridge::gateway::link::LinkFrame::SetConfirmAsks { ref channel, on: false, .. } if channel == "C1")
+        });
+        assert!(sent, "asked of the gateway");
+        assert!(bridge::Access::load(&dir).confirms_asks("C1"), "this machine's own record is untouched");
     }
 
     #[test]

@@ -1201,6 +1201,12 @@ impl crate::chat::Chat for Api {
     async fn channel_display_name(&self, channel: &str) -> Option<String> {
         Api::channel_display_name(self, channel).await
     }
+    async fn channel_info(&self, channel: &str) -> Result<(String, String, String), String> {
+        let c = self.get_json("conversations.info", &[("channel", channel)]).await?;
+        let c = c.get("channel").cloned().unwrap_or_default();
+        let s = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_string();
+        Ok((s(&c["name"]), s(&c["topic"]["value"]), s(&c["purpose"]["value"])))
+    }
     async fn bot_channels(&self) -> Result<Vec<(String, String)>, String> {
         Api::bot_channels(self).await
     }

@@ -364,6 +364,8 @@ pub trait Chat: Send + Sync + 'static {
     async fn thread_root_gone(&self, channel: &str, thread_ts: &str) -> bool;
     async fn get_permalink(&self, channel: &str, ts: &str) -> Result<String, String>;
     async fn channel_display_name(&self, channel: &str) -> Option<String>;
+    /// A channel's (name, topic, purpose), for agents choosing where to ask.
+    async fn channel_info(&self, channel: &str) -> Result<(String, String, String), String>;
     /// Every channel the bot is a member of, as (id, name). The gateway needs it for `status`: a channel
     /// nobody was assigned is **its own**, and until someone types in it there is nothing else to learn it from.
     async fn bot_channels(&self) -> Result<Vec<(String, String)>, String>;
@@ -637,6 +639,10 @@ pub mod fake {
         async fn get_permalink(&self, c: &str, ts: &str) -> Result<String, String> {
             self.record(format!("permalink {c} {ts}"))?;
             Ok(format!("https://slack/{c}/{ts}"))
+        }
+        async fn channel_info(&self, c: &str) -> Result<(String, String, String), String> {
+            let name = self.channels.iter().find(|(id, _)| id == c).map(|(_, n)| n.clone()).unwrap_or_default();
+            Ok((name, format!("topic of {c}"), format!("purpose of {c}")))
         }
         async fn channel_display_name(&self, c: &str) -> Option<String> {
             self.record(format!("channel_name {c}")).ok()?;
