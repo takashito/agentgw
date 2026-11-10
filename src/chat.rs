@@ -366,6 +366,10 @@ pub trait Chat: Send + Sync + 'static {
     async fn channel_display_name(&self, channel: &str) -> Option<String>;
     /// A channel's (name, topic, purpose), for agents choosing where to ask.
     async fn channel_info(&self, channel: &str) -> Result<(String, String, String), String>;
+    /// Replace a channel's topic (`conversations.setTopic`). An empty string clears it.
+    async fn set_channel_topic(&self, channel: &str, topic: &str) -> Result<(), String>;
+    /// Replace a channel's purpose, Slack's "description" (`conversations.setPurpose`). An empty string clears it.
+    async fn set_channel_purpose(&self, channel: &str, purpose: &str) -> Result<(), String>;
     /// Every channel the bot is a member of, as (id, name). The gateway needs it for `status`: a channel
     /// nobody was assigned is **its own**, and until someone types in it there is nothing else to learn it from.
     async fn bot_channels(&self) -> Result<Vec<(String, String)>, String>;
@@ -475,6 +479,8 @@ pub mod fake {
         pub channels: Vec<(String, String)>,
         /// How long `channel_info` takes.
         pub info_delay_ms: u64,
+        /// Topics and purposes set through the fake: channel → (topic, purpose). `channel_info` answers these.
+        pub set_info: Mutex<std::collections::HashMap<String, (Option<String>, Option<String>)>>,
     }
 
     impl FakeChat {
@@ -653,7 +659,22 @@ pub mod fake {
                 tokio::time::sleep(std::time::Duration::from_millis(self.info_delay_ms)).await;
             }
             let name = self.channels.iter().find(|(id, _)| id == c).map(|(_, n)| n.clone()).unwrap_or_default();
-            Ok((name, format!("topic of {c}"), format!("purpose of {c}")))
+            let (topic, purpose) = self.set_info.lock().unwrap().get(c).cloned().unwrap_or_default();
+            Ok((
+                name,
+                topic.unwrap_or_else(|| format!("topic of {c}")),
+                purpose.unwrap_or_else(|| format!("purpose of {c}")),
+            ))
+        }
+        async fn set_channel_topic(&self, c: &str, topic: &str) -> Result<(), String> {
+            self.record(format!("set_topic {c} {topic}"))?;
+            self.set_info.lock().unwrap().entry(c.to_string()).or_default().0 = Some(topic.to_string());
+            Ok(())
+        }
+        async fn set_channel_purpose(&self, c: &str, purpose: &str) -> Result<(), String> {
+            self.record(format!("set_purpose {c} {purpose}"))?;
+            self.set_info.lock().unwrap().entry(c.to_string()).or_default().1 = Some(purpose.to_string());
+            Ok(())
         }
         async fn channel_display_name(&self, c: &str) -> Option<String> {
             self.record(format!("channel_name {c}")).ok()?;

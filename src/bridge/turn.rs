@@ -2573,7 +2573,7 @@ impl crate::mcp::ToolExecutor for ToolExec {
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
         let (slack, dir, dispo, ask) = (self.slack.clone(), self.state_dir.clone(), self.dispo.clone(), self.ask.clone());
         Box::pin(async move {
-            if matches!(tool.as_str(), "ask_channel" | "list_channels") {
+            if matches!(tool.as_str(), "ask_channel" | "list_channels" | "set_channel_info") {
                 return execute_ask_tool(slack.as_ref(), &dir, &session_id, &tool, &args, ask.as_ref(), &dispo).await;
             }
             execute_tool(slack.as_ref(), &dir, &session_id, &tool, &args, &dispo).await
@@ -2581,7 +2581,7 @@ impl crate::mcp::ToolExecutor for ToolExec {
     }
 }
 
-/// The tools that need the gateway's answer: `ask_channel` and `list_channels`.
+/// The tools that need the gateway's answer: `ask_channel`, `list_channels` and `set_channel_info`.
 ///
 /// The asking thread is the caller's own, looked up from its session — never taken from the
 /// arguments, so an agent cannot ask on another thread's behalf.
@@ -2602,6 +2602,19 @@ pub async fn execute_ask_tool(
     if tool == "list_channels" {
         let channel_id = opt("channel_id");
         let out = ask.ask(|req_id| LinkFrame::ListChannels { req_id, channel_id }).await?;
+        return Ok(out.to_string());
+    }
+    if tool == "set_channel_info" {
+        let Some(channel_id) = opt("channel_id") else {
+            return Err("channel_id is required".into());
+        };
+        // An empty string is a value here (it clears), so only a missing field is "leave it"
+        let field = |k: &str| args[k].as_str().map(str::to_string);
+        let (topic, purpose) = (field("topic"), field("purpose"));
+        if topic.is_none() && purpose.is_none() {
+            return Err("give topic, purpose or both".into());
+        }
+        let out = ask.ask(|req_id| LinkFrame::SetChannelInfo { req_id, channel_id, topic, purpose }).await?;
         return Ok(out.to_string());
     }
     let threads = bridge::Threads::load(&crate::state_dir::StateDir::at(state_dir));
@@ -3251,7 +3264,8 @@ mod tests {
             while let Some(f) = rx.recv().await {
                 let id = match &f {
                     crate::bridge::gateway::link::LinkFrame::AskChannel { req_id, .. }
-                    | crate::bridge::gateway::link::LinkFrame::ListChannels { req_id, .. } => req_id.clone(),
+                    | crate::bridge::gateway::link::LinkFrame::ListChannels { req_id, .. }
+                    | crate::bridge::gateway::link::LinkFrame::SetChannelInfo { req_id, .. } => req_id.clone(),
                     _ => continue,
                 };
                 s2.lock().unwrap().push(f);
@@ -3300,6 +3314,25 @@ mod tests {
         let (gw, _) = answering(Ok(serde_json::json!({"channels": [{"id": "C2"}]})));
         let out = execute_ask_tool(&api, &dir, "sid", "list_channels", &serde_json::json!({}), Some(&gw), &tx).await.unwrap();
         assert!(out.contains("C2"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn set_channel_info_asks_the_gateway() {
+        let (api, _dir, tx, _rx) = harness();
+        let dir = dir_with_session("setinfo");
+        let (gw, seen) = answering(Ok(serde_json::json!({"id": "C2", "topic": "role=cos"})));
+        let args = serde_json::json!({"channel_id": "C2", "topic": "role=cos"});
+        let out = execute_ask_tool(&api, &dir, "sid", "set_channel_info", &args, Some(&gw), &tx).await.unwrap();
+        assert!(out.contains("role=cos"), "{out}");
+        match seen.lock().unwrap().first() {
+            Some(crate::bridge::gateway::link::LinkFrame::SetChannelInfo { channel_id, topic, purpose, .. }) => {
+                assert_eq!((channel_id.as_str(), topic.as_deref(), purpose.as_deref()), ("C2", Some("role=cos"), None));
+            }
+            other => panic!("{other:?}"),
+        }
+        let none = serde_json::json!({"channel_id": "C2"});
+        let err = execute_ask_tool(&api, &dir, "sid", "set_channel_info", &none, Some(&gw), &tx).await.unwrap_err();
+        assert!(err.contains("topic, purpose"), "{err}");
     }
 
     #[tokio::test]

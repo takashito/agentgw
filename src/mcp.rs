@@ -177,6 +177,19 @@ impl Mcp {
                     "required": [],
                 },
             }),
+            serde_json::json!({
+                "name": "set_channel_info",
+                "description": "Rewrite a Slack channel's topic and/or purpose (its description) — the topic and purpose list_channels shows, where tags such as `role=lead team=home` tell agents what a channel is for. Only channels the bot is in. Pass only the field(s) to change; an empty string clears one. Returns the channel's topic and purpose as Slack now shows them. Slack posts a visible notice in the channel for each change, so change them only when asked or when they are wrong.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "channel_id": { "type": "string", "description": "The channel (C...), as list_channels or a <#C...> link gives it." },
+                        "topic": { "type": "string", "description": "The new topic, at most 250 characters. Leave out to keep it; empty string to clear it." },
+                        "purpose": { "type": "string", "description": "The new purpose (Slack's channel description), at most 250 characters. Leave out to keep it; empty string to clear it." },
+                    },
+                    "required": ["channel_id"],
+                },
+            }),
         ]
     }
 
@@ -500,7 +513,8 @@ mod tests {
                 "fetch_messages",
                 "set_thread_title",
                 "ask_channel",
-                "list_channels"
+                "list_channels",
+                "set_channel_info"
             ]
         );
         for t in &tools {
@@ -574,6 +588,7 @@ mod tests {
         assert_eq!(req("set_thread_title"), ["channel_id", "thread_ts", "title"]);
         assert_eq!(req("ask_channel"), ["channel_id", "text"]);
         assert!(req("list_channels").is_empty());
+        assert_eq!(req("set_channel_info"), ["channel_id"]);
     }
 
     #[test]

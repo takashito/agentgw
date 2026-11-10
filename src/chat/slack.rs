@@ -1207,6 +1207,14 @@ impl crate::chat::Chat for Api {
         let s = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_string();
         Ok((s(&c["name"]), s(&c["topic"]["value"]), s(&c["purpose"]["value"])))
     }
+    async fn set_channel_topic(&self, channel: &str, topic: &str) -> Result<(), String> {
+        let req = SlackApiConversationsSetTopicRequest::new(channel.into(), topic.to_string());
+        self.client.open_session(&self.token).conversations_set_topic(&req).await.map(|_| ()).map_err(|e| e.to_string())
+    }
+    async fn set_channel_purpose(&self, channel: &str, purpose: &str) -> Result<(), String> {
+        let req = SlackApiConversationsSetPurposeRequest::new(channel.into(), purpose.to_string());
+        self.client.open_session(&self.token).conversations_set_purpose(&req).await.map(|_| ()).map_err(|e| e.to_string())
+    }
     async fn bot_channels(&self) -> Result<Vec<(String, String)>, String> {
         Api::bot_channels(self).await
     }

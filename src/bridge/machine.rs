@@ -380,6 +380,7 @@ impl FromRelay {
             F::ProjectSet { .. }
             | F::AskChannel { .. }
             | F::ListChannels { .. }
+            | F::SetChannelInfo { .. }
             | F::AgentReply { .. }
             | F::NeedsHuman { .. }
             | F::AskEnded { .. }

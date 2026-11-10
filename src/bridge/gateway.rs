@@ -264,7 +264,17 @@ pub mod link {
             #[serde(default, skip_serializing_if = "Option::is_none")]
             channel_id: Option<String>,
         },
-        /// gateway → machine: the answer to [`LinkFrame::AskChannel`] or [`LinkFrame::ListChannels`],
+        /// machine → gateway: rewrite a channel's topic and/or purpose (`set_channel_info`). Answered with
+        /// [`LinkFrame::AskAnswer`]. An absent field is left as it is; an empty one clears it.
+        SetChannelInfo {
+            req_id: String,
+            channel_id: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            topic: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            purpose: Option<String>,
+        },
+        /// gateway → machine: the answer to [`LinkFrame::AskChannel`], [`LinkFrame::ListChannels`] or [`LinkFrame::SetChannelInfo`],
         /// as the JSON the tool returns, or why not.
         AskAnswer {
             req_id: String,
@@ -3565,6 +3575,15 @@ impl Fleet {
                     }
                 });
             }
+            link::LinkFrame::SetChannelInfo { req_id, channel_id, topic, purpose } => {
+                let (fleet, machine) = (self.clone(), bridge_id.to_string());
+                tokio::spawn(async move {
+                    let result = fleet.set_channel_info(&channel_id, topic.as_deref(), purpose.as_deref()).await;
+                    if !fleet.send_frame(&machine, &link::LinkFrame::AskAnswer { req_id, result }).await {
+                        rlog("info", &format!("{machine}: could not return the channel info (link dropped)"));
+                    }
+                });
+            }
             link::LinkFrame::AskChannel {
                 req_id,
                 from_channel,
@@ -4809,6 +4828,40 @@ impl Fleet {
             rlog("info", &format!("ask: the asker {}:{} is away ({e}); counted for later", row.channel, row.thread_ts));
             self.edit_ask(channel, thread, |r| r.missed += 1).await;
         }
+    }
+
+    /// Rewrite a channel's topic and/or purpose for an agent (`set_channel_info`), then read it back so the
+    /// caller sees what Slack now shows. Only a channel the bot is in — the same ones `list_channels` lists.
+    pub(crate) async fn set_channel_info(
+        &self,
+        channel: &str,
+        topic: Option<&str>,
+        purpose: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        /// Slack's limit for both, in characters.
+        const MAX: usize = 250;
+        if topic.is_none() && purpose.is_none() {
+            return Err("give topic, purpose or both".into());
+        }
+        for (what, v) in [("topic", topic), ("purpose", purpose)] {
+            if let Some(v) = v
+                && v.chars().count() > MAX
+            {
+                return Err(format!("{what} is longer than Slack's {MAX} characters"));
+            }
+        }
+        if !self.api.is_member(channel).await? {
+            return Err(format!("the bot is not in {channel}"));
+        }
+        if let Some(t) = topic {
+            self.api.set_channel_topic(channel, t).await.map_err(|e| format!("setting the topic: {e}"))?;
+        }
+        if let Some(p) = purpose {
+            self.api.set_channel_purpose(channel, p).await.map_err(|e| format!("setting the purpose: {e}"))?;
+        }
+        rlog("info", &format!("channel info of {channel} set by an agent (topic: {}, purpose: {})", topic.is_some(), purpose.is_some()));
+        let (name, topic, purpose) = self.api.channel_info(channel).await?;
+        Ok(serde_json::json!({"id": channel, "name": name, "topic": topic, "purpose": purpose}))
     }
 
     /// The channels an agent may ask: every channel the bot is in, with the machine and folder that
@@ -9012,6 +9065,30 @@ mod ask_tests {
             .await;
         assert!(!Access::load(&r.fleet.dir).confirms_asks("C2"));
         assert!(calls(&r.api).iter().any(|c| c.contains(" C2 2.1 ") && c.contains("at once")), "{:?}", calls(&r.api));
+    }
+
+    #[tokio::test]
+    async fn the_gateway_sets_a_channels_topic_and_purpose() {
+        let r = rig("setinfo", FakeChat::in_channels(&[("C1", "cos"), ("C2", "dock-lan")]), &[]);
+        let out = r.fleet.set_channel_info("C2", Some("role=repo team=home"), None).await.unwrap();
+        assert_eq!((out["topic"].as_str(), out["purpose"].as_str()), (Some("role=repo team=home"), Some("purpose of C2")));
+        // `list_channels` shows the new value too
+        let list = r.fleet.list_channels(None).await.unwrap();
+        let c2 = list["channels"].as_array().unwrap().iter().find(|c| c["id"] == "C2").unwrap().clone();
+        assert_eq!(c2["topic"], "role=repo team=home");
+        // Both at once; an empty one clears
+        let out = r.fleet.set_channel_info("C1", Some(""), Some("role=cos")).await.unwrap();
+        assert_eq!((out["topic"].as_str(), out["purpose"].as_str()), (Some(""), Some("role=cos")));
+    }
+
+    #[tokio::test]
+    async fn setting_channel_info_refuses_what_slack_would() {
+        let r = rig("setinfo-no", FakeChat::in_channels(&[("C1", "cos")]), &[]);
+        assert!(r.fleet.set_channel_info("C1", None, None).await.unwrap_err().contains("topic, purpose"));
+        assert!(r.fleet.set_channel_info("C9", Some("x"), None).await.unwrap_err().contains("not in C9"));
+        let long = "あ".repeat(251);
+        assert!(r.fleet.set_channel_info("C1", None, Some(&long)).await.unwrap_err().contains("250"));
+        assert!(r.fleet.set_channel_info("C1", None, Some(&"あ".repeat(250))).await.is_ok());
     }
 
     #[tokio::test]
