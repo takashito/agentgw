@@ -1053,6 +1053,7 @@ impl Bridge {
                 renaming: Default::default(),
                 asks: tokio::sync::Mutex::new(crate::bridge::state::Threads::load(&dir).asked()),
                 reads: Default::default(),
+                departed: Default::default(),
             });
             // One listener per address: loopback for whatever terminates TLS in front, the LAN address
             // for machines on the same network

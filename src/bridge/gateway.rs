@@ -2461,7 +2461,14 @@ pub struct Fleet {
     pub asks: AsyncMutex<HashMap<String, (String, crate::bridge::state::AskedFrom)>>,
     /// `list_channels` waiting for a machine to read a folder's notes (req_id → the answer).
     pub reads: std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>,
+    /// Machines whose link dropped, and when. Their asks are only given up once they stay away past
+    /// [`ASK_OFFLINE_GRACE_MS`] — a restart or an update drops the link for a moment, workers and all intact.
+    pub departed: std::sync::Mutex<HashMap<String, u64>>,
 }
+
+/// How long a machine may be away before the threads waiting on its asks are told it went offline.
+/// Longer than a restart or an update takes.
+pub const ASK_OFFLINE_GRACE_MS: u64 = 120_000;
 
 /// A rename under way: the machine's old link is still to go down and its new name to come up.
 #[derive(Debug, Clone, PartialEq)]
@@ -2753,7 +2760,7 @@ impl Fleet {
                 .lock()
                 .await
                 .on_disconnect(bridge_id, now_ms());
-            self.asks_machine_left(bridge_id).await;
+            self.departed.lock().unwrap_or_else(|e| e.into_inner()).insert(bridge_id.to_string(), now_ms());
         }
     }
 
@@ -2792,6 +2799,7 @@ impl Fleet {
             for line in lines {
                 self.post_home(&line).await;
             }
+            self.asks_check_departed(now_ms()).await;
         }
     }
 
@@ -3499,11 +3507,16 @@ impl Fleet {
                     let _ = tx.send(text);
                 }
             }
+            // Off the link loop too: a channel's notes can come up this very link, and waiting
+            // here for them would wait on ourselves
             link::LinkFrame::ListChannels { req_id, channel_id } => {
-                let result = self.list_channels(channel_id.as_deref()).await;
-                if !self.send_frame(bridge_id, &link::LinkFrame::AskAnswer { req_id, result }).await {
-                    rlog("info", &format!("{bridge_id}: could not return the channel list (link dropped)"));
-                }
+                let (fleet, machine) = (self.clone(), bridge_id.to_string());
+                tokio::spawn(async move {
+                    let result = fleet.list_channels(channel_id.as_deref()).await;
+                    if !fleet.send_frame(&machine, &link::LinkFrame::AskAnswer { req_id, result }).await {
+                        rlog("info", &format!("{machine}: could not return the channel list (link dropped)"));
+                    }
+                });
             }
             link::LinkFrame::AskChannel {
                 req_id,
@@ -3513,12 +3526,17 @@ impl Fleet {
                 to_thread,
                 text,
             } => {
-                let result = self
-                    .ask(&from_channel, &from_thread, &to_channel, to_thread.as_deref(), &text)
-                    .await;
-                if !self.send_frame(bridge_id, &link::LinkFrame::AskAnswer { req_id, result }).await {
-                    rlog("info", &format!("{bridge_id}: could not return an ask's answer (link dropped)"));
-                }
+                // **Off the link loop**: an ask makes several Slack calls, and the loop that called
+                // us also carries this machine's pings and its other frames
+                let (fleet, machine) = (self.clone(), bridge_id.to_string());
+                tokio::spawn(async move {
+                    let result = fleet
+                        .ask(&from_channel, &from_thread, &to_channel, to_thread.as_deref(), &text)
+                        .await;
+                    if !fleet.send_frame(&machine, &link::LinkFrame::AskAnswer { req_id, result }).await {
+                        rlog("info", &format!("{machine}: could not return an ask's answer (link dropped)"));
+                    }
+                });
             }
             link::LinkFrame::UpdateFailed { version, why } => {
                 rlog("error", &format!("{bridge_id}: could not update to {version}: {why}"));
@@ -4715,6 +4733,27 @@ impl Fleet {
             if self.tell_origin(&origin, &origin_thread, &shown, &for_agent).await {
                 self.edit_ask(&ch, &ts, |r| r.missed = 0).await;
             }
+        }
+    }
+
+    /// Machines that dropped: the ones back already are forgotten, the ones away past the grace give up their asks.
+    pub(crate) async fn asks_check_departed(&self, now: u64) {
+        let connected = self.links.connected();
+        let gone: Vec<String> = {
+            let mut d = self.departed.lock().unwrap_or_else(|e| e.into_inner());
+            d.retain(|id, _| !connected.contains(id));
+            let gone: Vec<String> = d
+                .iter()
+                .filter(|(_, at)| now.saturating_sub(**at) >= ASK_OFFLINE_GRACE_MS)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in &gone {
+                d.remove(id);
+            }
+            gone
+        };
+        for id in gone {
+            self.asks_machine_left(&id).await;
         }
     }
 
@@ -6300,6 +6339,7 @@ mod tests {
             renaming: Default::default(),
             asks: Default::default(),
             reads: Default::default(),
+            departed: Default::default(),
         });
         (fleet, msg_rx)
     }
@@ -8304,6 +8344,7 @@ mod ask_tests {
             tunnels: Default::default(),
             renaming: Default::default(),
             reads: Default::default(),
+            departed: Default::default(),
         });
         Rig { fleet, api, msgs, notes }
     }
@@ -8610,6 +8651,37 @@ mod ask_tests {
     }
 
     #[tokio::test]
+    async fn a_slow_list_does_not_hold_up_the_machines_link() {
+        // The link loop handles one frame at a time; the answer the list waits for comes up the same link
+        let r = rig("slowlist", FakeChat::in_channels(&[("C2", "sibling")]), &[]);
+        let (tx, mut wire) = tokio::sync::mpsc::unbounded_channel::<String>();
+        r.fleet.links.register("mac", Conn::new(tx));
+        {
+            let mut a = Access::load(&r.fleet.dir);
+            a.set_bridge("C2", "mac");
+            a.save(&r.fleet.dir).unwrap();
+        }
+        let ask = link::LinkFrame::ListChannels { req_id: "q1".into(), channel_id: Some("C2".into()) };
+        let handled = tokio::time::timeout(std::time::Duration::from_secs(1), r.fleet.on_machine_frame("mac", ask)).await;
+        assert!(handled.is_ok(), "the frame handler returned while the list waits");
+        // The machine answers the read; the list then goes back down with the notes
+        let req = loop {
+            let raw = wire.recv().await.unwrap();
+            if let Some(link::LinkFrame::ReadProject { req_id, .. }) = link::decode(&raw) {
+                break req_id;
+            }
+        };
+        r.fleet.on_machine_frame("mac", link::LinkFrame::ProjectRead { req_id: req, text: "# sibling".into() }).await;
+        let answer = loop {
+            let raw = tokio::time::timeout(std::time::Duration::from_secs(2), wire.recv()).await.unwrap().unwrap();
+            if let Some(link::LinkFrame::AskAnswer { result, .. }) = link::decode(&raw) {
+                break result.unwrap();
+            }
+        };
+        assert_eq!(answer["channels"][0]["project"], "# sibling");
+    }
+
+    #[tokio::test]
     async fn project_detail_from_an_offline_machine_is_empty_with_a_note() {
         let r = rig("detail", FakeChat::in_channels(&[("C2", "pve-root")]), &[]);
         {
@@ -8621,6 +8693,18 @@ mod ask_tests {
         let c2 = &out["channels"][0];
         assert_eq!(c2["project"], "");
         assert!(c2["note"].as_str().unwrap_or_default().contains("offline"));
+    }
+
+    #[tokio::test]
+    async fn a_machine_back_within_the_grace_raises_no_offline_notice() {
+        let (mut r, thread) = approved("grace").await;
+        r.fleet.thread_routes.lock().await.insert(thread.clone(), "pve".into());
+        r.fleet.departed.lock().unwrap().insert("pve".into(), 1_000);
+        r.fleet.asks_check_departed(1_000 + ASK_OFFLINE_GRACE_MS - 1).await;
+        assert!(r.msgs.try_recv().is_err(), "a restart is not a departure");
+        r.fleet.asks_check_departed(1_000 + ASK_OFFLINE_GRACE_MS).await;
+        assert!(r.msgs.try_recv().unwrap().text.contains("offline"));
+        assert!(r.fleet.departed.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
