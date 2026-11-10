@@ -254,6 +254,9 @@ pub mod link {
             #[serde(default, skip_serializing_if = "Option::is_none")]
             to_thread: Option<String>,
             text: String,
+            /// A few words naming the request (absent from an agent too old to give one).
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            title: Option<String>,
         },
         /// machine → gateway: the channels an agent may ask (`list_channels`). Answered with [`LinkFrame::AskAnswer`].
         ListChannels {
@@ -2473,6 +2476,21 @@ pub struct Fleet {
     pub ask_capable: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
+/// The line on top of an ask: what is asked, who asks, and a link to **where** it was asked.
+fn ask_heading(title: &str, from_channel: &str, line_link: &str, follow_up: bool) -> String {
+    if follow_up {
+        crate::t!(
+            ":robot_face: Follow-up: **{title}** — from the Claude in <#{from_channel}> ([where it was asked]({line_link}))",
+            ":robot_face: 追加の依頼: **{title}** — <#{from_channel}> の Claude から([依頼した位置]({line_link}))"
+        )
+    } else {
+        crate::t!(
+            ":robot_face: **{title}** — a request from the Claude in <#{from_channel}> ([where it was asked]({line_link}))",
+            ":robot_face: **{title}** — <#{from_channel}> の Claude からの依頼([依頼した位置]({line_link}))"
+        )
+    }
+}
+
 /// How long a machine may be away before the threads waiting on its asks are told it went offline.
 /// Longer than a restart or an update takes.
 pub const ASK_OFFLINE_GRACE_MS: u64 = 120_000;
@@ -3540,13 +3558,14 @@ impl Fleet {
                 to_channel,
                 to_thread,
                 text,
+                title,
             } => {
                 // **Off the link loop**: an ask makes several Slack calls, and the loop that called
                 // us also carries this machine's pings and its other frames
                 let (fleet, machine) = (self.clone(), bridge_id.to_string());
                 tokio::spawn(async move {
                     let result = fleet
-                        .ask(&from_channel, &from_thread, &to_channel, to_thread.as_deref(), &text)
+                        .ask(&from_channel, &from_thread, &to_channel, to_thread.as_deref(), &text, title.as_deref())
                         .await;
                     if !fleet.send_frame(&machine, &link::LinkFrame::AskAnswer { req_id, result }).await {
                         rlog("info", &format!("{machine}: could not return an ask's answer (link dropped)"));
@@ -4301,10 +4320,12 @@ impl Fleet {
         to_channel: &str,
         to_thread: Option<&str>,
         text: &str,
+        title: Option<&str>,
     ) -> Result<serde_json::Value, String> {
         use crate::bridge::asks::{AgentDelivery, DeliveryKind, check_follow_up, check_new};
         use crate::bridge::state::{AskState, AskedFrom};
         let note = "The reply arrives as a message in your thread. Do not poll or wait.";
+        let title = crate::bridge::asks::request_title(title, text);
         if let Some(thread) = to_thread {
             // The thread must be the one asked **in that channel** (a ts is only unique within a channel)
             let row = self
@@ -4316,8 +4337,11 @@ impl Fleet {
                 .map(|(_, r)| r.clone());
             let online = self.thread_online(to_channel, thread).await;
             check_follow_up(row.as_ref(), from_channel, from_thread, online)?;
-            let shown = format!("{}\n\n{text}", self.ask_heading(from_channel, from_thread).await);
+            let (line, line_link) = self.post_asked_line(from_channel, from_thread, to_channel, &title, true, false, false).await?;
+            let shown = format!("{}\n\n{text}", ask_heading(&title, from_channel, &line_link, true));
             let ts = crate::bridge::turn::post_chunked(self.api.as_ref(), self.dir.path(), to_channel, &shown, Some(thread), true).await?;
+            let permalink = self.api.get_permalink(to_channel, &ts).await.unwrap_or_default();
+            self.finish_asked_line(from_channel, &line, to_channel, &title, &permalink, true, false, false).await;
             self.deliver_agent(AgentDelivery {
                 channel: to_channel.to_string(),
                 thread_ts: thread.to_string(),
@@ -4330,7 +4354,6 @@ impl Fleet {
             })
             .await?;
             self.edit_ask(to_channel, thread, |r| r.outstanding = true).await;
-            let permalink = self.api.get_permalink(to_channel, &ts).await.unwrap_or_default();
             return Ok(serde_json::json!({"thread_ts": thread, "permalink": permalink, "status": "delivered", "note": note}));
         }
         check_new(to_channel, from_channel, from_thread, None)?;
@@ -4339,10 +4362,20 @@ impl Fleet {
             return Err("the bot is not in that channel; invite it there first".into());
         }
         let confirm = self.access().confirms_asks(to_channel);
+        // Waiting for Run needs a person: the asking thread hears it in its line, and the top of the
+        // chain (where the Owner watches) separately; only the top mentions them
+        let targets = crate::bridge::asks::notify_targets_from(&*self.asks.lock().await, from_channel, from_thread);
+        let asker_is_top = targets.len() == 1;
+        // The line in the asking thread comes first, so the request can point at **where** it was asked
+        let (line, line_link) = self
+            .post_asked_line(from_channel, from_thread, to_channel, &title, false, confirm, confirm && asker_is_top)
+            .await?;
         // The root is the heading alone; the request goes inside the thread, and the buttons in a
         // message of their own, so pressing one can rewrite it without touching the request
-        let heading = self.ask_heading(from_channel, from_thread).await;
-        let root = self.api.post_markdown(to_channel, &heading, None).await?;
+        let root = self
+            .api
+            .post_markdown(to_channel, &ask_heading(&title, from_channel, &line_link, false), None)
+            .await?;
         crate::bridge::turn::post_chunked(self.api.as_ref(), self.dir.path(), to_channel, text, Some(&root), true).await?;
         let row = AskedFrom {
             channel: from_channel.to_string(),
@@ -4355,6 +4388,8 @@ impl Fleet {
         };
         self.put_ask(to_channel, &root, row).await;
         let permalink = self.api.get_permalink(to_channel, &root).await.unwrap_or_default();
+        self.finish_asked_line(from_channel, &line, to_channel, &title, &permalink, false, confirm, confirm && asker_is_top)
+            .await;
         if confirm {
             let offer = crate::bridge::asks::AskOffer {
                 from_channel: from_channel.to_string(),
@@ -4366,20 +4401,15 @@ impl Fleet {
             self.api
                 .post_blocks(to_channel, &question, crate::chat::slack::ask_offer_blocks(&question, &offer.encode()), Some(&root))
                 .await?;
-            // A person is needed: the thread that asked hears so, and so does the top of the chain,
-            // where the Owner is watching (the only one that mentions them)
-            let targets = crate::bridge::asks::notify_targets(&*self.asks.lock().await, &root);
-            let owner = self.owner();
-            for t in targets {
-                let mention = match (&owner, t.mention_owner) {
-                    (Some(o), true) => format!("<@{o}> "),
-                    _ => String::new(),
-                };
+            if let (false, Some(top)) = (asker_is_top, targets.last()) {
+                let mention = self.owner().map(|o| format!("<@{o}> ")).unwrap_or_default();
                 let waiting = crate::t!(
-                    "{mention}:hourglass: Waiting for Run: {permalink}",
-                    "{mention}:hourglass: 実行の確認待ち: {permalink}"
+                    "{mention}:hourglass: Waiting for Run — **{title}**: {permalink}",
+                    "{mention}:hourglass: 実行の確認待ち — **{title}**: {permalink}"
                 );
-                self.post(&t.channel, Some(&t.thread_ts), &waiting).await;
+                if let Err(e) = self.api.post_markdown(&top.channel, &waiting, Some(&top.thread_ts)).await {
+                    rlog("error", &format!("ask: could not post to {}: {e}", top.channel));
+                }
             }
             return Ok(serde_json::json!({"thread_ts": root, "permalink": permalink, "status": "waiting_for_run", "note": note}));
         }
@@ -4397,13 +4427,58 @@ impl Fleet {
         Ok(serde_json::json!({"thread_ts": root, "permalink": permalink, "status": "delivered", "note": note}))
     }
 
-    /// The line on top of an ask: who is asking, with a link back to the asking thread.
-    async fn ask_heading(&self, from_channel: &str, from_thread: &str) -> String {
-        let link = self.api.get_permalink(from_channel, from_thread).await.unwrap_or_default();
-        crate::t!(
-            ":robot_face: A request from the Claude in <#{from_channel}> ([thread]({link}))",
-            ":robot_face: <#{from_channel}> の Claude からの依頼([スレッド]({link}))"
-        )
+    /// The line in the asking thread, marking **where** the ask was made. Returns its ts and its link.
+    #[allow(clippy::too_many_arguments)]
+    async fn post_asked_line(
+        &self,
+        from_channel: &str,
+        from_thread: &str,
+        to_channel: &str,
+        title: &str,
+        follow_up: bool,
+        waiting: bool,
+        mention: bool,
+    ) -> Result<(String, String), String> {
+        let text = self.asked_line(to_channel, title, "", follow_up, waiting, mention);
+        let ts = self.api.post_markdown(from_channel, &text, Some(from_thread)).await?;
+        let link = self.api.get_permalink(from_channel, &ts).await.unwrap_or_default();
+        Ok((ts, link))
+    }
+
+    /// The same line, now with the link to the request.
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_asked_line(
+        &self,
+        from_channel: &str,
+        line: &str,
+        to_channel: &str,
+        title: &str,
+        link: &str,
+        follow_up: bool,
+        waiting: bool,
+        mention: bool,
+    ) {
+        let text = self.asked_line(to_channel, title, link, follow_up, waiting, mention);
+        self.rewrite(from_channel, line, &text).await;
+    }
+
+    fn asked_line(&self, to: &str, title: &str, link: &str, follow_up: bool, waiting: bool, mention: bool) -> String {
+        let who = match (mention, self.owner()) {
+            (true, Some(o)) => format!("<@{o}> "),
+            _ => String::new(),
+        };
+        let link = if link.is_empty() { String::new() } else { format!(" — {link}") };
+        let what = if follow_up {
+            crate::t!(":outbox_tray: Follow-up to <#{to}>: **{title}**", ":outbox_tray: <#{to}> に追加の依頼: **{title}**")
+        } else {
+            crate::t!(":outbox_tray: Asked <#{to}>: **{title}**", ":outbox_tray: <#{to}> に依頼: **{title}**")
+        };
+        let state = if waiting {
+            crate::t!(" (:hourglass: Waiting for Run)", "(:hourglass: 実行の確認待ち)")
+        } else {
+            String::new()
+        };
+        format!("{who}{what}{state}{link}")
     }
 
     /// The Owner pressed Run or Reject on an ask.
@@ -8416,21 +8491,38 @@ mod ask_tests {
     }
 
     #[tokio::test]
+    async fn a_new_ask_names_its_request_and_links_back_to_where_it_was_asked() {
+        let r = rig("titled", FakeChat::in_channels(&[("C2", "pve")]), &["C2"]);
+        let out = r.fleet.ask("C1", "1.1", "C2", None, "details of the work", Some("Fix the sandbox")).await.unwrap();
+        let root = out["thread_ts"].as_str().unwrap().to_string();
+        let said = calls(&r.api);
+        // The line in the asking thread, posted first: what was asked, and where
+        let line = said.iter().find(|c| c.starts_with("post_md C1 1.1 ") && c.contains("Fix the sandbox")).expect("a line where it was asked").clone();
+        let line_ts = said.iter().position(|c| *c == line).unwrap();
+        // The request's heading names it and links to that line, not to the top of the thread
+        let heading = said.iter().find(|c| c.starts_with("post_md C2 - ")).expect("the heading");
+        assert!(heading.contains("Fix the sandbox"), "{heading}");
+        assert!(heading.contains("https://slack/C1/") && !heading.contains("https://slack/C1/1.1"), "{heading}");
+        // …and the line gets the link to the request
+        assert!(said[line_ts..].iter().any(|c| c.starts_with("update_md C1 ") && c.contains(&format!("https://slack/C2/{root}"))), "{said:?}");
+    }
+
+    #[tokio::test]
     async fn a_new_ask_posts_with_buttons_and_waits() {
         let r = rig("new", FakeChat::in_channels(&[("C2", "pve")]), &[]);
-        let out = r.fleet.ask("C1", "1.1", "C2", None, "please check").await.unwrap();
+        let out = r.fleet.ask("C1", "1.1", "C2", None, "please check", None).await.unwrap();
         assert_eq!(out["status"], "waiting_for_run");
         let thread = out["thread_ts"].as_str().unwrap().to_string();
         let said = calls(&r.api);
         assert!(said.iter().any(|c| c.starts_with("post_blocks C2 ") && c.contains("perm:ask-run:ask")), "{said:?}");
-        assert!(said.iter().any(|c| c.contains(" C1 1.1 ") && c.contains("https://slack/C2/")), "{said:?}");
+        assert!(said.iter().any(|c| c.starts_with("update_md C1 ") && c.contains("https://slack/C2/") && c.contains("<@U_OWNER>")), "{said:?}");
         assert_eq!(r.fleet.asks.lock().await[&thread].1.state, AskState::Pending);
     }
 
     #[tokio::test]
     async fn a_channel_with_confirm_off_is_delivered_at_once() {
         let mut r = rig("off", FakeChat::in_channels(&[("C2", "lead")]), &["C2"]);
-        let out = r.fleet.ask("C1", "1.1", "C2", None, "plan this").await.unwrap();
+        let out = r.fleet.ask("C1", "1.1", "C2", None, "plan this", None).await.unwrap();
         assert_eq!(out["status"], "delivered");
         assert!(!calls(&r.api).iter().any(|c| c.contains("perm:ask-run:ask")));
         let m = r.msgs.try_recv().unwrap();
@@ -8441,14 +8533,14 @@ mod ask_tests {
     #[tokio::test]
     async fn the_bot_must_be_in_the_channel() {
         let r = rig("absent", FakeChat::in_channels(&[]), &[]);
-        assert!(r.fleet.ask("C1", "1.1", "C2", None, "x").await.unwrap_err().contains("not in that channel"));
+        assert!(r.fleet.ask("C1", "1.1", "C2", None, "x", None).await.unwrap_err().contains("not in that channel"));
         assert!(calls(&r.api).iter().all(|c| !c.starts_with("post")));
     }
 
     #[tokio::test]
     async fn only_the_owner_can_run_an_ask_and_only_once() {
         let mut r = rig("once", FakeChat::in_channels(&[("C2", "pve")]), &[]);
-        let out = r.fleet.ask("C1", "1.1", "C2", None, "check").await.unwrap();
+        let out = r.fleet.ask("C1", "1.1", "C2", None, "check", None).await.unwrap();
         let offer = offer_of(&r, out["thread_ts"].as_str().unwrap()).await;
         let (a, b) = press(&offer, crate::chat::slack::ASK_RUN, "U_SOMEONE");
         r.fleet.on_click(a, b).await;
@@ -8465,7 +8557,7 @@ mod ask_tests {
     #[tokio::test]
     async fn a_press_after_a_restart_still_delivers() {
         let mut r = rig("restart", FakeChat::in_channels(&[("C2", "pve")]), &[]);
-        let out = r.fleet.ask("C1", "1.1", "C2", None, "check after restart").await.unwrap();
+        let out = r.fleet.ask("C1", "1.1", "C2", None, "check after restart", None).await.unwrap();
         let thread = out["thread_ts"].as_str().unwrap().to_string();
         // The Bridge writes what the gateway asked it to; a new gateway reads it back
         let mut threads = crate::bridge::state::Threads::load(&r.fleet.dir);
@@ -8486,7 +8578,7 @@ mod ask_tests {
     async fn a_long_ask_puts_the_buttons_on_the_last_piece_and_delivers_it_whole() {
         let mut r = rig("long", FakeChat::in_channels(&[("C2", "pve")]), &[]);
         let text = "line of a long request\n".repeat(1200); // ~27k chars
-        let out = r.fleet.ask("C1", "1.1", "C2", None, &text).await.unwrap();
+        let out = r.fleet.ask("C1", "1.1", "C2", None, &text, None).await.unwrap();
         let posts: Vec<String> = calls(&r.api).into_iter().filter(|c| c.contains(" C2 ")).collect();
         assert!(posts.len() >= 3, "{}", posts.len());
         assert!(posts.last().unwrap().contains("perm:ask-run:ask"));
@@ -8500,10 +8592,10 @@ mod ask_tests {
     #[tokio::test]
     async fn a_follow_up_before_run_posts_nothing() {
         let r = rig("early", FakeChat::in_channels(&[("C2", "pve")]), &[]);
-        let out = r.fleet.ask("C1", "1.1", "C2", None, "first").await.unwrap();
+        let out = r.fleet.ask("C1", "1.1", "C2", None, "first", None).await.unwrap();
         let thread = out["thread_ts"].as_str().unwrap();
         let before = calls(&r.api).len();
-        let e = r.fleet.ask("C1", "1.1", "C2", Some(thread), "second").await.unwrap_err();
+        let e = r.fleet.ask("C1", "1.1", "C2", Some(thread), "second", None).await.unwrap_err();
         assert!(e.contains("Run"), "{e}");
         assert_eq!(calls(&r.api).len(), before);
     }
@@ -8511,22 +8603,22 @@ mod ask_tests {
     #[tokio::test]
     async fn a_follow_up_after_run_is_delivered_without_buttons() {
         let mut r = rig("follow", FakeChat::in_channels(&[("C2", "lead")]), &["C2"]);
-        let out = r.fleet.ask("C1", "1.1", "C2", None, "first").await.unwrap();
+        let out = r.fleet.ask("C1", "1.1", "C2", None, "first", None).await.unwrap();
         let _ = r.msgs.try_recv();
         let thread = out["thread_ts"].as_str().unwrap();
-        r.fleet.ask("C1", "1.1", "C2", Some(thread), "second").await.unwrap();
+        r.fleet.ask("C1", "1.1", "C2", Some(thread), "second", None).await.unwrap();
         assert_eq!(r.msgs.try_recv().unwrap().text, "second");
-        assert!(r.fleet.ask("C9", "9.9", "C2", Some(thread), "x").await.is_err(), "another thread may not follow up");
+        assert!(r.fleet.ask("C9", "9.9", "C2", Some(thread), "x", None).await.is_err(), "another thread may not follow up");
     }
 
     #[tokio::test]
     async fn a_follow_up_naming_the_wrong_channel_is_refused() {
         let mut r = rig("wrongch", FakeChat::in_channels(&[("C2", "lead"), ("C3", "other")]), &["C2", "C3"]);
-        let out = r.fleet.ask("C1", "1.1", "C2", None, "first").await.unwrap();
+        let out = r.fleet.ask("C1", "1.1", "C2", None, "first", None).await.unwrap();
         let _ = r.msgs.try_recv();
         let thread = out["thread_ts"].as_str().unwrap();
         let before = calls(&r.api).len();
-        assert!(r.fleet.ask("C1", "1.1", "C3", Some(thread), "second").await.is_err());
+        assert!(r.fleet.ask("C1", "1.1", "C3", Some(thread), "second", None).await.is_err());
         assert_eq!(calls(&r.api).len(), before, "nothing posted");
         assert_eq!(r.fleet.asks.lock().await[thread].0, "C2", "the record keeps its channel");
     }
@@ -8534,7 +8626,7 @@ mod ask_tests {
     #[tokio::test]
     async fn rejecting_ends_the_ask_and_tells_the_asker() {
         let mut r = rig("reject", FakeChat::in_channels(&[("C2", "pve")]), &[]);
-        let out = r.fleet.ask("C1", "1.1", "C2", None, "check").await.unwrap();
+        let out = r.fleet.ask("C1", "1.1", "C2", None, "check", None).await.unwrap();
         let offer = offer_of(&r, out["thread_ts"].as_str().unwrap()).await;
         let (a, b) = press(&offer, crate::chat::slack::ASK_REJECT, "U_OWNER");
         r.fleet.on_click(a, b).await;
@@ -8557,7 +8649,7 @@ mod ask_tests {
     /// An approved ask from C1/1.1 into C2 (confirm off), with its delivery taken off the inbox.
     async fn approved(name: &str) -> (Rig, String) {
         let mut r = rig(name, FakeChat::in_channels(&[("C2", "lead")]), &["C2"]);
-        let out = r.fleet.ask("C1", "1.1", "C2", None, "plan").await.unwrap();
+        let out = r.fleet.ask("C1", "1.1", "C2", None, "plan", None).await.unwrap();
         let _ = r.msgs.try_recv();
         (r, out["thread_ts"].as_str().unwrap().to_string())
     }
@@ -8599,7 +8691,7 @@ mod ask_tests {
         let (r, thread) = approved("target-exit").await;
         r.fleet.on_machine_frame("parent", link::LinkFrame::AskEnded { channel: "C2".into(), thread_ts: thread.clone() }).await;
         assert_eq!(r.fleet.asks.lock().await[&thread].1.state, AskState::Ended);
-        assert!(r.fleet.ask("C1", "1.1", "C2", Some(&thread), "more").await.unwrap_err().contains("new thread"));
+        assert!(r.fleet.ask("C1", "1.1", "C2", Some(&thread), "more", None).await.unwrap_err().contains("new thread"));
     }
 
     #[tokio::test]
@@ -8790,7 +8882,7 @@ mod ask_tests {
                 request: None,
             }),
         ); // CoS(C0/0.1) asked the Lead (C1/1.1)
-        r.fleet.ask("C1", "1.1", "C2", None, "reboot please").await.unwrap(); // the Lead asks the project
+        r.fleet.ask("C1", "1.1", "C2", None, "reboot please", None).await.unwrap(); // the Lead asks the project
         let said = calls(&r.api);
         let waiting = |ch: &str, th: &str| said.iter().filter(|c| c.contains(&format!(" {ch} {th} ")) && c.contains("Waiting for Run")).cloned().collect::<Vec<_>>();
         assert_eq!(waiting("C1", "1.1").len(), 1, "{said:?}");
@@ -8807,12 +8899,12 @@ mod ask_tests {
             a.set_bridge("C2", "pve"); // assigned to a machine that is not connected
             a.save(&r.fleet.dir).unwrap();
         }
-        let out = r.fleet.ask("C1", "1.1", "C2", None, "check").await.unwrap();
+        let out = r.fleet.ask("C1", "1.1", "C2", None, "check", None).await.unwrap();
         let offer = offer_of(&r, out["thread_ts"].as_str().unwrap()).await;
         let (a, b) = press(&offer, crate::chat::slack::ASK_RUN, "U_OWNER");
         r.fleet.on_click(a, b).await;
         assert!(r.msgs.try_recv().is_err());
-        assert!(!calls(&r.api).iter().any(|c| c.starts_with("update")), "the buttons stay");
+        assert!(!calls(&r.api).iter().any(|c| c.starts_with("update_md C2 ") || c.starts_with("update C2 ")), "the buttons stay");
         assert_eq!(r.fleet.asks.lock().await[&offer.request_ts].1.state, AskState::Pending);
     }
 }

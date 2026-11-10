@@ -203,6 +203,46 @@ pub fn read_project(dir: &std::path::Path) -> String {
     text[..end].to_string()
 }
 
+/// A few words naming a request: the title the agent gave, or else the first line of the request
+/// without its Markdown marks, cut to 60 characters.
+pub fn request_title(title: Option<&str>, text: &str) -> String {
+    let raw = title
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            let first = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or_default();
+            first
+                .trim_start_matches(['#', '>', '-', ' '])
+                .replace(['*', '`', '_'], "")
+                .trim()
+                .to_string()
+        });
+    if raw.chars().count() <= 60 {
+        return raw;
+    }
+    raw.chars().take(59).chain(['…']).collect()
+}
+
+/// [`notify_targets`] for a thread that is about to ask: itself, and the top of its chain.
+/// One target when it is the top. Only the top mentions the Owner.
+pub fn notify_targets_from(
+    rows: &std::collections::HashMap<String, (String, AskedFrom)>,
+    channel: &str,
+    thread_ts: &str,
+) -> Vec<NotifyTarget> {
+    let mut up = notify_targets(rows, thread_ts);
+    let me = NotifyTarget {
+        channel: channel.to_string(),
+        thread_ts: thread_ts.to_string(),
+        mention_owner: up.is_empty(),
+    };
+    match up.pop() {
+        None => vec![me],
+        Some(top) => vec![me, top],
+    }
+}
+
 #[cfg(test)]
 mod frame_tests {
     use crate::bridge::gateway::link::{decode, encode, LinkFrame};
@@ -217,6 +257,7 @@ mod frame_tests {
                 to_channel: "C2".into(),
                 to_thread: None,
                 text: "exit".into(),
+                title: Some("Check the sandbox".into()),
             },
             LinkFrame::AskAnswer { req_id: "r1".into(), result: Err("no".into()) },
             LinkFrame::AgentReply {
@@ -377,5 +418,28 @@ mod project_tests {
     #[test]
     fn a_folder_without_notes_reads_empty() {
         assert_eq!(read_project(&dir_with("none", "", "")), "");
+    }
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::request_title;
+
+    #[test]
+    fn a_given_title_is_used_trimmed() {
+        assert_eq!(request_title(Some("  Fix the sandbox "), "body"), "Fix the sandbox");
+    }
+
+    #[test]
+    fn without_a_title_the_first_line_names_the_request() {
+        assert_eq!(request_title(None, "\n## **Fix** the `bwrap` sandbox\nmore detail"), "Fix the bwrap sandbox");
+        assert_eq!(request_title(Some(""), "first\nsecond"), "first");
+    }
+
+    #[test]
+    fn a_long_title_is_cut_to_60_characters() {
+        let t = request_title(None, &"あ".repeat(100));
+        assert_eq!(t.chars().count(), 60);
+        assert!(t.ends_with('…'));
     }
 }

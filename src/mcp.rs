@@ -159,6 +159,7 @@ impl Mcp {
                     "properties": {
                         "channel_id": { "type": "string", "description": "The channel to ask (C...), as list_channels or a <#C...> link gives it." },
                         "text": { "type": "string", "description": "The request, standard Markdown. Say everything the other Claude needs: it does not see your conversation." },
+                        "title": { "type": "string", "description": "A few words naming the request, shown on top of it in Slack so people can tell what each thread is about." },
                         "thread_ts": { "type": "string", "description": "Only for a follow-up: the thread_ts of the thread you asked before (from the earlier result or the reply's from_thread)." },
                         "message_ids": { "type": "array", "items": { "type": "string" }, "description": "The inbound message_id(s) this call answers, as with reply — marks them answered once the ask is posted." },
                     },

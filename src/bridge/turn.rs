@@ -2593,7 +2593,7 @@ pub async fn execute_ask_tool(
     let (Some(to_channel), Some(text)) = (opt("channel_id"), opt("text")) else {
         return Err("channel_id and text are required".into());
     };
-    let to_thread = opt("thread_ts");
+    let (to_thread, title) = (opt("thread_ts"), opt("title"));
     let out = ask
         .ask(|req_id| LinkFrame::AskChannel {
             req_id,
@@ -2602,6 +2602,7 @@ pub async fn execute_ask_tool(
             to_channel,
             to_thread,
             text,
+            title,
         })
         .await?;
     let ids: Vec<String> = args["message_ids"]
