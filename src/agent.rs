@@ -288,7 +288,27 @@ pub struct Envelope {
     /// attribute out. Without it the agent can't tell whether the name still fits the conversation,
     /// which is the one thing `set_thread_title` asks it to judge.
     pub thread_title: Option<String>,
+    /// Set when this came from an agent in another channel: where it came from, and the line that
+    /// tells the agent what that means (its reply goes back, or this is the answer to its ask).
+    pub from_agent: Option<EnvelopeAgent>,
 }
+
+/// The agent-to-agent part of an envelope.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EnvelopeAgent {
+    pub channel: String,
+    pub thread_ts: String,
+    pub needs_human: bool,
+    pub note: &'static str,
+}
+
+/// The line on a request from another channel's agent. Read by the agent, so English only.
+pub const ASKED_NOTE: &str = "This message is a request from the Claude in another channel \
+    (from_channel/from_thread). Your reply to it goes back to that Claude. If a person must decide \
+    or act, pass needs_human: true to reply.";
+/// The line on something coming back to the agent that asked.
+pub const ANSWER_NOTE: &str = "This is the result of your ask in from_channel/from_thread. To ask \
+    again in the same exchange, call ask_channel with that channel and thread_ts.";
 
 /// The source Claude Code uses when drawing a push notification. Using the same value makes
 /// the injected first message byte-identical to a pushed one.
@@ -334,9 +354,21 @@ impl Envelope {
             Some("") => " loop_guard=\"true\"".to_string(),
             Some(who) => format!(" loop_guard=\"true\" loop_notify=\"{who}\""),
         };
+        let (agent, note) = match &e.from_agent {
+            None => (String::new(), String::new()),
+            Some(a) => (
+                format!(
+                    " from_channel=\"{}\" from_thread=\"{}\"{}",
+                    a.channel,
+                    a.thread_ts,
+                    if a.needs_human { " needs_human=\"true\"" } else { "" }
+                ),
+                format!("{}\n", a.note),
+            ),
+        };
         format!(
             "<channel source=\"{CHANNEL_SOURCE}\" channel_id=\"{}\" message_id=\"{}\" user=\"{}\" \
-             user_id=\"{}\" ts=\"{}\"{thread_ts}{thread_title}{files}{file_errors}{loop_guard}>\n{}\n</channel>",
+             user_id=\"{}\" ts=\"{}\"{thread_ts}{thread_title}{files}{file_errors}{loop_guard}{agent}>\n{note}{}\n</channel>",
             e.channel_id, e.message_id, e.user, e.user, e.ts, e.text
         )
     }
@@ -1010,6 +1042,7 @@ mod tests {
             file_errors: Vec::new(),
             loop_guard: None,
             thread_title: None,
+            from_agent: None,
         };
         assert_eq!(
             e.render(),
@@ -1036,6 +1069,7 @@ mod tests {
                 file_errors: Vec::new(),
                 loop_guard: None,
                 thread_title: Some(t.into()),
+                from_agent: None,
             }
             .render()
         };
@@ -1057,6 +1091,7 @@ mod tests {
             file_errors: errors,
             loop_guard: None,
             thread_title: None,
+            from_agent: None,
         }
         .render()
     }
@@ -1076,6 +1111,7 @@ mod tests {
                 file_errors: Vec::new(),
                 loop_guard: guard.map(str::to_string),
                 thread_title: None,
+                from_agent: None,
             }
             .render()
         };

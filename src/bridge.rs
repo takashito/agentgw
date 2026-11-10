@@ -1844,8 +1844,11 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
             Some(a) => a.answer(&req_id, result),
             None => LogCtx::default().debug("bridge", &format!("ask answer {req_id}: nobody waiting")),
         },
+        // From an agent in another channel: into the same inbox as Slack's messages
         machine::FromRelay::AgentMessage(d) => {
-            LogCtx::default().debug("bridge", &format!("agent message for {}:{} dropped", d.channel, d.thread_ts));
+            if msg_tx.send(d.into()).await.is_err() {
+                return;
+            }
         }
         machine::FromRelay::ReadProject { req_id, .. } => {
             LogCtx::default().debug("bridge", &format!("read-project {req_id} dropped"));
@@ -2509,6 +2512,94 @@ mod tests {
         b.on_inbound(&m).await;
         b.on_inbound(&m).await;
         assert_eq!(agent.spawned.lock().unwrap().len(), 1);
+    }
+
+    fn agent_msg(thread: &str, ts: &str, text: &str, kind: crate::chat::DeliveryKind) -> InboundMsg {
+        crate::bridge::asks::AgentDelivery {
+            channel: "C_ADMIN".into(),
+            thread_ts: thread.into(),
+            ts: ts.into(),
+            text: text.into(),
+            origin_channel: Some("C_LAN".into()),
+            origin_thread: Some("1781000000.000100".into()),
+            kind,
+            needs_human: false,
+        }
+        .into()
+    }
+
+    #[tokio::test]
+    async fn agent_messages_from_the_gateway_reach_the_inbox() {
+        let dir = crate::state_dir::StateDir::at(std::env::temp_dir().join(format!("agentgw-pump-agent-{}", std::process::id())));
+        let (msg_tx, mut msg_rx) = mpsc::channel(4);
+        let sinks = RelaySinks { msg_tx, click_tx: mpsc::channel(4).0, dir, reload: mpsc::channel(4).0, relink: mpsc::channel(4).0, up: mpsc::unbounded_channel().0, machine: "desk".into(), gateway_url: String::new(), left: mpsc::channel(4).0, arriving: mpsc::channel(4).0, updated: mpsc::channel(4).0, asker: None };
+        let d = match agent_msg(ROOT, ROOT, "check", crate::chat::DeliveryKind::Ask) {
+            m => crate::bridge::asks::AgentDelivery {
+                channel: m.channel,
+                thread_ts: ROOT.into(),
+                ts: m.ts,
+                text: m.text,
+                origin_channel: Some("C_LAN".into()),
+                origin_thread: Some("1781000000.000100".into()),
+                kind: crate::chat::DeliveryKind::Ask,
+                needs_human: false,
+            },
+        };
+        pump_relay(machine::FromRelay::AgentMessage(d), &sinks).await;
+        let got = msg_rx.try_recv().expect("handed to the inbox");
+        assert_eq!(got.from_agent.map(|o| o.kind), Some(crate::chat::DeliveryKind::Ask));
+    }
+
+    #[tokio::test]
+    async fn an_ask_that_reads_like_a_command_is_delivered_as_text() {
+        let (d, _slack, agent, _clock) = flow_deps("ask-exit");
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.on_inbound(&agent_msg(ROOT, ROOT, "exit", crate::chat::DeliveryKind::Ask)).await;
+        let spawned = agent.spawned.lock().unwrap();
+        assert_eq!(spawned.len(), 1, "an agent starts for the request");
+        let prompt = spawned[0].prompt.clone().unwrap_or_default();
+        assert!(prompt.contains("\nexit\n"), "{prompt}");
+        assert!(prompt.contains(r#"from_channel="C_LAN""#), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn an_agent_message_skips_the_gate_and_the_loop_guard() {
+        let (d, _slack, _agent, _clock) = flow_deps("ask-loop");
+        let (mut b, _fx) = Bridge::for_test(d);
+        for i in 0..(crate::bridge::state::LOOP_LIMIT + 2) {
+            let ts = format!("1782000000.0002{i:02}");
+            b.on_inbound(&agent_msg(ROOT, &ts, &format!("m{i}"), crate::chat::DeliveryKind::Ask)).await;
+        }
+        assert_ne!(b.threads.status_of(ROOT), "paused");
+    }
+
+    #[tokio::test]
+    async fn an_ask_writes_asked_from_on_the_thread_and_marks_the_ledger() {
+        let (d, _slack, _agent, _clock) = flow_deps("ask-row");
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.on_inbound(&agent_msg(ROOT, ROOT, "check", crate::chat::DeliveryKind::Ask)).await;
+        let a = b.threads.get(ROOT).and_then(|e| e.asked_from.clone()).expect("asked_from");
+        assert_eq!((a.channel.as_str(), a.thread_ts.as_str()), ("C_LAN", "1781000000.000100"));
+        let key = ThreadKey::new("C_ADMIN", ROOT);
+        assert_eq!(b.ledger.from_agent_ids(&key), vec![ROOT.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_reply_going_back_is_not_marked_as_a_request() {
+        let (d, _slack, _agent, _clock) = flow_deps("ask-back");
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.on_inbound(&agent_msg(ROOT, ROOT, "done", crate::chat::DeliveryKind::Reply)).await;
+        assert!(b.threads.get(ROOT).and_then(|e| e.asked_from.clone()).is_none());
+        assert!(b.ledger.from_agent_ids(&ThreadKey::new("C_ADMIN", ROOT)).is_empty());
+    }
+
+    #[test]
+    fn the_envelope_says_where_an_ask_came_from() {
+        let e = crate::bridge::inbound::envelope(&agent_msg(ROOT, ROOT, "hi", crate::chat::DeliveryKind::Ask), ROOT, None, 0);
+        assert!(e.contains(r#"from_channel="C_LAN""#) && e.contains(r#"from_thread="1781000000.000100""#), "{e}");
+        assert!(e.contains("goes back to that Claude"), "{e}");
+        let back = crate::bridge::inbound::envelope(&agent_msg(ROOT, ROOT, "ok", crate::chat::DeliveryKind::Reply), ROOT, None, 0);
+        assert!(back.contains("result of your ask"), "{back}");
     }
 
     const ROOT: &str = "1782000000.000100";

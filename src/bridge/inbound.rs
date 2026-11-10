@@ -68,6 +68,15 @@ pub fn envelope_guarded(
         // The message carries the result of the eager download (it survives the queue too)
         file_paths: msg.file_paths.clone(),
         file_errors: msg.file_errors.clone(),
+        from_agent: msg.from_agent.as_ref().map(|o| crate::agent::EnvelopeAgent {
+            channel: o.channel.clone().unwrap_or_default(),
+            thread_ts: o.thread_ts.clone().unwrap_or_default(),
+            needs_human: o.needs_human,
+            note: match o.kind {
+                crate::chat::DeliveryKind::Ask => crate::agent::ASKED_NOTE,
+                _ => crate::agent::ANSWER_NOTE,
+            },
+        }),
     }
     .render()
 }
@@ -288,6 +297,30 @@ impl Bridge {
     /// Download the incoming message's attachments up front and write the result back to msg.
     /// **Never fails**: each file's failure is swallowed into a degraded note, so one broken or
     /// oversized file doesn't take the user's text or other attachments down with it.
+    /// Write down which thread asked this one, so a person needed here can be announced there.
+    /// **A record already there is kept**: on the gateway the same row also carries the gateway's own
+    /// bookkeeping of the exchange, which this must not overwrite.
+    fn note_asked_from(&mut self, root_ts: &str, channel: &str, from: Option<&crate::chat::AgentOrigin>) {
+        let Some(o) = from else { return };
+        let (Some(c), Some(t)) = (o.channel.clone(), o.thread_ts.clone()) else { return };
+        if self.threads.get(root_ts).is_some_and(|e| e.asked_from.is_some()) {
+            return;
+        }
+        let row = crate::bridge::state::AskedFrom {
+            channel: c,
+            thread_ts: t,
+            state: crate::bridge::state::AskState::Approved,
+            outstanding: false,
+            missed: 0,
+            origin_closed: false,
+            request: None,
+        };
+        self.threads.set_asked(root_ts, channel, Some(row));
+        if let Err(e) = self.threads.save() {
+            LogCtx::default().error("bridge", &format!("threads.json save failed: {e}"));
+        }
+    }
+
     async fn with_attachments(&self, mut msg: InboundMsg, ctx: &LogCtx) -> InboundMsg {
         let (mut paths, mut errors) = (Vec::new(), Vec::new());
         // This runs inside an arm of the select loop: while it waits, hooks / dispositions /
@@ -370,7 +403,10 @@ impl Bridge {
         // the sender gave up on long ago arrives and says goodbye a second time. Drop it before
         // any command path. Ordinary requests are untouched: late delivery beats losing real work
         let body = crate::bridge::command::Message::new(&msg.text, self.bot_user_id.as_deref());
-        if let Some(cmd) = crate::bridge::command::Cmd::parse(&body, self.deps.agent.as_ref())
+        // A message from another channel's agent is never a command, whatever it says
+        let from_agent = msg.from_agent.clone();
+        if from_agent.is_none()
+            && let Some(cmd) = crate::bridge::command::Cmd::parse(&body, self.deps.agent.as_ref())
             && let Some(stale) = cmd.stale_reason(&msg.ts, self.started_at_ms, RETRY_NUM)
         {
             LogCtx {
@@ -460,7 +496,13 @@ impl Bridge {
             || crate::bridge::command::Message::new(&msg.text, self.bot_user_id.as_deref())
                 .mentions_bot();
         let is_active_thread = !dm && self.threads.is_active(&root_ts);
-        let context_only = match self.access.gate(msg, is_mention, is_active_thread) {
+        // The gateway made it only after its own checks (the Owner's Run, or an approved exchange)
+        let verdict = if from_agent.is_some() {
+            GateVerdict::Serve
+        } else {
+            self.access.gate(msg, is_mention, is_active_thread)
+        };
+        let context_only = match verdict {
             GateVerdict::Drop(reason) => {
                 ctx(None).info(
                     "bridge",
@@ -557,7 +599,8 @@ impl Bridge {
         // Loop guard (channels only). Once bots are allowed, bots can reply to each other forever.
         // This stops the thread **until a person steps in**
         let mut loop_guard: Option<String> = None;
-        if !dm {
+        // Agents talking through an exchange the Owner approved are not a runaway bot loop
+        if !dm && from_agent.is_none() {
             if msg.is_bot {
                 if self.threads.status_of(&root_ts) == "paused" {
                     ctx(None).info(
@@ -603,7 +646,7 @@ impl Bridge {
 
         // The Bridge answers commands itself and **stops here**; they never reach the agent.
         // Returning before the ack keeps 👀 off commands
-        if self.handle_command(msg, &key, &root_ts).await {
+        if from_agent.is_none() && self.handle_command(msg, &key, &root_ts).await {
             // The Bridge **spoke in this thread**. Even for commands that don't start an agent,
             // like status / usage, the thread is active from now on and follow-ups are taken
             // without a mention (the user's call; independent of whether a session exists)
@@ -627,7 +670,13 @@ impl Bridge {
             &key,
         )
         .await;
-        self.ledger.track(&key, &msg.ts);
+        match from_agent.as_ref().map(|o| o.kind) {
+            Some(crate::chat::DeliveryKind::Ask) => {
+                self.ledger.track_from_agent(&key, &msg.ts);
+                self.note_asked_from(&root_ts, &msg.channel, from_agent.as_ref());
+            }
+            _ => self.ledger.track(&key, &msg.ts),
+        }
         // A message owing an answer **is** the turn: the same thing `restore_pending` reads back
         // from threads.json after a restart, so a turn that crosses one keeps its reason.
         self.presence_add(&key, Reason::Turn);
