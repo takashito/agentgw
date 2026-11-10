@@ -1312,6 +1312,9 @@ pub struct PermClick {
 /// The `action` of the two answers to a [`FolderOffer`](crate::bridge::state::FolderOffer).
 pub const FOLDER_YES: &str = "mkdir-yes";
 pub const FOLDER_NO: &str = "mkdir-no";
+/// The buttons on an ask from an agent in another channel.
+pub const ASK_RUN: &str = "ask-run";
+pub const ASK_REJECT: &str = "ask-reject";
 
 /// The question and its two buttons. `value` is the encoded offer.
 pub fn folder_offer_blocks(question: &str, value: &str) -> serde_json::Value {
