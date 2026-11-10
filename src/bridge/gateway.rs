@@ -4403,9 +4403,10 @@ impl Fleet {
                 .await?;
             if let (false, Some(top)) = (asker_is_top, targets.last()) {
                 let mention = self.owner().map(|o| format!("<@{o}> ")).unwrap_or_default();
+                let name = self.channel_label(to_channel).await;
                 let waiting = crate::t!(
-                    "{mention}:hourglass: Waiting for Run — **{title}**: {permalink}",
-                    "{mention}:hourglass: 実行の確認待ち — **{title}**: {permalink}"
+                    "{mention}:hourglass: [Waiting for Run in {name}: {title}]({permalink})",
+                    "{mention}:hourglass: [{name} で実行の確認待ち: {title}]({permalink})"
                 );
                 if let Err(e) = self.api.post_markdown(&top.channel, &waiting, Some(&top.thread_ts)).await {
                     rlog("error", &format!("ask: could not post to {}: {e}", top.channel));
@@ -4439,7 +4440,8 @@ impl Fleet {
         waiting: bool,
         mention: bool,
     ) -> Result<(String, String), String> {
-        let text = self.asked_line(to_channel, title, "", follow_up, waiting, mention);
+        let name = self.channel_label(to_channel).await;
+        let text = self.asked_line(&name, title, "", follow_up, waiting, mention);
         let ts = self.api.post_markdown(from_channel, &text, Some(from_thread)).await?;
         let link = self.api.get_permalink(from_channel, &ts).await.unwrap_or_default();
         Ok((ts, link))
@@ -4458,27 +4460,34 @@ impl Fleet {
         waiting: bool,
         mention: bool,
     ) {
-        let text = self.asked_line(to_channel, title, link, follow_up, waiting, mention);
+        let name = self.channel_label(to_channel).await;
+        let text = self.asked_line(&name, title, link, follow_up, waiting, mention);
         self.rewrite(from_channel, line, &text).await;
     }
 
+    /// `📤 Asked #pve-lan: title` — once the request is posted, the words themselves link to it.
     fn asked_line(&self, to: &str, title: &str, link: &str, follow_up: bool, waiting: bool, mention: bool) -> String {
         let who = match (mention, self.owner()) {
             (true, Some(o)) => format!("<@{o}> "),
             _ => String::new(),
         };
-        let link = if link.is_empty() { String::new() } else { format!(" — {link}") };
         let what = if follow_up {
-            crate::t!(":outbox_tray: Follow-up to <#{to}>: **{title}**", ":outbox_tray: <#{to}> に追加の依頼: **{title}**")
+            crate::t!("Follow-up to {to}: {title}", "{to} に追加の依頼: {title}")
         } else {
-            crate::t!(":outbox_tray: Asked <#{to}>: **{title}**", ":outbox_tray: <#{to}> に依頼: **{title}**")
+            crate::t!("Asked {to}: {title}", "{to} に依頼: {title}")
         };
+        let what = if link.is_empty() { format!("**{what}**") } else { format!("[**{what}**]({link})") };
         let state = if waiting {
             crate::t!(" (:hourglass: Waiting for Run)", "(:hourglass: 実行の確認待ち)")
         } else {
             String::new()
         };
-        format!("{who}{what}{state}{link}")
+        format!("{who}:outbox_tray: {what}{state}")
+    }
+
+    /// `#name` for a channel, as plain words (a `<#C…>` would be a second link beside the one that matters).
+    async fn channel_label(&self, channel: &str) -> String {
+        self.api.channel_display_name(channel).await.unwrap_or_else(|| format!("#{channel}"))
     }
 
     /// The Owner pressed Run or Reject on an ask.
@@ -4688,11 +4697,13 @@ impl Fleet {
             self.api.get_permalink(channel, ts).await.unwrap_or_default()
         };
         let (shown, for_agent, kind) = if outcome == "reply" {
-            let shown = crate::t!(":leftwards_arrow_with_hook: Reply from <#{channel}>: {link}", ":leftwards_arrow_with_hook: <#{channel}> からの返事: {link}");
+            let name = self.channel_label(channel).await;
+            let shown = crate::t!(":leftwards_arrow_with_hook: [Reply from {name}]({link})", ":leftwards_arrow_with_hook: [{name} からの返事]({link})");
             (shown, text, crate::chat::DeliveryKind::Reply)
         } else {
             let line = crate::bridge::asks::dead_end_line(outcome, &text);
-            let shown = crate::t!(":information_source: No reply from <#{channel}> ({link}): {line}", ":information_source: <#{channel}> から返事がありません({link}): {line}");
+            let name = self.channel_label(channel).await;
+            let shown = crate::t!(":information_source: [No reply from {name}]({link}): {line}", ":information_source: [{name} から返事がありません]({link}): {line}");
             (shown, line, crate::chat::DeliveryKind::Notice)
         };
         let Ok(posted) = self.api.post_markdown(&row.channel, &shown, Some(&row.thread_ts)).await else {
@@ -4785,6 +4796,7 @@ impl Fleet {
             return;
         }
         let link = self.api.get_permalink(channel, ts).await.unwrap_or_default();
+        let name = self.channel_label(channel).await;
         let owner = self.owner();
         for t in targets {
             let mention = match (&owner, t.mention_owner) {
@@ -4792,10 +4804,12 @@ impl Fleet {
                 _ => String::new(),
             };
             let text = crate::t!(
-                "{mention}:raising_hand: A person is needed in <#{channel}>: {link}",
-                "{mention}:raising_hand: <#{channel}> で人の確認が必要です: {link}"
+                "{mention}:raising_hand: [A person is needed in {name}]({link})",
+                "{mention}:raising_hand: [{name} で人の確認が必要です]({link})"
             );
-            self.post(&t.channel, Some(&t.thread_ts), &text).await;
+            if let Err(e) = self.api.post_markdown(&t.channel, &text, Some(&t.thread_ts)).await {
+                rlog("error", &format!("ask: could not post to {}: {e}", t.channel));
+            }
         }
     }
 
@@ -8889,6 +8903,22 @@ mod ask_tests {
         assert!(!waiting("C1", "1.1")[0].contains("<@U_OWNER>"));
         assert_eq!(waiting("C0", "0.1").len(), 1, "{said:?}");
         assert!(waiting("C0", "0.1")[0].contains("<@U_OWNER>"));
+    }
+
+    #[tokio::test]
+    async fn notices_link_with_a_word_not_a_bare_url() {
+        let (r, thread) = approved("nobareurl").await;
+        r.fleet.on_machine_frame("parent", link::LinkFrame::NeedsHuman { channel: "C2".into(), thread_ts: thread.clone(), ts: "2.9".into() }).await;
+        r.fleet.on_machine_frame("parent", reply_frame(&thread, "reply", "done")).await;
+        r.fleet.on_machine_frame("parent", reply_frame(&thread, "stopped", "")).await;
+        let bare: Vec<String> = calls(&r.api)
+            .into_iter()
+            .filter(|c| c.starts_with("post") || c.starts_with("update"))
+            .filter(|c| c.split_whitespace().any(|w| w.trim_matches(|ch: char| "():".contains(ch)).starts_with("https://")))
+            .collect();
+        assert!(bare.is_empty(), "{bare:#?}");
+        let human = calls(&r.api).into_iter().find(|c| c.contains("person is needed")).expect("the notice");
+        assert!(human.contains("](https://slack/C2/2.9)") && !human.contains("<#C2>"), "one link, straight to the message: {human}");
     }
 
     #[tokio::test]
