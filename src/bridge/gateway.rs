@@ -322,6 +322,10 @@ pub mod link {
             #[serde(default, skip_serializing_if = "std::ops::Not::not")]
             needs_human: bool,
             outcome: String,
+            /// The asked agent wrote this reply straight into the asking thread (`ts` is that post), not in
+            /// its own: hand it over on that post instead of posting a line pointing at it.
+            #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+            posted_in_asker: bool,
         },
         /// machine → gateway: a person is needed in this asked thread (`ts` is the message to link to).
         NeedsHuman {
@@ -3588,7 +3592,8 @@ impl Fleet {
                 text,
                 needs_human,
                 outcome,
-            } => self.on_agent_reply(&channel, &thread_ts, &ts, text, needs_human, &outcome).await,
+                posted_in_asker,
+            } => self.on_agent_reply(&channel, &thread_ts, &ts, text, needs_human, &outcome, posted_in_asker).await,
             link::LinkFrame::AskEnded { channel, thread_ts } => self.on_ask_ended(&channel, &thread_ts).await,
             link::LinkFrame::NeedsHuman { channel, thread_ts, ts } => self.on_needs_human(&channel, &thread_ts, &ts).await,
             link::LinkFrame::ProjectRead { req_id, text } => {
@@ -4778,7 +4783,12 @@ impl Fleet {
     }
 
     /// How an asked thread answered: pass it to the thread that asked, or note why it can't be.
-    async fn on_agent_reply(&self, channel: &str, thread: &str, ts: &str, text: String, needs_human: bool, outcome: &str) {
+    ///
+    /// `posted_in_asker`: the asked agent wrote the reply straight into the asking thread, where its
+    /// own post (a bot's) is never let in. That post carries the answer as it is: no line is posted
+    /// under it, and the delivery rides on its ts (the dedup key of a delivery is apart from the echo's).
+    #[allow(clippy::too_many_arguments)]
+    async fn on_agent_reply(&self, channel: &str, thread: &str, ts: &str, text: String, needs_human: bool, outcome: &str, posted_in_asker: bool) {
         use crate::bridge::state::AskState;
         let found = self.asks.lock().await.get(thread).filter(|(ch, _)| ch == channel).map(|(_, r)| r.clone());
         let Some(row) = found else {
@@ -4803,6 +4813,11 @@ impl Fleet {
             }
             return;
         }
+        if posted_in_asker && outcome == "reply" && !ts.is_empty() {
+            rlog("info", &format!("ask: the answer from {channel}:{thread} was posted in {}:{} as {ts}", row.channel, row.thread_ts));
+            self.hand_back(channel, thread, &row, ts.to_string(), text, crate::chat::DeliveryKind::Reply, needs_human).await;
+            return;
+        }
         let link = if ts.is_empty() {
             self.api.get_permalink(channel, thread).await.unwrap_or_default()
         } else {
@@ -4822,6 +4837,22 @@ impl Fleet {
             rlog("error", &format!("ask: could not post to {}:{}", row.channel, row.thread_ts));
             return;
         };
+        self.hand_back(channel, thread, &row, posted, for_agent, kind, needs_human).await;
+    }
+
+    /// Deliver an answer from the asked thread `channel`/`thread` to the agent that asked (`row`), riding on
+    /// the post `ts` in the asking thread. A missed delivery is counted for later.
+    #[allow(clippy::too_many_arguments)]
+    async fn hand_back(
+        &self,
+        channel: &str,
+        thread: &str,
+        row: &crate::bridge::state::AskedFrom,
+        posted: String,
+        for_agent: String,
+        kind: crate::chat::DeliveryKind,
+        needs_human: bool,
+    ) {
         let d = crate::bridge::asks::AgentDelivery {
             channel: row.channel.clone(),
             thread_ts: row.thread_ts.clone(),
@@ -8931,6 +8962,7 @@ mod ask_tests {
             text: text.into(),
             needs_human: false,
             outcome: outcome.into(),
+            posted_in_asker: false,
         }
     }
 
@@ -8951,6 +8983,25 @@ mod ask_tests {
         assert_eq!((m.channel.as_str(), m.thread_ts.as_deref(), m.text.as_str()), ("C1", Some("1.1"), "done"));
         assert_eq!((o.kind, o.channel.as_deref(), o.thread_ts.as_deref()), (DeliveryKind::Reply, Some("C2"), Some(thread.as_str())));
         assert!(calls(&r.api).iter().any(|c| c.contains(" C1 1.1 ") && c.contains("https://slack/C2/2.9")), "a line in the asking thread");
+        assert!(!r.fleet.asks.lock().await[&thread].1.outstanding);
+    }
+
+    #[tokio::test]
+    async fn a_reply_already_posted_in_the_asking_thread_rides_on_that_post() {
+        let (mut r, thread) = approved("direct").await;
+        let before = calls(&r.api).len();
+        let mut f = reply_frame(&thread, "reply", "done");
+        if let link::LinkFrame::AgentReply { ts, posted_in_asker, .. } = &mut f {
+            *ts = "1.5".into();
+            *posted_in_asker = true;
+        }
+        r.fleet.on_machine_frame("parent", f).await;
+        let m = r.msgs.try_recv().expect("delivered to the asker");
+        assert_eq!((m.channel.as_str(), m.thread_ts.as_deref(), m.ts.as_str(), m.text.as_str()), ("C1", Some("1.1"), "1.5", "done"));
+        assert_eq!(m.from_agent.unwrap().kind, DeliveryKind::Reply);
+        assert!(r.msgs.try_recv().is_err(), "once");
+        let posted: Vec<String> = calls(&r.api)[before..].iter().filter(|c| c.starts_with("post")).cloned().collect();
+        assert!(posted.is_empty(), "no second line under the answer: {posted:?}");
         assert!(!r.fleet.asks.lock().await[&thread].1.outstanding);
     }
 

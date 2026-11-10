@@ -495,7 +495,20 @@ impl Bridge {
     /// If this disposition answers a request from an agent in another channel, send the answer
     /// back through the gateway. Decided by what the ledger is about to clear: a reply to a person
     /// alone clears no request, so it does not go back.
-    fn answer_asker(&mut self, key: &ThreadKey, root: &str, d: &Disposition) {
+    /// A reply posted in `d.channel_id`/`root` by an agent whose own thread was asked from exactly
+    /// there: that thread's channel and root. None for any other post, a reply in its own thread included.
+    fn asker_thread_of(&self, d: &Disposition, root: &str) -> Option<(String, String)> {
+        if d.kind != "reply" || d.body.as_ref().is_none_or(|b| b.ts.is_empty()) {
+            return None;
+        }
+        let (own_root, e) = self.threads.find_by_session(&d.session_id)?;
+        let from = e.asked_from.as_ref()?;
+        let own_channel = e.channel_id.clone()?;
+        let is_asker = from.channel == d.channel_id && from.thread_ts == root;
+        (is_asker && (own_channel.as_str(), own_root.as_str()) != (d.channel_id.as_str(), root)).then(|| (own_channel, own_root.clone()))
+    }
+
+    fn answer_asker(&mut self, key: &ThreadKey, root: &str, d: &Disposition, posted_in_asker: bool) {
         let cover = |list: Vec<String>| -> Vec<String> {
             if d.message_ids.is_empty() {
                 list
@@ -539,7 +552,7 @@ impl Bridge {
                     ("no_reply", b) => ("no_reply", b.as_ref().map(|b| b.text.clone()).unwrap_or_default(), String::new(), false),
                     _ => return,
                 };
-                self.send_agent_reply(key, root, outcome, text, ts, needs_human);
+                self.send_agent_reply(key, root, outcome, text, ts, needs_human, posted_in_asker);
                 // Only a real answer pays what is owed: a word to a person on the way does not
                 if !owed.is_empty() && (!asks.is_empty() || owed_now) {
                     self.set_owed(root, Vec::new());
@@ -566,7 +579,7 @@ impl Bridge {
         if waiting.is_empty() && !owed {
             return;
         }
-        self.send_agent_reply(key, &root, outcome, text, String::new(), false);
+        self.send_agent_reply(key, &root, outcome, text, String::new(), false, false);
         self.ledger.disposed(key, &waiting);
         if owed {
             self.set_owed(&root, Vec::new());
@@ -582,7 +595,7 @@ impl Bridge {
         if !waiting && !owed.iter().any(|id| id == deleted) {
             return;
         }
-        self.send_agent_reply(key, &root, "cancelled", String::new(), String::new(), false);
+        self.send_agent_reply(key, &root, "cancelled", String::new(), String::new(), false, false);
         // Told now: the interruption that follows must not report it a second time as "stopped".
         // It stays unanswered until then, so that interruption still finds something to stop
         self.ledger.forget_from_agent(key, deleted);
@@ -605,7 +618,8 @@ impl Bridge {
         });
     }
 
-    fn send_agent_reply(&self, key: &ThreadKey, root: &str, outcome: &str, text: String, ts: String, needs_human: bool) {
+    #[allow(clippy::too_many_arguments)]
+    fn send_agent_reply(&self, key: &ThreadKey, root: &str, outcome: &str, text: String, ts: String, needs_human: bool, posted_in_asker: bool) {
         let Some(up) = &self.ask_gateway else { return };
         let (channel, _) = key.split();
         let frame = crate::bridge::gateway::link::LinkFrame::AgentReply {
@@ -615,6 +629,7 @@ impl Bridge {
             text,
             needs_human,
             outcome: outcome.to_string(),
+            posted_in_asker,
         };
         if up.send(frame).is_err() {
             LogCtx::default().error("bridge", &format!("could not send the answer for {key} to the gateway"));
@@ -2191,7 +2206,7 @@ impl Bridge {
     }
 
     /// A tool "answered" — drop it from the ledger and settle the progress message.
-    pub(super) async fn on_disposition(&mut self, d: Disposition) {
+    pub(super) async fn on_disposition(&mut self, mut d: Disposition) {
         // reply / no_reply / edit may not carry thread_ts — look the root back up from the session
         let root = d.thread_ts.clone().or_else(|| {
             self.threads
@@ -2212,11 +2227,27 @@ impl Bridge {
             );
             return;
         };
+        // An asked agent may write its answer straight into the thread that asked it instead of its
+        // own. There it is a bot's post, which that thread never lets in, so the asker would never
+        // hear it. It is this thread's answer: settle it here and hand it back riding on that post
+        let posted_in_asker = self.asker_thread_of(&d, &root);
+        let root = match &posted_in_asker {
+            Some((own_channel, own_root)) => {
+                d.channel_id = own_channel.clone();
+                d.thread_ts = Some(own_root.clone());
+                own_root.clone()
+            }
+            None => root,
+        };
+        let posted_in_asker = posted_in_asker.is_some();
         let key = ThreadKey::new(&d.channel_id, &root);
         let ctx = LogCtx {
             session_id: Some(d.session_id.clone()),
             thread_key: Some(key.clone()),
         };
+        if posted_in_asker {
+            ctx.info("bridge", "the reply was posted in the thread that asked: it answers this one");
+        }
         // **A rename is not an answer.** It clears no ledger entry and ends no turn, so it is
         // handled here and never reaches the code below
         if d.kind == "title" {
@@ -2228,9 +2259,10 @@ impl Bridge {
         self.stall.remove(&key);
         self.presence_remove(&key, &Reason::Turn);
         // An answer to a request from another channel's agent goes back to it
-        self.answer_asker(&key, &root, &d);
+        self.answer_asker(&key, &root, &d, posted_in_asker);
         if let Some(b) = d.body.as_ref().filter(|b| b.needs_human && !b.ts.is_empty()) {
-            self.needs_human(&d.channel_id, &root, &b.ts);
+            // A post in the asking thread is not in this channel: point at this thread instead
+            self.needs_human(&d.channel_id, &root, if posted_in_asker { &root } else { &b.ts });
         }
         let before = self.ledger.pending(&key).len();
         if d.message_ids.is_empty() {

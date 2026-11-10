@@ -2783,6 +2783,50 @@ mod tests {
         assert!(replies_up(&mut up).is_empty());
     }
 
+    fn origin_frames(rx: &mut mpsc::UnboundedReceiver<crate::bridge::gateway::link::LinkFrame>) -> Vec<(String, String, String, String, bool)> {
+        let mut out = Vec::new();
+        while let Ok(f) = rx.try_recv() {
+            if let crate::bridge::gateway::link::LinkFrame::AgentReply { channel, thread_ts, ts, text, posted_in_asker, .. } = f {
+                out.push((channel, thread_ts, ts, text, posted_in_asker));
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn a_reply_posted_straight_into_the_asking_thread_goes_back_as_the_answer() {
+        let (mut b, mut up, sid) = asked_thread("ask-direct").await;
+        // The asked agent writes its answer in the thread that asked (C_LAN), not in its own
+        let mut d = dispo("reply", &[ROOT], Some("done, see 2fc6a41"), &sid);
+        d.channel_id = "C_LAN".into();
+        d.thread_ts = Some("1781000000.000100".into());
+        b.on_disposition(d).await;
+        assert_eq!(
+            origin_frames(&mut up),
+            vec![("C_ADMIN".into(), ROOT.into(), "1782000000.000900".into(), "done, see 2fc6a41".into(), true)],
+            "answered for its own thread, marked as already posted where the asker is"
+        );
+        assert!(b.ledger.from_agent_ids(&ThreadKey::new("C_ADMIN", ROOT)).is_empty(), "the request is answered");
+    }
+
+    #[tokio::test]
+    async fn a_reply_into_an_unrelated_thread_does_not_go_back() {
+        let (mut b, mut up, sid) = asked_thread("ask-elsewhere").await;
+        let mut d = dispo("reply", &[], Some("hello"), &sid);
+        d.channel_id = "C_LAN".into();
+        d.thread_ts = Some("1781000000.000777".into());
+        b.on_disposition(d).await;
+        assert!(origin_frames(&mut up).is_empty());
+        assert_eq!(b.ledger.from_agent_ids(&ThreadKey::new("C_ADMIN", ROOT)), vec![ROOT.to_string()], "the request still waits");
+    }
+
+    #[tokio::test]
+    async fn a_reply_in_its_own_thread_is_not_marked_as_posted_in_the_asker() {
+        let (mut b, mut up, sid) = asked_thread("ask-own").await;
+        b.on_disposition(dispo("reply", &[ROOT], Some("done"), &sid)).await;
+        assert_eq!(origin_frames(&mut up).iter().map(|f| f.4).collect::<Vec<_>>(), vec![false]);
+    }
+
     #[tokio::test]
     async fn a_middle_layer_passes_the_result_back_after_delegating() {
         let (mut b, mut up, sid) = asked_thread("ask-middle").await;

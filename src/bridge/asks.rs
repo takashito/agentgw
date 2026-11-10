@@ -270,6 +270,7 @@ mod frame_tests {
                 text: "done".into(),
                 needs_human: true,
                 outcome: "reply".into(),
+                posted_in_asker: true,
             },
         ] {
             assert_eq!(decode(&encode(&f)), Some(f));
