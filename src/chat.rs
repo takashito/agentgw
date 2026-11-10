@@ -369,6 +369,8 @@ pub trait Chat: Send + Sync + 'static {
     /// Every channel the bot is a member of, as (id, name). The gateway needs it for `status`: a channel
     /// nobody was assigned is **its own**, and until someone types in it there is nothing else to learn it from.
     async fn bot_channels(&self) -> Result<Vec<(String, String)>, String>;
+    /// Whether the bot is a member of `channel` (one `conversations.info`, not the whole list).
+    async fn is_member(&self, channel: &str) -> Result<bool, String>;
     async fn user_display_name(&self, user: &str) -> Option<String>;
     async fn auth_test(&self) -> Result<(String, Option<String>), String>;
     async fn resolve_bot_id(&self, user_id: &str) -> Result<Option<String>, String>;
@@ -471,6 +473,8 @@ pub mod fake {
         pub file_size: u64,
         /// What `bot_channels` answers: (id, name).
         pub channels: Vec<(String, String)>,
+        /// How long `channel_info` takes.
+        pub info_delay_ms: u64,
     }
 
     impl FakeChat {
@@ -640,7 +644,14 @@ pub mod fake {
             self.record(format!("permalink {c} {ts}"))?;
             Ok(format!("https://slack/{c}/{ts}"))
         }
+        async fn is_member(&self, c: &str) -> Result<bool, String> {
+            self.record(format!("is_member {c}"))?;
+            Ok(self.channels.iter().any(|(id, _)| id == c))
+        }
         async fn channel_info(&self, c: &str) -> Result<(String, String, String), String> {
+            if self.info_delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(self.info_delay_ms)).await;
+            }
             let name = self.channels.iter().find(|(id, _)| id == c).map(|(_, n)| n.clone()).unwrap_or_default();
             Ok((name, format!("topic of {c}"), format!("purpose of {c}")))
         }

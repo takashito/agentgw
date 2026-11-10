@@ -2747,6 +2747,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deleting_a_follow_up_request_tells_the_asker_it_was_cancelled() {
+        let (mut b, mut up, sid) = asked_thread("ask-follow-gone").await;
+        b.on_disposition(dispo("reply", &[ROOT], Some("first done"), &sid)).await;
+        let _ = replies_up(&mut up);
+        let more = "1782000000.000950";
+        b.on_inbound(&agent_msg(ROOT, more, "one more thing", crate::chat::DeliveryKind::Ask)).await;
+        let mut gone = channel_msg("1782000000.000991", "U_OWNER", "");
+        gone.channel = "C_ADMIN".into();
+        gone.thread_ts = Some(ROOT.into());
+        gone.deleted_ts = Some(more.into());
+        b.on_inbound(&gone).await;
+        let said = replies_up(&mut up);
+        assert_eq!(said.iter().map(|(o, _)| o.as_str()).collect::<Vec<_>>(), vec!["cancelled"], "{said:?}");
+        assert!(b.ledger.from_agent_ids(&ThreadKey::new("C_ADMIN", ROOT)).is_empty());
+    }
+
+    #[tokio::test]
     async fn deleting_the_asked_threads_root_tells_the_asker() {
         let (mut b, mut up, _sid) = asked_thread("ask-root-gone").await;
         let mut gone = channel_msg("1782000000.000990", "U_OWNER", "");
@@ -2755,6 +2772,27 @@ mod tests {
         gone.deleted_ts = Some(ROOT.into());
         b.on_inbound(&gone).await;
         assert_eq!(replies_up(&mut up).first().map(|(o, _)| o.clone()), Some("deleted".to_string()));
+    }
+
+    #[tokio::test]
+    async fn passing_a_request_on_draws_the_progress_card_one_last_time() {
+        let (d, slack, _agent, _clock) = flow_deps("ask-sticky");
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.on_inbound(&agent_msg(ROOT, ROOT, "check it", crate::chat::DeliveryKind::Ask)).await;
+        let sid = b.threads.get(ROOT).and_then(|e| e.agent_id.clone()).expect("an agent");
+        let key = ThreadKey::new("C_ADMIN", ROOT);
+        let none = Default::default();
+        b.sticky.upsert_tool(&key, "t1", "Bash", "uptime", slack::ToolStatus::Pending, &none, &serde_json::Value::Null);
+        b.sticky.set_posted(&key, "1782000000.000700");
+        b.sticky.upsert_tool(&key, "t1", "Bash", "uptime", slack::ToolStatus::Done, &none, &serde_json::Value::Null);
+        b.on_disposition(dispo("ask", &[ROOT], None, &sid)).await;
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            slack.calls().iter().any(|c| c.starts_with("update_blocks C_ADMIN 1782000000.000700 ")),
+            "the card is drawn finished, not left running: {:?}",
+            slack.calls()
+        );
     }
 
     #[tokio::test]

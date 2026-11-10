@@ -560,6 +560,24 @@ impl Bridge {
         }
     }
 
+    /// A person deleted one request from another channel's agent (not the thread's root): that request
+    /// is cancelled, and the agent that asked hears so. The thread itself goes on.
+    pub(super) fn cancel_ask(&mut self, key: &ThreadKey, deleted: &str) {
+        let Some(root) = key.split().1 else { return };
+        let waiting = self.ledger.from_agent_ids(key).iter().any(|id| id == deleted);
+        let owed = self.threads.get(&root).map(|e| e.ask_owed.clone()).unwrap_or_default();
+        if !waiting && !owed.iter().any(|id| id == deleted) {
+            return;
+        }
+        self.send_agent_reply(key, &root, "cancelled", String::new(), String::new(), false);
+        // Told now: the interruption that follows must not report it a second time as "stopped".
+        // It stays unanswered until then, so that interruption still finds something to stop
+        self.ledger.forget_from_agent(key, deleted);
+        if owed.iter().any(|id| id == deleted) {
+            self.set_owed(&root, owed.into_iter().filter(|id| id != deleted).collect());
+        }
+    }
+
     /// A person is needed in this thread (`ts` is the message to point at). If another channel's
     /// agent asked for this thread, the gateway tells the threads up the chain.
     pub(super) fn needs_human(&self, channel: &str, root: &str, ts: &str) {
@@ -2205,8 +2223,9 @@ impl Bridge {
                 d.kind
             ),
         );
-        // Reply and edit show the final picture and stay as a record. Silence and reactions remove the whole progress message
-        if matches!(d.kind, "reply" | "edit")
+        // Reply, edit and passing the request on (ask) show the final picture and stay as a record.
+        // Silence and reactions remove the whole progress message
+        if matches!(d.kind, "reply" | "edit" | "ask")
             && let Some((posted, body)) = self.sticky.take_final(&key)
         {
             self.flush_sticky(&key, posted, body).await;

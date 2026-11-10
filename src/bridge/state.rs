@@ -1663,6 +1663,17 @@ impl Ledger {
         }
     }
 
+    /// `id` stays unanswered but is no longer owed to an agent (that agent was already told).
+    pub fn forget_from_agent(&mut self, key: &ThreadKey, id: &str) {
+        if let Some(e) = self
+            .by_key
+            .get_mut(key)
+            .and_then(|v| v.iter_mut().find(|e| e.id == id))
+        {
+            e.from_agent = false;
+        }
+    }
+
     /// `track` for something coming back from an agent this thread asked.
     pub fn track_agent_return(&mut self, key: &ThreadKey, id: &str) {
         self.track(key, id);

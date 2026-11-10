@@ -1210,6 +1210,14 @@ impl crate::chat::Chat for Api {
     async fn bot_channels(&self) -> Result<Vec<(String, String)>, String> {
         Api::bot_channels(self).await
     }
+    async fn is_member(&self, channel: &str) -> Result<bool, String> {
+        // A private channel the bot is not in does not exist as far as the bot can see
+        match self.get_json("conversations.info", &[("channel", channel)]).await {
+            Ok(c) => Ok(c["channel"]["is_member"].as_bool() == Some(true)),
+            Err(e) if e.contains("channel_not_found") => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
     async fn user_display_name(&self, user: &str) -> Option<String> {
         Api::user_display_name(self, user).await
     }

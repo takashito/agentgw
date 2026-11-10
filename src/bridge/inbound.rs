@@ -1087,7 +1087,10 @@ impl Bridge {
             self.awaiting_receipt.retain(|_, (k, ..)| k != key);
             return;
         }
-        if !self.ledger.pending(key).iter().any(|id| id == deleted) {
+        let in_flight = self.ledger.pending(key).iter().any(|id| id == deleted);
+        // A request from another channel's agent: the agent that asked would otherwise keep waiting
+        self.cancel_ask(key, deleted);
+        if !in_flight {
             ctx.info(
                 "bridge",
                 &format!(

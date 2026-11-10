@@ -235,8 +235,11 @@ impl GatewayAsk {
             Ok(Ok(result)) => result,
             _ => {
                 self.slots().remove(&req_id);
+                // The request is out: the gateway may still post and deliver it after we stop
+                // waiting, so asking again blind could make it twice
                 Err(format!(
-                    "the gateway did not answer within {}s; nothing was posted",
+                    "the gateway did not answer within {}s. It may still post and deliver this; \
+                     before asking again, check the target channel with fetch_messages",
                     wait.as_secs()
                 ))
             }
@@ -1368,7 +1371,10 @@ mod gateway_ask_tests {
                 Duration::from_millis(30),
             )
             .await;
-        assert!(e.unwrap_err().contains("did not answer"));
+        let e = e.unwrap_err();
+        assert!(e.contains("did not answer"));
+        // The gateway may still post and deliver it: claiming otherwise invites a second request
+        assert!(!e.contains("nothing was posted") && e.contains("fetch_messages"), "{e}");
     }
 
     #[test]

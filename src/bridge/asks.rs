@@ -73,18 +73,11 @@ pub fn check_follow_up(
     }
 }
 
-/// Whether a new ask may go to `to_channel`.
-pub fn check_new(
-    to_channel: &str,
-    from_channel: &str,
-    from_thread: &str,
-    to_thread: Option<&str>,
-) -> Result<(), String> {
+/// Whether a new ask may go to `to_channel`. A new ask always opens a new thread, so it can never
+/// land in the thread that asks (a follow-up into it is refused by [`check_follow_up`]: no record).
+pub fn check_new(to_channel: &str) -> Result<(), String> {
     if to_channel.starts_with('D') {
         return Err("asks cannot go to a DM".into());
-    }
-    if to_channel == from_channel && to_thread == Some(from_thread) {
-        return Err("cannot ask your own thread".into());
     }
     Ok(())
 }
@@ -103,17 +96,26 @@ pub struct NotifyTarget {
 /// `rows` maps an asked thread's ts to (its channel, its record).
 pub fn notify_targets(
     rows: &std::collections::HashMap<String, (String, AskedFrom)>,
+    channel: &str,
     thread_ts: &str,
 ) -> Vec<NotifyTarget> {
-    let Some((_, first)) = rows.get(thread_ts) else {
+    // A ts is only unique within a channel: a record kept for another channel is not this thread's
+    let live = |ch: &str, ts: &str| {
+        rows.get(ts)
+            .filter(|(c, r)| c == ch && r.state != AskState::Ended && !r.origin_closed)
+            .map(|(_, r)| r)
+    };
+    // An exchange that ended (Reject, `exit` on either side) has nobody waiting on it any more
+    let Some(first) = live(channel, thread_ts) else {
         return Vec::new();
     };
     let asker = (first.channel.clone(), first.thread_ts.clone());
     // Each thread's record is written once, when it is asked, so the chain cannot loop; the visited
-    // set only keeps a broken record from spinning
+    // set only keeps a broken record from spinning. It stops below a link that ended: above it,
+    // nobody is following this work any more
     let mut top = asker.clone();
     let mut seen = std::collections::HashSet::from([thread_ts.to_string()]);
-    while let Some((_, up)) = rows.get(&top.1) {
+    while let Some(up) = live(&top.0, &top.1) {
         if !seen.insert(top.1.clone()) {
             break;
         }
@@ -168,6 +170,9 @@ pub fn dead_end_line(outcome: &str, detail: &str) -> String {
         "exited" => "A person ended this exchange. Ask in a new thread if you need more.".into(),
         "refused" => format!("The other agent could not take the request ({detail})."),
         "deleted" => "The other thread was deleted.".into(),
+        "cancelled" => "A person deleted your request in the other thread, so it was cancelled. \
+                        You can still ask again in the same thread."
+            .into(),
         "closed" => "The other thread was closed before it answered.".into(),
         "offline" => OFFLINE_LINE.into(),
         other => format!("The other agent ended without a reply ({other})."),
@@ -189,18 +194,37 @@ pub const PROJECT_NOTES_BYTES: usize = 4096;
 /// The project notes of a folder: its `CLAUDE.md`, else its `README.md`, cut to
 /// [`PROJECT_NOTES_BYTES`] on a character boundary. Empty when there are none.
 pub fn read_project(dir: &std::path::Path) -> String {
-    let text = ["CLAUDE.md", "README.md"]
+    ["CLAUDE.md", "README.md"]
         .iter()
-        .find_map(|f| std::fs::read_to_string(dir.join(f)).ok())
-        .unwrap_or_default();
-    if text.len() <= PROJECT_NOTES_BYTES {
-        return text;
+        .find_map(|f| read_notes(dir, f))
+        .unwrap_or_default()
+}
+
+/// The first [`PROJECT_NOTES_BYTES`] of `dir/name`. A link is followed only while it stays inside
+/// `dir` (a repo may keep its notes in a folder of its own); one leading out is not read.
+fn read_notes(dir: &std::path::Path, name: &str) -> Option<String> {
+    use std::io::Read;
+    let path = dir.join(name);
+    let real = path.canonicalize().ok()?;
+    if !real.starts_with(dir.canonicalize().ok()?) || !real.is_file() {
+        return None;
     }
-    let mut end = PROJECT_NOTES_BYTES;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text[..end].to_string()
+    let mut bytes = Vec::with_capacity(PROJECT_NOTES_BYTES);
+    std::fs::File::open(&real)
+        .ok()?
+        .take(PROJECT_NOTES_BYTES as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    // Cut on a character boundary: drop the tail of a character the limit split
+    Some(match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(e) => {
+            let ok = e.utf8_error().valid_up_to();
+            let mut bytes = e.into_bytes();
+            bytes.truncate(ok);
+            String::from_utf8(bytes).unwrap_or_default()
+        }
+    })
 }
 
 /// A few words naming a request: the title the agent gave, or else the first line of the request
@@ -231,7 +255,7 @@ pub fn notify_targets_from(
     channel: &str,
     thread_ts: &str,
 ) -> Vec<NotifyTarget> {
-    let mut up = notify_targets(rows, thread_ts);
+    let mut up = notify_targets(rows, channel, thread_ts);
     let me = NotifyTarget {
         channel: channel.to_string(),
         thread_ts: thread_ts.to_string(),
@@ -332,10 +356,9 @@ mod decision_tests {
     }
 
     #[test]
-    fn new_asks_refuse_dms_and_the_same_thread() {
-        assert!(check_new("D1", "C1", "1.1", None).is_err());
-        assert!(check_new("C1", "C1", "1.1", Some("1.1")).is_err());
-        assert!(check_new("C2", "C1", "1.1", None).is_ok());
+    fn new_asks_refuse_dms() {
+        assert!(check_new("D1").is_err());
+        assert!(check_new("C2").is_ok());
     }
 
     #[test]
@@ -345,7 +368,7 @@ mod decision_tests {
         rows.insert("1.1".to_string(), ("C1".to_string(), row("C0", "0.1", AskState::Approved)));
         rows.insert("2.1".to_string(), ("C2".to_string(), row("C1", "1.1", AskState::Approved)));
         assert_eq!(
-            notify_targets(&rows, "2.1"),
+            notify_targets(&rows, "C2", "2.1"),
             vec![
                 NotifyTarget { channel: "C1".into(), thread_ts: "1.1".into(), mention_owner: false },
                 NotifyTarget { channel: "C0".into(), thread_ts: "0.1".into(), mention_owner: true },
@@ -358,14 +381,14 @@ mod decision_tests {
         let mut rows = HashMap::new();
         rows.insert("1.1".to_string(), ("C1".to_string(), row("C0", "0.1", AskState::Approved)));
         assert_eq!(
-            notify_targets(&rows, "1.1"),
+            notify_targets(&rows, "C1", "1.1"),
             vec![NotifyTarget { channel: "C0".into(), thread_ts: "0.1".into(), mention_owner: true }]
         );
     }
 
     #[test]
     fn a_thread_nobody_asked_has_nobody_to_tell() {
-        assert!(notify_targets(&HashMap::new(), "1.1").is_empty());
+        assert!(notify_targets(&HashMap::new(), "C1", "1.1").is_empty());
     }
 
     #[test]
@@ -373,7 +396,43 @@ mod decision_tests {
         let mut rows = HashMap::new();
         rows.insert("1.1".to_string(), ("C1".to_string(), row("C2", "2.1", AskState::Approved)));
         rows.insert("2.1".to_string(), ("C2".to_string(), row("C1", "1.1", AskState::Approved)));
-        assert!(notify_targets(&rows, "1.1").len() <= 2);
+        assert!(notify_targets(&rows, "C1", "1.1").len() <= 2);
+    }
+
+    #[test]
+    fn an_ended_exchange_tells_nobody_that_a_person_is_needed() {
+        let mut rows = HashMap::new();
+        rows.insert("1.1".to_string(), ("C1".to_string(), row("C0", "0.1", AskState::Ended)));
+        assert!(notify_targets(&rows, "C1", "1.1").is_empty());
+        let mut closed = row("C0", "0.1", AskState::Approved);
+        closed.origin_closed = true;
+        rows.insert("1.1".to_string(), ("C1".to_string(), closed));
+        assert!(notify_targets(&rows, "C1", "1.1").is_empty());
+    }
+
+    #[test]
+    fn the_chain_stops_below_an_ended_link() {
+        // CoS(C0/0.1) → Lead(C1/1.1) ended; Lead → project(C2/2.1) still on: the Lead is the top now
+        let mut rows = HashMap::new();
+        rows.insert("1.1".to_string(), ("C1".to_string(), row("C0", "0.1", AskState::Ended)));
+        rows.insert("2.1".to_string(), ("C2".to_string(), row("C1", "1.1", AskState::Approved)));
+        assert_eq!(
+            notify_targets(&rows, "C2", "2.1"),
+            vec![NotifyTarget { channel: "C1".into(), thread_ts: "1.1".into(), mention_owner: true }]
+        );
+    }
+
+    #[test]
+    fn a_record_in_another_channel_with_the_same_ts_is_not_the_one() {
+        let mut rows = HashMap::new();
+        rows.insert("1.1".to_string(), ("C9".to_string(), row("C0", "0.1", AskState::Approved)));
+        assert!(notify_targets(&rows, "C1", "1.1").is_empty());
+        // …nor a link up the chain
+        rows.insert("2.1".to_string(), ("C2".to_string(), row("C1", "1.1", AskState::Approved)));
+        assert_eq!(
+            notify_targets(&rows, "C2", "2.1"),
+            vec![NotifyTarget { channel: "C1".into(), thread_ts: "1.1".into(), mention_owner: true }]
+        );
     }
 
     #[test]
@@ -415,6 +474,24 @@ mod project_tests {
     fn readme_is_read_when_there_is_no_claude_md() {
         let d = dir_with("readme", "README.md", "# hello");
         assert_eq!(read_project(&d), "# hello");
+    }
+
+    #[test]
+    fn a_link_to_a_file_outside_the_folder_is_not_read() {
+        let outside = dir_with("outside", "secret.txt", "do not show");
+        let d = dir_with("linkout", "", "");
+        std::os::unix::fs::symlink(outside.join("secret.txt"), d.join("CLAUDE.md")).unwrap();
+        assert_eq!(read_project(&d), "");
+    }
+
+    #[test]
+    fn a_link_that_stays_inside_the_folder_is_read() {
+        // This repo's own CLAUDE.md is a link into a folder inside it
+        let d = dir_with("linkin", "", "");
+        std::fs::create_dir_all(d.join(".private")).unwrap();
+        std::fs::write(d.join(".private/CLAUDE.md"), "# notes").unwrap();
+        std::os::unix::fs::symlink(d.join(".private/CLAUDE.md"), d.join("CLAUDE.md")).unwrap();
+        assert_eq!(read_project(&d), "# notes");
     }
 
     #[test]
