@@ -240,6 +240,61 @@ pub mod link {
         },
         /// `machines`, asked from a machine — same reason as [`LinkFrame::Routes`].
         Machines { channel: String, thread_ts: String },
+        /// machine → gateway: an agent asks the agent in another channel for something (`ask_channel`).
+        /// `to_thread` is a follow-up in a thread it asked before. Answered with [`LinkFrame::AskAnswer`].
+        AskChannel {
+            req_id: String,
+            from_channel: String,
+            from_thread: String,
+            to_channel: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            to_thread: Option<String>,
+            text: String,
+        },
+        /// machine → gateway: the channels an agent may ask (`list_channels`). Answered with [`LinkFrame::AskAnswer`].
+        ListChannels {
+            req_id: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            channel_id: Option<String>,
+        },
+        /// gateway → machine: the answer to [`LinkFrame::AskChannel`] or [`LinkFrame::ListChannels`],
+        /// as the JSON the tool returns, or why not.
+        AskAnswer {
+            req_id: String,
+            result: Result<serde_json::Value, String>,
+        },
+        /// gateway → machine: a message from an agent for an agent here (an
+        /// [`AgentDelivery`](crate::bridge::asks::AgentDelivery), as JSON).
+        AgentMessage { msg: serde_json::Value },
+        /// machine → gateway: how an asked thread answered — a reply, or one of the dead ends
+        /// (`outcome`: reply / no_reply / failed / stopped / exited / refused / deleted).
+        AgentReply {
+            channel: String,
+            thread_ts: String,
+            ts: String,
+            text: String,
+            #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+            needs_human: bool,
+            outcome: String,
+        },
+        /// machine → gateway: a person is needed in this asked thread (`ts` is the message to link to).
+        NeedsHuman {
+            channel: String,
+            thread_ts: String,
+            ts: String,
+        },
+        /// machine → gateway: a person typed `exit` in this thread (asked or asking — the gateway works out which).
+        AskEnded { channel: String, thread_ts: String },
+        /// machine → gateway: `confirm-asks on|off` typed in a machine's channel.
+        SetConfirmAsks {
+            channel: String,
+            thread_ts: String,
+            on: bool,
+        },
+        /// gateway → machine: read the project notes of this channel's folder. Answered with [`LinkFrame::ProjectRead`].
+        ReadProject { req_id: String, channel: String },
+        /// machine → gateway: the notes (empty when there are none).
+        ProjectRead { req_id: String, text: String },
         /// `route`, asked from a machine. **The gateway only sees messages that mention the bot**, and a
         /// follow-up in a running thread doesn't; the machine that owns the thread asks on its behalf.
         /// **Sent as `routes`, still read as `channels`.** This frame only goes machine → gateway, and

@@ -172,6 +172,15 @@ pub enum FromRelay {
         size: u64,
         sha256: String,
     },
+    /// The gateway's answer to an ask this machine made (`ask_channel` / `list_channels`).
+    AskAnswer {
+        req_id: String,
+        result: Result<serde_json::Value, String>,
+    },
+    /// A message from an agent in another channel, for an agent here.
+    AgentMessage(crate::bridge::asks::AgentDelivery),
+    /// Read the project notes of this channel's folder for the gateway.
+    ReadProject { req_id: String, channel: String },
     /// A refusal that talking won't fix. **No retry.**
     Fatal(Fatal),
 }
@@ -290,8 +299,19 @@ impl FromRelay {
                 size,
                 sha256,
             },
+            F::AskAnswer { req_id, result } => FromRelay::AskAnswer { req_id, result },
+            // An unreadable delivery is not a frame for us (an older or newer gateway's shape)
+            F::AgentMessage { msg } => FromRelay::AgentMessage(serde_json::from_value(msg).ok()?),
+            F::ReadProject { req_id, channel } => FromRelay::ReadProject { req_id, channel },
             // Answers and asks only ever go the other way
             F::ProjectSet { .. }
+            | F::AskChannel { .. }
+            | F::ListChannels { .. }
+            | F::AgentReply { .. }
+            | F::NeedsHuman { .. }
+            | F::AskEnded { .. }
+            | F::SetConfirmAsks { .. }
+            | F::ProjectRead { .. }
             | F::Routes { .. }
             | F::PwdOn { .. }
             | F::SetHome { .. }

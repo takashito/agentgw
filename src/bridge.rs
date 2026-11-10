@@ -1822,6 +1822,16 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
                 created: create,
             });
         }
+        // Asks between channels. Wired up in the steps that use them
+        machine::FromRelay::AskAnswer { req_id, .. } => {
+            LogCtx::default().debug("bridge", &format!("ask answer {req_id}: nobody waiting"));
+        }
+        machine::FromRelay::AgentMessage(d) => {
+            LogCtx::default().debug("bridge", &format!("agent message for {}:{} dropped", d.channel, d.thread_ts));
+        }
+        machine::FromRelay::ReadProject { req_id, .. } => {
+            LogCtx::default().debug("bridge", &format!("read-project {req_id} dropped"));
+        }
         // Getting here means the link has been given up. **Don't touch the agents** — running ones
         // keep running. New Slack messages just stop coming until a person fixes the config and restarts
         machine::FromRelay::Fatal(f) => {
