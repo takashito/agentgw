@@ -4366,12 +4366,21 @@ impl Fleet {
             self.api
                 .post_blocks(to_channel, &question, crate::chat::slack::ask_offer_blocks(&question, &offer.encode()), Some(&root))
                 .await?;
-            let owner = self.owner().map(|o| format!("<@{o}> ")).unwrap_or_default();
-            let waiting = crate::t!(
-                "{owner}:hourglass: Waiting for Run: {permalink}",
-                "{owner}:hourglass: 実行の確認待ち: {permalink}"
-            );
-            self.post(from_channel, Some(from_thread), &waiting).await;
+            // A person is needed: the thread that asked hears so, and so does the top of the chain,
+            // where the Owner is watching (the only one that mentions them)
+            let targets = crate::bridge::asks::notify_targets(&*self.asks.lock().await, &root);
+            let owner = self.owner();
+            for t in targets {
+                let mention = match (&owner, t.mention_owner) {
+                    (Some(o), true) => format!("<@{o}> "),
+                    _ => String::new(),
+                };
+                let waiting = crate::t!(
+                    "{mention}:hourglass: Waiting for Run: {permalink}",
+                    "{mention}:hourglass: 実行の確認待ち: {permalink}"
+                );
+                self.post(&t.channel, Some(&t.thread_ts), &waiting).await;
+            }
             return Ok(serde_json::json!({"thread_ts": root, "permalink": permalink, "status": "waiting_for_run", "note": note}));
         }
         self.deliver_agent(AgentDelivery {
@@ -8764,6 +8773,30 @@ mod ask_tests {
             .on_machine_frame("pve", link::LinkFrame::MachineVersion { version: "0.68.0".into(), build: String::new(), triple: String::new(), asks: true })
             .await;
         assert!(r.fleet.deliver_agent(d("2.1")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn waiting_for_run_is_announced_up_the_chain() {
+        let r = rig("waitchain", FakeChat::in_channels(&[("C2", "pve")]), &[]);
+        r.fleet.asks.lock().await.insert(
+            "1.1".into(),
+            ("C1".into(), crate::bridge::state::AskedFrom {
+                channel: "C0".into(),
+                thread_ts: "0.1".into(),
+                state: AskState::Approved,
+                outstanding: true,
+                missed: 0,
+                origin_closed: false,
+                request: None,
+            }),
+        ); // CoS(C0/0.1) asked the Lead (C1/1.1)
+        r.fleet.ask("C1", "1.1", "C2", None, "reboot please").await.unwrap(); // the Lead asks the project
+        let said = calls(&r.api);
+        let waiting = |ch: &str, th: &str| said.iter().filter(|c| c.contains(&format!(" {ch} {th} ")) && c.contains("Waiting for Run")).cloned().collect::<Vec<_>>();
+        assert_eq!(waiting("C1", "1.1").len(), 1, "{said:?}");
+        assert!(!waiting("C1", "1.1")[0].contains("<@U_OWNER>"));
+        assert_eq!(waiting("C0", "0.1").len(), 1, "{said:?}");
+        assert!(waiting("C0", "0.1")[0].contains("<@U_OWNER>"));
     }
 
     #[tokio::test]
