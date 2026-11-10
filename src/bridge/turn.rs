@@ -527,6 +527,20 @@ impl Bridge {
         self.ledger.disposed(key, &waiting);
     }
 
+    /// A person is needed in this thread (`ts` is the message to point at). If another channel's
+    /// agent asked for this thread, the gateway tells the threads up the chain.
+    pub(super) fn needs_human(&self, channel: &str, root: &str, ts: &str) {
+        if self.threads.get(root).is_none_or(|e| e.asked_from.is_none()) {
+            return;
+        }
+        let Some(up) = &self.ask_gateway else { return };
+        let _ = up.send(crate::bridge::gateway::link::LinkFrame::NeedsHuman {
+            channel: channel.to_string(),
+            thread_ts: root.to_string(),
+            ts: ts.to_string(),
+        });
+    }
+
     fn send_agent_reply(&self, key: &ThreadKey, root: &str, outcome: &str, text: String, ts: String, needs_human: bool) {
         let Some(up) = &self.ask_gateway else { return };
         let (channel, _) = key.split();
@@ -1430,6 +1444,7 @@ impl Bridge {
                  awaiting click"
             ),
         );
+        self.needs_human(&channel, &thread_ts, &prompt_ts);
         // From here the agent is silent waiting for a person. Stop the watch
         self.suspend_stall_for_perm(&ThreadKey::new(&channel, &thread_ts));
         self.remember_perm_prompt(&thread_ts, &prompt_ts);
@@ -1592,6 +1607,7 @@ impl Bridge {
                 d.options.len()
             ),
         );
+        self.needs_human(channel, thread_ts, &prompt_ts);
 
         // **Written down, not only remembered.** A restart empties the map, and a button whose
         // id nobody recognises is ignored in silence -- while the dialog it belongs to is still
@@ -2136,6 +2152,9 @@ impl Bridge {
         self.presence_remove(&key, &Reason::Turn);
         // An answer to a request from another channel's agent goes back to it
         self.answer_asker(&key, &root, &d);
+        if let Some(b) = d.body.as_ref().filter(|b| b.needs_human && !b.ts.is_empty()) {
+            self.needs_human(&d.channel_id, &root, &b.ts);
+        }
         let before = self.ledger.pending(&key).len();
         if d.message_ids.is_empty() {
             self.ledger.dispose_all(&key); // no ids = the whole thread is done

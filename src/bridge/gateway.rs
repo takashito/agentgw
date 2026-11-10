@@ -3487,6 +3487,7 @@ impl Fleet {
                 outcome,
             } => self.on_agent_reply(&channel, &thread_ts, &ts, text, needs_human, &outcome).await,
             link::LinkFrame::AskEnded { channel, thread_ts } => self.on_ask_ended(&channel, &thread_ts).await,
+            link::LinkFrame::NeedsHuman { channel, thread_ts, ts } => self.on_needs_human(&channel, &thread_ts, &ts).await,
             link::LinkFrame::AskChannel {
                 req_id,
                 from_channel,
@@ -4558,6 +4559,28 @@ impl Fleet {
         if let Err(e) = self.deliver_agent(d).await {
             rlog("info", &format!("ask: the asker {}:{} is away ({e}); counted for later", row.channel, row.thread_ts));
             self.edit_ask(channel, thread, |r| r.missed += 1).await;
+        }
+    }
+
+    /// A person is needed in an asked thread: a link to the thread that asked, and to the top of the
+    /// chain (where the Owner gave the first instruction, and the only one that mentions them).
+    async fn on_needs_human(&self, channel: &str, thread: &str, ts: &str) {
+        let targets = crate::bridge::asks::notify_targets(&*self.asks.lock().await, thread);
+        if targets.is_empty() {
+            return;
+        }
+        let link = self.api.get_permalink(channel, ts).await.unwrap_or_default();
+        let owner = self.owner();
+        for t in targets {
+            let mention = match (&owner, t.mention_owner) {
+                (Some(o), true) => format!("<@{o}> "),
+                _ => String::new(),
+            };
+            let text = crate::t!(
+                "{mention}:raising_hand: A person is needed in <#{channel}>: {link}",
+                "{mention}:raising_hand: <#{channel}> で人の確認が必要です: {link}"
+            );
+            self.post(&t.channel, Some(&t.thread_ts), &text).await;
         }
     }
 
@@ -8430,6 +8453,34 @@ mod ask_tests {
         let m = r.msgs.try_recv().expect("told once");
         assert!(m.text.contains("offline"), "{}", m.text);
         assert!(r.msgs.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn the_gateway_posts_one_link_to_the_asker_and_one_with_a_mention_to_the_top() {
+        let r = rig("chain", FakeChat::default(), &[]);
+        let row = |ch: &str, th: &str| crate::bridge::state::AskedFrom {
+            channel: ch.into(),
+            thread_ts: th.into(),
+            state: AskState::Approved,
+            outstanding: true,
+            missed: 0,
+            origin_closed: false,
+            request: None,
+        };
+        {
+            let mut asks = r.fleet.asks.lock().await;
+            asks.insert("1.1".into(), ("C1".into(), row("C0", "0.1"))); // CoS → Lead
+            asks.insert("2.1".into(), ("C2".into(), row("C1", "1.1"))); // Lead → project
+        }
+        r.fleet
+            .on_machine_frame("parent", link::LinkFrame::NeedsHuman { channel: "C2".into(), thread_ts: "2.1".into(), ts: "2.9".into() })
+            .await;
+        let said = calls(&r.api);
+        let to = |ch: &str, th: &str| said.iter().filter(|c| c.contains(&format!(" {ch} {th} ")) && c.contains("https://slack/C2/2.9")).cloned().collect::<Vec<_>>();
+        assert_eq!(to("C1", "1.1").len(), 1, "{said:?}");
+        assert!(!to("C1", "1.1")[0].contains("<@U_OWNER>"));
+        assert_eq!(to("C0", "0.1").len(), 1, "{said:?}");
+        assert!(to("C0", "0.1")[0].contains("<@U_OWNER>"));
     }
 
     #[tokio::test]

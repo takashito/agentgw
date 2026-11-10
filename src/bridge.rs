@@ -2691,6 +2691,58 @@ mod tests {
         assert!(ended, "the gateway hears the exit");
     }
 
+    fn bash_perm(sid: &str) -> (HookEvent, tokio::sync::oneshot::Receiver<serde_json::Value>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let ev = HookEvent {
+            kind: "perm".into(),
+            session_id: sid.to_string(),
+            payload: serde_json::json!({"tool_name": "Bash", "tool_input": {"command": "rm -r build"}, "tool_use_id": "toolu_9"}),
+            respond: Some(tx),
+        };
+        (ev, rx)
+    }
+
+    fn needs_human_up(rx: &mut mpsc::UnboundedReceiver<crate::bridge::gateway::link::LinkFrame>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(f) = rx.try_recv() {
+            if let crate::bridge::gateway::link::LinkFrame::NeedsHuman { thread_ts, .. } = f {
+                out.push(thread_ts);
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn a_permission_prompt_in_an_asked_thread_raises_needs_human() {
+        let (mut b, mut up, sid) = asked_thread("ask-perm").await;
+        let (ev, _rx) = bash_perm(&sid);
+        b.on_hook(ev).await;
+        assert_eq!(needs_human_up(&mut up), vec![ROOT.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_thread_nobody_asked_raises_nothing() {
+        let (d, _slack, agent, _clock) = flow_deps("ask-perm-none");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let (tx, mut up) = mpsc::unbounded_channel();
+        b.ask_gateway = Some(tx);
+        let sid = running_thread(&mut b, &agent).await;
+        let (ev, _rx) = bash_perm(&sid);
+        b.on_hook(ev).await;
+        assert!(needs_human_up(&mut up).is_empty());
+    }
+
+    #[tokio::test]
+    async fn needs_human_on_a_reply_both_notifies_and_returns_the_reply() {
+        let (mut b, mut up, sid) = asked_thread("ask-reply-human").await;
+        let mut d = dispo("reply", &[ROOT], Some("please approve the reboot"), &sid);
+        d.body.as_mut().unwrap().needs_human = true;
+        b.on_disposition(d).await;
+        let frames: Vec<_> = std::iter::from_fn(|| up.try_recv().ok()).collect();
+        assert!(frames.iter().any(|f| matches!(f, crate::bridge::gateway::link::LinkFrame::AgentReply { needs_human: true, .. })));
+        assert!(frames.iter().any(|f| matches!(f, crate::bridge::gateway::link::LinkFrame::NeedsHuman { .. })));
+    }
+
     #[test]
     fn the_envelope_says_where_an_ask_came_from() {
         let e = crate::bridge::inbound::envelope(&agent_msg(ROOT, ROOT, "hi", crate::chat::DeliveryKind::Ask), ROOT, None, 0);
