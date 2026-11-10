@@ -134,9 +134,12 @@ impl Claude {
         prompt: &str,
     ) -> String {
         format!(
-            // --strict-mcp-config: do not load MCP from the production plugin (isolates dev agents)
+            // No --strict-mcp-config: the agent gets the same MCP servers as a plain `claude`
+            // (user config, plugins, claude.ai connectors, the folder's .mcp.json) plus ours.
+            // The folder's .mcp.json approval dialog is settled by `enableAllProjectMcpServers`
+            // in the --settings file, so it never waits on screen.
             "AGENTGW_SESSION_ID={} claude --settings {hooks_file} --mcp-config {mcp_config} \
-             --strict-mcp-config {} {}",
+             {} {}",
             mode.session_id(),
             mode.flag(),
             Self::single_quote(prompt)
@@ -1959,6 +1962,12 @@ impl HookIntake {
         serde_json::json!({
             // Agents are Slack-driven sessions. Only one --settings takes effect, so it lives here too.
             "disableRemoteControl": true,
+            // Without it, a folder with a .mcp.json opens "New MCP server found in this project" at
+            // startup and waits for an answer, which holds every delivery (measured on 2.1.322). Set
+            // here, it approves them without writing anything into the folder (answering on screen
+            // writes .claude/settings.local.json there). The agent in that folder can run anything
+            // with Bash already, so refusing the folder's servers would not protect anything.
+            "enableAllProjectMcpServers": true,
             "hooks": {
                 // Only SessionStart has Claude Code ignore http, so it uses curl. Headers are not carried,
                 // so session_id is taken from the body (measured in the spike).
@@ -2107,9 +2116,11 @@ mod tests {
         assert_eq!(
             line,
             "AGENTGW_SESSION_ID=sid-1 claude --settings /st/worker-hooks.json \
-             --mcp-config /st/mcp/sid-1.json --strict-mcp-config --session-id sid-1 \
+             --mcp-config /st/mcp/sid-1.json --session-id sid-1 \
              'it'\\''s here'"
         );
+        // The worker reads the user's MCP setup like a plain `claude`: never isolate it again
+        assert!(!line.contains("--strict-mcp-config"), "{line}");
     }
 
     /// The launch line built from `SpawnReq` has the same shape as the string the old `src/worker.rs`
@@ -2137,7 +2148,7 @@ mod tests {
         assert!(
             got.starts_with(
                 "AGENTGW_SESSION_ID=sid-1 claude --settings /st/h.json --mcp-config /st/m.json \
-                 --strict-mcp-config --session-id sid-1 'This is a NEW Slack thread;"
+                 --session-id sid-1 'This is a NEW Slack thread;"
             ),
             "{got}"
         );
@@ -2151,7 +2162,7 @@ mod tests {
             got,
             format!(
                 "AGENTGW_SESSION_ID=sid-2 claude --settings /st/h.json --mcp-config /st/m.json \
-                 --strict-mcp-config --resume sid-2 '{WORKER_STARTUP_PROMPT}'"
+                 --resume sid-2 '{WORKER_STARTUP_PROMPT}'"
             )
         );
     }
@@ -2522,6 +2533,8 @@ mod tests {
         let v = HookIntake::settings_json(8791, "tok");
         // Only one --settings takes effect → disableRemoteControl must live alongside
         assert_eq!(v["disableRemoteControl"], true);
+        // A folder's .mcp.json would otherwise stop the worker on an approval dialog
+        assert_eq!(v["enableAllProjectMcpServers"], true);
         // SessionStart ignores http, so it is a curl command
         let ss = &v["hooks"]["SessionStart"][0]["hooks"][0];
         assert_eq!(ss["type"], "command");
