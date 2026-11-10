@@ -2481,17 +2481,27 @@ fn waiting_note() -> String {
 }
 
 /// The line on top of an ask: what is asked, who asks, and a link to **where** it was asked.
-fn ask_heading(title: &str, from_channel: &str, line_link: &str, follow_up: bool) -> String {
-    if follow_up {
-        crate::t!(
+///
+/// The title shows only when the asking agent gave one: one made from the first line would only
+/// repeat the line right below it.
+fn ask_heading(title: Option<&str>, from_channel: &str, line_link: &str, follow_up: bool) -> String {
+    match (follow_up, title) {
+        (true, Some(title)) => crate::t!(
             ":robot_face: Follow-up: **{title}** — from the Claude in <#{from_channel}> ([where it was asked]({line_link}))",
             ":robot_face: 追加の依頼: **{title}** — <#{from_channel}> の Claude から([依頼した位置]({line_link}))"
-        )
-    } else {
-        crate::t!(
+        ),
+        (true, None) => crate::t!(
+            ":robot_face: Follow-up from the Claude in <#{from_channel}> ([where it was asked]({line_link}))",
+            ":robot_face: <#{from_channel}> の Claude から追加の依頼([依頼した位置]({line_link}))"
+        ),
+        (false, Some(title)) => crate::t!(
             ":robot_face: **{title}** — a request from the Claude in <#{from_channel}> ([where it was asked]({line_link}))",
             ":robot_face: **{title}** — <#{from_channel}> の Claude からの依頼([依頼した位置]({line_link}))"
-        )
+        ),
+        (false, None) => crate::t!(
+            ":robot_face: A request from the Claude in <#{from_channel}> ([where it was asked]({line_link}))",
+            ":robot_face: <#{from_channel}> の Claude からの依頼([依頼した位置]({line_link}))"
+        ),
     }
 }
 
@@ -4329,6 +4339,7 @@ impl Fleet {
         use crate::bridge::asks::{AgentDelivery, DeliveryKind, check_follow_up, check_new};
         use crate::bridge::state::{AskState, AskedFrom};
         let note = "The reply arrives as a message in your thread. Do not poll or wait.";
+        let given = title.map(str::trim).filter(|t| !t.is_empty());
         let title = crate::bridge::asks::request_title(title, text);
         if let Some(thread) = to_thread {
             // The thread must be the one asked **in that channel** (a ts is only unique within a channel)
@@ -4342,7 +4353,7 @@ impl Fleet {
             let online = self.thread_online(to_channel, thread).await;
             check_follow_up(row.as_ref(), from_channel, from_thread, online)?;
             let (line, line_link) = self.post_asked_line(from_channel, from_thread, to_channel, &title, true, false, false).await?;
-            let shown = format!("{}\n\n{text}", ask_heading(&title, from_channel, &line_link, true));
+            let shown = format!("{}\n\n{text}", ask_heading(given, from_channel, &line_link, true));
             let ts = crate::bridge::turn::post_chunked(self.api.as_ref(), self.dir.path(), to_channel, &shown, Some(thread), true).await?;
             let permalink = self.api.get_permalink(to_channel, &ts).await.unwrap_or_default();
             self.finish_asked_line(from_channel, &line, to_channel, &title, &permalink, true, false, false).await;
@@ -4374,13 +4385,18 @@ impl Fleet {
         let (line, line_link) = self
             .post_asked_line(from_channel, from_thread, to_channel, &title, false, confirm, confirm && asker_is_top)
             .await?;
-        // The root is the heading alone; the request goes inside the thread, and the buttons in a
-        // message of their own, so pressing one can rewrite it without touching the request
+        // **One message**: the heading and the request together start the thread (a request split from
+        // its heading reads like a reply). Only what does not fit continues inside the thread. The
+        // buttons get a message of their own, so pressing one can rewrite it without touching the request
+        let shown = format!("{}\n\n{text}", ask_heading(given, from_channel, &line_link, false));
+        let mut parts = self.chunks(&shown).into_iter();
         let root = self
             .api
-            .post_markdown(to_channel, &ask_heading(&title, from_channel, &line_link, false), None)
+            .post_markdown(to_channel, &parts.next().unwrap_or_default(), None)
             .await?;
-        crate::bridge::turn::post_chunked(self.api.as_ref(), self.dir.path(), to_channel, text, Some(&root), true).await?;
+        for part in parts {
+            self.api.post_markdown(to_channel, &part, Some(&root)).await?;
+        }
         let row = AskedFrom {
             channel: from_channel.to_string(),
             thread_ts: from_thread.to_string(),
@@ -4432,6 +4448,16 @@ impl Fleet {
         })
         .await?;
         Ok(serde_json::json!({"thread_ts": root, "permalink": permalink, "status": "delivered", "note": note}))
+    }
+
+    /// A long text in Slack-sized pieces, the same way replies are split.
+    fn chunks(&self, text: &str) -> Vec<String> {
+        let a = self.access();
+        let limit = a
+            .text_chunk_limit
+            .unwrap_or(crate::chat::slack::MAX_CHUNK_LIMIT)
+            .clamp(1, crate::chat::slack::MAX_CHUNK_LIMIT);
+        crate::chat::slack::chunk(text, limit, a.chunk_mode.as_deref() == Some("newline"))
     }
 
     /// The line in the asking thread, marking **where** the ask was made. Returns its ts and its link.
@@ -8531,9 +8557,23 @@ mod ask_tests {
         // The request's heading names it and links to that line, not to the top of the thread
         let heading = said.iter().find(|c| c.starts_with("post_md C2 - ")).expect("the heading");
         assert!(heading.contains("Fix the sandbox"), "{heading}");
+        assert!(heading.contains("details of the work"), "the request is in the same message as its heading: {heading}");
         assert!(heading.contains("https://slack/C1/") && !heading.contains("https://slack/C1/1.1"), "{heading}");
         // …and the line gets the link to the request
         assert!(said[line_ts..].iter().any(|c| c.starts_with("update_md C1 ") && c.contains(&format!("https://slack/C2/{root}"))), "{said:?}");
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_is_one_message_without_repeating_its_first_line() {
+        let mut r = rig("followfmt", FakeChat::in_channels(&[("C2", "lead")]), &["C2"]);
+        let out = r.fleet.ask("C1", "1.1", "C2", None, "first", None).await.unwrap();
+        let _ = r.msgs.try_recv();
+        let thread = out["thread_ts"].as_str().unwrap().to_string();
+        let before = calls(&r.api).len();
+        r.fleet.ask("C1", "1.1", "C2", Some(&thread), "All done on our side.\nThanks.", None).await.unwrap();
+        let posts: Vec<String> = calls(&r.api)[before..].iter().filter(|c| c.starts_with(&format!("post_md C2 {thread} "))).cloned().collect();
+        assert_eq!(posts.len(), 1, "{posts:?}");
+        assert_eq!(posts[0].matches("All done on our side.").count(), 1, "no title made of the first line: {}", posts[0]);
     }
 
     #[tokio::test]
@@ -8611,6 +8651,7 @@ mod ask_tests {
         let posts: Vec<String> = calls(&r.api).into_iter().filter(|c| c.contains(" C2 ")).collect();
         assert!(posts.len() >= 3, "{}", posts.len());
         assert!(posts.last().unwrap().contains("perm:ask-run:ask"));
+        assert!(posts[0].starts_with("post_md C2 - ") && posts[0].contains("line of a long request"), "the root carries the start of the request");
         assert!(posts[..posts.len() - 1].iter().all(|p| !p.contains("perm:ask-run")));
         let offer = offer_of(&r, out["thread_ts"].as_str().unwrap()).await;
         let (a, b) = press(&offer, crate::chat::slack::ASK_RUN, "U_OWNER");
