@@ -1215,6 +1215,15 @@ impl crate::chat::Chat for Api {
         let req = SlackApiConversationsSetPurposeRequest::new(channel.into(), purpose.to_string());
         self.client.open_session(&self.token).conversations_set_purpose(&req).await.map(|_| ()).map_err(|e| e.to_string())
     }
+    async fn create_channel(&self, name: &str) -> Result<String, String> {
+        let req = SlackApiConversationsCreateRequest::new(name.to_string()).with_is_private(false);
+        let res = self.client.open_session(&self.token).conversations_create(&req).await.map_err(|e| e.to_string())?;
+        Ok(res.channel.id.to_string())
+    }
+    async fn join_channel(&self, channel: &str) -> Result<(), String> {
+        let req = SlackApiConversationsJoinRequest::new(channel.into());
+        self.client.open_session(&self.token).conversations_join(&req).await.map(|_| ()).map_err(|e| e.to_string())
+    }
     async fn bot_channels(&self) -> Result<Vec<(String, String)>, String> {
         Api::bot_channels(self).await
     }

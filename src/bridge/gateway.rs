@@ -274,7 +274,20 @@ pub mod link {
             #[serde(default, skip_serializing_if = "Option::is_none")]
             purpose: Option<String>,
         },
-        /// gateway → machine: the answer to [`LinkFrame::AskChannel`], [`LinkFrame::ListChannels`] or [`LinkFrame::SetChannelInfo`],
+        /// machine → gateway: create a public channel the bot is in (`create_channel`), with a topic and
+        /// purpose if given. Answered with [`LinkFrame::AskAnswer`].
+        CreateChannel {
+            req_id: String,
+            name: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            topic: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            purpose: Option<String>,
+        },
+        /// machine → gateway: put the bot into a public channel (`join_channel`). Answered with [`LinkFrame::AskAnswer`].
+        JoinChannel { req_id: String, channel_id: String },
+        /// gateway → machine: the answer to an agent's ask ([`LinkFrame::AskChannel`], [`LinkFrame::ListChannels`],
+        /// [`LinkFrame::SetChannelInfo`], [`LinkFrame::CreateChannel`], [`LinkFrame::JoinChannel`]),
         /// as the JSON the tool returns, or why not.
         AskAnswer {
             req_id: String,
@@ -3584,6 +3597,24 @@ impl Fleet {
                     }
                 });
             }
+            link::LinkFrame::CreateChannel { req_id, name, topic, purpose } => {
+                let (fleet, machine) = (self.clone(), bridge_id.to_string());
+                tokio::spawn(async move {
+                    let result = fleet.create_channel(&name, topic.as_deref(), purpose.as_deref()).await;
+                    if !fleet.send_frame(&machine, &link::LinkFrame::AskAnswer { req_id, result }).await {
+                        rlog("info", &format!("{machine}: could not return the new channel (link dropped)"));
+                    }
+                });
+            }
+            link::LinkFrame::JoinChannel { req_id, channel_id } => {
+                let (fleet, machine) = (self.clone(), bridge_id.to_string());
+                tokio::spawn(async move {
+                    let result = fleet.join_channel(&channel_id).await;
+                    if !fleet.send_frame(&machine, &link::LinkFrame::AskAnswer { req_id, result }).await {
+                        rlog("info", &format!("{machine}: could not return the joined channel (link dropped)"));
+                    }
+                });
+            }
             link::LinkFrame::AskChannel {
                 req_id,
                 from_channel,
@@ -4860,8 +4891,39 @@ impl Fleet {
             self.api.set_channel_purpose(channel, p).await.map_err(|e| format!("setting the purpose: {e}"))?;
         }
         rlog("info", &format!("channel info of {channel} set by an agent (topic: {}, purpose: {})", topic.is_some(), purpose.is_some()));
+        self.channel_row(channel).await
+    }
+
+    /// A channel as `set_channel_info`, `create_channel` and `join_channel` answer it: what Slack now shows.
+    async fn channel_row(&self, channel: &str) -> Result<serde_json::Value, String> {
         let (name, topic, purpose) = self.api.channel_info(channel).await?;
         Ok(serde_json::json!({"id": channel, "name": name, "topic": topic, "purpose": purpose}))
+    }
+
+    /// Create a public channel for an agent (`create_channel`). The bot is in it from the start, so it shows
+    /// in `list_channels` and the gateway's agent answers there until it is assigned to a machine.
+    pub(crate) async fn create_channel(
+        &self,
+        name: &str,
+        topic: Option<&str>,
+        purpose: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        let id = self.api.create_channel(name).await.map_err(|e| format!("creating #{name}: {e}"))?;
+        rlog("info", &format!("channel #{name} ({id}) created by an agent"));
+        if topic.is_some() || purpose.is_some() {
+            // The channel exists either way; say what did not stick rather than hide the new ID
+            if let Err(e) = self.set_channel_info(&id, topic, purpose).await {
+                return Err(format!("created #{name} ({id}), but {e}"));
+            }
+        }
+        self.channel_row(&id).await
+    }
+
+    /// Put the bot into a public channel for an agent (`join_channel`).
+    pub(crate) async fn join_channel(&self, channel: &str) -> Result<serde_json::Value, String> {
+        self.api.join_channel(channel).await.map_err(|e| format!("joining {channel}: {e}"))?;
+        rlog("info", &format!("joined {channel} for an agent"));
+        self.channel_row(channel).await
     }
 
     /// The channels an agent may ask: every channel the bot is in, with the machine and folder that
@@ -9079,6 +9141,19 @@ mod ask_tests {
         // Both at once; an empty one clears
         let out = r.fleet.set_channel_info("C1", Some(""), Some("role=cos")).await.unwrap();
         assert_eq!((out["topic"].as_str(), out["purpose"].as_str()), (Some(""), Some("role=cos")));
+    }
+
+    #[tokio::test]
+    async fn the_gateway_creates_and_joins_channels() {
+        // The fake does not add the new channel to the bot's list, so setting its topic must not hinge on `is_member`
+        let r = rig("create", FakeChat::in_channels(&[("C1", "cos"), ("CNEW_home-lead", "home-lead")]), &[]);
+        let out = r.fleet.create_channel("home-lead", Some("role=lead team=home linear=HOME"), None).await.unwrap();
+        assert_eq!((out["id"].as_str(), out["topic"].as_str()), (Some("CNEW_home-lead"), Some("role=lead team=home linear=HOME")));
+        let out = r.fleet.join_channel("C7").await.unwrap();
+        assert_eq!(out["id"], "C7");
+        let calls = r.api.calls.lock().unwrap().clone();
+        assert!(calls.contains(&"create_channel home-lead".to_string()), "{calls:?}");
+        assert!(calls.contains(&"join_channel C7".to_string()), "{calls:?}");
     }
 
     #[tokio::test]

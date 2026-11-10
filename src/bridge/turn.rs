@@ -2573,7 +2573,7 @@ impl crate::mcp::ToolExecutor for ToolExec {
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
         let (slack, dir, dispo, ask) = (self.slack.clone(), self.state_dir.clone(), self.dispo.clone(), self.ask.clone());
         Box::pin(async move {
-            if matches!(tool.as_str(), "ask_channel" | "list_channels" | "set_channel_info") {
+            if matches!(tool.as_str(), "ask_channel" | "list_channels" | "set_channel_info" | "create_channel" | "join_channel") {
                 return execute_ask_tool(slack.as_ref(), &dir, &session_id, &tool, &args, ask.as_ref(), &dispo).await;
             }
             execute_tool(slack.as_ref(), &dir, &session_id, &tool, &args, &dispo).await
@@ -2581,7 +2581,8 @@ impl crate::mcp::ToolExecutor for ToolExec {
     }
 }
 
-/// The tools that need the gateway's answer: `ask_channel`, `list_channels` and `set_channel_info`.
+/// The tools that need the gateway's answer: `ask_channel`, `list_channels`, and the channel tools
+/// `set_channel_info`, `create_channel` and `join_channel`.
 ///
 /// The asking thread is the caller's own, looked up from its session — never taken from the
 /// arguments, so an agent cannot ask on another thread's behalf.
@@ -2615,6 +2616,21 @@ pub async fn execute_ask_tool(
             return Err("give topic, purpose or both".into());
         }
         let out = ask.ask(|req_id| LinkFrame::SetChannelInfo { req_id, channel_id, topic, purpose }).await?;
+        return Ok(out.to_string());
+    }
+    if tool == "create_channel" {
+        let Some(name) = opt("name") else {
+            return Err("name is required".into());
+        };
+        let (topic, purpose) = (opt("topic"), opt("purpose"));
+        let out = ask.ask(|req_id| LinkFrame::CreateChannel { req_id, name, topic, purpose }).await?;
+        return Ok(out.to_string());
+    }
+    if tool == "join_channel" {
+        let Some(channel_id) = opt("channel_id") else {
+            return Err("channel_id is required".into());
+        };
+        let out = ask.ask(|req_id| LinkFrame::JoinChannel { req_id, channel_id }).await?;
         return Ok(out.to_string());
     }
     let threads = bridge::Threads::load(&crate::state_dir::StateDir::at(state_dir));
@@ -3265,7 +3281,9 @@ mod tests {
                 let id = match &f {
                     crate::bridge::gateway::link::LinkFrame::AskChannel { req_id, .. }
                     | crate::bridge::gateway::link::LinkFrame::ListChannels { req_id, .. }
-                    | crate::bridge::gateway::link::LinkFrame::SetChannelInfo { req_id, .. } => req_id.clone(),
+                    | crate::bridge::gateway::link::LinkFrame::SetChannelInfo { req_id, .. }
+                    | crate::bridge::gateway::link::LinkFrame::CreateChannel { req_id, .. }
+                    | crate::bridge::gateway::link::LinkFrame::JoinChannel { req_id, .. } => req_id.clone(),
                     _ => continue,
                 };
                 s2.lock().unwrap().push(f);
@@ -3333,6 +3351,22 @@ mod tests {
         let none = serde_json::json!({"channel_id": "C2"});
         let err = execute_ask_tool(&api, &dir, "sid", "set_channel_info", &none, Some(&gw), &tx).await.unwrap_err();
         assert!(err.contains("topic, purpose"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn create_and_join_channel_ask_the_gateway() {
+        use crate::bridge::gateway::link::LinkFrame;
+        let (api, _dir, tx, _rx) = harness();
+        let dir = dir_with_session("create");
+        let (gw, seen) = answering(Ok(serde_json::json!({"id": "C9"})));
+        let args = serde_json::json!({"name": "home-lead", "topic": "role=lead"});
+        execute_ask_tool(&api, &dir, "sid", "create_channel", &args, Some(&gw), &tx).await.unwrap();
+        execute_ask_tool(&api, &dir, "sid", "join_channel", &serde_json::json!({"channel_id": "C9"}), Some(&gw), &tx).await.unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert!(matches!(&seen[0], LinkFrame::CreateChannel { name, topic: Some(t), purpose: None, .. } if name == "home-lead" && t == "role=lead"), "{seen:?}");
+        assert!(matches!(&seen[1], LinkFrame::JoinChannel { channel_id, .. } if channel_id == "C9"), "{seen:?}");
+        let err = execute_ask_tool(&api, &dir, "sid", "create_channel", &serde_json::json!({}), Some(&gw), &tx).await.unwrap_err();
+        assert!(err.contains("name"), "{err}");
     }
 
     #[tokio::test]

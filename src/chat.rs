@@ -370,6 +370,10 @@ pub trait Chat: Send + Sync + 'static {
     async fn set_channel_topic(&self, channel: &str, topic: &str) -> Result<(), String>;
     /// Replace a channel's purpose, Slack's "description" (`conversations.setPurpose`). An empty string clears it.
     async fn set_channel_purpose(&self, channel: &str, purpose: &str) -> Result<(), String>;
+    /// Create a public channel (`conversations.create`); the bot that creates it is in it. Returns its ID.
+    async fn create_channel(&self, name: &str) -> Result<String, String>;
+    /// Put the bot into a public channel (`conversations.join`). Joining one it is already in is fine.
+    async fn join_channel(&self, channel: &str) -> Result<(), String>;
     /// Every channel the bot is a member of, as (id, name). The gateway needs it for `status`: a channel
     /// nobody was assigned is **its own**, and until someone types in it there is nothing else to learn it from.
     async fn bot_channels(&self) -> Result<Vec<(String, String)>, String>;
@@ -674,6 +678,14 @@ pub mod fake {
         async fn set_channel_purpose(&self, c: &str, purpose: &str) -> Result<(), String> {
             self.record(format!("set_purpose {c} {purpose}"))?;
             self.set_info.lock().unwrap().entry(c.to_string()).or_default().1 = Some(purpose.to_string());
+            Ok(())
+        }
+        async fn create_channel(&self, name: &str) -> Result<String, String> {
+            self.record(format!("create_channel {name}"))?;
+            Ok(format!("CNEW_{name}"))
+        }
+        async fn join_channel(&self, c: &str) -> Result<(), String> {
+            self.record(format!("join_channel {c}"))?;
             Ok(())
         }
         async fn channel_display_name(&self, c: &str) -> Option<String> {

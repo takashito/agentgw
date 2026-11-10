@@ -190,6 +190,30 @@ impl Mcp {
                     "required": ["channel_id"],
                 },
             }),
+            serde_json::json!({
+                "name": "create_channel",
+                "description": "Create a public Slack channel. The bot is in it from the start, so it shows up in list_channels and can be asked with ask_channel; until a machine and folder are assigned to it, the gateway's Claude answers there. Optionally set its topic and purpose in the same call. People are not added: tell the Owner the channel's name so they can join.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "The channel name without #: lowercase letters, digits, - and _, at most 80 characters (Slack's rule)." },
+                        "topic": { "type": "string", "description": "Optional topic, at most 250 characters." },
+                        "purpose": { "type": "string", "description": "Optional purpose (Slack's channel description), at most 250 characters." },
+                    },
+                    "required": ["name"],
+                },
+            }),
+            serde_json::json!({
+                "name": "join_channel",
+                "description": "Put the bot into an existing public Slack channel, so it shows up in list_channels and can be asked with ask_channel. Private channels need a person to invite the bot.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "channel_id": { "type": "string", "description": "The channel (C...), as a <#C...> link gives it." },
+                    },
+                    "required": ["channel_id"],
+                },
+            }),
         ]
     }
 
@@ -514,7 +538,9 @@ mod tests {
                 "set_thread_title",
                 "ask_channel",
                 "list_channels",
-                "set_channel_info"
+                "set_channel_info",
+                "create_channel",
+                "join_channel"
             ]
         );
         for t in &tools {
@@ -589,6 +615,8 @@ mod tests {
         assert_eq!(req("ask_channel"), ["channel_id", "text"]);
         assert!(req("list_channels").is_empty());
         assert_eq!(req("set_channel_info"), ["channel_id"]);
+        assert_eq!(req("create_channel"), ["name"]);
+        assert_eq!(req("join_channel"), ["channel_id"]);
     }
 
     #[test]
