@@ -15,6 +15,7 @@ pub mod inbound;
 pub mod turn;
 pub mod state;
 pub mod worker;
+pub mod asks;
 
 use crate::agent::claude::HookIntake;
 use crate::agent::claude::Claude;

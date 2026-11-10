@@ -228,8 +228,45 @@ pub struct ThreadEntry {
     /// channel, the bot's or not, so it cannot answer that question; [`Threads::load`] drops it.
     #[serde(rename = "machine", skip_serializing_if = "Option::is_none")]
     pub bridge: Option<String>,
+    /// This thread was opened by **an agent in another thread** asking for something (`ask_channel`).
+    ///
+    /// The gateway keeps it to check follow-ups and to know where replies go back; the machine running
+    /// the thread keeps it to know which threads to tell when a person is needed here.
+    #[serde(rename = "askedFrom", skip_serializing_if = "Option::is_none")]
+    pub asked_from: Option<AskedFrom>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Where an asked thread was asked from, and how far the exchange has got.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AskedFrom {
+    pub channel: String,
+    pub thread_ts: String,
+    pub state: AskState,
+    /// The gateway delivered a request and no answer or dead end has come back yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub outstanding: bool,
+    /// Replies that could not be handed over because the asking machine was offline.
+    #[serde(default, skip_serializing_if = "no_missed")]
+    pub missed: u32,
+    /// A person closed the asking thread (`exit`): replies are no longer delivered there.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub origin_closed: bool,
+}
+
+fn no_missed(n: &u32) -> bool {
+    *n == 0
+}
+
+/// `Pending` waits for the Owner to press Run; `Ended` refuses follow-ups (rejected, or a person
+/// typed `exit` in the asked thread).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskState {
+    Pending,
+    Approved,
+    Ended,
 }
 
 /// Where a moved conversation used to live.
@@ -724,6 +761,9 @@ pub struct Route {
     /// **Unset = this machine handles it itself** (the default for a standalone Bridge).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bridge: Option<String>,
+    /// Whether asks from agents in other channels wait for the Owner to press Run. Unset = they do.
+    #[serde(rename = "confirmAsks", skip_serializing_if = "Option::is_none")]
+    pub confirm_asks: Option<bool>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -1035,6 +1075,14 @@ pub struct Access {
 }
 
 impl Access {
+    /// Whether an ask into `channel` waits for the Owner's Run (the default) or starts at once.
+    pub fn confirms_asks(&self, channel: &str) -> bool {
+        self.routes
+            .get(channel)
+            .and_then(|r| r.confirm_asks)
+            .unwrap_or(true)
+    }
+
     /// Emoji for the receive ack ("eyes" when unset).
     pub fn ack_emoji(&self) -> &str {
         self.ack_reaction.as_deref().unwrap_or("eyes")
@@ -1472,6 +1520,9 @@ pub struct Inflight {
     /// Resends used on turn failure. **Kept in the item itself**, so when the item is answered and dropped
     /// the budget goes with it (no separate map to clean up).
     retries: u32,
+    /// A request from an agent in another channel. Answering it sends the answer back to that agent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    from_agent: bool,
 }
 
 impl Ledger {
@@ -1548,9 +1599,30 @@ impl Ledger {
                 received: false,
                 envelope: None,
                 retries: 0,
+                from_agent: false,
             }),
         }
         self.dirty = true;
+    }
+
+    /// `track` for a request from an agent in another channel.
+    pub fn track_from_agent(&mut self, key: &ThreadKey, id: &str) {
+        self.track(key, id);
+        if let Some(e) = self
+            .by_key
+            .get_mut(key)
+            .and_then(|v| v.iter_mut().find(|e| e.id == id))
+        {
+            e.from_agent = true;
+        }
+    }
+
+    /// The unanswered items in this thread that came from an agent.
+    pub fn from_agent_ids(&self, key: &ThreadKey) -> Vec<String> {
+        self.by_key
+            .get(key)
+            .map(|v| v.iter().filter(|e| e.from_agent).map(|e| e.id.clone()).collect())
+            .unwrap_or_default()
     }
 
     /// Remembers the delivered envelope. `track` runs right after the ack (before the envelope exists),
@@ -2933,5 +3005,49 @@ mod tests {
         for bad in ["", "-x", ".x", "a b", "の使い方", "a/b", "<@U1>"] {
             assert!(!is_machine_name(bad), "{bad}");
         }
+    }
+}
+
+#[cfg(test)]
+mod ask_record_tests {
+    use super::*;
+    use crate::chat::ThreadKey;
+
+    #[test]
+    fn asked_from_roundtrips_and_keeps_unknown_fields() {
+        let raw = r#"{"session_id":"s","askedFrom":{"channel":"C1","thread_ts":"1.1","state":"approved"},"zzz":1}"#;
+        let e: ThreadEntry = serde_json::from_str(raw).unwrap();
+        let a = e.asked_from.clone().unwrap();
+        assert_eq!((a.channel.as_str(), a.thread_ts.as_str(), a.state), ("C1", "1.1", AskState::Approved));
+        assert!(!a.outstanding && a.missed == 0 && !a.origin_closed);
+        let back = serde_json::to_value(&e).unwrap();
+        assert_eq!(back["zzz"], 1);
+        assert_eq!(back["askedFrom"]["state"], "approved");
+        assert!(back["askedFrom"].get("missed").is_none(), "defaults are not written");
+    }
+
+    #[test]
+    fn a_thread_without_an_ask_writes_no_asked_from() {
+        let v = serde_json::to_value(ThreadEntry::default()).unwrap();
+        assert!(v.get("askedFrom").is_none());
+    }
+
+    #[test]
+    fn confirm_asks_defaults_to_on() {
+        let mut a = Access::default();
+        assert!(a.confirms_asks("C1"));
+        a.routes.entry("C1".into()).or_default().confirm_asks = Some(false);
+        assert!(!a.confirms_asks("C1"));
+        let v = serde_json::to_value(&a).unwrap();
+        assert_eq!(v["routes"]["C1"]["confirmAsks"], false);
+    }
+
+    #[test]
+    fn the_ledger_remembers_which_items_came_from_an_agent() {
+        let k = ThreadKey::new("C1", "1.0");
+        let mut l = Ledger::default();
+        l.track(&k, "1.1");
+        l.track_from_agent(&k, "1.2");
+        assert_eq!(l.from_agent_ids(&k), vec!["1.2".to_string()]);
     }
 }
