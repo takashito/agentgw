@@ -250,6 +250,9 @@ pub(super) fn dedup_key(msg: &InboundMsg) -> String {
         // An edit passes once per revision (redeliveries of the same revision are dropped)
         (_, Some(e), _) => format!("{}#edit#{}", msg.ts, e.revision),
         (_, _, Some(_)) => format!("{}#deleted", msg.ts),
+        // A delivery from another channel's agent rides on a post the bot just made, whose own
+        // echo from Slack arrives under the same ts. A namespace of its own keeps one from eating the other
+        _ if msg.from_agent.is_some() => format!("{}#agent", msg.ts),
         _ => msg.ts.clone(),
     }
 }

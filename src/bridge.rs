@@ -2578,6 +2578,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_agent_delivery_is_not_taken_for_the_echo_of_our_own_post() {
+        // Slack sends the bot's own post back as an event; the delivery reuses that post's ts
+        let (d, _slack, agent, _clock) = flow_deps("ask-echo");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let mut echo = channel_msg(ROOT, "U_BOT", "request heading");
+        echo.channel = "C_ADMIN".into();
+        echo.is_bot = true;
+        echo.bot_id = Some("B_SELF".into());
+        b.on_inbound(&echo).await;
+        b.on_inbound(&agent_msg(ROOT, ROOT, "check", crate::chat::DeliveryKind::Ask)).await;
+        assert_eq!(agent.spawned.lock().unwrap().len(), 1, "the request still reaches an agent");
+    }
+
+    #[tokio::test]
     async fn an_ask_that_reads_like_a_command_is_delivered_as_text() {
         let (d, _slack, agent, _clock) = flow_deps("ask-exit");
         let (mut b, _fx) = Bridge::for_test(d);
