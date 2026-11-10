@@ -317,6 +317,8 @@ impl Bridge {
             missed: 0,
             origin_closed: false,
             request: None,
+            line: None,
+            title: None,
         };
         self.threads.set_asked(root_ts, channel, Some(row));
         if let Err(e) = self.threads.save() {

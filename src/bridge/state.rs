@@ -261,6 +261,12 @@ pub struct AskedFrom {
     /// a press after a restart still has the text; cleared once delivered or rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request: Option<String>,
+    /// The line in the asking thread that says what was asked (`📤 …`), rewritten as the ask moves on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<String>,
+    /// The few words naming the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 fn no_missed(n: &u32) -> bool {
@@ -3129,6 +3135,8 @@ mod ask_record_tests {
             missed: 0,
             origin_closed: false,
             request: None,
+            line: None,
+            title: None,
         };
         t.set_asked("2.1", "C2", Some(row(AskState::Pending)));
         assert!(!t.is_active("2.1"), "nothing may start it before Run");

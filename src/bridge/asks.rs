@@ -313,6 +313,8 @@ mod decision_tests {
             missed: 0,
             origin_closed: false,
             request: None,
+            line: None,
+            title: None,
         }
     }
 

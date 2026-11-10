@@ -2476,6 +2476,10 @@ pub struct Fleet {
     pub ask_capable: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
+fn waiting_note() -> String {
+    crate::t!(":hourglass: Waiting for Run", ":hourglass: 実行の確認待ち")
+}
+
 /// The line on top of an ask: what is asked, who asks, and a link to **where** it was asked.
 fn ask_heading(title: &str, from_channel: &str, line_link: &str, follow_up: bool) -> String {
     if follow_up {
@@ -4385,6 +4389,8 @@ impl Fleet {
             missed: 0,
             origin_closed: false,
             request: confirm.then(|| text.to_string()),
+            line: Some(line.clone()),
+            title: Some(title.clone()),
         };
         self.put_ask(to_channel, &root, row).await;
         let permalink = self.api.get_permalink(to_channel, &root).await.unwrap_or_default();
@@ -4441,7 +4447,8 @@ impl Fleet {
         mention: bool,
     ) -> Result<(String, String), String> {
         let name = self.channel_label(to_channel).await;
-        let text = self.asked_line(&name, title, "", follow_up, waiting, mention);
+        let note = waiting.then(waiting_note);
+        let text = self.asked_line(&name, title, "", follow_up, note.as_deref(), mention);
         let ts = self.api.post_markdown(from_channel, &text, Some(from_thread)).await?;
         let link = self.api.get_permalink(from_channel, &ts).await.unwrap_or_default();
         Ok((ts, link))
@@ -4461,12 +4468,13 @@ impl Fleet {
         mention: bool,
     ) {
         let name = self.channel_label(to_channel).await;
-        let text = self.asked_line(&name, title, link, follow_up, waiting, mention);
+        let note = waiting.then(waiting_note);
+        let text = self.asked_line(&name, title, link, follow_up, note.as_deref(), mention);
         self.rewrite(from_channel, line, &text).await;
     }
 
     /// `📤 Asked #pve-lan: title` — once the request is posted, the words themselves link to it.
-    fn asked_line(&self, to: &str, title: &str, link: &str, follow_up: bool, waiting: bool, mention: bool) -> String {
+    fn asked_line(&self, to: &str, title: &str, link: &str, follow_up: bool, note: Option<&str>, mention: bool) -> String {
         let who = match (mention, self.owner()) {
             (true, Some(o)) => format!("<@{o}> "),
             _ => String::new(),
@@ -4477,12 +4485,17 @@ impl Fleet {
             crate::t!("Asked {to}: {title}", "{to} に依頼: {title}")
         };
         let what = if link.is_empty() { format!("**{what}**") } else { format!("[**{what}**]({link})") };
-        let state = if waiting {
-            crate::t!(" (:hourglass: Waiting for Run)", "(:hourglass: 実行の確認待ち)")
-        } else {
-            String::new()
-        };
+        let state = note.map(|n| format!(" ({n})")).unwrap_or_default();
         format!("{who}:outbox_tray: {what}{state}")
+    }
+
+    /// Rewrite an ask's line in the asking thread once Run or Reject is pressed (`note` = what it says now).
+    async fn settle_asked_line(&self, to_channel: &str, root: &str, row: &crate::bridge::state::AskedFrom, note: Option<&str>) {
+        let (Some(line), Some(title)) = (&row.line, &row.title) else { return };
+        let link = self.api.get_permalink(to_channel, root).await.unwrap_or_default();
+        let name = self.channel_label(to_channel).await;
+        let text = self.asked_line(&name, title, &link, false, note, false);
+        self.rewrite(&row.channel, line, &text).await;
     }
 
     /// `#name` for a channel, as plain words (a `<#C…>` would be a second link beside the one that matters).
@@ -4515,6 +4528,7 @@ impl Fleet {
             .await;
             let done = crate::t!(":no_entry: Rejected by <@{by}>", ":no_entry: <@{by}> が却下しました");
             self.rewrite(to, &click.message_ts, &done).await;
+            self.settle_asked_line(to, root, &row, Some(&crate::t!(":no_entry: Rejected", ":no_entry: 却下"))).await;
             self.tell_origin(
                 &row.channel,
                 &row.thread_ts,
@@ -4546,6 +4560,7 @@ impl Fleet {
                 .await;
                 let done = crate::t!(":arrow_forward: Running — by <@{by}>", ":arrow_forward: 実行中 — <@{by}>");
                 self.rewrite(to, &click.message_ts, &done).await;
+                self.settle_asked_line(to, root, &row, None).await;
             }
             // The buttons stay: pressing again once the machine is back runs it
             Err(why) => self.post(to, Some(root), &why).await,
@@ -8754,6 +8769,8 @@ mod ask_tests {
             missed: 0,
             origin_closed: false,
             request: None,
+            line: None,
+            title: None,
         };
         {
             let mut asks = r.fleet.asks.lock().await;
@@ -8894,6 +8911,8 @@ mod ask_tests {
                 missed: 0,
                 origin_closed: false,
                 request: None,
+                line: None,
+                title: None,
             }),
         ); // CoS(C0/0.1) asked the Lead (C1/1.1)
         r.fleet.ask("C1", "1.1", "C2", None, "reboot please", None).await.unwrap(); // the Lead asks the project
@@ -8919,6 +8938,35 @@ mod ask_tests {
         assert!(bare.is_empty(), "{bare:#?}");
         let human = calls(&r.api).into_iter().find(|c| c.contains("person is needed")).expect("the notice");
         assert!(human.contains("](https://slack/C2/2.9)") && !human.contains("<#C2>"), "one link, straight to the message: {human}");
+    }
+
+    #[tokio::test]
+    async fn the_asked_line_drops_waiting_once_run_is_pressed() {
+        let mut r = rig("lineclear", FakeChat::in_channels(&[("C2", "pve")]), &[]);
+        let out = r.fleet.ask("C1", "1.1", "C2", None, "check", Some("Check it")).await.unwrap();
+        let offer = offer_of(&r, out["thread_ts"].as_str().unwrap()).await;
+        let before = calls(&r.api).len();
+        let (a, b) = press(&offer, crate::chat::slack::ASK_RUN, "U_OWNER");
+        r.fleet.on_click(a, b).await;
+        let _ = r.msgs.try_recv();
+        let line = calls(&r.api)[before..]
+            .iter()
+            .find(|c| c.starts_with("update_md C1 ") && c.contains("Check it"))
+            .cloned()
+            .expect("the asked line is rewritten");
+        assert!(!line.contains("Waiting for Run"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn the_asked_line_says_rejected() {
+        let mut r = rig("linereject", FakeChat::in_channels(&[("C2", "pve")]), &[]);
+        let out = r.fleet.ask("C1", "1.1", "C2", None, "check", Some("Check it")).await.unwrap();
+        let offer = offer_of(&r, out["thread_ts"].as_str().unwrap()).await;
+        let before = calls(&r.api).len();
+        let (a, b) = press(&offer, crate::chat::slack::ASK_REJECT, "U_OWNER");
+        r.fleet.on_click(a, b).await;
+        let _ = r.msgs.try_recv();
+        assert!(calls(&r.api)[before..].iter().any(|c| c.starts_with("update_md C1 ") && c.contains("Check it") && c.contains("Rejected")));
     }
 
     #[tokio::test]
