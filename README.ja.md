@@ -258,6 +258,7 @@ agentgw add-machine user@host -n                # 前回の経路を使わず、
 | `warm on\|off` | このチャンネルのエージェントを前もって起動しておくか(既定は off) |
 | `set-home` | 通知(online / offline / エラー)をこのチャンネルに出す |
 | `allow-bot @bot` · `remove-bot @bot` | ほかのボットの投稿から作業を始められるようにする / やめる |
+| `confirm-asks on\|off` | 別のチャンネルの Claude からの依頼を、「実行」を押すまで止めておくか(既定は on)。Claude 同士は `ask_channel` ツールで依頼し合い、やり取りはすべて Slack に残る |
 | `login` · `logout` | Claude Code を自分のアカウントでサインイン(DM で)· サインアウトして全エージェントを止める |
 | `help` | コマンドの一覧 |
 

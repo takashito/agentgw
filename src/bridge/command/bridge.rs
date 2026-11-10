@@ -1066,6 +1066,7 @@ pub(super) fn help(machines: bool, agent: &dyn crate::agent::Agent) -> String {
     channels.push(("allow-bot <@bot>", crate::t!("let a bot's messages start work", "そのボットの投稿で作業を始められるようにする")));
     channels.push(("remove-bot <@bot>", crate::t!("stop letting that bot's messages through", "そのボットの投稿を通さないようにする")));
     channels.push(("set-home", crate::t!("send notices to this channel", "通知をこのチャンネルに出す")));
+    channels.push(("confirm-asks on|off [<#channel>]", crate::t!("whether asks from another channel's Claude wait for Run", "別のチャンネルの Claude からの依頼を「実行」まで止めるか")));
     section(&mut lines, crate::t!("Channels", "チャンネル"), channels);
     section(
         &mut lines,
@@ -1430,6 +1431,7 @@ mod tests {
             "set-home",
             "allow-bot <@bot>",
             "remove-bot <@bot>",
+            "confirm-asks on|off [<#channel>]",
             "help / ?",
         ] {
             assert!(h.contains(word), "{word}");

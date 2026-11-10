@@ -266,6 +266,7 @@ Mention the bot (`@agentgw <command>`), or type in a thread it's working in.
 | `warm on\|off` | Keep an agent started ahead of time for this channel (off by default) |
 | `set-home` | Send notices (online, offline, errors) to this channel |
 | `allow-bot @bot` · `remove-bot @bot` | Let another bot's messages start work |
+| `confirm-asks on\|off` | Whether a request from the Claude in another channel waits for you to press Run before it starts here (on by default). Agents ask each other with the `ask_channel` tool; the whole exchange stays in Slack |
 | `login` · `logout` | Sign Claude Code in to your account (by DM) · sign out and stop all agents |
 | `help` | All commands |
 
