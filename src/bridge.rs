@@ -1054,6 +1054,7 @@ impl Bridge {
                 asks: tokio::sync::Mutex::new(crate::bridge::state::Threads::load(&dir).asked()),
                 reads: Default::default(),
                 departed: Default::default(),
+                ask_capable: Default::default(),
             });
             // One listener per address: loopback for whatever terminates TLS in front, the LAN address
             // for machines on the same network
@@ -1653,6 +1654,7 @@ fn version_frame() -> crate::bridge::gateway::link::LinkFrame {
         version: env!("CARGO_PKG_VERSION").to_string(),
         build: crate::build_label::LABEL.to_string(),
         triple: crate::setup::update::this_triple().unwrap_or_default().to_string(),
+        asks: true,
     }
 }
 

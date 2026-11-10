@@ -194,6 +194,10 @@ pub mod link {
             /// What it runs on (`aarch64-apple-darwin`) — which build `update local` sends it.
             #[serde(default, skip_serializing_if = "String::is_empty")]
             triple: String,
+            /// It takes asks from agents in other channels (`AgentMessage`, `ReadProject`). A machine too
+            /// old to say would drop those frames unread, so the gateway refuses to send it asks.
+            #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+            asks: bool,
         },
         /// `update [version]`, asked from wherever the Owner typed it — only the gateway knows every
         /// machine. `None` = the latest release.
@@ -2464,6 +2468,9 @@ pub struct Fleet {
     /// Machines whose link dropped, and when. Their asks are only given up once they stay away past
     /// [`ASK_OFFLINE_GRACE_MS`] — a restart or an update drops the link for a moment, workers and all intact.
     pub departed: std::sync::Mutex<HashMap<String, u64>>,
+    /// Machines that said they take asks (in their `MachineVersion`). Memory only: every machine says
+    /// it again on each connect.
+    pub ask_capable: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// How long a machine may be away before the threads waiting on its asks are told it went offline.
@@ -3458,8 +3465,16 @@ impl Fleet {
                 self.assign_project(&channel, &thread_ts, &machine, path, thread_only, false)
                     .await
             }
-            link::LinkFrame::MachineVersion { version, build, triple } => {
+            link::LinkFrame::MachineVersion { version, build, triple, asks } => {
                 let id = bridge_id.to_string();
+                {
+                    let mut able = self.ask_capable.lock().unwrap_or_else(|e| e.into_inner());
+                    if asks {
+                        able.insert(id.clone());
+                    } else {
+                        able.remove(&id);
+                    }
+                }
                 let known = self
                     .access()
                     .machines
@@ -4484,6 +4499,12 @@ impl Fleet {
         );
         let to = match &decision {
             Delivery::Local => self.self_id.clone(),
+            Delivery::Forward(b) if !self.takes_asks(b) => {
+                return Err(crate::t!(
+                    "*{b}* runs an older agentgw that can't take requests from other agents; update it first.",
+                    "*{b}* の agentgw は古く、ほかの Agent からの依頼を受けられません。先に更新してください。"
+                ));
+            }
             Delivery::Forward(b) => b.clone(),
             Delivery::Offline(b) => return Err(Delivery::offline_notice(b, &connected)),
             Delivery::UnknownChannel => return Err("no channel to deliver to".into()),
@@ -4510,6 +4531,12 @@ impl Fleet {
         } else {
             Err(Delivery::offline_notice(&to, &self.links.connected()))
         }
+    }
+
+    /// Whether `machine` said it takes asks (this gateway always does).
+    fn takes_asks(&self, machine: &str) -> bool {
+        machine == self.self_id
+            || self.ask_capable.lock().unwrap_or_else(|e| e.into_inner()).contains(machine)
     }
 
     /// Whether the machine that has (or would get) this thread is reachable now.
@@ -4657,6 +4684,9 @@ impl Fleet {
         let req_id = format!("read-{}-{}", now_ms(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.reads.lock().unwrap_or_else(|e| e.into_inner()).insert(req_id.clone(), tx);
+        if !self.takes_asks(machine) {
+            return None;
+        }
         let sent = self.links.send_to(machine, &link::LinkFrame::ReadProject { req_id: req_id.clone(), channel: channel.to_string() });
         let got = if sent { tokio::time::timeout(std::time::Duration::from_secs(5), rx).await.ok().and_then(Result::ok) } else { None };
         self.reads.lock().unwrap_or_else(|e| e.into_inner()).remove(&req_id);
@@ -6340,6 +6370,7 @@ mod tests {
             asks: Default::default(),
             reads: Default::default(),
             departed: Default::default(),
+            ask_capable: Default::default(),
         });
         (fleet, msg_rx)
     }
@@ -6637,7 +6668,7 @@ mod tests {
             .map(|id| {
                 let (fleet, id) = (fleet.clone(), id.clone());
                 tokio::spawn(async move {
-                    let frame = link::LinkFrame::MachineVersion { version: "0.57.0".into(), build: String::new(), triple: String::new() };
+                    let frame = link::LinkFrame::MachineVersion { version: "0.57.0".into(), build: String::new(), triple: String::new(), asks: false };
                     fleet.on_machine_frame(&id, frame).await;
                 })
             })
@@ -7878,7 +7909,8 @@ mod tests {
             Some(link::LinkFrame::MachineVersion {
                 version: "0.64.9".into(),
                 build: String::new(),
-                triple: String::new()
+                triple: String::new(),
+                asks: false,
             })
         );
         assert_eq!(
@@ -7897,6 +7929,7 @@ mod tests {
             version: "0.65.0".into(),
             build: "0.65.0+e1a48c9".into(),
             triple: "x86_64-unknown-linux-musl".into(),
+            asks: true,
         };
         fleet.on_machine_frame("pve", frame).await;
         let l = Access::load(&dir).machines.get("pve").cloned().unwrap();
@@ -8074,11 +8107,12 @@ mod tests {
             link::LinkFrame::Update { version: "0.56.0".into(), build: String::new() },
             link::LinkFrame::Update { version: "0.65.0".into(), build: "0.65.0+aaa".into() },
             link::LinkFrame::UpdateFailed { version: "0.56.0".into(), why: "404".into() },
-            link::LinkFrame::MachineVersion { version: "0.55.0".into(), build: String::new(), triple: String::new() },
+            link::LinkFrame::MachineVersion { version: "0.55.0".into(), build: String::new(), triple: String::new(), asks: false },
             link::LinkFrame::MachineVersion {
                 version: "0.65.0".into(),
                 build: "0.65.0+aaa".into(),
                 triple: "aarch64-apple-darwin".into(),
+                asks: true,
             },
             link::LinkFrame::StartUpdate { channel: "D1".into(), thread_ts: "1.0".into(), version: None },
             link::LinkFrame::FileReady {
@@ -8345,6 +8379,7 @@ mod ask_tests {
             renaming: Default::default(),
             reads: Default::default(),
             departed: Default::default(),
+            ask_capable: Default::default(),
         });
         Rig { fleet, api, msgs, notes }
     }
@@ -8656,6 +8691,7 @@ mod ask_tests {
         let r = rig("slowlist", FakeChat::in_channels(&[("C2", "sibling")]), &[]);
         let (tx, mut wire) = tokio::sync::mpsc::unbounded_channel::<String>();
         r.fleet.links.register("mac", Conn::new(tx));
+        r.fleet.ask_capable.lock().unwrap().insert("mac".into());
         {
             let mut a = Access::load(&r.fleet.dir);
             a.set_bridge("C2", "mac");
@@ -8705,6 +8741,29 @@ mod ask_tests {
         r.fleet.asks_check_departed(1_000 + ASK_OFFLINE_GRACE_MS).await;
         assert!(r.msgs.try_recv().unwrap().text.contains("offline"));
         assert!(r.fleet.departed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_machine_too_old_for_asks_is_refused_not_silently_skipped() {
+        let r = rig("old", FakeChat::in_channels(&[("C2", "pve")]), &[]);
+        let (tx, _wire) = tokio::sync::mpsc::unbounded_channel::<String>();
+        r.fleet.links.register("pve", Conn::new(tx));
+        let d = |t: &str| crate::bridge::asks::AgentDelivery {
+            channel: "C2".into(),
+            thread_ts: t.into(),
+            ts: t.into(),
+            text: "x".into(),
+            origin_channel: None,
+            origin_thread: None,
+            kind: DeliveryKind::Ask,
+            needs_human: false,
+        };
+        r.fleet.thread_routes.lock().await.insert("2.1".into(), "pve".into());
+        assert!(r.fleet.deliver_agent(d("2.1")).await.unwrap_err().contains("update"));
+        r.fleet
+            .on_machine_frame("pve", link::LinkFrame::MachineVersion { version: "0.68.0".into(), build: String::new(), triple: String::new(), asks: true })
+            .await;
+        assert!(r.fleet.deliver_agent(d("2.1")).await.is_ok());
     }
 
     #[tokio::test]

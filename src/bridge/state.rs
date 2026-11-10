@@ -415,7 +415,12 @@ impl Threads {
     /// Whether this thread is **already running** (`isThreadActive`). If so, a channel
     /// follow-up is accepted without a mention. `pending` / `paused` count as not running.
     pub fn is_active(&self, thread_ts: &str) -> bool {
-        !matches!(self.status_of(thread_ts), "pending" | "paused" | "none")
+        // An ask still waiting for the Owner's Run has a row but nothing running: a follow-up there
+        // must not start an agent ahead of the button
+        let waiting_for_run = self.get(thread_ts).is_some_and(|e| {
+            e.agent_id.is_none() && e.asked_from.as_ref().is_some_and(|a| a.state == AskState::Pending)
+        });
+        !waiting_for_run && !matches!(self.status_of(thread_ts), "pending" | "paused" | "none")
     }
 
     /// `getThreadStatus` — an unknown thread is `none`, an entry without `status` is `active`.
@@ -3108,6 +3113,27 @@ mod ask_record_tests {
         assert!(!a.confirms_asks("C1"));
         let v = serde_json::to_value(&a).unwrap();
         assert_eq!(v["routes"]["C1"]["confirmAsks"], false);
+    }
+
+    #[test]
+    fn an_ask_waiting_for_run_is_not_an_active_thread() {
+        let dir = crate::state_dir::StateDir::at(std::env::temp_dir().join(format!("agentgw-pending-ask-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let mut t = Threads::load(&dir);
+        let row = |state| AskedFrom {
+            channel: "C1".into(),
+            thread_ts: "1.1".into(),
+            state,
+            outstanding: false,
+            missed: 0,
+            origin_closed: false,
+            request: None,
+        };
+        t.set_asked("2.1", "C2", Some(row(AskState::Pending)));
+        assert!(!t.is_active("2.1"), "nothing may start it before Run");
+        t.set_asked("2.1", "C2", Some(row(AskState::Approved)));
+        assert!(t.is_active("2.1"));
     }
 
     #[test]
