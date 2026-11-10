@@ -2685,6 +2685,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_middle_layer_passes_the_result_back_after_delegating() {
+        let (mut b, mut up, sid) = asked_thread("ask-middle").await;
+        // The Lead delegates downwards, answering the request with the ask
+        b.on_disposition(dispo("ask", &[ROOT], None, &sid)).await;
+        assert!(replies_up(&mut up).is_empty(), "delegating is not the answer");
+        // The project's reply comes back, and the Lead answers it
+        b.on_inbound(&agent_msg(ROOT, "1782000000.000800", "result from below", crate::chat::DeliveryKind::Reply)).await;
+        b.on_disposition(dispo("reply", &["1782000000.000800"], Some("summary for the CoS"), &sid)).await;
+        assert_eq!(replies_up(&mut up), vec![("reply".to_string(), "summary for the CoS".to_string())]);
+        // Owed once: the next answer to the result of another ask has nobody waiting above
+        b.on_inbound(&agent_msg(ROOT, "1782000000.000810", "late", crate::chat::DeliveryKind::Reply)).await;
+        b.on_disposition(dispo("reply", &["1782000000.000810"], Some("noted"), &sid)).await;
+        assert!(replies_up(&mut up).is_empty());
+    }
+
+    #[tokio::test]
+    async fn while_an_answer_is_owed_a_reply_to_a_person_stays_here() {
+        let (mut b, mut up, sid) = asked_thread("ask-owed-person").await;
+        b.on_disposition(dispo("ask", &[ROOT], None, &sid)).await;
+        let mut person = channel_msg("1782000000.000500", "U_OWNER", "how is it going?");
+        person.channel = "C_ADMIN".into();
+        person.thread_ts = Some(ROOT.into());
+        b.on_inbound(&person).await;
+        b.on_disposition(dispo("reply", &["1782000000.000500"], Some("waiting on the project"), &sid)).await;
+        assert!(replies_up(&mut up).is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_exit_after_delegating_still_tells_the_asker() {
+        let (mut b, mut up, sid) = asked_thread("ask-owed-exit").await;
+        b.on_disposition(dispo("ask", &[ROOT], None, &sid)).await;
+        let mut bye = channel_msg("1782000000.000600", "U_OWNER", "exit");
+        bye.channel = "C_ADMIN".into();
+        bye.thread_ts = Some(ROOT.into());
+        b.on_inbound(&bye).await;
+        assert!(replies_up(&mut up).iter().any(|(o, _)| o == "exited"));
+    }
+
+    #[tokio::test]
     async fn a_reply_without_ids_still_answers_the_ask() {
         let (mut b, mut up, sid) = asked_thread("ask-noids").await;
         b.on_disposition(dispo("reply", &[], Some("all done"), &sid)).await;

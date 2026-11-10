@@ -683,7 +683,8 @@ impl Bridge {
                 self.ledger.track_from_agent(&key, &msg.ts);
                 self.note_asked_from(&root_ts, &msg.channel, from_agent.as_ref());
             }
-            _ => self.ledger.track(&key, &msg.ts),
+            Some(_) => self.ledger.track_agent_return(&key, &msg.ts),
+            None => self.ledger.track(&key, &msg.ts),
         }
         // A message owing an answer **is** the turn: the same thing `restore_pending` reads back
         // from threads.json after a restart, so a turn that crosses one keeps its reason.

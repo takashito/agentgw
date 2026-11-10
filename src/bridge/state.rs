@@ -234,6 +234,10 @@ pub struct ThreadEntry {
     /// the thread keeps it to know which threads to tell when a person is needed here.
     #[serde(rename = "askedFrom", skip_serializing_if = "Option::is_none")]
     pub asked_from: Option<AskedFrom>,
+    /// Requests from the asking agent that this thread's agent passed on (`ask_channel`) or only
+    /// acknowledged: it still owes that agent an answer, and its next real reply is it.
+    #[serde(rename = "askOwed", default, skip_serializing_if = "Vec::is_empty")]
+    pub ask_owed: Vec<String>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -1550,6 +1554,9 @@ pub struct Inflight {
     /// A request from an agent in another channel. Answering it sends the answer back to that agent.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     from_agent: bool,
+    /// Something coming back from an agent this thread asked (its reply, or a notice).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    agent_return: bool,
 }
 
 impl Ledger {
@@ -1627,6 +1634,7 @@ impl Ledger {
                 envelope: None,
                 retries: 0,
                 from_agent: false,
+                agent_return: false,
             }),
         }
         self.dirty = true;
@@ -1642,6 +1650,26 @@ impl Ledger {
         {
             e.from_agent = true;
         }
+    }
+
+    /// `track` for something coming back from an agent this thread asked.
+    pub fn track_agent_return(&mut self, key: &ThreadKey, id: &str) {
+        self.track(key, id);
+        if let Some(e) = self
+            .by_key
+            .get_mut(key)
+            .and_then(|v| v.iter_mut().find(|e| e.id == id))
+        {
+            e.agent_return = true;
+        }
+    }
+
+    /// The unanswered items in this thread that came back from agents it asked.
+    pub fn agent_return_ids(&self, key: &ThreadKey) -> Vec<String> {
+        self.by_key
+            .get(key)
+            .map(|v| v.iter().filter(|e| e.agent_return).map(|e| e.id.clone()).collect())
+            .unwrap_or_default()
     }
 
     /// The unanswered items in this thread that came from an agent.

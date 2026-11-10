@@ -496,35 +496,68 @@ impl Bridge {
     /// back through the gateway. Decided by what the ledger is about to clear: a reply to a person
     /// alone clears no request, so it does not go back.
     fn answer_asker(&mut self, key: &ThreadKey, root: &str, d: &Disposition) {
-        let waiting = self.ledger.from_agent_ids(key);
-        let covered = if d.message_ids.is_empty() {
-            !waiting.is_empty()
-        } else {
-            d.message_ids.iter().any(|id| waiting.contains(id))
+        let cover = |list: Vec<String>| -> Vec<String> {
+            if d.message_ids.is_empty() {
+                list
+            } else {
+                list.into_iter().filter(|id| d.message_ids.contains(id)).collect()
+            }
         };
-        if !covered {
-            return;
+        let asks = cover(self.ledger.from_agent_ids(key));
+        let returns = cover(self.ledger.agent_return_ids(key));
+        let owed = self.threads.get(root).map(|e| e.ask_owed.clone()).unwrap_or_default();
+        match d.kind {
+            // Passing the request on, or acknowledging it, is not answering it: the answer is owed
+            "ask" | "react" => {
+                if !asks.is_empty() {
+                    self.set_owed(root, [owed, asks].concat());
+                }
+            }
+            "reply" | "edit" | "no_reply" => {
+                // An answer to the request itself, or — while one is owed — the answer to what came
+                // back from below (or a reply that names no message). A reply to a person alone is not it
+                let owed_now = !owed.is_empty() && (d.message_ids.is_empty() || !returns.is_empty());
+                if asks.is_empty() && !owed_now {
+                    return;
+                }
+                let (outcome, text, ts, needs_human) = match (d.kind, &d.body) {
+                    ("reply" | "edit", Some(b)) => ("reply", b.text.clone(), b.ts.clone(), b.needs_human),
+                    // A reply that was not posted because the thread's root is gone
+                    ("reply", None) => ("deleted", String::new(), String::new(), false),
+                    ("no_reply", b) => ("no_reply", b.as_ref().map(|b| b.text.clone()).unwrap_or_default(), String::new(), false),
+                    _ => return,
+                };
+                self.send_agent_reply(key, root, outcome, text, ts, needs_human);
+                if !owed.is_empty() {
+                    self.set_owed(root, Vec::new());
+                }
+            }
+            _ => {}
         }
-        let (outcome, text, ts, needs_human) = match (d.kind, &d.body) {
-            ("reply" | "edit", Some(b)) => ("reply", b.text.clone(), b.ts.clone(), b.needs_human),
-            // A reply that was not posted because the thread's root is gone
-            ("reply", None) => ("deleted", String::new(), String::new(), false),
-            ("no_reply", b) => ("no_reply", b.as_ref().map(|b| b.text.clone()).unwrap_or_default(), String::new(), false),
-            _ => return,
-        };
-        self.send_agent_reply(key, root, outcome, text, ts, needs_human);
+    }
+
+    fn set_owed(&mut self, root: &str, owed: Vec<String>) {
+        let Some(e) = self.threads.entries.get_mut(root) else { return };
+        e.ask_owed = owed;
+        if let Err(err) = self.threads.save() {
+            LogCtx::default().error("bridge", &format!("threads.json save failed: {err}"));
+        }
     }
 
     /// A request from another channel's agent ends here without an answer (`outcome` says how).
     /// Tell that agent, and clear the request so the thread is not left owing it.
     pub(super) fn tell_asker(&mut self, key: &ThreadKey, outcome: &str, text: String) {
         let waiting = self.ledger.from_agent_ids(key);
-        if waiting.is_empty() {
+        let Some(root) = key.split().1 else { return };
+        let owed = self.threads.get(&root).is_some_and(|e| !e.ask_owed.is_empty());
+        if waiting.is_empty() && !owed {
             return;
         }
-        let Some(root) = key.split().1 else { return };
         self.send_agent_reply(key, &root, outcome, text, String::new(), false);
         self.ledger.disposed(key, &waiting);
+        if owed {
+            self.set_owed(&root, Vec::new());
+        }
     }
 
     /// A person is needed in this thread (`ts` is the message to point at). If another channel's
