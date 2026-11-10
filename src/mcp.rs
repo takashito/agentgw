@@ -41,8 +41,8 @@ pub trait ToolExecutor: Send + Sync + 'static {
 pub struct Mcp;
 
 impl Mcp {
-    /// The six MCP tool definitions (names, schemas and descriptions ported
-    /// faithfully). The anti-narration wording is a behavior contract — don't shorten or paraphrase it.
+    /// The MCP tool definitions. The first six are ported faithfully from the original connector (names,
+    /// schemas and descriptions). The anti-narration wording is a behavior contract — don't shorten or paraphrase it.
     pub fn tool_definitions() -> Vec<serde_json::Value> {
         vec![
             serde_json::json!({
@@ -55,6 +55,7 @@ impl Mcp {
                         "text": { "type": "string", "description": "Message text. Standard Markdown by default — see `markdown`." },
                         "markdown": { "type": "boolean", "description": "Defaults to TRUE: `text` is read as standard Markdown, so headings (##), tables, task lists and fenced code blocks with language all render. Slack mentions (<@U…>), channel links (<#C…>) and :emoji: still work. Set FALSE only to fall back to Slack mrkdwn — the legacy dialect where bold is *single asterisks* and there is no table syntax." },
                         "thread_ts": { "type": "string", "description": "Thread timestamp for threaded replies" },
+                        "needs_human": { "type": "boolean", "description": "Set true when a person must decide or act before the work can continue. The thread that asked you is notified." },
                         "files": {
                             "type": "array",
                             "items": { "type": "string" },
@@ -107,6 +108,7 @@ impl Mcp {
                         "markdown": { "type": "boolean", "description": "Defaults to TRUE (standard Markdown). Set FALSE for legacy Slack mrkdwn." },
                         "text": { "type": "string", "description": "The message's new full text (it REPLACES the old text, not appended). Standard Markdown by default — see `markdown`." },
                         "thread_ts": { "type": "string", "description": "Thread root timestamp. Pass it together with message_ids when this edit is your answer (marks the message(s) answered and clears the thinking indicator)." },
+                        "needs_human": { "type": "boolean", "description": "Set true when a person must decide or act before the work can continue. The thread that asked you is notified." },
                         "message_ids": { "type": "array", "items": { "type": "string" }, "description": "If this edit IS your answer to one or more inbound messages, pass their message_id(s) — marks them answered (correlation/audit, and so they are not re-delivered after a worker reconnect). OMIT for a mere progress-update edit (the turn is not done yet)." },
                     },
                     "required": ["channel_id", "message_ts", "text"],
@@ -147,6 +149,31 @@ impl Mcp {
                         "title": { "type": "string", "description": "The new name, a few words (at most 200 characters). Slack rejects the whole title if it contains any character outside this set: letters and digits of any script (Japanese, full-width and emoji included), plain spaces, and the ASCII marks - _ . , ! ? ( ) & ' \" = |. Every other mark is refused — Japanese punctuation (、 。 「 」 ・ ： ／ ！ and the full-width space), dashes and arrows (– — → …), and ASCII : / @ # + * ~ % $ < > [ ] { } ; ` ^ \\. Write titles that need none of them: \"スレッド名が付かない件の調査\", not \"スレッド名、調査\"." },
                     },
                     "required": ["channel_id", "thread_ts", "title"],
+                },
+            }),
+            serde_json::json!({
+                "name": "ask_channel",
+                "description": "Ask the Claude in another Slack channel to do something, in a new thread there (or a follow-up in a thread you asked before, with thread_ts). The Owner may have to press Run first. Its reply arrives later as a message in your thread; do not poll or wait. Use list_channels to find the right channel.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "channel_id": { "type": "string", "description": "The channel to ask (C...), as list_channels or a <#C...> link gives it." },
+                        "text": { "type": "string", "description": "The request, standard Markdown. Say everything the other Claude needs: it does not see your conversation." },
+                        "thread_ts": { "type": "string", "description": "Only for a follow-up: the thread_ts of the thread you asked before (from the earlier result or the reply's from_thread)." },
+                        "message_ids": { "type": "array", "items": { "type": "string" }, "description": "The inbound message_id(s) this call answers, as with reply — marks them answered once the ask is posted." },
+                    },
+                    "required": ["channel_id", "text"],
+                },
+            }),
+            serde_json::json!({
+                "name": "list_channels",
+                "description": "List the Slack channels you can ask, with the machine, folder, topic and purpose of each. Pass channel_id for one channel's project notes (its CLAUDE.md or README).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "channel_id": { "type": "string", "description": "Optional: one channel (C...) to describe, with its project notes." },
+                    },
+                    "required": [],
                 },
             }),
         ]
@@ -243,6 +270,21 @@ impl Mcp {
     }
 }
 
+/// What every agent reads first. **MCP tools load deferred**: an agent sees only their names until
+/// it searches for them, so anything it must know to reach for a tool is said here.
+pub fn server_instructions() -> String {
+    "Slack bridge — reply to the Slack thread with these tools. \
+     Events: <channel source=\"slack\" channel_id=... message_id=...>; attachments \
+     are pre-downloaded (`file_paths` = local files to Read, `file_errors` = \
+     failures). Use `download_attachment` only for a file from another \
+     message/thread. `thread_title` is the thread's current name (empty = none \
+     yet): name it with `set_thread_title` once its topic is clear, and again \
+     whenever the topic moves on. \
+     To get work done by the Claude in another channel, use ask_channel (find the channel with \
+     list_channels); its reply comes back as a message, so end your turn instead of waiting."
+        .into()
+}
+
 /// The handler plugged into rmcp. Holds tool execution (`exec`) and the hook entry point (`hooks`).
 ///
 /// Holds no session state — streamable http **must be stateless** (with a session table, a Bridge
@@ -273,16 +315,7 @@ impl ServerHandler for McpServer {
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             // The attachment sentence is copied verbatim from the original connector's `RESPONDER`
             // This is the only place that tells the agent what file_paths on the envelope mean
-            instructions: Some(
-                "Slack bridge — reply to the Slack thread with these tools. \
-                 Events: <channel source=\"slack\" channel_id=... message_id=...>; attachments \
-                 are pre-downloaded (`file_paths` = local files to Read, `file_errors` = \
-                 failures). Use `download_attachment` only for a file from another \
-                 message/thread. `thread_title` is the thread's current name (empty = none \
-                 yet): name it with `set_thread_title` once its topic is clear, and again \
-                 whenever the topic moves on."
-                    .into(),
-            ),
+            instructions: Some(server_instructions()),
             ..Default::default()
         }
     }
@@ -464,7 +497,9 @@ mod tests {
                 "edit_message",
                 "download_attachment",
                 "fetch_messages",
-                "set_thread_title"
+                "set_thread_title",
+                "ask_channel",
+                "list_channels"
             ]
         );
         for t in &tools {
@@ -536,5 +571,22 @@ mod tests {
         assert_eq!(req("download_attachment"), ["file_id"]);
         assert_eq!(req("fetch_messages"), ["channel"]);
         assert_eq!(req("set_thread_title"), ["channel_id", "thread_ts", "title"]);
+        assert_eq!(req("ask_channel"), ["channel_id", "text"]);
+        assert!(req("list_channels").is_empty());
+    }
+
+    #[test]
+    fn reply_and_edit_take_needs_human() {
+        for n in ["reply", "edit_message"] {
+            let t = Mcp::tool_definitions().into_iter().find(|t| t["name"] == n).unwrap();
+            assert!(t["inputSchema"]["properties"]["needs_human"].is_object(), "{n}");
+        }
+    }
+
+    #[test]
+    fn instructions_tell_the_agent_not_to_wait_for_an_ask() {
+        let i = server_instructions();
+        assert!(i.contains("ask_channel") && i.contains("end your turn instead of waiting"), "{i}");
+        assert!(i.starts_with("Slack bridge — reply to the Slack thread"), "the existing words stay first");
     }
 }

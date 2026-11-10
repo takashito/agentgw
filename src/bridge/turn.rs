@@ -2516,11 +2516,82 @@ impl crate::mcp::ToolExecutor for ToolExec {
         tool: String,
         args: serde_json::Value,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
-        let (slack, dir, dispo) = (self.slack.clone(), self.state_dir.clone(), self.dispo.clone());
+        let (slack, dir, dispo, ask) = (self.slack.clone(), self.state_dir.clone(), self.dispo.clone(), self.ask.clone());
         Box::pin(async move {
+            if matches!(tool.as_str(), "ask_channel" | "list_channels") {
+                return execute_ask_tool(slack.as_ref(), &dir, &session_id, &tool, &args, ask.as_ref(), &dispo).await;
+            }
             execute_tool(slack.as_ref(), &dir, &session_id, &tool, &args, &dispo).await
         })
     }
+}
+
+/// The tools that need the gateway's answer: `ask_channel` and `list_channels`.
+///
+/// The asking thread is the caller's own, looked up from its session — never taken from the
+/// arguments, so an agent cannot ask on another thread's behalf.
+pub async fn execute_ask_tool(
+    _slack: &dyn Chat,
+    state_dir: &std::path::Path,
+    session_id: &str,
+    tool: &str,
+    args: &serde_json::Value,
+    ask: Option<&crate::bridge::machine::GatewayAsk>,
+    dispo: &tokio::sync::mpsc::Sender<Disposition>,
+) -> Result<String, String> {
+    use crate::bridge::gateway::link::LinkFrame;
+    let Some(ask) = ask else {
+        return Err("asks between channels need the gateway role; this Bridge has no gateway".into());
+    };
+    let opt = |k: &str| args[k].as_str().filter(|v| !v.is_empty()).map(str::to_string);
+    if tool == "list_channels" {
+        let channel_id = opt("channel_id");
+        let out = ask.ask(|req_id| LinkFrame::ListChannels { req_id, channel_id }).await?;
+        return Ok(out.to_string());
+    }
+    let threads = bridge::Threads::load(&crate::state_dir::StateDir::at(state_dir));
+    let Some((root, entry)) = threads.find_by_session(session_id) else {
+        return Err("this session has no thread".into());
+    };
+    let (from_channel, from_thread) = (entry.channel_id.clone().unwrap_or_default(), root.clone());
+    let (Some(to_channel), Some(text)) = (opt("channel_id"), opt("text")) else {
+        return Err("channel_id and text are required".into());
+    };
+    let to_thread = opt("thread_ts");
+    let out = ask
+        .ask(|req_id| LinkFrame::AskChannel {
+            req_id,
+            from_channel: from_channel.clone(),
+            from_thread: from_thread.clone(),
+            to_channel,
+            to_thread,
+            text,
+        })
+        .await?;
+    let ids: Vec<String> = args["message_ids"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    let c = LogCtx {
+        session_id: Some(session_id.to_string()),
+        thread_key: Some(ThreadKey::new(&from_channel, &from_thread)),
+    };
+    c.info("bridge", &format!("disposition=ask covers=[{}]", ids.join(",")));
+    // Posted: the ask answers the messages it was given, like a reply. Without ids it answers nothing
+    // (an ask is not the end of the conversation the way a bare reply is)
+    if !ids.is_empty() {
+        let d = Disposition {
+            kind: "ask",
+            channel_id: from_channel,
+            thread_ts: Some(from_thread),
+            message_ids: ids,
+            session_id: session_id.to_string(),
+            title: None,
+            body: None,
+        };
+        notify(dispo, d, &c).await;
+    }
+    Ok(out.to_string())
 }
 
 /// Validate all attachments **before posting**. The gate that posts nothing, not even the text,
@@ -3096,6 +3167,83 @@ mod tests {
             "{:?}",
             api.calls()
         );
+    }
+
+    /// A state dir whose threads.json says session `sid` runs thread C1/1.0.
+    fn dir_with_session(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("agentgw-asktool-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sd = crate::state_dir::StateDir::at(dir.clone());
+        let mut t = crate::bridge::state::Threads::load(&sd);
+        t.upsert("1.0", crate::bridge::state::ThreadEntry {
+            agent_id: Some("sid".into()),
+            channel_id: Some("C1".into()),
+            ..Default::default()
+        });
+        t.save().unwrap();
+        dir
+    }
+
+    /// A gateway that answers every request with `answer`, and the requests it saw.
+    fn answering(answer: Result<serde_json::Value, String>) -> (crate::bridge::machine::GatewayAsk, std::sync::Arc<std::sync::Mutex<Vec<crate::bridge::gateway::link::LinkFrame>>>) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let ask = crate::bridge::machine::GatewayAsk::new(tx);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (a2, s2) = (ask.clone(), seen.clone());
+        tokio::spawn(async move {
+            while let Some(f) = rx.recv().await {
+                let id = match &f {
+                    crate::bridge::gateway::link::LinkFrame::AskChannel { req_id, .. }
+                    | crate::bridge::gateway::link::LinkFrame::ListChannels { req_id, .. } => req_id.clone(),
+                    _ => continue,
+                };
+                s2.lock().unwrap().push(f);
+                a2.answer(&id, answer.clone());
+            }
+        });
+        (ask, seen)
+    }
+
+    #[tokio::test]
+    async fn ask_channel_without_a_gateway_says_so_and_posts_nothing() {
+        let (api, _dir, tx, mut rx) = harness();
+        let dir = dir_with_session("nogw");
+        let args = serde_json::json!({"channel_id": "C2", "text": "hi"});
+        let e = execute_ask_tool(&api, &dir, "sid", "ask_channel", &args, None, &tx).await.unwrap_err();
+        assert!(e.contains("gateway"), "{e}");
+        assert!(api.calls().is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn ask_channel_names_the_calling_thread_and_covers_ids_only_when_posted() {
+        let (api, _dir, tx, mut rx) = harness();
+        let dir = dir_with_session("covers");
+        let args = serde_json::json!({"channel_id": "C2", "text": "check", "message_ids": ["1.5"]});
+        let (refusing, _) = answering(Err("still waiting for the Owner to press Run".into()));
+        assert!(execute_ask_tool(&api, &dir, "sid", "ask_channel", &args, Some(&refusing), &tx).await.is_err());
+        assert!(rx.try_recv().is_err(), "a refusal answers nothing");
+        let (ok, seen) = answering(Ok(serde_json::json!({"thread_ts": "2.1", "status": "delivered"})));
+        let out = execute_ask_tool(&api, &dir, "sid", "ask_channel", &args, Some(&ok), &tx).await.unwrap();
+        assert!(out.contains("2.1"), "{out}");
+        match &seen.lock().unwrap()[0] {
+            crate::bridge::gateway::link::LinkFrame::AskChannel { from_channel, from_thread, to_channel, .. } => {
+                assert_eq!((from_channel.as_str(), from_thread.as_str(), to_channel.as_str()), ("C1", "1.0", "C2"));
+            }
+            other => panic!("{other:?}"),
+        }
+        let d = rx.try_recv().expect("the ask answers the message it was given");
+        assert_eq!((d.kind, d.message_ids.clone()), ("ask", vec!["1.5".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn list_channels_asks_the_gateway() {
+        let (api, _dir, tx, _rx) = harness();
+        let dir = dir_with_session("list");
+        let (gw, _) = answering(Ok(serde_json::json!({"channels": [{"id": "C2"}]})));
+        let out = execute_ask_tool(&api, &dir, "sid", "list_channels", &serde_json::json!({}), Some(&gw), &tx).await.unwrap();
+        assert!(out.contains("C2"), "{out}");
     }
 
     #[tokio::test]
