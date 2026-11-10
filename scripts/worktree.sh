@@ -62,12 +62,22 @@ fi
 # worktree creation when this runs as a WorktreeCreate hook. A cold target/ still builds.
 seed() {
   echo "==> Seeding $dst from $src"
-  if cp -Rc "$src" "$dst" 2>/dev/null; then
+  mkdir -p "$dst"
+  # **Only cargo's own entries**, never a folder something else left in target/ (a leftover
+  # `.claude/worktrees/*/target` once held 1.3M files and made every seed on dock take 9 minutes
+  # instead of seconds). Cargo's top level is the profiles, the triples, `tmp` and two dotfiles.
+  local entries=()
+  for e in "$src"/* "$src"/.rustc_info.json "$src"/CACHEDIR.TAG; do
+    [ -e "$e" ] && entries+=("$e")
+  done
+  if [ "$(uname)" = Darwin ] && cp -Rc "${entries[@]}" "$dst"/ 2>/dev/null; then
     how="clone (APFS, no bytes copied)"
   else
-    # BSD cp has no -l, and neither does macOS's. cpio is everywhere and links as it walks.
-    mkdir -p "$dst"
-    (cd "$src" && find . -type f -print | cpio -pdlm "$dst" 2>/dev/null)
+    # GNU cp has no -c, BSD cp has no -l: cpio is everywhere and links as it walks. incremental/
+    # is left out here rather than linked and then deleted (it is most of the files)
+    (cd "$src" && for e in "${entries[@]}"; do
+      find "./${e#"$src"/}" -name incremental -prune -o -type f -print
+    done | cpio -pdlm "$dst" 2>/dev/null)
     how="hardlinks"
   fi
 
