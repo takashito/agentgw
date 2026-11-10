@@ -2837,9 +2837,32 @@ mod tests {
         b.on_inbound(&agent_msg(ROOT, "1782000000.000800", "result from below", crate::chat::DeliveryKind::Reply)).await;
         b.on_disposition(dispo("reply", &["1782000000.000800"], Some("summary for the CoS"), &sid)).await;
         assert_eq!(replies_up(&mut up), vec![("reply".to_string(), "summary for the CoS".to_string())]);
-        // Owed once: the next answer to the result of another ask has nobody waiting above
+        // Owed once, but the asker still hears what this thread posts about later results
         b.on_inbound(&agent_msg(ROOT, "1782000000.000810", "late", crate::chat::DeliveryKind::Reply)).await;
         b.on_disposition(dispo("reply", &["1782000000.000810"], Some("noted"), &sid)).await;
+        assert_eq!(replies_up(&mut up), vec![("reply".to_string(), "noted".to_string())]);
+        assert!(b.threads.get(ROOT).is_some_and(|e| e.ask_owed.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn after_answering_a_reply_to_the_result_of_its_own_ask_goes_back() {
+        let (mut b, mut up, sid) = asked_thread("ask-own-ask-after-answer").await;
+        // The request is answered first, so nothing is owed when the agent asks elsewhere on its own
+        b.on_disposition(dispo("reply", &[ROOT], Some("on it"), &sid)).await;
+        b.on_disposition(dispo("ask", &[], None, &sid)).await;
+        assert_eq!(replies_up(&mut up), vec![("reply".to_string(), "on it".to_string())]);
+        // Progress and the final report both answer what came back from that ask: the asker hears both
+        b.on_inbound(&agent_msg(ROOT, "1782000000.000800", "check A passed", crate::chat::DeliveryKind::Reply)).await;
+        b.on_disposition(dispo("reply", &["1782000000.000800"], Some("A passed, B running"), &sid)).await;
+        b.on_inbound(&agent_msg(ROOT, "1782000000.000810", "check B passed", crate::chat::DeliveryKind::Reply)).await;
+        b.on_disposition(dispo("reply", &["1782000000.000810"], Some("done"), &sid)).await;
+        assert_eq!(
+            replies_up(&mut up),
+            vec![("reply".to_string(), "A passed, B running".to_string()), ("reply".to_string(), "done".to_string())]
+        );
+        // Edits and no_reply about it still stay here
+        b.on_disposition(dispo("edit", &["1782000000.000810"], Some("done (typo)"), &sid)).await;
+        b.on_disposition(dispo("no_reply", &["1782000000.000810"], None, &sid)).await;
         assert!(replies_up(&mut up).is_empty());
     }
 

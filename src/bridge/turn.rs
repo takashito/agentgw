@@ -532,11 +532,11 @@ impl Bridge {
                 let owed_now = !owed.is_empty() && (d.message_ids.is_empty() || !returns.is_empty());
                 // In a thread another agent asked for, a posted reply to a person goes back too: the
                 // Owner often steers the work here directly after the first answer, and the asker
-                // would otherwise never hear how it ended. Edits and no_reply to a person stay here, and
-                // so does a reply to what came back from an ask of its own once nothing is owed above
+                // would otherwise never hear how it ended. So does a reply to what came back from an ask
+                // of its own after the request was answered: that is often the progress or the final
+                // report. Edits and no_reply stay here
                 let asked_live = d.kind == "reply"
                     && d.body.is_some()
-                    && returns.is_empty()
                     && self
                         .threads
                         .get(root)
