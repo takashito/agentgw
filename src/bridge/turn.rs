@@ -2431,6 +2431,8 @@ pub struct ToolExec {
     pub state_dir: std::path::PathBuf,
     /// Where dispositions are sent (main receives them and clears the ledger).
     pub dispo: tokio::sync::mpsc::Sender<Disposition>,
+    /// The way to the gateway for tools that need its answer. None without a gateway.
+    pub ask: Option<crate::bridge::machine::GatewayAsk>,
 }
 
 impl crate::mcp::ToolExecutor for ToolExec {

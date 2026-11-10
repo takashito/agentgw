@@ -185,6 +185,76 @@ pub enum FromRelay {
     Fatal(Fatal),
 }
 
+/// How long an agent's tool call waits for the gateway before giving up (nothing is posted then).
+pub const GATEWAY_ANSWER_WAIT: Duration = Duration::from_secs(15);
+
+type AnswerSlot = tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>;
+
+/// An agent's tool call that needs **the gateway's answer** (`ask_channel`, `list_channels`).
+///
+/// Link frames are otherwise fire-and-forget; this pairs a request with its answer by `req_id`. The
+/// gateway's own Bridge uses it too: its uplink loops back into its own fleet, and the answer comes
+/// back down the same way a machine's does.
+#[derive(Clone)]
+pub struct GatewayAsk {
+    up: tokio::sync::mpsc::UnboundedSender<LinkFrame>,
+    waiting: Arc<std::sync::Mutex<std::collections::HashMap<String, AnswerSlot>>>,
+}
+
+impl GatewayAsk {
+    pub fn new(up: tokio::sync::mpsc::UnboundedSender<LinkFrame>) -> Self {
+        Self {
+            up,
+            waiting: Default::default(),
+        }
+    }
+
+    /// Send the request `make` builds around a fresh `req_id`, and wait for its answer.
+    pub async fn ask(
+        &self,
+        make: impl FnOnce(String) -> LinkFrame,
+    ) -> Result<serde_json::Value, String> {
+        self.ask_within(make, GATEWAY_ANSWER_WAIT).await
+    }
+
+    pub async fn ask_within(
+        &self,
+        make: impl FnOnce(String) -> LinkFrame,
+        wait: Duration,
+    ) -> Result<serde_json::Value, String> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let req_id = format!("ask-{}-{n}", crate::clock::now_ms());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.slots().insert(req_id.clone(), tx);
+        if self.up.send(make(req_id.clone())).is_err() {
+            self.slots().remove(&req_id);
+            return Err("the link to the gateway is closed; nothing was posted".into());
+        }
+        match tokio::time::timeout(wait, rx).await {
+            Ok(Ok(result)) => result,
+            _ => {
+                self.slots().remove(&req_id);
+                Err(format!(
+                    "the gateway did not answer within {}s; nothing was posted",
+                    wait.as_secs()
+                ))
+            }
+        }
+    }
+
+    /// The gateway answered. An answer nobody waits for any more (timed out) is dropped.
+    pub fn answer(&self, req_id: &str, result: Result<serde_json::Value, String>) {
+        if let Some(tx) = self.slots().remove(req_id) {
+            let _ = tx.send(result);
+        }
+    }
+
+    fn slots(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, AnswerSlot>> {
+        self.waiting.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
 /// Answers a machine sends up the link (see [`LinkFrame::ProjectSet`]). Shared by every connection this
 /// machine has had, so an answer queued while the link was down goes out on the next one.
 pub type Uplink = Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<LinkFrame>>>;
@@ -1267,5 +1337,48 @@ mod tests {
         // A config that can't start is exactly when status needs to give the reason (without opening the logs)
         let broken = line(&[], &Access::default());
         assert!(broken.starts_with("Role: can't tell"), "{broken}");
+    }
+}
+
+#[cfg(test)]
+mod gateway_ask_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn an_answer_is_matched_to_its_request() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let ask = GatewayAsk::new(tx);
+        let a2 = ask.clone();
+        let waiter = tokio::spawn(async move {
+            a2.ask(|id| LinkFrame::ListChannels { req_id: id, channel_id: None }).await
+        });
+        let Some(LinkFrame::ListChannels { req_id, .. }) = rx.recv().await else {
+            panic!("no request went up")
+        };
+        ask.answer(&req_id, Ok(serde_json::json!({"channels": []})));
+        assert_eq!(waiter.await.unwrap().unwrap()["channels"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn no_answer_is_an_error_naming_the_wait() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let e = GatewayAsk::new(tx)
+            .ask_within(
+                |id| LinkFrame::ListChannels { req_id: id, channel_id: None },
+                Duration::from_millis(30),
+            )
+            .await;
+        assert!(e.unwrap_err().contains("did not answer"));
+    }
+
+    #[test]
+    fn the_full_wait_is_15s() {
+        assert_eq!(GATEWAY_ANSWER_WAIT, Duration::from_secs(15));
+    }
+
+    #[tokio::test]
+    async fn an_answer_nobody_waits_for_is_dropped() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        GatewayAsk::new(tx).answer("nobody", Ok(serde_json::Value::Null));
     }
 }

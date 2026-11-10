@@ -904,6 +904,10 @@ impl Bridge {
         // Whether the link to the gateway is up right now; the link itself keeps it current
         let link_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let uplink: machine::Uplink = Arc::new(tokio::sync::Mutex::new(up_rx));
+        // Tool calls that need the gateway's answer. Only where there is a gateway to ask: this Bridge
+        // is one (it accepts machines) or is linked to one
+        let gateway_ask = (wiring.children.is_some() || up_is_linked)
+            .then(|| machine::GatewayAsk::new(up_tx.clone()));
         // Via Relay the bot token **comes in the handshake**, so the Api can only be built after it.
         // This is the only ordering difference from a direct connection.
         let (bot_token, link_home, gateway_name, relay_rx) = match &mode {
@@ -967,6 +971,7 @@ impl Bridge {
                 slack: api.clone(),
                 state_dir: dir.path().to_path_buf(),
                 dispo: dispo_tx,
+                ask: gateway_ask.clone(),
             }),
             hook_tx,
         )
@@ -1063,6 +1068,7 @@ impl Bridge {
                     left: left_tx.clone(),
                     arriving: arriving_tx.clone(),
                     updated: updated_tx.clone(),
+                    asker: gateway_ask.clone(),
                 };
                 let mut down_rx = down_rx;
                 tokio::spawn(async move {
@@ -1171,6 +1177,7 @@ impl Bridge {
                     left: left_tx.clone(),
                     arriving: arriving_tx.clone(),
                     updated: updated_tx.clone(),
+                    asker: gateway_ask.clone(),
                 };
                 tokio::spawn(async move {
                     while let Some(item) = rx.recv().await {
@@ -1544,6 +1551,8 @@ struct RelaySinks {
     arriving: mpsc::Sender<ArrivingThread>,
     /// A new binary is in place: the main loop restarts into it (the reason goes in the log).
     updated: mpsc::Sender<String>,
+    /// Tool calls waiting for the gateway's answer.
+    asker: Option<machine::GatewayAsk>,
 }
 
 /// Tell the gateway where this machine works for each of its channels. The folders are **this machine's
@@ -1680,6 +1689,7 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
         left,
         arriving,
         updated,
+        asker,
     } = sinks;
     match item {
         machine::FromRelay::Event { name, event } => {
@@ -1823,9 +1833,10 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
             });
         }
         // Asks between channels. Wired up in the steps that use them
-        machine::FromRelay::AskAnswer { req_id, .. } => {
-            LogCtx::default().debug("bridge", &format!("ask answer {req_id}: nobody waiting"));
-        }
+        machine::FromRelay::AskAnswer { req_id, result } => match asker {
+            Some(a) => a.answer(&req_id, result),
+            None => LogCtx::default().debug("bridge", &format!("ask answer {req_id}: nobody waiting")),
+        },
         machine::FromRelay::AgentMessage(d) => {
             LogCtx::default().debug("bridge", &format!("agent message for {}:{} dropped", d.channel, d.thread_ts));
         }
@@ -2216,7 +2227,7 @@ mod tests {
         let (reload, mut reload_rx) = mpsc::channel(4);
         let (relink, _relink_rx) = mpsc::channel(4);
         let (up, mut up_rx) = mpsc::unbounded_channel();
-        let sinks = RelaySinks { msg_tx, click_tx, dir: dir.clone(), reload, relink, up, machine: "desk".into(), gateway_url: String::new(), left: mpsc::channel(4).0, arriving: mpsc::channel(4).0, updated: mpsc::channel(4).0 };
+        let sinks = RelaySinks { msg_tx, click_tx, dir: dir.clone(), reload, relink, up, machine: "desk".into(), gateway_url: String::new(), left: mpsc::channel(4).0, arriving: mpsc::channel(4).0, updated: mpsc::channel(4).0, asker: None };
         let ask = |path: &str| machine::FromRelay::SetProject {
             channel: "C1".into(),
             thread_ts: "1.1".into(),
@@ -2268,6 +2279,7 @@ mod tests {
             left: mpsc::channel(4).0,
             arriving: mpsc::channel(4).0,
             updated: mpsc::channel(4).0,
+            asker: None,
         };
         pump_relay(
             machine::FromRelay::Linked {
@@ -4509,7 +4521,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let dir = crate::state_dir::StateDir::at(base.join("state"));
         let (up, mut up_rx) = mpsc::unbounded_channel();
-        let sinks = RelaySinks { msg_tx: mpsc::channel(4).0, click_tx: mpsc::channel(4).0, dir: dir.clone(), reload: mpsc::channel(4).0, relink: mpsc::channel(4).0, up, machine: "desk".into(), gateway_url: String::new(), left: mpsc::channel(4).0, arriving: mpsc::channel(4).0, updated: mpsc::channel(4).0 };
+        let sinks = RelaySinks { msg_tx: mpsc::channel(4).0, click_tx: mpsc::channel(4).0, dir: dir.clone(), reload: mpsc::channel(4).0, relink: mpsc::channel(4).0, up, machine: "desk".into(), gateway_url: String::new(), left: mpsc::channel(4).0, arriving: mpsc::channel(4).0, updated: mpsc::channel(4).0, asker: None };
         let target = base.join("a/b").to_string_lossy().to_string();
         let ask = |create| machine::FromRelay::SetProject {
             channel: "C1".into(),
