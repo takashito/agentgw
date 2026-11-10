@@ -4273,7 +4273,14 @@ impl Fleet {
         use crate::bridge::state::{AskState, AskedFrom};
         let note = "The reply arrives as a message in your thread. Do not poll or wait.";
         if let Some(thread) = to_thread {
-            let row = self.asks.lock().await.get(thread).map(|(_, r)| r.clone());
+            // The thread must be the one asked **in that channel** (a ts is only unique within a channel)
+            let row = self
+                .asks
+                .lock()
+                .await
+                .get(thread)
+                .filter(|(ch, _)| ch == to_channel)
+                .map(|(_, r)| r.clone());
             let online = self.thread_online(to_channel, thread).await;
             check_follow_up(row.as_ref(), from_channel, from_thread, online)?;
             let shown = format!("{}\n\n{text}", self.ask_heading(from_channel, from_thread).await);
@@ -8425,6 +8432,18 @@ mod ask_tests {
         r.fleet.ask("C1", "1.1", "C2", Some(thread), "second").await.unwrap();
         assert_eq!(r.msgs.try_recv().unwrap().text, "second");
         assert!(r.fleet.ask("C9", "9.9", "C2", Some(thread), "x").await.is_err(), "another thread may not follow up");
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_naming_the_wrong_channel_is_refused() {
+        let mut r = rig("wrongch", FakeChat::in_channels(&[("C2", "lead"), ("C3", "other")]), &["C2", "C3"]);
+        let out = r.fleet.ask("C1", "1.1", "C2", None, "first").await.unwrap();
+        let _ = r.msgs.try_recv();
+        let thread = out["thread_ts"].as_str().unwrap();
+        let before = calls(&r.api).len();
+        assert!(r.fleet.ask("C1", "1.1", "C3", Some(thread), "second").await.is_err());
+        assert_eq!(calls(&r.api).len(), before, "nothing posted");
+        assert_eq!(r.fleet.asks.lock().await[thread].0, "C2", "the record keeps its channel");
     }
 
     #[tokio::test]

@@ -594,6 +594,9 @@ impl Bridge {
     /// Settle it: otherwise the unanswered messages keep the silence watchdog armed and
     /// "is thinking…" stays up on a turn that is already over.
     pub(super) fn settle_told(&mut self, key: &ThreadKey) {
+        // Callers that know the reason tell the asking agent first; anything still owed here
+        // ends without one
+        self.tell_asker(key, "failed", "the request could not be handled".into());
         self.stall.remove(key);
         self.presence_remove(key, &Reason::Turn);
         self.ledger.dispose_all(key);

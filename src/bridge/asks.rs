@@ -168,6 +168,7 @@ pub fn dead_end_line(outcome: &str, detail: &str) -> String {
         "exited" => "A person ended this exchange. Ask in a new thread if you need more.".into(),
         "refused" => format!("The other agent could not take the request ({detail})."),
         "deleted" => "The other thread was deleted.".into(),
+        "closed" => "The other thread was closed before it answered.".into(),
         "offline" => OFFLINE_LINE.into(),
         other => format!("The other agent ended without a reply ({other})."),
     }

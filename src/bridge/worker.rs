@@ -509,6 +509,9 @@ impl Bridge {
             session_id: sid.map(str::to_string),
             thread_key: Some(key.clone()),
         };
+        // An agent in another channel still waiting on this thread hears it was closed (an exit has
+        // already told it, so this only speaks for the other ways a thread ends)
+        self.tell_asker(key, "closed", String::new());
         // 1. Drop unanswered messages **before** kill. Kill with them left and the agent-reclaim path
         // that sees the disconnect reads it as "lost a reply" and cold-spawns a replacement
         self.ledger.dispose_all(key);

@@ -2724,6 +2724,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_request_settled_without_a_reply_tells_the_asker() {
+        let (mut b, mut up, _sid) = asked_thread("ask-settled").await;
+        b.settle_told(&ThreadKey::new("C_ADMIN", ROOT));
+        assert_eq!(replies_up(&mut up).first().map(|(o, _)| o.clone()), Some("failed".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_thread_closed_under_a_request_tells_the_asker() {
+        let (mut b, mut up, _sid) = asked_thread("ask-terminated").await;
+        b.terminate(&ThreadKey::new("C_ADMIN", ROOT), None, None).await;
+        assert_eq!(replies_up(&mut up).first().map(|(o, _)| o.clone()), Some("closed".to_string()));
+    }
+
+    #[tokio::test]
     async fn a_reply_without_ids_still_answers_the_ask() {
         let (mut b, mut up, sid) = asked_thread("ask-noids").await;
         b.on_disposition(dispo("reply", &[], Some("all done"), &sid)).await;
