@@ -61,6 +61,29 @@ pub struct InboundMsg {
     /// Set when **a person renamed this thread's session** in Slack. Nothing is delivered to the
     /// agent — the Bridge notes that the name is theirs now and stops renaming it.
     pub session_title: Option<String>,
+    /// Set when this came from **an agent in another channel**, not from Slack. The gateway only
+    /// makes one after its own checks (the Owner's Run, a follow-up on an approved exchange, or a
+    /// reply going back), so it is not gated, not counted by the loop guard, and never a command.
+    pub from_agent: Option<AgentOrigin>,
+}
+
+/// The other end of an exchange between agents.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentOrigin {
+    pub channel: Option<String>,
+    pub thread_ts: Option<String>,
+    pub kind: DeliveryKind,
+    pub needs_human: bool,
+}
+
+/// What one delivery between agents is: a request to the asked thread, or something going back to
+/// the asking thread (its reply, or a notice that no reply is coming).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryKind {
+    Ask,
+    Reply,
+    Notice,
 }
 
 /// One edit. `revision` is Slack's `edited.ts` (marks the same edit being redelivered).

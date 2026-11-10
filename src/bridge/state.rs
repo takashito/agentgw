@@ -253,6 +253,10 @@ pub struct AskedFrom {
     /// A person closed the asking thread (`exit`): replies are no longer delivered there.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub origin_closed: bool,
+    /// The request, whole, while it waits for Run. Delivered from here when the Owner presses it, so
+    /// a press after a restart still has the text; cleared once delivered or rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<String>,
 }
 
 fn no_missed(n: &u32) -> bool {
@@ -504,6 +508,7 @@ impl Threads {
                     deleted_ts: None,
                     edited: None,
                     session_title: None,
+                    from_agent: None,
                 })
             })
             .collect()
@@ -584,6 +589,23 @@ impl Threads {
             .entry(thread_ts.to_string())
             .or_default()
             .bridge = Some(bridge_id.to_string());
+    }
+
+    /// Every asked thread: its ts → (its channel, where it was asked from). What the gateway starts from.
+    pub fn asked(&self) -> std::collections::HashMap<String, (String, AskedFrom)> {
+        self.entries
+            .iter()
+            .filter_map(|(ts, e)| Some((ts.clone(), (e.channel_id.clone()?, e.asked_from.clone()?))))
+            .collect()
+    }
+
+    /// Write (or with `None`, clear) where a thread was asked from, leaving the rest of the row alone.
+    pub fn set_asked(&mut self, thread_ts: &str, channel: &str, asked_from: Option<AskedFrom>) {
+        let e = self.entries.entry(thread_ts.to_string()).or_default();
+        if e.channel_id.is_none() {
+            e.channel_id = Some(channel.to_string());
+        }
+        e.asked_from = asked_from;
     }
 
     /// Every thread that went to machine `from` goes to `to` now. Nothing else on the rows changes.
@@ -2197,6 +2219,7 @@ mod tests {
             deleted_ts: None,
             edited: None,
             session_title: None,
+            from_agent: None,
         };
         assert!(t.threads_with_pending().is_empty());
         t.enqueue_pending("1.0", "C1", &msg("1.1", "ひとつ目"));
@@ -3019,7 +3042,7 @@ mod ask_record_tests {
         let e: ThreadEntry = serde_json::from_str(raw).unwrap();
         let a = e.asked_from.clone().unwrap();
         assert_eq!((a.channel.as_str(), a.thread_ts.as_str(), a.state), ("C1", "1.1", AskState::Approved));
-        assert!(!a.outstanding && a.missed == 0 && !a.origin_closed);
+        assert!(!a.outstanding && a.missed == 0 && !a.origin_closed && a.request.is_none());
         let back = serde_json::to_value(&e).unwrap();
         assert_eq!(back["zzz"], 1);
         assert_eq!(back["askedFrom"]["state"], "approved");

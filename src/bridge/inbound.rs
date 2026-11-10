@@ -1721,6 +1721,7 @@ mod tests {
             deleted_ts: None,
             edited: None,
             session_title: None,
+            from_agent: None,
         }
     }
 

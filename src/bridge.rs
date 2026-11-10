@@ -819,6 +819,12 @@ impl Bridge {
         match note {
             RouteNote::Thread { thread_ts, machine } => self.remember_thread_route(&thread_ts, &machine),
             RouteNote::Renamed { from, to } => self.rename_thread_routes(&from, &to),
+            RouteNote::Asked { channel, thread_ts, asked_from } => {
+                self.threads.set_asked(&thread_ts, &channel, asked_from);
+                if let Err(e) = self.threads.save() {
+                    LogCtx::default().error("bridge", &format!("threads.json save failed: {e}"));
+                }
+            }
         }
     }
 
@@ -1045,6 +1051,7 @@ impl Bridge {
                 to_self: down_tx.clone(),
                 tunnels: Default::default(),
                 renaming: Default::default(),
+                asks: tokio::sync::Mutex::new(crate::bridge::state::Threads::load(&dir).asked()),
             });
             // One listener per address: loopback for whatever terminates TLS in front, the LAN address
             // for machines on the same network
@@ -2115,6 +2122,7 @@ mod tests {
             deleted_ts: None,
             edited: None,
             session_title: None,
+            from_agent: None,
         };
         let deleted = InboundMsg {
             deleted_ts: Some("1.1".into()),
@@ -2465,6 +2473,7 @@ mod tests {
             deleted_ts: None,
             edited: None,
             session_title: None,
+            from_agent: None,
         }
     }
 

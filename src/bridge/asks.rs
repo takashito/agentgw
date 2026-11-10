@@ -5,15 +5,7 @@
 
 pub use crate::bridge::state::{AskState, AskedFrom};
 
-/// What one delivery between agents is: a request to the asked thread, or something going back to
-/// the asking thread (its reply, or a notice that no reply is coming).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DeliveryKind {
-    Ask,
-    Reply,
-    Notice,
-}
+pub use crate::chat::DeliveryKind;
 
 /// One message from an agent for an agent, as the gateway hands it to the machine that runs the thread.
 ///
@@ -32,6 +24,34 @@ pub struct AgentDelivery {
     pub kind: DeliveryKind,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub needs_human: bool,
+}
+
+impl From<AgentDelivery> for crate::chat::InboundMsg {
+    fn from(d: AgentDelivery) -> Self {
+        crate::chat::InboundMsg {
+            channel: d.channel,
+            channel_kind: crate::chat::ChannelKind::Channel,
+            ts: d.ts,
+            thread_ts: Some(d.thread_ts),
+            user: None,
+            is_bot: false,
+            bot_id: None,
+            text: d.text,
+            files: Vec::new(),
+            file_paths: Vec::new(),
+            file_errors: Vec::new(),
+            reaction: None,
+            deleted_ts: None,
+            edited: None,
+            session_title: None,
+            from_agent: Some(crate::chat::AgentOrigin {
+                channel: d.origin_channel,
+                thread_ts: d.origin_thread,
+                kind: d.kind,
+                needs_human: d.needs_human,
+            }),
+        }
+    }
 }
 
 /// Whether a follow-up from `from_channel`/`from_thread` may go into the asked thread whose record is
@@ -203,6 +223,7 @@ mod decision_tests {
             outstanding: false,
             missed: 0,
             origin_closed: false,
+            request: None,
         }
     }
 
