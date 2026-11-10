@@ -76,6 +76,7 @@ pub fn envelope_guarded(
                 crate::chat::DeliveryKind::Ask => crate::agent::ASKED_NOTE,
                 _ => crate::agent::ANSWER_NOTE,
             },
+            quotes: o.quotes.clone(),
         }),
     }
     .render()

@@ -24,6 +24,9 @@ pub struct AgentDelivery {
     pub kind: DeliveryKind,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub needs_human: bool,
+    /// The Owner's posts the request linked to, fetched and author-checked by the gateway ([`owner_links`]).
+    #[serde(default, skip_serializing_if = "crate::chat::OwnerQuotes::is_empty")]
+    pub quotes: crate::chat::OwnerQuotes,
 }
 
 impl From<AgentDelivery> for crate::chat::InboundMsg {
@@ -49,6 +52,7 @@ impl From<AgentDelivery> for crate::chat::InboundMsg {
                 thread_ts: d.origin_thread,
                 kind: d.kind,
                 needs_human: d.needs_human,
+                quotes: d.quotes,
             }),
         }
     }
@@ -227,6 +231,117 @@ pub fn request_title(title: Option<&str>, text: &str) -> String {
     raw.chars().take(59).chain(['…']).collect()
 }
 
+/// How many linked posts one request may have checked (each costs a Slack call).
+pub const OWNER_LINKS_MAX: usize = 3;
+
+/// A Slack message link found in a request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageLink {
+    /// The link as written (up to the end of its query string).
+    pub url: String,
+    pub channel: String,
+    pub ts: String,
+    /// The thread it is in: `thread_ts` from the query, else the message itself.
+    pub thread_ts: String,
+}
+
+/// The Slack message links in `text` (`https://<ws>.slack.com/archives/<C>/p<16 digits>[?…]`), first
+/// [`OWNER_LINKS_MAX`] distinct ones. Also finds them inside `<…|…>` and Markdown links.
+pub fn owner_links(text: &str) -> Vec<MessageLink> {
+    let mut out: Vec<MessageLink> = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("https://") {
+        let tail = &rest[at..];
+        let end = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, '>' | '|' | ')' | '<' | '"' | '\'' | ']'))
+            .unwrap_or(tail.len());
+        let url = &tail[..end];
+        rest = &tail[end.max(1)..];
+        let Some(link) = parse_message_link(url) else { continue };
+        if !out.iter().any(|l| l.channel == link.channel && l.ts == link.ts) {
+            out.push(link);
+        }
+        if out.len() == OWNER_LINKS_MAX {
+            break;
+        }
+    }
+    out
+}
+
+fn parse_message_link(url: &str) -> Option<MessageLink> {
+    let after = url.strip_prefix("https://")?;
+    let (host, path) = after.split_once('/')?;
+    if !host.ends_with(".slack.com") {
+        return None;
+    }
+    let (path, query) = path.split_once('?').unwrap_or((path, ""));
+    let mut parts = path.trim_end_matches('/').split('/');
+    if parts.next()? != "archives" {
+        return None;
+    }
+    let channel = parts.next()?;
+    let p = parts.next()?.strip_prefix('p')?;
+    if parts.next().is_some()
+        || channel.is_empty()
+        || !channel.chars().all(|c| c.is_ascii_alphanumeric())
+        || p.len() != 16
+        || !p.chars().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    let ts = format!("{}.{}", &p[..10], &p[10..]);
+    // `&amp;` when the link was copied out of Slack's own escaped text
+    let thread_ts = query
+        .replace("&amp;", "&")
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("thread_ts=").map(str::to_string))
+        .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit() || c == '.'))
+        .unwrap_or_else(|| ts.clone());
+    Some(MessageLink { url: url.to_string(), channel: channel.to_string(), ts, thread_ts })
+}
+
+/// Longest stretch of a quoted post handed on (a long post would crowd out the request).
+const QUOTE_MAX_CHARS: usize = 2000;
+
+/// The Owner's post at `link` among `thread` (its thread, as Slack returned it), or why it is not one.
+/// Only a post **written by `owner`** counts; the post before it comes along as context.
+pub fn pick_owner_post(
+    thread: &[crate::chat::FetchedMsg],
+    link: &MessageLink,
+    owner: &str,
+) -> Result<crate::chat::OwnerQuote, &'static str> {
+    if owner.is_empty() {
+        return Err("no Owner is set");
+    }
+    let mut rows: Vec<&crate::chat::FetchedMsg> = thread.iter().collect();
+    rows.sort_by(|a, b| a.ts.cmp(&b.ts));
+    let at = rows.iter().position(|m| m.ts == link.ts).ok_or("the post was not found")?;
+    let m = rows[at];
+    if m.user != owner {
+        return Err("the post is not the Owner's");
+    }
+    let cut = |t: &str| truncate_chars(t, QUOTE_MAX_CHARS);
+    Ok(crate::chat::OwnerQuote {
+        user: m.user.clone(),
+        channel: link.channel.clone(),
+        ts: m.ts.clone(),
+        permalink: link.url.clone(),
+        text: cut(&m.text),
+        before: at.checked_sub(1).map(|i| crate::chat::QuotedPost {
+            user: rows[i].user.clone(),
+            ts: rows[i].ts.clone(),
+            text: cut(&rows[i].text),
+        }),
+    })
+}
+
+fn truncate_chars(t: &str, max: usize) -> String {
+    if t.chars().count() <= max {
+        return t.to_string();
+    }
+    t.chars().take(max).chain(['…']).collect()
+}
+
 /// [`notify_targets`] for a thread that is about to ask: itself, and the top of its chain.
 /// One target when it is the top. Only the top mentions the Owner.
 pub fn notify_targets_from(
@@ -294,6 +409,7 @@ mod frame_tests {
             origin_thread: Some("1.1".into()),
             kind: super::DeliveryKind::Ask,
             needs_human: false,
+            quotes: Default::default(),
         };
         let f = LinkFrame::AgentMessage { msg: serde_json::to_value(&d).unwrap() };
         match crate::bridge::machine::FromRelay::of(f) {
@@ -496,5 +612,88 @@ mod title_tests {
         let t = request_title(None, &"あ".repeat(100));
         assert_eq!(t.chars().count(), 60);
         assert!(t.ends_with('…'));
+    }
+}
+
+#[cfg(test)]
+mod owner_link_tests {
+    use super::*;
+    use crate::chat::FetchedMsg;
+
+    fn post(ts: &str, user: &str, text: &str) -> FetchedMsg {
+        FetchedMsg { ts: ts.into(), user: user.into(), text: text.into(), thread_ts: Some("1700000001.000100".into()) }
+    }
+
+    #[test]
+    fn finds_message_links_in_any_wrapping() {
+        let text = "OK: https://ws.slack.com/archives/C0AAAAAAAAA/p1700000003000300?thread_ts=1700000001.000100&cid=C0AAAAAAAAA\n\
+                    and <https://ws.slack.com/archives/C0BBBBBBBBB/p1700000000000900|the thread> \
+                    and [this](https://ws.slack.com/archives/C1/p1700000005000500?thread_ts=1700000001.000100&amp;cid=C1) \
+                    again https://ws.slack.com/archives/C0AAAAAAAAA/p1700000003000300 \
+                    not https://evil.example.com/archives/C1/p1700000005000500 nor https://ws.slack.com/archives/C1/p123 \
+                    a fourth https://ws.slack.com/archives/C2/p1700000005000500";
+        let got = owner_links(text);
+        let ids: Vec<(&str, &str, &str)> =
+            got.iter().map(|l| (l.channel.as_str(), l.ts.as_str(), l.thread_ts.as_str())).collect();
+        assert_eq!(
+            ids,
+            vec![
+                ("C0AAAAAAAAA", "1700000003.000300", "1700000001.000100"),
+                ("C0BBBBBBBBB", "1700000000.000900", "1700000000.000900"),
+                ("C1", "1700000005.000500", "1700000001.000100"),
+            ],
+            "duplicates, other hosts and short ids are skipped; at most {OWNER_LINKS_MAX}"
+        );
+        assert_eq!(got[1].url, "https://ws.slack.com/archives/C0BBBBBBBBB/p1700000000000900");
+    }
+
+    #[test]
+    fn only_the_owners_own_post_is_taken() {
+        let link = owner_links("https://ws.slack.com/archives/C9/p1700000005000500?thread_ts=1700000001.000100").remove(0);
+        let thread = vec![
+            post("1700000005.000500", "U_OWNER", "go ahead"),
+            post("1700000001.000100", "U_OWNER", "sort this out"),
+            post("1700000004.000400", "U_BOT", "may I start?"),
+        ];
+        let q = pick_owner_post(&thread, &link, "U_OWNER").unwrap();
+        assert_eq!((q.user.as_str(), q.ts.as_str(), q.text.as_str()), ("U_OWNER", "1700000005.000500", "go ahead"));
+        assert_eq!(q.channel, "C9");
+        assert_eq!(q.permalink, link.url);
+        // The post just before it (by time, whatever order Slack gave) comes along as context
+        let b = q.before.unwrap();
+        assert_eq!((b.user.as_str(), b.text.as_str()), ("U_BOT", "may I start?"));
+
+        // Someone else's post, a missing post, or no Owner set: refused
+        let bot = owner_links("https://ws.slack.com/archives/C9/p1700000004000400?thread_ts=1700000001.000100").remove(0);
+        assert_eq!(pick_owner_post(&thread, &bot, "U_OWNER").unwrap_err(), "the post is not the Owner's");
+        let gone = owner_links("https://ws.slack.com/archives/C9/p1700000009000000").remove(0);
+        assert_eq!(pick_owner_post(&thread, &gone, "U_OWNER").unwrap_err(), "the post was not found");
+        assert_eq!(pick_owner_post(&thread, &link, "").unwrap_err(), "no Owner is set");
+        // A root post has nothing before it
+        let root = owner_links("https://ws.slack.com/archives/C9/p1700000001000100").remove(0);
+        assert!(pick_owner_post(&thread, &root, "U_OWNER").unwrap().before.is_none());
+    }
+
+    #[test]
+    fn quotes_ride_the_wire_and_reach_the_envelope() {
+        let d = AgentDelivery {
+            channel: "C2".into(),
+            thread_ts: "2.1".into(),
+            ts: "2.1".into(),
+            text: "deploy".into(),
+            origin_channel: Some("C1".into()),
+            origin_thread: Some("1.1".into()),
+            kind: DeliveryKind::Ask,
+            needs_human: false,
+            quotes: crate::chat::OwnerQuotes { verified: Vec::new(), unverified: vec!["https://x".into()] },
+        };
+        let back: AgentDelivery = serde_json::from_value(serde_json::to_value(&d).unwrap()).unwrap();
+        assert_eq!(back, d);
+        // An older gateway's frame (no `quotes`) still reads
+        let old = serde_json::json!({"channel":"C2","thread_ts":"2.1","ts":"2.1","text":"x","kind":"ask"});
+        assert!(serde_json::from_value::<AgentDelivery>(old).unwrap().quotes.is_empty());
+        let msg: crate::chat::InboundMsg = d.into();
+        let env = crate::bridge::inbound::envelope(&msg, "2.1", None, 0);
+        assert!(env.contains("could not verify this link as the Owner's own post, so it is not one: https://x"), "{env}");
     }
 }

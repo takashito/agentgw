@@ -4445,6 +4445,33 @@ impl Fleet {
 
     // ── Asks between channels ─────────────────────────────────────────────────
 
+    /// The Owner's posts that `text` links to, each fetched from Slack and kept only when the
+    /// Owner wrote it. A link that fails the check is named in `unverified`, not dropped silently.
+    async fn owner_quotes(&self, text: &str) -> crate::chat::OwnerQuotes {
+        use crate::bridge::asks::{owner_links, pick_owner_post};
+        let links = owner_links(text);
+        let mut out = crate::chat::OwnerQuotes::default();
+        if links.is_empty() {
+            return out;
+        }
+        let owner = self.access().owner;
+        for link in links {
+            // Up to 200 posts of its thread: the post itself and the one before it
+            let got = match self.api.replies(&link.channel, &link.thread_ts, 200).await {
+                Ok(thread) => pick_owner_post(&thread, &link, &owner),
+                Err(_) => Err("Slack did not return it"),
+            };
+            match got {
+                Ok(q) => out.verified.push(q),
+                Err(why) => {
+                    rlog("info", &format!("ask: link {}:{} not taken as the Owner's: {why}", link.channel, link.ts));
+                    out.unverified.push(link.url);
+                }
+            }
+        }
+        out
+    }
+
     /// An agent in `from_channel`/`from_thread` asks the agent in `to_channel` for something: a new
     /// thread there, or a follow-up in `to_thread`. Returns what the asking tool gets back.
     pub(crate) async fn ask(
@@ -4461,6 +4488,9 @@ impl Fleet {
         let note = "The reply arrives as a message in your thread. Do not poll or wait.";
         let given = title.map(str::trim).filter(|t| !t.is_empty());
         let title = crate::bridge::asks::request_title(title, text);
+        // The Owner's posts the request links to, checked here against Slack — the only way the
+        // Owner's own words reach the asked agent as theirs
+        let quotes = self.owner_quotes(text).await;
         if let Some(thread) = to_thread {
             // The thread must be the one asked **in that channel** (a ts is only unique within a channel)
             let row = self
@@ -4486,6 +4516,7 @@ impl Fleet {
                 origin_thread: Some(from_thread.to_string()),
                 kind: DeliveryKind::Ask,
                 needs_human: false,
+                quotes: quotes.clone(),
             })
             .await?;
             self.edit_ask(to_channel, thread, |r| r.outstanding = true).await;
@@ -4534,6 +4565,7 @@ impl Fleet {
                 origin_thread: Some(from_thread.to_string()),
                 kind: DeliveryKind::Ask,
                 needs_human: false,
+                quotes: quotes.clone(),
             })
             .await;
         if let Err(why) = delivered {
@@ -4592,6 +4624,7 @@ impl Fleet {
                 origin_thread: Some(from_thread.to_string()),
                 kind: DeliveryKind::End,
                 needs_human: false,
+                quotes: Default::default(),
             })
             .await;
         rlog("info", &format!("ask {to_channel}:{to_thread}: ended by {from_channel}:{from_thread}"));
@@ -4667,6 +4700,7 @@ impl Fleet {
             origin_thread: None,
             kind: crate::chat::DeliveryKind::Notice,
             needs_human: false,
+            quotes: Default::default(),
         };
         match self.deliver_agent(d).await {
             Ok(()) => true,
@@ -4862,6 +4896,7 @@ impl Fleet {
             origin_thread: Some(thread.to_string()),
             kind,
             needs_human,
+            quotes: Default::default(),
         };
         if let Err(e) = self.deliver_agent(d).await {
             rlog("info", &format!("ask: the asker {}:{} is away ({e}); counted for later", row.channel, row.thread_ts));
@@ -9269,6 +9304,7 @@ mod ask_tests {
             origin_thread: None,
             kind: DeliveryKind::Ask,
             needs_human: false,
+            quotes: Default::default(),
         };
         r.fleet.thread_routes.lock().await.insert("2.1".into(), "pve".into());
         assert!(r.fleet.deliver_agent(d("2.1")).await.unwrap_err().contains("update"));

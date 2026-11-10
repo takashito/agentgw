@@ -2592,6 +2592,7 @@ mod tests {
             origin_thread: Some("1781000000.000100".into()),
             kind,
             needs_human: false,
+            quotes: Default::default(),
         }
         .into()
     }
@@ -2611,6 +2612,7 @@ mod tests {
                 origin_thread: Some("1781000000.000100".into()),
                 kind: crate::chat::DeliveryKind::Ask,
                 needs_human: false,
+                quotes: Default::default(),
             },
         };
         pump_relay(machine::FromRelay::AgentMessage(d), &sinks).await;

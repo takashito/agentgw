@@ -74,6 +74,47 @@ pub struct AgentOrigin {
     pub thread_ts: Option<String>,
     pub kind: DeliveryKind,
     pub needs_human: bool,
+    /// The Owner's own posts the request linked to, as the gateway fetched them from Slack.
+    pub quotes: OwnerQuotes,
+}
+
+/// The Owner's posts a request between agents linked to, fetched from Slack and author-checked by
+/// the gateway. **Only the gateway makes these** — never from the asking agent's words — so the
+/// agent that receives the request can tell the Owner's own words from another Claude's.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OwnerQuotes {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verified: Vec<OwnerQuote>,
+    /// Links that could not be confirmed as the Owner's (someone else's post, or not found).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unverified: Vec<String>,
+}
+
+impl OwnerQuotes {
+    pub fn is_empty(&self) -> bool {
+        self.verified.is_empty() && self.unverified.is_empty()
+    }
+}
+
+/// One post by the Owner, with the post just before it in its thread (a short "go ahead" names
+/// what it agrees to only through what it answers).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OwnerQuote {
+    pub user: String,
+    pub channel: String,
+    pub ts: String,
+    pub permalink: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<QuotedPost>,
+}
+
+/// A post shown as context only: whoever wrote it, its words are not the Owner's consent.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QuotedPost {
+    pub user: String,
+    pub ts: String,
+    pub text: String,
 }
 
 /// What one delivery between agents is: a request to the asked thread, or something going back to
