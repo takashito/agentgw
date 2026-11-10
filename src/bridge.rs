@@ -785,6 +785,14 @@ impl Bridge {
                 sid.as_deref().unwrap_or("none")
             ),
         );
+        // A request from another channel's agent is not dropped by the move: it becomes owed, and
+        // goes with the row, so the agent where the thread lands still answers it
+        let asked = self.ledger.from_agent_ids(&key);
+        if !asked.is_empty()
+            && let Some(e) = self.threads.entries.get_mut(thread_ts)
+        {
+            e.ask_owed.extend(asked);
+        }
         // **Down first, then read.** A turn still running would be writing to the very file about to
         // be sent, and half a sentence would arrive
         self.terminate(&key, sid.as_deref(), None).await;
@@ -796,8 +804,13 @@ impl Bridge {
                 self.threads.entries.remove(thread_ts);
             }
             false => {
+                // Where it was asked from stays too: the gateway checks follow-ups and sends replies
+                // back from this record, and it must outlive a restart
+                let kept = self.threads.get(thread_ts).cloned().unwrap_or_default();
                 let left = crate::bridge::state::ThreadEntry {
                     bridge: Some(to.to_string()),
+                    asked_from: kept.asked_from,
+                    ask_owed: kept.ask_owed,
                     ..Default::default()
                 };
                 self.threads.entries.insert(thread_ts.to_string(), left);
@@ -2734,10 +2747,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_thread_closed_under_a_request_tells_the_asker() {
-        let (mut b, mut up, _sid) = asked_thread("ask-terminated").await;
-        b.terminate(&ThreadKey::new("C_ADMIN", ROOT), None, None).await;
-        assert_eq!(replies_up(&mut up).first().map(|(o, _)| o.clone()), Some("closed".to_string()));
+    async fn deleting_the_asked_threads_root_tells_the_asker() {
+        let (mut b, mut up, _sid) = asked_thread("ask-root-gone").await;
+        let mut gone = channel_msg("1782000000.000990", "U_OWNER", "");
+        gone.channel = "C_ADMIN".into();
+        gone.thread_ts = Some(ROOT.into());
+        gone.deleted_ts = Some(ROOT.into());
+        b.on_inbound(&gone).await;
+        assert_eq!(replies_up(&mut up).first().map(|(o, _)| o.clone()), Some("deleted".to_string()));
+    }
+
+    #[tokio::test]
+    async fn moving_an_asked_thread_keeps_the_link_and_tells_nobody() {
+        let (mut b, mut up, sid) = asked_thread("ask-cd").await;
+        b.on_disposition(dispo("ask", &[ROOT], None, &sid)).await; // an answer is owed
+        b.give_up_thread("C_ADMIN", ROOT, "pve", "/srv").await;
+        assert!(replies_up(&mut up).is_empty(), "a move is not a dead end");
+        let row = b.threads.get(ROOT).cloned().expect("the row stays");
+        assert_eq!(row.asked_from.map(|a| a.channel), Some("C_LAN".to_string()));
+        assert_eq!(row.ask_owed, vec![ROOT.to_string()]);
     }
 
     #[tokio::test]

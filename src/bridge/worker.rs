@@ -509,9 +509,6 @@ impl Bridge {
             session_id: sid.map(str::to_string),
             thread_key: Some(key.clone()),
         };
-        // An agent in another channel still waiting on this thread hears it was closed (an exit has
-        // already told it, so this only speaks for the other ways a thread ends)
-        self.tell_asker(key, "closed", String::new());
         // 1. Drop unanswered messages **before** kill. Kill with them left and the agent-reclaim path
         // that sees the disconnect reads it as "lost a reply" and cold-spawns a replacement
         self.ledger.dispose_all(key);
@@ -923,6 +920,8 @@ impl Bridge {
         // waiting are the very agents being killed, so breaking the Stop contract's 5s window
         // hurts nobody (that agent will not answer anymore)
         for (key, sid, _) in &live {
+            // Agents in other channels waiting on these threads hear they are gone
+            self.tell_asker(key, "closed", String::new());
             self.terminate(key, Some(sid.as_str()), None).await;
         }
         // The pool is not covered by `terminate` (it does not belong to any thread yet)
