@@ -135,6 +135,8 @@ flowchart LR
 3. **That machine** hands it to the thread's agent, starting one in the channel's project directory if needed.
 4. **The agent** replies through agentgw's MCP tools, with progress and permission prompts along the way.
 
+An agent has the same MCP servers as a plain `claude` on that machine — your user config, plugins, claude.ai connectors and the directory's `.mcp.json` — plus agentgw's. Servers in a `.mcp.json` are approved without asking, since a prompt would stall the agent.
+
 Only the gateway reads Slack's event stream. Other machines get the bot token over the link and keep it in memory only; the app token never leaves the gateway.
 
 ## Requirements
