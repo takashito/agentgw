@@ -1170,6 +1170,16 @@ impl Bridge {
                 session_id: Some(session.clone()),
                 thread_key: Some(key.clone()),
             };
+            // **A window still starting belongs to the start-up watch** while it runs: it answers
+            // the workspace-trust screen itself, a second or two in. Offering that screen here as
+            // well raced it, and told the asking thread a person was needed for a screen that
+            // was gone a second later (a real machine, 2026-11-10). If the watch ends with the
+            // window still starting, the screen is stuck, and the next round offers it as usual
+            if self.workers.is_starting(&session)
+                && self.spawn_watching.lock().unwrap().contains(&session)
+            {
+                continue;
+            }
             let window = self.workers.window_for(&session);
             let on_screen = screens.get(&session).cloned().flatten();
             // A prompt already up for this window holds the place **only while it still matches

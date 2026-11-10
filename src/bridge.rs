@@ -108,6 +108,12 @@ pub struct Bridge {
     /// One entry per window: a newer prompt for the same window replaces the older one, so a
     /// stale prompt cannot answer a modal that has since changed.
     dialog_pending: HashMap<String, DialogPending>,
+    /// Sessions whose start-up screens are still being watched (`start_spawn_screen_watch`).
+    /// **That watch answers the workspace-trust screen itself**, so while it runs the dialog scan
+    /// leaves a still-starting window alone: offering the same screen to the thread raced the
+    /// watch and told the asking thread a person was needed for a screen answered a second
+    /// later. The watch's task removes its own entry, so this is shared with it.
+    spawn_watching: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// `thread_key\0message_id` → narration fragments whose final hasn't arrived yet.
     narration: HashMap<String, String>,
     /// The hooks settings handed to every agent, rendered once at start-up and **written out on
@@ -330,6 +336,7 @@ impl Bridge {
             perm_pending: HashMap::new(),
             dialog_watch_at_ms: 0,
             dialog_pending: HashMap::new(),
+            spawn_watching: Default::default(),
             narration: HashMap::new(),
             hooks_settings: config.hooks_settings,
             mcp_port: config.mcp_port,
@@ -3301,6 +3308,47 @@ mod tests {
         assert!(
             slack.calls().iter().any(|c| c.starts_with("update_md C1") && c.contains("buttons do nothing")),
             "the prompt it replaced was left looking live: {:?}",
+            slack.calls()
+        );
+    }
+
+    /// **The start-up watch owns a starting window's screen.** It answers the workspace-trust
+    /// screen itself; the scan offering the same screen raced it and told the asking thread a
+    /// person was needed for a screen answered a second later (real machine, 2026-11-10). Once
+    /// the watch has ended with the window still starting, the screen is stuck: offer it.
+    #[tokio::test]
+    async fn a_starting_window_under_the_spawn_watch_is_not_offered_until_the_watch_ends() {
+        let (d, slack, agent, clock) = flow_deps("spawn-watch-trust");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let sid = running_thread(&mut b, &agent).await;
+        settle().await;
+        // Back to the moment before the first prompt: still starting, the watch still running
+        b.workers.mark_starting(&sid);
+        b.spawn_watching.lock().unwrap().insert(sid.clone());
+        *agent.dialog.lock().unwrap() = Some(crate::agent::Dialog {
+            title: "Quick safety check: Is this a project you created or one you trust?".into(),
+            footer: "Enter to confirm \u{b7} Esc to cancel".into(),
+            options: vec!["No, exit".into(), "Yes, I trust this folder".into()],
+            details: vec![String::new(), String::new()],
+            asked: false,
+            selected: 0,
+        });
+        b.stall.clear();
+        clock.advance(30_000);
+        b.dialog_tick().await;
+        assert!(
+            !slack.calls().iter().any(|c| c.starts_with("dialog C1")),
+            "the screen the start-up watch answers was offered to the thread: {:?}",
+            slack.calls()
+        );
+
+        // The watch ran out and the window never took its first prompt: a stuck screen
+        b.spawn_watching.lock().unwrap().remove(&sid);
+        clock.advance(30_000);
+        b.dialog_tick().await;
+        assert!(
+            slack.calls().iter().any(|c| c.starts_with("dialog C1") && c.contains("trust this folder")),
+            "a trust screen left after the watch was never offered: {:?}",
             slack.calls()
         );
     }

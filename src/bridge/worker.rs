@@ -1363,10 +1363,14 @@ impl Bridge {
         let (tx, w, ctx) = (self.cmd_tx.clone(), w.clone(), ctx.clone());
         let session_id = session_id.to_string();
         let agent = self.deps.agent.clone();
+        // While this runs, the dialog scan keeps off the window (`decide_dialogs`)
+        let watching = self.spawn_watching.clone();
+        watching.lock().unwrap().insert(session_id.clone());
         tokio::spawn(async move {
             let out = agent
                 .watch_spawn_screens(&w, SPAWN_SCREEN_BUDGET_MS, SPAWN_SCREEN_POLL_MS, &ctx)
                 .await;
+            watching.lock().unwrap().remove(&session_id);
             // Windows that start normally come here every time — only a rejection or an exit is worth waking main for
             if matches!(
                 out,
