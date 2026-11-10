@@ -658,6 +658,11 @@ impl Bridge {
         // This comes **after** commands so stop/restart/logout still work at the limit
         if self.deps.clock.now_ms() < self.limited_until_ms {
             let text = super::turn::limited_notice(self.limited_until_ms);
+            // A request from another channel's agent is turned away too: that agent hears why
+            if from_agent.as_ref().is_some_and(|o| o.kind == crate::chat::DeliveryKind::Ask) {
+                self.ledger.track_from_agent(&key, &msg.ts);
+                self.tell_asker(&key, "refused", "usage limit".into());
+            }
             self.post(&msg.channel, &root_ts, text, &key);
             return;
         }
@@ -725,6 +730,7 @@ impl Bridge {
             && !self.deps.agent.workdir_exists(&cwd)
         {
             ctx(None).error("bridge", &format!("project folder {cwd} is missing — not starting an agent"));
+            self.tell_asker(&key, "refused", format!("the project folder {cwd} is missing"));
             self.settle_told(&key);
             let machine = &self.machine_name;
             self.post_error_frame(

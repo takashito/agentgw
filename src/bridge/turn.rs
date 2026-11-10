@@ -6,7 +6,7 @@ use super::{Bridge, DialogPending, DialogScan, Host, ProbeDone, StickyPosted};
 use crate::agent::Window;
 use crate::agent::{Dialog, HookEvent, ProbeErr, SessionId};
 use crate::bridge::state as bridge;
-use crate::bridge::state::Disposition;
+use crate::bridge::state::{DispoBody, Disposition};
 use super::command::CmdFx;
 use crate::log::LogCtx;
 use crate::chat::{Chat, FetchedMsg, ThreadKey};
@@ -473,6 +473,7 @@ impl Bridge {
         // and `rate_limit` is also used for congestion), so ask the agent's own history. Re-sending into the limit
         // is **the one answer that never works**, and it replaces the one sentence the person needs with silence
         if !ev.session_id.is_empty() && self.turn_hit_usage_limit(&ev.session_id, key, ctx) {
+            self.tell_asker(key, "failed", "usage limit".into());
             self.settle_told(key);
             return;
         }
@@ -485,9 +486,61 @@ impl Bridge {
         }
         // A retry-class message the worker couldn't take yet still belongs to the recovery paths
         if klass != TurnFailureClass::Retry {
+            self.tell_asker(key, "failed", reason.to_string());
             self.settle_told(key);
         }
         self.post_error_frame(channel, thread_ts, text);
+    }
+
+    /// If this disposition answers a request from an agent in another channel, send the answer
+    /// back through the gateway. Decided by what the ledger is about to clear: a reply to a person
+    /// alone clears no request, so it does not go back.
+    fn answer_asker(&mut self, key: &ThreadKey, root: &str, d: &Disposition) {
+        let waiting = self.ledger.from_agent_ids(key);
+        let covered = if d.message_ids.is_empty() {
+            !waiting.is_empty()
+        } else {
+            d.message_ids.iter().any(|id| waiting.contains(id))
+        };
+        if !covered {
+            return;
+        }
+        let (outcome, text, ts, needs_human) = match (d.kind, &d.body) {
+            ("reply" | "edit", Some(b)) => ("reply", b.text.clone(), b.ts.clone(), b.needs_human),
+            // A reply that was not posted because the thread's root is gone
+            ("reply", None) => ("deleted", String::new(), String::new(), false),
+            ("no_reply", b) => ("no_reply", b.as_ref().map(|b| b.text.clone()).unwrap_or_default(), String::new(), false),
+            _ => return,
+        };
+        self.send_agent_reply(key, root, outcome, text, ts, needs_human);
+    }
+
+    /// A request from another channel's agent ends here without an answer (`outcome` says how).
+    /// Tell that agent, and clear the request so the thread is not left owing it.
+    pub(super) fn tell_asker(&mut self, key: &ThreadKey, outcome: &str, text: String) {
+        let waiting = self.ledger.from_agent_ids(key);
+        if waiting.is_empty() {
+            return;
+        }
+        let Some(root) = key.split().1 else { return };
+        self.send_agent_reply(key, &root, outcome, text, String::new(), false);
+        self.ledger.disposed(key, &waiting);
+    }
+
+    fn send_agent_reply(&self, key: &ThreadKey, root: &str, outcome: &str, text: String, ts: String, needs_human: bool) {
+        let Some(up) = &self.ask_gateway else { return };
+        let (channel, _) = key.split();
+        let frame = crate::bridge::gateway::link::LinkFrame::AgentReply {
+            channel,
+            thread_ts: root.to_string(),
+            ts,
+            text,
+            needs_human,
+            outcome: outcome.to_string(),
+        };
+        if up.send(frame).is_err() {
+            LogCtx::default().error("bridge", &format!("could not send the answer for {key} to the gateway"));
+        }
     }
 
     /// The person was told why this turn produced no reply — that is the thread's answer.
@@ -2081,6 +2134,8 @@ impl Bridge {
         // thread (a command running beside it) keeps it busy on its own.
         self.stall.remove(&key);
         self.presence_remove(&key, &Reason::Turn);
+        // An answer to a request from another channel's agent goes back to it
+        self.answer_asker(&key, &root, &d);
         let before = self.ledger.pending(&key).len();
         if d.message_ids.is_empty() {
             self.ledger.dispose_all(&key); // no ids = the whole thread is done
@@ -2570,6 +2625,7 @@ pub async fn execute_tool(
                         message_ids: ids,
                         session_id: session_id.to_string(),
                         title: None,
+                        body: None,
                     },
                     &c,
                 )
@@ -2624,6 +2680,11 @@ pub async fn execute_tool(
                     message_ids: ids,
                     session_id: session_id.to_string(),
                     title: None,
+                    body: Some(DispoBody {
+                        text: s("text"),
+                        ts: ts.clone(),
+                        needs_human: args["needs_human"].as_bool().unwrap_or(false),
+                    }),
                 };
                 notify(dispo, d, &c).await;
                 Ok(format!("posted ts={ts}"))
@@ -2667,6 +2728,7 @@ pub async fn execute_tool(
                                 message_ids: vec![message_ts],
                                 session_id: session_id.to_string(),
                                 title: None,
+                                body: None,
                             };
                             notify(dispo, d, &c).await;
                         }
@@ -2717,6 +2779,11 @@ pub async fn execute_tool(
                             message_ids: ids,
                             session_id: session_id.to_string(),
                             title: None,
+                            body: Some(DispoBody {
+                                text: s("text"),
+                                ts: s("message_ts"),
+                                needs_human: args["needs_human"].as_bool().unwrap_or(false),
+                            }),
                         };
                         notify(dispo, d, &c).await;
                     }
@@ -2757,6 +2824,11 @@ pub async fn execute_tool(
                 message_ids: ids,
                 session_id: session_id.to_string(),
                 title: None,
+                body: Some(DispoBody {
+                    text: opt("reason").unwrap_or_default(),
+                    ts: String::new(),
+                    needs_human: false,
+                }),
             };
             notify(dispo, d, &c).await;
             Ok("recorded — nothing posted".to_string())
@@ -2775,6 +2847,7 @@ pub async fn execute_tool(
                 message_ids: Vec::new(),
                 session_id: session_id.to_string(),
                 title: Some(title),
+                body: None,
             };
             notify(dispo, d, &c).await;
             Ok("asked the bridge to rename this thread (a name a person set by hand stands)".to_string())

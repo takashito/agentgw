@@ -2593,6 +2593,104 @@ mod tests {
         assert!(b.ledger.from_agent_ids(&ThreadKey::new("C_ADMIN", ROOT)).is_empty());
     }
 
+    /// A Bridge running an asked thread (C_ADMIN/ROOT), with what it sends the gateway captured.
+    async fn asked_thread(name: &str) -> (Bridge, mpsc::UnboundedReceiver<crate::bridge::gateway::link::LinkFrame>, String) {
+        let (d, _slack, _agent, _clock) = flow_deps(name);
+        let (mut b, _fx) = Bridge::for_test(d);
+        let (tx, rx) = mpsc::unbounded_channel();
+        b.ask_gateway = Some(tx);
+        b.on_inbound(&agent_msg(ROOT, ROOT, "check it", crate::chat::DeliveryKind::Ask)).await;
+        let sid = b.threads.get(ROOT).and_then(|e| e.agent_id.clone()).expect("an agent");
+        (b, rx, sid)
+    }
+
+    fn dispo(kind: &'static str, ids: &[&str], text: Option<&str>, sid: &str) -> bridge::Disposition {
+        bridge::Disposition {
+            kind,
+            channel_id: "C_ADMIN".into(),
+            thread_ts: Some(ROOT.to_string()),
+            message_ids: ids.iter().map(|s| s.to_string()).collect(),
+            session_id: sid.to_string(),
+            title: None,
+            body: text.map(|t| bridge::DispoBody {
+                text: t.to_string(),
+                ts: "1782000000.000900".into(),
+                needs_human: false,
+            }),
+        }
+    }
+
+    fn replies_up(rx: &mut mpsc::UnboundedReceiver<crate::bridge::gateway::link::LinkFrame>) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        while let Ok(f) = rx.try_recv() {
+            if let crate::bridge::gateway::link::LinkFrame::AgentReply { outcome, text, .. } = f {
+                out.push((outcome, text));
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn an_answer_to_the_ask_goes_back_but_an_answer_to_a_person_does_not() {
+        let (mut b, mut up, sid) = asked_thread("ask-answer").await;
+        let mut person = channel_msg("1782000000.000500", "U_OWNER", "also look at X");
+        person.channel = "C_ADMIN".into();
+        person.thread_ts = Some(ROOT.into());
+        b.on_inbound(&person).await;
+        b.on_disposition(dispo("reply", &["1782000000.000500"], Some("looked at X"), &sid)).await;
+        assert!(replies_up(&mut up).is_empty(), "an answer to the person stays here");
+        b.on_disposition(dispo("reply", &[ROOT], Some("done"), &sid)).await;
+        assert_eq!(replies_up(&mut up), vec![("reply".to_string(), "done".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn a_reply_without_ids_still_answers_the_ask() {
+        let (mut b, mut up, sid) = asked_thread("ask-noids").await;
+        b.on_disposition(dispo("reply", &[], Some("all done"), &sid)).await;
+        assert_eq!(replies_up(&mut up), vec![("reply".to_string(), "all done".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn choosing_not_to_reply_tells_the_asker() {
+        let (mut b, mut up, sid) = asked_thread("ask-noreply").await;
+        b.on_disposition(dispo("no_reply", &[ROOT], Some("not for me"), &sid)).await;
+        let got = replies_up(&mut up);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "no_reply");
+        assert!(got[0].1.contains("not for me"), "{got:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_turn_tells_the_asker() {
+        let (mut b, mut up, sid) = asked_thread("ask-failed").await;
+        b.on_hook(HookEvent {
+            kind: "error".into(),
+            session_id: sid,
+            payload: serde_json::json!({"error_type": "billing_error"}),
+            respond: None,
+        })
+        .await;
+        let got = replies_up(&mut up);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].0, "failed");
+    }
+
+    #[tokio::test]
+    async fn exit_sends_ask_ended_from_either_side() {
+        let (mut b, mut up, _sid) = asked_thread("ask-exit-cmd").await;
+        let mut bye = channel_msg("1782000000.000600", "U_OWNER", "exit");
+        bye.channel = "C_ADMIN".into();
+        bye.thread_ts = Some(ROOT.into());
+        b.on_inbound(&bye).await;
+        let mut ended = false;
+        while let Ok(f) = up.try_recv() {
+            if let crate::bridge::gateway::link::LinkFrame::AskEnded { channel, thread_ts } = f {
+                ended = channel == "C_ADMIN" && thread_ts == ROOT;
+            }
+        }
+        assert!(ended, "the gateway hears the exit");
+    }
+
     #[test]
     fn the_envelope_says_where_an_ask_came_from() {
         let e = crate::bridge::inbound::envelope(&agent_msg(ROOT, ROOT, "hi", crate::chat::DeliveryKind::Ask), ROOT, None, 0);
@@ -3303,6 +3401,7 @@ mod tests {
             message_ids: Vec::new(),
             session_id: sid.clone(),
             title: Some(title.to_string()),
+            body: None,
         };
         // Nothing named it yet: the agent is told so, with an empty name
         b.on_inbound(&in_thread("1782000000.000200", "first")).await;

@@ -2731,6 +2731,8 @@ impl Fleet {
             home: self.home(),
             gateway: Some(self.self_id.clone()),
         });
+        // Replies that waited for an asking machine to come back
+        self.catch_up_asks().await;
         (conn, rx)
     }
 
@@ -2749,6 +2751,7 @@ impl Fleet {
                 .lock()
                 .await
                 .on_disconnect(bridge_id, now_ms());
+            self.asks_machine_left(bridge_id).await;
         }
     }
 
@@ -3475,6 +3478,15 @@ impl Fleet {
                 to,
             } => self.rename_machine(&channel, &thread_ts, &from, &to).await,
             link::LinkFrame::RenameFailed { why } => self.rename_failed(bridge_id, &why).await,
+            link::LinkFrame::AgentReply {
+                channel,
+                thread_ts,
+                ts,
+                text,
+                needs_human,
+                outcome,
+            } => self.on_agent_reply(&channel, &thread_ts, &ts, text, needs_human, &outcome).await,
+            link::LinkFrame::AskEnded { channel, thread_ts } => self.on_ask_ended(&channel, &thread_ts).await,
             link::LinkFrame::AskChannel {
                 req_id,
                 from_channel,
@@ -4391,10 +4403,10 @@ impl Fleet {
 
     /// Post a short line in the asking thread and hand the asking agent `for_agent` with it.
     /// Every delivery between agents rides on a real post, so the ledger and reactions have a message.
-    async fn tell_origin(self: &Arc<Self>, channel: &str, thread: &str, shown: &str, for_agent: &str) {
+    async fn tell_origin(&self, channel: &str, thread: &str, shown: &str, for_agent: &str) -> bool {
         let Ok(ts) = self.api.post_markdown(channel, shown, Some(thread)).await else {
             rlog("error", &format!("ask: could not post to {channel}:{thread}"));
-            return;
+            return false;
         };
         let d = crate::bridge::asks::AgentDelivery {
             channel: channel.to_string(),
@@ -4406,13 +4418,17 @@ impl Fleet {
             kind: crate::chat::DeliveryKind::Notice,
             needs_human: false,
         };
-        if let Err(e) = self.deliver_agent(d).await {
-            rlog("info", &format!("ask: could not tell {channel}:{thread}: {e}"));
+        match self.deliver_agent(d).await {
+            Ok(()) => true,
+            Err(e) => {
+                rlog("info", &format!("ask: could not tell {channel}:{thread}: {e}"));
+                false
+            }
         }
     }
 
     /// Hand one message from an agent to the machine running its thread (this one included).
-    pub(crate) async fn deliver_agent(self: &Arc<Self>, d: crate::bridge::asks::AgentDelivery) -> Result<(), String> {
+    pub(crate) async fn deliver_agent(&self, d: crate::bridge::asks::AgentDelivery) -> Result<(), String> {
         let (routes, connected) = (self.access().bridges(), self.links.connected());
         let thread_routes = self.thread_routes.lock().await.clone();
         let decision = Delivery::decide(
@@ -4485,6 +4501,136 @@ impl Fleet {
             row.clone()
         };
         self.put_ask(channel, thread, row).await;
+    }
+
+    /// How an asked thread answered: pass it to the thread that asked, or note why it can't be.
+    async fn on_agent_reply(&self, channel: &str, thread: &str, ts: &str, text: String, needs_human: bool, outcome: &str) {
+        use crate::bridge::state::AskState;
+        let Some((_, row)) = self.asks.lock().await.get(thread).cloned() else {
+            rlog("info", &format!("ask: an answer from {channel}:{thread}, which nobody asked"));
+            return;
+        };
+        self.edit_ask(channel, thread, |r| {
+            r.outstanding = false;
+            if outcome == "deleted" {
+                r.state = AskState::Ended;
+            }
+        })
+        .await;
+        if row.origin_closed {
+            // Said once per request: the next answer finds `outstanding` already down
+            if row.outstanding {
+                let said = crate::t!(
+                    "The thread that asked has ended, so this reply was not passed on.",
+                    "依頼元のスレッドは終了しているので、この返事は届けていません。"
+                );
+                self.post(channel, Some(thread), &said).await;
+            }
+            return;
+        }
+        let link = if ts.is_empty() {
+            self.api.get_permalink(channel, thread).await.unwrap_or_default()
+        } else {
+            self.api.get_permalink(channel, ts).await.unwrap_or_default()
+        };
+        let (shown, for_agent, kind) = if outcome == "reply" {
+            let shown = crate::t!(":leftwards_arrow_with_hook: Reply from <#{channel}>: {link}", ":leftwards_arrow_with_hook: <#{channel}> からの返事: {link}");
+            (shown, text, crate::chat::DeliveryKind::Reply)
+        } else {
+            let line = crate::bridge::asks::dead_end_line(outcome, &text);
+            let shown = crate::t!(":information_source: No reply from <#{channel}> ({link}): {line}", ":information_source: <#{channel}> から返事がありません({link}): {line}");
+            (shown, line, crate::chat::DeliveryKind::Notice)
+        };
+        let Ok(posted) = self.api.post_markdown(&row.channel, &shown, Some(&row.thread_ts)).await else {
+            rlog("error", &format!("ask: could not post to {}:{}", row.channel, row.thread_ts));
+            return;
+        };
+        let d = crate::bridge::asks::AgentDelivery {
+            channel: row.channel.clone(),
+            thread_ts: row.thread_ts.clone(),
+            ts: posted,
+            text: for_agent,
+            origin_channel: Some(channel.to_string()),
+            origin_thread: Some(thread.to_string()),
+            kind,
+            needs_human,
+        };
+        if let Err(e) = self.deliver_agent(d).await {
+            rlog("info", &format!("ask: the asker {}:{} is away ({e}); counted for later", row.channel, row.thread_ts));
+            self.edit_ask(channel, thread, |r| r.missed += 1).await;
+        }
+    }
+
+    /// `exit` in `channel`/`thread`: an exchange asked into it ends, and one asked from it stops
+    /// passing replies back.
+    async fn on_ask_ended(&self, channel: &str, thread: &str) {
+        let touched: Vec<(String, String)> = self
+            .asks
+            .lock()
+            .await
+            .iter()
+            .filter(|(ts, (ch, row))| {
+                (ts.as_str() == thread && ch == channel) || (row.channel == channel && row.thread_ts == thread)
+            })
+            .map(|(ts, (ch, _))| (ch.clone(), ts.clone()))
+            .collect();
+        for (ch, ts) in touched {
+            let asked_here = ts == thread && ch == channel;
+            self.edit_ask(&ch, &ts, |r| {
+                if asked_here {
+                    r.state = crate::bridge::state::AskState::Ended;
+                } else {
+                    r.origin_closed = true;
+                }
+            })
+            .await;
+        }
+    }
+
+    /// Replies that could not be handed over while the asking machine was away: one notice each.
+    pub(crate) async fn catch_up_asks(&self) {
+        let owed: Vec<(String, String, String, String, u32)> = self
+            .asks
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, (_, r))| r.missed > 0 && !r.origin_closed)
+            .map(|(ts, (ch, r))| (ch.clone(), ts.clone(), r.channel.clone(), r.thread_ts.clone(), r.missed))
+            .collect();
+        for (ch, ts, origin, origin_thread, n) in owed {
+            let shown = crate::t!(
+                ":information_source: {n} replies from <#{ch}> arrived while this thread's machine was away.",
+                ":information_source: このスレッドのマシンが離れている間に、<#{ch}> から返事が {n} 件届きました。"
+            );
+            let for_agent = format!(
+                "{n} replies from the other agent arrived while you were offline. Read them with \
+                 fetch_messages (channel {ch}, thread_ts {ts})."
+            );
+            if self.tell_origin(&origin, &origin_thread, &shown, &for_agent).await {
+                self.edit_ask(&ch, &ts, |r| r.missed = 0).await;
+            }
+        }
+    }
+
+    /// A machine dropped: the threads asking something of one of its threads hear so, once.
+    pub(crate) async fn asks_machine_left(&self, machine: &str) {
+        let routes = self.thread_routes.lock().await.clone();
+        let hit: Vec<(String, String, String, String)> = self
+            .asks
+            .lock()
+            .await
+            .iter()
+            .filter(|(ts, (_, r))| r.outstanding && routes.get(*ts).map(String::as_str) == Some(machine))
+            .map(|(ts, (ch, r))| (ch.clone(), ts.clone(), r.channel.clone(), r.thread_ts.clone()))
+            .collect();
+        for (ch, ts, origin, origin_thread) in hit {
+            self.edit_ask(&ch, &ts, |r| r.outstanding = false).await;
+            let shown = crate::t!(
+                ":information_source: The machine for <#{ch}> went offline while working on this request.",
+                ":information_source: 依頼の処理中に <#{ch}> のマシンがオフラインになりました。"
+            );
+            self.tell_origin(&origin, &origin_thread, &shown, crate::bridge::asks::OFFLINE_LINE).await;
+        }
     }
 
     async fn rewrite(&self, channel: &str, ts: &str, text: &str) {
@@ -8190,6 +8336,100 @@ mod ask_tests {
         assert_eq!(r.fleet.asks.lock().await[&offer.request_ts].1.state, AskState::Ended);
         let told = r.msgs.try_recv().unwrap();
         assert_eq!((told.channel.as_str(), told.from_agent.unwrap().kind), ("C1", DeliveryKind::Notice));
+    }
+
+    fn reply_frame(thread: &str, outcome: &str, text: &str) -> link::LinkFrame {
+        link::LinkFrame::AgentReply {
+            channel: "C2".into(),
+            thread_ts: thread.into(),
+            ts: "2.9".into(),
+            text: text.into(),
+            needs_human: false,
+            outcome: outcome.into(),
+        }
+    }
+
+    /// An approved ask from C1/1.1 into C2 (confirm off), with its delivery taken off the inbox.
+    async fn approved(name: &str) -> (Rig, String) {
+        let mut r = rig(name, FakeChat::in_channels(&[("C2", "lead")]), &["C2"]);
+        let out = r.fleet.ask("C1", "1.1", "C2", None, "plan").await.unwrap();
+        let _ = r.msgs.try_recv();
+        (r, out["thread_ts"].as_str().unwrap().to_string())
+    }
+
+    #[tokio::test]
+    async fn a_reply_goes_back_to_the_asking_thread() {
+        let (mut r, thread) = approved("back").await;
+        r.fleet.on_machine_frame("parent", reply_frame(&thread, "reply", "done")).await;
+        let m = r.msgs.try_recv().expect("delivered to the asker");
+        let o = m.from_agent.clone().unwrap();
+        assert_eq!((m.channel.as_str(), m.thread_ts.as_deref(), m.text.as_str()), ("C1", Some("1.1"), "done"));
+        assert_eq!((o.kind, o.channel.as_deref(), o.thread_ts.as_deref()), (DeliveryKind::Reply, Some("C2"), Some(thread.as_str())));
+        assert!(calls(&r.api).iter().any(|c| c.contains(" C1 1.1 ") && c.contains("https://slack/C2/2.9")), "a line in the asking thread");
+        assert!(!r.fleet.asks.lock().await[&thread].1.outstanding);
+    }
+
+    #[tokio::test]
+    async fn a_dead_end_reaches_the_asker_as_a_notice() {
+        let (mut r, thread) = approved("dead").await;
+        r.fleet.on_machine_frame("parent", reply_frame(&thread, "stopped", "")).await;
+        let m = r.msgs.try_recv().unwrap();
+        assert_eq!(m.from_agent.unwrap().kind, DeliveryKind::Notice);
+        assert!(m.text.contains("stopped"), "{}", m.text);
+    }
+
+    #[tokio::test]
+    async fn a_closed_asker_is_not_woken() {
+        let (mut r, thread) = approved("closed").await;
+        r.fleet.on_machine_frame("parent", link::LinkFrame::AskEnded { channel: "C1".into(), thread_ts: "1.1".into() }).await;
+        r.fleet.on_machine_frame("parent", reply_frame(&thread, "reply", "one")).await;
+        r.fleet.on_machine_frame("parent", reply_frame(&thread, "reply", "two")).await;
+        assert!(r.msgs.try_recv().is_err(), "nothing delivered to a closed thread");
+        let told: Vec<String> = calls(&r.api).into_iter().filter(|c| c.contains(&format!(" C2 {thread} ")) && c.contains("ended")).collect();
+        assert_eq!(told.len(), 1, "{told:?}");
+    }
+
+    #[tokio::test]
+    async fn exit_in_the_asked_thread_ends_the_exchange() {
+        let (r, thread) = approved("target-exit").await;
+        r.fleet.on_machine_frame("parent", link::LinkFrame::AskEnded { channel: "C2".into(), thread_ts: thread.clone() }).await;
+        assert_eq!(r.fleet.asks.lock().await[&thread].1.state, AskState::Ended);
+        assert!(r.fleet.ask("C1", "1.1", "C2", Some(&thread), "more").await.unwrap_err().contains("new thread"));
+    }
+
+    #[tokio::test]
+    async fn an_offline_asker_gets_one_catch_up_notice() {
+        let (mut r, thread) = approved("missed").await;
+        {
+            let mut a = Access::load(&r.fleet.dir);
+            a.set_bridge("C1", "mac"); // the asking channel's machine is away
+            a.save(&r.fleet.dir).unwrap();
+        }
+        r.fleet.on_machine_frame("parent", reply_frame(&thread, "reply", "one")).await;
+        r.fleet.on_machine_frame("parent", reply_frame(&thread, "reply", "two")).await;
+        assert!(r.msgs.try_recv().is_err());
+        assert_eq!(r.fleet.asks.lock().await[&thread].1.missed, 2);
+        {
+            let mut a = Access::load(&r.fleet.dir);
+            a.routes.get_mut("C1").unwrap().bridge = None; // back (handled here)
+            a.save(&r.fleet.dir).unwrap();
+        }
+        r.fleet.catch_up_asks().await;
+        let m = r.msgs.try_recv().expect("one catch-up notice");
+        assert!(m.text.contains('2') && m.text.contains("fetch_messages"), "{}", m.text);
+        assert!(r.msgs.try_recv().is_err());
+        assert_eq!(r.fleet.asks.lock().await[&thread].1.missed, 0);
+    }
+
+    #[tokio::test]
+    async fn the_asker_hears_once_when_the_asked_machine_drops() {
+        let (mut r, thread) = approved("dropped").await;
+        r.fleet.thread_routes.lock().await.insert(thread.clone(), "pve".into());
+        r.fleet.asks_machine_left("pve").await;
+        r.fleet.asks_machine_left("pve").await;
+        let m = r.msgs.try_recv().expect("told once");
+        assert!(m.text.contains("offline"), "{}", m.text);
+        assert!(r.msgs.try_recv().is_err());
     }
 
     #[tokio::test]

@@ -76,6 +76,8 @@ impl Bridge {
             );
             return;
         };
+        // An agent in another channel waiting on this turn hears that a person stopped it
+        self.tell_asker(key, "stopped", String::new());
         // Drop the ledger **first** — otherwise the turn cut by ESC ends still holding an unanswered message,
         // and the stop hook fires an "awaiting reply" re-prompt
         self.ledger.disposed(key, &pending);
@@ -107,6 +109,14 @@ impl Bridge {
     /// so the farewell lands **below** the agent's last reply.
     pub(super) async fn user_exit(&mut self, msg: &InboundMsg, key: &ThreadKey, root_ts: &str, ctx: &LogCtx) {
         let farewell = Some((msg.channel.clone(), root_ts.to_string()));
+        // An exchange between agents through this thread ends here, whichever end it is
+        self.tell_asker(key, "exited", String::new());
+        if let Some(up) = &self.ask_gateway {
+            let _ = up.send(crate::bridge::gateway::link::LinkFrame::AskEnded {
+                channel: msg.channel.clone(),
+                thread_ts: root_ts.to_string(),
+            });
+        }
         let sid = self.threads.get(root_ts).and_then(|e| e.agent_id.clone());
         let name = sid
             .as_deref()

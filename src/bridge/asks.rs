@@ -155,6 +155,24 @@ impl AskOffer {
     }
 }
 
+/// What the asking agent is told when the asked machine drops mid-request.
+pub const OFFLINE_LINE: &str = "The machine for that channel went offline while working on your request.";
+
+/// What the asking agent is told when its request ended without a reply. English: read by the agent.
+pub fn dead_end_line(outcome: &str, detail: &str) -> String {
+    let detail = if detail.is_empty() { "no reason given" } else { detail };
+    match outcome {
+        "no_reply" => format!("The other agent chose not to reply ({detail})."),
+        "failed" => format!("The other agent's turn failed ({detail})."),
+        "stopped" => "A person stopped the other agent. You can still ask again in the same thread.".into(),
+        "exited" => "A person ended this exchange. Ask in a new thread if you need more.".into(),
+        "refused" => format!("The other agent could not take the request ({detail})."),
+        "deleted" => "The other thread was deleted.".into(),
+        "offline" => OFFLINE_LINE.into(),
+        other => format!("The other agent ended without a reply ({other})."),
+    }
+}
+
 #[cfg(test)]
 mod frame_tests {
     use crate::bridge::gateway::link::{decode, encode, LinkFrame};

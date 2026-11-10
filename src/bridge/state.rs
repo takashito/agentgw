@@ -1875,6 +1875,18 @@ pub struct Disposition {
     /// Only for `kind: "title"` — the name the agent asked for. The rename itself happens on the
     /// main side, which holds Threads and therefore knows whether a person already named this one.
     pub title: Option<String>,
+    /// What was posted (`reply`, an answering `edit`) or why nothing was (`no_reply`'s reason) —
+    /// what goes back to an agent in another channel when this answers its request.
+    pub body: Option<DispoBody>,
+}
+
+/// The content of a disposition, for answering an agent in another channel.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DispoBody {
+    pub text: String,
+    /// The post that carries it (empty for `no_reply`).
+    pub ts: String,
+    pub needs_human: bool,
 }
 
 /// Whether the agent may end its turn. true means block Stop and push for a disposition.
