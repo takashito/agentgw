@@ -2907,6 +2907,13 @@ impl Fleet {
         }
 
         let thread = self.thread_of(&ev).await;
+        if name == "message"
+            && !ev.from_a_bot()
+            && ev.user().is_some()
+            && let (Some(ch), Some(t)) = (channel, thread.as_deref())
+        {
+            self.reopen_asks_from(ch, t).await;
+        }
         let (routes, connected) = (self.access().bridges(), self.links.connected());
         let thread_routes = self.thread_routes.lock().await.clone();
         let decision = Delivery::decide(
@@ -5048,6 +5055,25 @@ impl Fleet {
                 }
             })
             .await;
+        }
+    }
+
+    /// A person wrote in `channel`/`thread` again after an `exit` there. `exit` ends only the agent —
+    /// the next message resumes the same conversation — so the asks it sent out are live again and
+    /// their replies come back here. (Written before the message reaches the machine, so the `exit`
+    /// itself is reopened first and closed after.)
+    async fn reopen_asks_from(&self, channel: &str, thread: &str) {
+        let closed: Vec<(String, String)> = self
+            .asks
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, (_, r))| r.origin_closed && r.channel == channel && r.thread_ts == thread)
+            .map(|(ts, (ch, _))| (ch.clone(), ts.clone()))
+            .collect();
+        for (ch, ts) in closed {
+            rlog("info", &format!("ask: {channel}:{thread} is back after exit; replies from {ch}:{ts} go to it again"));
+            self.edit_ask(&ch, &ts, |r| r.origin_closed = false).await;
         }
     }
 
@@ -9018,6 +9044,24 @@ mod ask_tests {
         assert!(r.msgs.try_recv().is_err(), "nothing delivered to a closed thread");
         let told: Vec<String> = calls(&r.api).into_iter().filter(|c| c.contains(&format!(" C2 {thread} ")) && c.contains("ended")).collect();
         assert_eq!(told.len(), 1, "{told:?}");
+    }
+
+    #[tokio::test]
+    async fn a_person_back_in_the_asking_thread_after_exit_reopens_its_asks() {
+        let (mut r, thread) = approved("reopen").await;
+        r.fleet.on_machine_frame("parent", link::LinkFrame::AskEnded { channel: "C1".into(), thread_ts: "1.1".into() }).await;
+        assert!(r.fleet.asks.lock().await[&thread].1.origin_closed);
+        // The bot's own post there does not count; a person's does
+        let post = |user: &str| serde_json::json!({"channel": "C1", "user": user, "text": "go on", "ts": "1.9", "thread_ts": "1.1"});
+        let mut own = post("U_BOT");
+        own["bot_id"] = "B1".into();
+        r.fleet.on_event("message", &own).await;
+        assert!(r.fleet.asks.lock().await[&thread].1.origin_closed);
+        r.fleet.on_event("message", &post("U_OWNER")).await;
+        assert!(!r.fleet.asks.lock().await[&thread].1.origin_closed);
+        while r.msgs.try_recv().is_ok() {}
+        r.fleet.on_machine_frame("parent", reply_frame(&thread, "reply", "done")).await;
+        assert_eq!(r.msgs.try_recv().expect("delivered to the asker again").text, "done");
     }
 
     #[tokio::test]
