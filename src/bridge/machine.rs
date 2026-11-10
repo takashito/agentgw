@@ -146,6 +146,8 @@ pub enum FromRelay {
         to: String,
         path: String,
     },
+    /// Slack says this channel is gone: drop its folder and its threads, and stop their agents.
+    ChannelGone { channel: String },
     /// One slice of a conversation arriving from the machine that had this thread.
     ThreadChunk {
         channel: String,
@@ -354,6 +356,7 @@ impl FromRelay {
                 last,
                 data,
             },
+            F::ChannelGone { channel } => FromRelay::ChannelGone { channel },
             F::Home { channel } => FromRelay::Home { channel },
             F::Update { version, build } => FromRelay::Update { version, build },
             F::Rename { to } => FromRelay::Rename { to },

@@ -1235,6 +1235,11 @@ impl crate::chat::Chat for Api {
             Err(e) => Err(e),
         }
     }
+    async fn channel_gone(&self, channel: &str) -> bool {
+        self.get_json("conversations.info", &[("channel", channel)])
+            .await
+            .is_err_and(|e| e.contains("channel_not_found"))
+    }
     async fn user_display_name(&self, user: &str) -> Option<String> {
         Api::user_display_name(self, user).await
     }

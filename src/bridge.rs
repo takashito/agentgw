@@ -822,6 +822,25 @@ impl Bridge {
         self.awaiting_receipt.retain(|_, (k, ..)| k != &key);
     }
 
+    /// The channel is gone from Slack: end every thread it had here, agent and row. Nothing is sent
+    /// anywhere — there is no channel left to carry the conversation on.
+    async fn forget_channel(&mut self, channel: &str) {
+        let threads: Vec<String> = self
+            .threads
+            .entries
+            .iter()
+            .filter(|(_, e)| e.channel_id.as_deref() == Some(channel))
+            .map(|(ts, _)| ts.clone())
+            .collect();
+        for ts in &threads {
+            self.give_up_thread(channel, ts, "", "").await;
+        }
+        LogCtx::default().info(
+            "bridge",
+            &format!("channel {channel} gone: {} thread(s) dropped", threads.len()),
+        );
+    }
+
     /// Write down which machine a thread belongs to, for the gateway to read back after a restart.
     ///
     /// Nothing else about the row is touched, and a row that says something else already is left
@@ -1076,6 +1095,7 @@ impl Bridge {
             }
             tokio::spawn(fleet.clone().watch_presence());
             tokio::spawn(fleet.clone().drive_updates());
+            tokio::spawn(fleet.clone().sweep_gone_channels());
             {
                 // Frames the gateway addresses to itself, handled exactly as a machine handles the
                 // ones that come down its link
@@ -1379,7 +1399,10 @@ impl Bridge {
                 // job alone — see `Threads::set_bridge`
                 Some(note) = remember_rx.recv() => b.note_thread_routes(note),
                 // This thread is another machine's now: let go of it before it answers twice
-                Some((channel, thread_ts, to, path)) = left_rx.recv() => b.give_up_thread(&channel, &thread_ts, &to, &path).await,
+                Some((channel, thread_ts, to, path)) = left_rx.recv() => match thread_ts.is_empty() {
+                    true => b.forget_channel(&channel).await,
+                    false => b.give_up_thread(&channel, &thread_ts, &to, &path).await,
+                },
                 // A slice of a conversation being moved here
                 Some(part) = arriving_rx.recv() => b.take_thread_chunk(part).await,
                 // The link to the gateway was re-established. **Post online again** — for a machine
@@ -1569,6 +1592,7 @@ struct RelaySinks {
     gateway_url: String,
     /// Threads the gateway handed to someone else: `(channel, thread_ts, to, path)`.
     /// The main loop sends the conversation after them and tears each one down.
+    /// An empty `thread_ts` means **every** thread in the channel, which is gone from Slack.
     left: mpsc::Sender<(String, String, String, String)>,
     /// Slices of a conversation arriving from the machine that had the thread.
     arriving: mpsc::Sender<ArrivingThread>,
@@ -1778,6 +1802,23 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
             path,
         } => {
             let _ = left.send((channel, thread_ts, to, path)).await;
+        }
+        // Slack says the channel is gone. **Its folder goes first** — the handshake replays every folder
+        // this machine has, and a row left here would hand the channel back to the gateway on the next
+        // one. On the gateway the fleet has already dropped the row from the same file, so there is
+        // nothing to save. Then the threads: an empty `thread_ts` asks the main loop for all of them
+        machine::FromRelay::ChannelGone { channel } => {
+            let mut access = bridge::Access::load(dir);
+            if access.routes.remove(&channel).is_some() {
+                match access.save(dir) {
+                    Ok(()) => {
+                        let _ = reload.send(()).await;
+                    }
+                    Err(e) => LogCtx::default().error("bridge", &format!("could not save access.json: {e}")),
+                }
+            }
+            LogCtx::default().info("bridge", &format!("channel {channel} is gone from Slack — forgetting it"));
+            let _ = left.send((channel, String::new(), String::new(), String::new())).await;
         }
         // A conversation arriving from the machine that had this thread. Kept aside until the last
         // slice lands — see `Bridge::take_thread_chunk`
@@ -2568,6 +2609,28 @@ mod tests {
         pump_relay(machine::FromRelay::AgentMessage(d), &sinks).await;
         let got = msg_rx.try_recv().expect("handed to the inbox");
         assert_eq!(got.from_agent.map(|o| o.kind), Some(crate::chat::DeliveryKind::Ask));
+    }
+
+    /// The machine's own folder for a gone channel goes, or its next handshake would hand the channel
+    /// back to the gateway; then the main loop is asked to end the channel's threads.
+    #[tokio::test]
+    async fn a_gone_channel_loses_its_folder_here_and_its_threads_are_asked_for() {
+        let dir = crate::state_dir::StateDir::at(std::env::temp_dir().join(format!("agentgw-pump-gone-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        bridge::Access::from_str(r#"{"owner":"U1","routes":{"C_GONE":{"repo_path":"/srv/a"},"C_LIVE":{"repo_path":"/srv/b"}}}"#)
+            .unwrap()
+            .save(&dir)
+            .unwrap();
+        let (left, mut left_rx) = mpsc::channel(4);
+        let sinks = RelaySinks { msg_tx: mpsc::channel(4).0, click_tx: mpsc::channel(4).0, dir: dir.clone(), reload: mpsc::channel(4).0, relink: mpsc::channel(4).0, up: mpsc::unbounded_channel().0, machine: "desk".into(), gateway_url: String::new(), left, arriving: mpsc::channel(4).0, updated: mpsc::channel(4).0, asker: None };
+
+        pump_relay(machine::FromRelay::ChannelGone { channel: "C_GONE".into() }, &sinks).await;
+
+        let routes = bridge::Access::load(&dir).routes;
+        assert!(!routes.contains_key("C_GONE") && routes.contains_key("C_LIVE"), "{routes:?}");
+        let (ch, ts, ..) = left_rx.try_recv().expect("the main loop was asked");
+        assert_eq!((ch.as_str(), ts.as_str()), ("C_GONE", ""));
     }
 
     #[tokio::test]
@@ -4096,6 +4159,28 @@ mod tests {
             "the agent was left running, so both machines would answer"
         );
         assert!(b.threads.get(ROOT).is_none(), "the row stayed behind");
+    }
+
+    /// A channel deleted in Slack takes every thread it had here with it, and only those.
+    #[tokio::test]
+    async fn a_gone_channel_ends_its_threads_and_no_others() {
+        let (d, _slack, agent, _clock) = flow_deps("channel-gone");
+        let ((mut b, _fx), _deliv) = Bridge::for_test_with_deliveries(d);
+        let sid = running_thread(&mut b, &agent).await;
+        b.threads.entries.insert(
+            "1782000000.000900".into(),
+            crate::bridge::state::ThreadEntry {
+                channel_id: Some("C_OTHER".into()),
+                ..Default::default()
+            },
+        );
+
+        b.forget_channel("C1").await;
+
+        let name = crate::agent::SessionId::from(sid).window_name();
+        assert!(crate::agent::Agent::pid_of(&*agent, None, &name).is_none(), "the agent was left running");
+        assert!(b.threads.get(ROOT).is_none(), "the row stayed behind");
+        assert!(b.threads.get("1782000000.000900").is_some(), "another channel's thread went too");
     }
 
     /// A renamed machine's threads follow it in threads.json, and nothing else on them changes.

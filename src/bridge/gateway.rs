@@ -143,6 +143,13 @@ pub mod link {
             #[serde(default, skip_serializing_if = "String::is_empty")]
             path: String,
         },
+        /// Slack says this channel is gone (deleted): forget it — its folder, its threads, and any agent
+        /// still running for one of them.
+        ///
+        /// **Sent to the machine that handled it.** The gateway's own record goes first, but a machine
+        /// keeps its own and replays it on every handshake, so one left alone would hand the channel
+        /// straight back. A machine too old to read this drops the frame, which changes nothing.
+        ChannelGone { channel: String },
         /// One slice of a conversation on its way to the machine that now has its thread.
         ///
         /// **Split because it is big** — a transcript measured on a real machine was 5MB, and one
@@ -563,6 +570,7 @@ pub mod link {
                     to: "dock".into(),
                     path: "/srv/app".into(),
                 },
+                LinkFrame::ChannelGone { channel: "C1".into() },
                 LinkFrame::ThreadChunk {
                     to: "dock".into(),
                     channel: "C1".into(),
@@ -3227,6 +3235,15 @@ impl Fleet {
             // because nothing here says a word (2026-09-26: `route dock:…` held for 19 minutes,
             // until the link dropped once)
             if let Ok(abs) = result {
+                // **A channel we have no row for may be one we dropped as gone** while this machine was
+                // away. Its handshake would put it straight back, so ask Slack — only here, for a row we
+                // don't have, so a reconnect costs nothing for the channels we know
+                if !self.access().routes.contains_key(channel) && self.api.channel_gone(channel).await {
+                    let frame = link::LinkFrame::ChannelGone { channel: channel.to_string() };
+                    self.send_frame(bridge_id, &frame).await;
+                    rlog("info", &format!("{bridge_id} still had {channel}, which is gone from Slack — told it to drop it"));
+                    return;
+                }
                 let (ch, id) = (channel.to_string(), bridge_id.to_string());
                 self.edit_access(move |a| {
                     let r = a.routes.entry(ch).or_default();
@@ -4018,6 +4035,51 @@ impl Fleet {
             size: e.size,
             sha256: e.sha256,
         })
+    }
+
+    /// Forget channels that were deleted in Slack. Once shortly after start-up (the links are up by
+    /// then, so a machine hears about its own), then once a day.
+    pub async fn sweep_gone_channels(self: Arc<Self>) {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        loop {
+            self.drop_gone_channels().await;
+            tokio::time::sleep(std::time::Duration::from_secs(24 * 60 * 60)).await;
+        }
+    }
+
+    /// Ask Slack about every channel with a route, and drop the ones it says are gone: the row here,
+    /// then the machine that handled it is told to drop its own (see [`link::LinkFrame::ChannelGone`]).
+    ///
+    /// **Only `channel_not_found` counts.** An archived channel can come back, and an error from the
+    /// network or a token says nothing about the channel — a route dropped on that would lose its folder.
+    pub(crate) async fn drop_gone_channels(&self) -> Vec<String> {
+        let mut gone = vec![];
+        for (channel, route) in self.access().routes {
+            if !self.api.channel_gone(&channel).await {
+                continue;
+            }
+            let ch = channel.clone();
+            self.edit_access(move |a| {
+                a.routes.remove(&ch);
+            })
+            .await;
+            // No machine named = the gateway's own
+            let to = route.bridge.unwrap_or_else(|| self.self_id.clone());
+            let told = self
+                .send_frame(&to, &link::LinkFrame::ChannelGone { channel: channel.clone() })
+                .await;
+            // A machine away right now hears it when it comes back: its handshake replays this
+            // channel, and `on_project_set` answers that the same way
+            rlog(
+                "info",
+                &format!(
+                    "channel {channel} is gone from Slack — route dropped, {to} {}",
+                    if told { "told" } else { "away (told when it links)" }
+                ),
+            );
+            gone.push(channel);
+        }
+        gone
     }
 
     /// Carries an `update` through, one machine at a time. **The only clock the rollout has** — it
@@ -6621,6 +6683,90 @@ mod tests {
             ask_capable: Default::default(),
         });
         (fleet, msg_rx)
+    }
+
+    // ── channels deleted in Slack ───────────────────────────────────────────────
+
+    /// A gateway with `C_GONE` on `mac` and `C_LIVE` on `pve`; Slack says `C_GONE` is gone.
+    fn a_fleet_with_a_gone_channel(name: &str) -> (Arc<Fleet>, Arc<crate::chat::fake::FakeChat>) {
+        let dir = StateDir::at(
+            std::env::temp_dir().join(format!("agentgw-gone-{name}-{}", std::process::id())),
+        );
+        let _ = std::fs::remove_dir_all(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let mut access = Access::default();
+        access.owner = "U_OWNER".into();
+        for (ch, m) in [("C_GONE", "mac"), ("C_LIVE", "pve")] {
+            let r = access.routes.entry(ch.to_string()).or_default();
+            r.bridge = Some(m.into());
+            r.repo_path = Some("/srv/x".into());
+        }
+        access.save(&dir).unwrap();
+        let mut api = crate::chat::fake::FakeChat::default();
+        api.gone = vec!["C_GONE".into()];
+        let api = Arc::new(api);
+        let (fleet, _rx) = a_fleet_with(dir, api.clone());
+        (fleet, api)
+    }
+
+    #[tokio::test]
+    async fn a_channel_gone_from_slack_loses_its_route_and_its_machine_is_told() {
+        let (fleet, _api) = a_fleet_with_a_gone_channel("sweep");
+        let (c, mut frames) = conn();
+        fleet.links.register("mac", c);
+
+        assert_eq!(fleet.drop_gone_channels().await, vec!["C_GONE".to_string()]);
+
+        let routes = fleet.access().routes;
+        assert!(!routes.contains_key("C_GONE"), "{routes:?}");
+        assert!(routes.contains_key("C_LIVE"), "a channel Slack still has stays");
+        let told = link::decode(&frames.try_recv().expect("the machine was told")).unwrap();
+        assert_eq!(told, link::LinkFrame::ChannelGone { channel: "C_GONE".into() });
+    }
+
+    /// The machine was away for the sweep: its handshake replays the channel, and that must not put
+    /// the row back.
+    #[tokio::test]
+    async fn a_machine_replaying_a_gone_channel_is_told_to_drop_it_instead() {
+        let (fleet, _api) = a_fleet_with_a_gone_channel("replay");
+        fleet.drop_gone_channels().await;
+        let (c, mut frames) = conn();
+        fleet.links.register("mac", c);
+
+        for ch in ["C_GONE", "C_NEW"] {
+            let replay = link::LinkFrame::ProjectSet {
+                channel: ch.into(),
+                thread_ts: String::new(),
+                result: Ok("/srv/x".into()),
+                thread_only: false,
+                missing: None,
+                created: false,
+            };
+            fleet.on_machine_frame("mac", replay).await;
+        }
+
+        let routes = fleet.access().routes;
+        assert!(!routes.contains_key("C_GONE"), "{routes:?}");
+        assert!(routes.contains_key("C_NEW"), "a channel Slack has is still taken");
+        let told = link::decode(&frames.try_recv().expect("the machine was told")).unwrap();
+        assert_eq!(told, link::LinkFrame::ChannelGone { channel: "C_GONE".into() });
+        assert!(frames.try_recv().is_err(), "only the gone one");
+    }
+
+    /// A reconnect asks Slack only about channels it has no row for.
+    #[tokio::test]
+    async fn a_replayed_channel_with_a_row_is_not_asked_about() {
+        let (fleet, api) = a_fleet_with_a_gone_channel("known");
+        let replay = link::LinkFrame::ProjectSet {
+            channel: "C_GONE".into(),
+            thread_ts: String::new(),
+            result: Ok("/srv/x".into()),
+            thread_only: false,
+            missing: None,
+            created: false,
+        };
+        fleet.on_machine_frame("mac", replay).await;
+        assert!(!posts(&api).contains("channel_gone"), "{}", posts(&api));
     }
 
     // ── rename-machine ──────────────────────────────────────────────────────────

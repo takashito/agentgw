@@ -382,6 +382,10 @@ pub trait Chat: Send + Sync + 'static {
     async fn bot_channels(&self) -> Result<Vec<(String, String)>, String>;
     /// Whether the bot is a member of `channel` (one `conversations.info`, not the whole list).
     async fn is_member(&self, channel: &str) -> Result<bool, String>;
+    /// Whether Slack says `channel` is **gone** (`channel_not_found`: deleted, or a private channel the bot
+    /// was taken out of). An archived channel is still there, and an error that is not this answer —
+    /// the network, a token — is not proof of anything, so both are `false`.
+    async fn channel_gone(&self, channel: &str) -> bool;
     async fn user_display_name(&self, user: &str) -> Option<String>;
     async fn auth_test(&self) -> Result<(String, Option<String>), String>;
     async fn resolve_bot_id(&self, user_id: &str) -> Result<Option<String>, String>;
@@ -488,6 +492,8 @@ pub mod fake {
         pub info_delay_ms: u64,
         /// Topics and purposes set through the fake: channel → (topic, purpose). `channel_info` answers these.
         pub set_info: Mutex<std::collections::HashMap<String, (Option<String>, Option<String>)>>,
+        /// Channels `channel_gone` says are gone.
+        pub gone: Vec<String>,
     }
 
     impl FakeChat {
@@ -660,6 +666,10 @@ pub mod fake {
         async fn is_member(&self, c: &str) -> Result<bool, String> {
             self.record(format!("is_member {c}"))?;
             Ok(self.channels.iter().any(|(id, _)| id == c))
+        }
+        async fn channel_gone(&self, c: &str) -> bool {
+            let _ = self.record(format!("channel_gone {c}"));
+            self.gone.iter().any(|g| g == c)
         }
         async fn channel_info(&self, c: &str) -> Result<(String, String, String), String> {
             if self.info_delay_ms > 0 {
