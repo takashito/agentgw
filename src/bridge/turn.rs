@@ -517,7 +517,19 @@ impl Bridge {
                 // An answer to the request itself, or — while one is owed — the answer to what came
                 // back from below (or a reply that names no message). A reply to a person alone is not it
                 let owed_now = !owed.is_empty() && (d.message_ids.is_empty() || !returns.is_empty());
-                if asks.is_empty() && !owed_now {
+                // In a thread another agent asked for, a posted reply to a person goes back too: the
+                // Owner often steers the work here directly after the first answer, and the asker
+                // would otherwise never hear how it ended. Edits and no_reply to a person stay here, and
+                // so does a reply to what came back from an ask of its own once nothing is owed above
+                let asked_live = d.kind == "reply"
+                    && d.body.is_some()
+                    && returns.is_empty()
+                    && self
+                        .threads
+                        .get(root)
+                        .and_then(|e| e.asked_from.as_ref())
+                        .is_some_and(|a| a.state == crate::bridge::state::AskState::Approved && !a.origin_closed);
+                if asks.is_empty() && !owed_now && !asked_live {
                     return;
                 }
                 let (outcome, text, ts, needs_human) = match (d.kind, &d.body) {
@@ -528,7 +540,8 @@ impl Bridge {
                     _ => return,
                 };
                 self.send_agent_reply(key, root, outcome, text, ts, needs_human);
-                if !owed.is_empty() {
+                // Only a real answer pays what is owed: a word to a person on the way does not
+                if !owed.is_empty() && (!asks.is_empty() || owed_now) {
                     self.set_owed(root, Vec::new());
                 }
             }

@@ -2688,16 +2688,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_answer_to_the_ask_goes_back_but_an_answer_to_a_person_does_not() {
+    async fn every_reply_in_an_asked_thread_goes_back_even_to_a_person() {
         let (mut b, mut up, sid) = asked_thread("ask-answer").await;
-        let mut person = channel_msg("1782000000.000500", "U_OWNER", "also look at X");
+        // The first answer (a plan), then the Owner steers the work in this thread and the agent
+        // reports twice more: the asker hears all three
+        b.on_disposition(dispo("reply", &[ROOT], Some("plan"), &sid)).await;
+        let mut person = channel_msg("1782000000.000500", "U_OWNER", "go ahead");
         person.channel = "C_ADMIN".into();
         person.thread_ts = Some(ROOT.into());
         b.on_inbound(&person).await;
-        b.on_disposition(dispo("reply", &["1782000000.000500"], Some("looked at X"), &sid)).await;
-        assert!(replies_up(&mut up).is_empty(), "an answer to the person stays here");
-        b.on_disposition(dispo("reply", &[ROOT], Some("done"), &sid)).await;
-        assert_eq!(replies_up(&mut up), vec![("reply".to_string(), "done".to_string())]);
+        b.on_disposition(dispo("reply", &["1782000000.000500"], Some("done"), &sid)).await;
+        b.on_disposition(dispo("reply", &["1782000000.000500"], Some("one more thing done"), &sid)).await;
+        assert_eq!(
+            replies_up(&mut up),
+            vec![
+                ("reply".to_string(), "plan".to_string()),
+                ("reply".to_string(), "done".to_string()),
+                ("reply".to_string(), "one more thing done".to_string()),
+            ]
+        );
+        // Edits and no_reply to a person stay here
+        b.on_disposition(dispo("edit", &["1782000000.000500"], Some("done (fixed typo)"), &sid)).await;
+        b.on_disposition(dispo("no_reply", &["1782000000.000500"], None, &sid)).await;
+        assert!(replies_up(&mut up).is_empty());
     }
 
     #[tokio::test]
@@ -2717,7 +2730,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn while_an_answer_is_owed_a_reply_to_a_person_stays_here() {
+    async fn while_an_answer_is_owed_a_reply_to_a_person_goes_back_and_the_answer_stays_owed() {
         let (mut b, mut up, sid) = asked_thread("ask-owed-person").await;
         b.on_disposition(dispo("ask", &[ROOT], None, &sid)).await;
         let mut person = channel_msg("1782000000.000500", "U_OWNER", "how is it going?");
@@ -2725,7 +2738,13 @@ mod tests {
         person.thread_ts = Some(ROOT.into());
         b.on_inbound(&person).await;
         b.on_disposition(dispo("reply", &["1782000000.000500"], Some("waiting on the project"), &sid)).await;
-        assert!(replies_up(&mut up).is_empty());
+        assert_eq!(replies_up(&mut up), vec![("reply".to_string(), "waiting on the project".to_string())]);
+        assert!(b.threads.get(ROOT).is_some_and(|e| !e.ask_owed.is_empty()), "the real answer is still owed");
+        // The result from below comes back, and its summary is the answer
+        b.on_inbound(&agent_msg(ROOT, "1782000000.000800", "result from below", crate::chat::DeliveryKind::Reply)).await;
+        b.on_disposition(dispo("reply", &["1782000000.000800"], Some("summary"), &sid)).await;
+        assert_eq!(replies_up(&mut up), vec![("reply".to_string(), "summary".to_string())]);
+        assert!(b.threads.get(ROOT).is_some_and(|e| e.ask_owed.is_empty()));
     }
 
     #[tokio::test]
