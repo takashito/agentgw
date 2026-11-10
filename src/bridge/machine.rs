@@ -379,6 +379,7 @@ impl FromRelay {
             // Answers and asks only ever go the other way
             F::ProjectSet { .. }
             | F::AskChannel { .. }
+            | F::EndAsk { .. }
             | F::ListChannels { .. }
             | F::SetChannelInfo { .. }
             | F::CreateChannel { .. }
@@ -386,7 +387,6 @@ impl FromRelay {
             | F::AgentReply { .. }
             | F::NeedsHuman { .. }
             | F::AskEnded { .. }
-            | F::SetConfirmAsks { .. }
             | F::ProjectRead { .. }
             | F::Routes { .. }
             | F::PwdOn { .. }

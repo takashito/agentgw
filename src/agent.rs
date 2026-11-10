@@ -308,7 +308,8 @@ pub const ASKED_NOTE: &str = "This message is a request from the Claude in anoth
     or act, pass needs_human: true to reply.";
 /// The line on something coming back to the agent that asked.
 pub const ANSWER_NOTE: &str = "This is the result of your ask in from_channel/from_thread. To ask \
-    again in the same exchange, call ask_channel with that channel and thread_ts.";
+    again in the same exchange, call ask_channel with that channel and thread_ts; once you are done \
+    with that thread, close it with end_ask.";
 
 /// The source Claude Code uses when drawing a push notification. Using the same value makes
 /// the injected first message byte-identical to a pushed one.

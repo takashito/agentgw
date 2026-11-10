@@ -372,7 +372,7 @@ impl Cmd {
     fn looks_like_owner(verb: &str, args: &[String]) -> bool {
         let first = args.first().map(String::as_str).unwrap_or("");
         match verb {
-            "warm" | "confirm-asks" => matches!(first.to_lowercase().as_str(), "on" | "off"),
+            "warm" => matches!(first.to_lowercase().as_str(), "on" | "off"),
             "allow-bot" | "remove-bot" => {
                 SlackId::is_bot(first) || SlackId::from_user_mention(first).is_some()
             }
@@ -436,7 +436,7 @@ pub enum Target {
 // Access management is not an MCP tool: the Owner sends a plain message and the Bridge parses it here and
 // runs it **before delivery** (it never reaches the agent = zero prompt-injection surface).
 
-const OWNER_COMMAND_VERBS: [&str; 5] = ["allow-bot", "remove-bot", "set-home", "warm", "confirm-asks"];
+const OWNER_COMMAND_VERBS: [&str; 4] = ["allow-bot", "remove-bot", "set-home", "warm"];
 
 /// One parsed Owner command (`allow-bot U123` etc.).
 ///
@@ -1273,9 +1273,7 @@ mod tests {
             assert_eq!(t(verb), Some(Target::Usage)); // bare: says nothing about where
             assert_eq!(t(&format!("please {verb} /x")), None);
         }
-        let ca = Cmd::owner(&Message::new("confirm-asks off", None)).unwrap();
-        assert_eq!((ca.verb, ca.args.len()), ("confirm-asks", 1));
-        assert!(Cmd::owner(&Message::new("confirm-asks の話", None)).is_none(), "a sentence");
+        assert!(Cmd::owner(&Message::new("confirm-asks off", None)).is_none(), "gone with the Run button");
         let oc = Cmd::owner(&Message::new("warm on <#C1|general>", None)).unwrap();
         assert_eq!((oc.verb, oc.args.len()), ("warm", 2));
         assert!(Cmd::owner(&Message::new("warm の話をしよう", None)).is_none()); // no on/off = a sentence

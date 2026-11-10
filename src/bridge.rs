@@ -2926,18 +2926,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_machine_forwards_confirm_asks_to_the_gateway() {
-        let (d, _slack, _agent, _clock) = flow_deps("confirm-asks");
-        let dir = d.dir.clone();
-        let (mut b, _fx) = Bridge::for_test(d);
-        let (tx, mut up) = mpsc::unbounded_channel();
-        b.ask_gateway = Some(tx);
-        b.on_inbound(&channel_msg("1782000000.000700", "U_OWNER", "<@U_BOT> confirm-asks off")).await;
-        let sent = std::iter::from_fn(|| up.try_recv().ok()).any(|f| {
-            matches!(f, crate::bridge::gateway::link::LinkFrame::SetConfirmAsks { ref channel, on: false, .. } if channel == "C1")
-        });
-        assert!(sent, "asked of the gateway");
-        assert!(bridge::Access::load(&dir).confirms_asks("C1"), "this machine's own record is untouched");
+    async fn the_asker_ending_a_thread_ends_it_like_exit_and_tells_nobody() {
+        let (mut b, mut up, sid) = asked_thread("ask-end").await;
+        b.on_disposition(dispo("ask", &[ROOT], None, &sid)).await; // an answer is owed
+        let _ = replies_up(&mut up);
+        b.on_inbound(&agent_msg(ROOT, "1782000000.000700", "", crate::chat::DeliveryKind::End)).await;
+        let mut back = Vec::new();
+        while let Ok(f) = up.try_recv() {
+            back.push(format!("{f:?}"));
+        }
+        assert!(back.iter().all(|f| !f.contains("AgentReply") && !f.contains("AskEnded")), "{back:?}");
+        assert!(b.ledger.from_agent_ids(&ThreadKey::new("C_ADMIN", ROOT)).is_empty(), "nothing is owed");
+        assert!(b.threads.get(ROOT).is_some_and(|e| e.ask_owed.is_empty()));
+        assert!(b.threads.get(ROOT).is_some(), "the thread stays, as after exit");
     }
 
     #[test]

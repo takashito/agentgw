@@ -62,8 +62,8 @@ pub struct InboundMsg {
     /// agent — the Bridge notes that the name is theirs now and stops renaming it.
     pub session_title: Option<String>,
     /// Set when this came from **an agent in another channel**, not from Slack. The gateway only
-    /// makes one after its own checks (the Owner's Run, a follow-up on an approved exchange, or a
-    /// reply going back), so it is not gated, not counted by the loop guard, and never a command.
+    /// makes one after its own checks (a new ask into a channel the bot is in, a follow-up or `end_ask` from
+    /// the thread that asked, or a reply going back), so it is not gated, not counted by the loop guard, and never a command.
     pub from_agent: Option<AgentOrigin>,
 }
 
@@ -77,13 +77,16 @@ pub struct AgentOrigin {
 }
 
 /// What one delivery between agents is: a request to the asked thread, or something going back to
-/// the asking thread (its reply, or a notice that no reply is coming).
+/// the asking thread (its reply, or a notice that no reply is coming), or the asking agent ending
+/// the asked thread (`end_ask`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryKind {
     Ask,
     Reply,
     Notice,
+    /// The asking agent is done with this thread: end its agent the way `exit` does. Carries no text.
+    End,
 }
 
 /// One edit. `revision` is Slack's `edited.ts` (marks the same edit being redelivered).

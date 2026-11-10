@@ -66,11 +66,19 @@ pub fn check_follow_up(
         return Err("no ask from this thread goes to that thread".into());
     };
     match row.state {
-        AskState::Pending => Err("still waiting for the Owner to press Run".into()),
-        AskState::Ended => Err("a person ended this exchange; ask again in a new thread".into()),
+        AskState::Ended => Err("this exchange has ended; ask again in a new thread".into()),
         AskState::Approved if !target_online => Err("the machine for that channel is offline".into()),
         AskState::Approved => Ok(()),
     }
+}
+
+/// Whether `from_channel`/`from_thread` may end the asked thread whose record is `row` (`end_ask`):
+/// only the thread that asked it can. `Ok(true)` = it has ended already, nothing more to do.
+pub fn check_end(row: Option<&AskedFrom>, from_channel: &str, from_thread: &str) -> Result<bool, String> {
+    let Some(row) = row.filter(|r| r.channel == from_channel && r.thread_ts == from_thread) else {
+        return Err("that thread was not asked from this thread; you can only end threads you asked".into());
+    };
+    Ok(row.state == AskState::Ended)
 }
 
 /// Whether a new ask may go to `to_channel`. A new ask always opens a new thread, so it can never
@@ -137,26 +145,6 @@ pub fn notify_targets(
     out
 }
 
-/// What the Run / Reject buttons carry, so a press works across a restart with no table in memory.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct AskOffer {
-    pub from_channel: String,
-    pub from_thread: String,
-    pub to_channel: String,
-    /// The first post of the request (the asked thread's root).
-    pub request_ts: String,
-}
-
-impl AskOffer {
-    pub fn encode(&self) -> String {
-        serde_json::to_string(self).unwrap_or_default()
-    }
-
-    pub fn decode(value: &str) -> Option<Self> {
-        serde_json::from_str(value).ok()
-    }
-}
-
 /// What the asking agent is told when the asked machine drops mid-request.
 pub const OFFLINE_LINE: &str = "The machine for that channel went offline while working on your request.";
 
@@ -176,15 +164,6 @@ pub fn dead_end_line(outcome: &str, detail: &str) -> String {
         "closed" => "The other thread was closed before it answered.".into(),
         "offline" => OFFLINE_LINE.into(),
         other => format!("The other agent ended without a reply ({other})."),
-    }
-}
-
-/// What `confirm-asks on|off` answers.
-pub fn confirm_asks_said(channel: &str, on: bool) -> String {
-    if on {
-        crate::t!("Asks into <#{channel}> now wait for Run.", "<#{channel}> への依頼は「実行」を押すまで止まります。")
-    } else {
-        crate::t!("Asks into <#{channel}> now start at once.", "<#{channel}> への依頼は確認なしで始まります。")
     }
 }
 
@@ -336,7 +315,6 @@ mod decision_tests {
             outstanding: false,
             missed: 0,
             origin_closed: false,
-            request: None,
             line: None,
             title: None,
         }
@@ -348,8 +326,6 @@ mod decision_tests {
         assert!(check_follow_up(Some(&ok), "C1", "1.1", true).is_ok());
         assert!(check_follow_up(None, "C1", "1.1", true).is_err());
         assert!(check_follow_up(Some(&ok), "C1", "9.9", true).is_err());
-        let pending = row("C1", "1.1", AskState::Pending);
-        assert!(check_follow_up(Some(&pending), "C1", "1.1", true).unwrap_err().contains("Run"));
         let ended = row("C1", "1.1", AskState::Ended);
         assert!(check_follow_up(Some(&ended), "C1", "1.1", true).unwrap_err().contains("new thread"));
         assert!(check_follow_up(Some(&ok), "C1", "1.1", false).unwrap_err().contains("offline"));
@@ -436,15 +412,14 @@ mod decision_tests {
     }
 
     #[test]
-    fn an_ask_offer_survives_the_button_value() {
-        let o = AskOffer {
-            from_channel: "C1".into(),
-            from_thread: "1.1".into(),
-            to_channel: "C2".into(),
-            request_ts: "2.1".into(),
-        };
-        assert_eq!(AskOffer::decode(&o.encode()), Some(o.clone()));
-        assert!(crate::bridge::state::FolderOffer::decode(&o.encode()).is_none(), "not mistaken for a folder offer");
+    fn only_the_asking_thread_may_end_an_ask() {
+        let ok = row("C1", "1.1", AskState::Approved);
+        assert_eq!(check_end(Some(&ok), "C1", "1.1"), Ok(false));
+        assert!(check_end(Some(&ok), "C1", "9.9").is_err(), "another thread");
+        assert!(check_end(Some(&ok), "C9", "1.1").is_err(), "another channel");
+        assert!(check_end(None, "C1", "1.1").is_err(), "a thread nobody asked");
+        let ended = row("C1", "1.1", AskState::Ended);
+        assert_eq!(check_end(Some(&ended), "C1", "1.1"), Ok(true), "ending twice is fine");
     }
 }
 

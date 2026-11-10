@@ -1343,34 +1343,6 @@ pub struct PermClick {
 /// The `action` of the two answers to a [`FolderOffer`](crate::bridge::state::FolderOffer).
 pub const FOLDER_YES: &str = "mkdir-yes";
 pub const FOLDER_NO: &str = "mkdir-no";
-/// The buttons on an ask from an agent in another channel.
-pub const ASK_RUN: &str = "ask-run";
-pub const ASK_REJECT: &str = "ask-reject";
-
-/// Run / Reject on an ask from an agent. `value` is the encoded [`AskOffer`](crate::bridge::asks::AskOffer)
-/// (the gateway reads it; nothing is kept in memory, so a press works across a restart).
-pub fn ask_offer_blocks(question: &str, value: &str) -> serde_json::Value {
-    let button = |label: String, action: &str, style: Option<&str>| {
-        let mut b = serde_json::json!({
-            "type": "button",
-            "action_id": format!("perm:{action}:ask"),
-            "text": {"type": "plain_text", "text": label},
-            "value": value,
-        });
-        if let Some(s) = style {
-            b["style"] = s.into();
-        }
-        b
-    };
-    serde_json::json!([
-        {"type": "markdown", "text": question},
-        {"type": "actions", "elements": [
-            button(crate::t!("Run", "実行"), ASK_RUN, Some("primary")),
-            button(crate::t!("Reject", "却下"), ASK_REJECT, None),
-        ]},
-    ])
-}
-
 /// The question and its two buttons. `value` is the encoded offer.
 pub fn folder_offer_blocks(question: &str, value: &str) -> serde_json::Value {
     let button = |label: String, action: &str, style: Option<&str>| {

@@ -316,7 +316,6 @@ impl Bridge {
             outstanding: false,
             missed: 0,
             origin_closed: false,
-            request: None,
             line: None,
             title: None,
         };
@@ -494,6 +493,14 @@ impl Bridge {
             thread_key: Some(key.clone()),
         };
 
+        // The asking agent is done with this thread (`end_ask`): end its agent the way `exit` does.
+        // The gateway checked who may and has already ended the exchange, so nothing is told back
+        if from_agent.as_ref().is_some_and(|o| o.kind == crate::chat::DeliveryKind::End) {
+            ctx(None).info("bridge", &format!("slack-events: ended by the asking agent msg={} channel={}", msg.ts, msg.channel));
+            self.end_agent(msg, &key, &root_ts, &ctx(None), false).await;
+            return;
+        }
+
         // In a channel it takes **a mention or an already active thread** to get in
         // (a DM counts as a mention). Registration is not checked; these two are all that matter
         let dm = msg.channel_kind == inbound::ChannelKind::Dm;
@@ -501,7 +508,7 @@ impl Bridge {
             || crate::bridge::command::Message::new(&msg.text, self.bot_user_id.as_deref())
                 .mentions_bot();
         let is_active_thread = !dm && self.threads.is_active(&root_ts);
-        // The gateway made it only after its own checks (the Owner's Run, or an approved exchange)
+        // The gateway made it only after its own checks (a channel the bot is in, or a live exchange)
         let verdict = if from_agent.is_some() {
             GateVerdict::Serve
         } else {

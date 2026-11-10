@@ -537,32 +537,6 @@ impl Bridge {
                 };
                 bridge::AccessOp::SetWarm { channel, on }
             }
-            // `confirm-asks on|off [<#channel>]`: whether asks from agents into that channel wait for
-            // Run. The gateway decides asks, so it is the one that keeps this
-            "confirm-asks" => {
-                let on = oc.args.first().is_some_and(|a| a.eq_ignore_ascii_case("on"));
-                let ch = match oc.args.get(1) {
-                    Some(tok) => crate::chat::slack::SlackId::from_channel_mention(tok),
-                    None if !dm => Some(msg.channel.clone()),
-                    None => None,
-                };
-                let Some(channel) = ch else {
-                    let usage = crate::t!("Usage: `confirm-asks on|off [<#channel>]`", "使い方: `confirm-asks on|off [<#channel>]`");
-                    self.post(&msg.channel, root_ts, usage, key);
-                    return;
-                };
-                if self.ask_the_gateway(
-                    crate::bridge::gateway::link::LinkFrame::SetConfirmAsks {
-                        channel: channel.clone(),
-                        thread_ts: root_ts.to_string(),
-                        on,
-                    },
-                    ctx,
-                ) {
-                    return;
-                }
-                bridge::AccessOp::SetConfirmAsks { channel, on }
-            }
             // Home must be a real channel — the place where it was typed becomes Home
             "set-home" => {
                 if dm || !crate::chat::slack::SlackId::is_channel(&msg.channel) {
@@ -1066,7 +1040,6 @@ pub(super) fn help(machines: bool, agent: &dyn crate::agent::Agent) -> String {
     channels.push(("allow-bot <@bot>", crate::t!("let a bot's messages start work", "そのボットの投稿で作業を始められるようにする")));
     channels.push(("remove-bot <@bot>", crate::t!("stop letting that bot's messages through", "そのボットの投稿を通さないようにする")));
     channels.push(("set-home", crate::t!("send notices to this channel", "通知をこのチャンネルに出す")));
-    channels.push(("confirm-asks on|off [<#channel>]", crate::t!("whether asks from another channel's Claude wait for Run", "別のチャンネルの Claude からの依頼を「実行」まで止めるか")));
     section(&mut lines, crate::t!("Channels", "チャンネル"), channels);
     section(
         &mut lines,
@@ -1431,7 +1404,6 @@ mod tests {
             "set-home",
             "allow-bot <@bot>",
             "remove-bot <@bot>",
-            "confirm-asks on|off [<#channel>]",
             "help / ?",
         ] {
             assert!(h.contains(word), "{word}");

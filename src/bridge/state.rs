@@ -257,10 +257,6 @@ pub struct AskedFrom {
     /// A person closed the asking thread (`exit`): replies are no longer delivered there.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub origin_closed: bool,
-    /// The request, whole, while it waits for Run. Delivered from here when the Owner presses it, so
-    /// a press after a restart still has the text; cleared once delivered or rejected.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request: Option<String>,
     /// The line in the asking thread that says what was asked (`📤 …`), rewritten as the ask moves on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line: Option<String>,
@@ -273,13 +269,15 @@ fn no_missed(n: &u32) -> bool {
     *n == 0
 }
 
-/// `Pending` waits for the Owner to press Run; `Ended` refuses follow-ups (rejected, or a person
-/// typed `exit` in the asked thread).
+/// `Ended` refuses follow-ups (a person typed `exit` in the asked thread, or the asking agent closed it
+/// with `end_ask`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AskState {
-    Pending,
     Approved,
+    /// `pending` is an ask left waiting for the Run button, which no longer exists: it was never
+    /// delivered, so it reads as ended.
+    #[serde(alias = "pending")]
     Ended,
 }
 
@@ -421,12 +419,7 @@ impl Threads {
     /// Whether this thread is **already running** (`isThreadActive`). If so, a channel
     /// follow-up is accepted without a mention. `pending` / `paused` count as not running.
     pub fn is_active(&self, thread_ts: &str) -> bool {
-        // An ask still waiting for the Owner's Run has a row but nothing running: a follow-up there
-        // must not start an agent ahead of the button
-        let waiting_for_run = self.get(thread_ts).is_some_and(|e| {
-            e.agent_id.is_none() && e.asked_from.as_ref().is_some_and(|a| a.state == AskState::Pending)
-        });
-        !waiting_for_run && !matches!(self.status_of(thread_ts), "pending" | "paused" | "none")
+        !matches!(self.status_of(thread_ts), "pending" | "paused" | "none")
     }
 
     /// `getThreadStatus` — an unknown thread is `none`, an entry without `status` is `active`.
@@ -798,9 +791,6 @@ pub struct Route {
     /// **Unset = this machine handles it itself** (the default for a standalone Bridge).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bridge: Option<String>,
-    /// Whether asks from agents in other channels wait for the Owner to press Run. Unset = they do.
-    #[serde(rename = "confirmAsks", skip_serializing_if = "Option::is_none")]
-    pub confirm_asks: Option<bool>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -1112,14 +1102,6 @@ pub struct Access {
 }
 
 impl Access {
-    /// Whether an ask into `channel` waits for the Owner's Run (the default) or starts at once.
-    pub fn confirms_asks(&self, channel: &str) -> bool {
-        self.routes
-            .get(channel)
-            .and_then(|r| r.confirm_asks)
-            .unwrap_or(true)
-    }
-
     /// Emoji for the receive ack ("eyes" when unset).
     pub fn ack_emoji(&self) -> &str {
         self.ack_reaction.as_deref().unwrap_or("eyes")
@@ -1255,10 +1237,6 @@ impl Access {
                 // (not the raw internal id).
                 crate::t!("<#{channel}> now uses the project directory `{path}`.", "<#{channel}> をプロジェクト `{path}` に紐付けました。")
             }
-            AccessOp::SetConfirmAsks { channel, on } => {
-                access.routes.entry(channel.clone()).or_default().confirm_asks = Some(on);
-                crate::bridge::asks::confirm_asks_said(&channel, on)
-            }
             AccessOp::SetWarm { channel, on } => {
                 // Warm pool keys are cwds, so this only means something for channels with a repo
                 // (channels without one are served by the resident Home pool). Keep the flag, but say so.
@@ -1360,7 +1338,6 @@ pub enum AccessOp {
     SetRepo { channel: String, path: String },
     SetWarm { channel: String, on: bool },
     SetHome(String),
-    SetConfirmAsks { channel: String, on: bool },
 }
 
 
@@ -3109,7 +3086,7 @@ mod ask_record_tests {
         let e: ThreadEntry = serde_json::from_str(raw).unwrap();
         let a = e.asked_from.clone().unwrap();
         assert_eq!((a.channel.as_str(), a.thread_ts.as_str(), a.state), ("C1", "1.1", AskState::Approved));
-        assert!(!a.outstanding && a.missed == 0 && !a.origin_closed && a.request.is_none());
+        assert!(!a.outstanding && a.missed == 0 && !a.origin_closed);
         let back = serde_json::to_value(&e).unwrap();
         assert_eq!(back["zzz"], 1);
         assert_eq!(back["askedFrom"]["state"], "approved");
@@ -3123,36 +3100,18 @@ mod ask_record_tests {
     }
 
     #[test]
-    fn confirm_asks_defaults_to_on() {
-        let mut a = Access::default();
-        assert!(a.confirms_asks("C1"));
-        a.routes.entry("C1".into()).or_default().confirm_asks = Some(false);
-        assert!(!a.confirms_asks("C1"));
+    fn an_old_confirm_asks_setting_is_kept_but_not_read() {
+        let raw = r#"{"routes":{"C1":{"confirmAsks":false}}}"#;
+        let a: Access = serde_json::from_str(raw).unwrap();
         let v = serde_json::to_value(&a).unwrap();
-        assert_eq!(v["routes"]["C1"]["confirmAsks"], false);
+        assert_eq!(v["routes"]["C1"]["confirmAsks"], false, "left as it was");
     }
 
     #[test]
-    fn an_ask_waiting_for_run_is_not_an_active_thread() {
-        let dir = crate::state_dir::StateDir::at(std::env::temp_dir().join(format!("agentgw-pending-ask-{}", std::process::id())));
-        let _ = std::fs::remove_dir_all(dir.path());
-        std::fs::create_dir_all(dir.path()).unwrap();
-        let mut t = Threads::load(&dir);
-        let row = |state| AskedFrom {
-            channel: "C1".into(),
-            thread_ts: "1.1".into(),
-            state,
-            outstanding: false,
-            missed: 0,
-            origin_closed: false,
-            request: None,
-            line: None,
-            title: None,
-        };
-        t.set_asked("2.1", "C2", Some(row(AskState::Pending)));
-        assert!(!t.is_active("2.1"), "nothing may start it before Run");
-        t.set_asked("2.1", "C2", Some(row(AskState::Approved)));
-        assert!(t.is_active("2.1"));
+    fn an_ask_left_waiting_for_run_reads_as_ended() {
+        let raw = r#"{"channel":"C1","thread_ts":"1.1","state":"pending","request":"do it"}"#;
+        let a: AskedFrom = serde_json::from_str(raw).unwrap();
+        assert_eq!(a.state, AskState::Ended);
     }
 
     #[test]

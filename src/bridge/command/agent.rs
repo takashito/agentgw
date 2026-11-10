@@ -108,14 +108,30 @@ impl Bridge {
     /// continues the same session with `--resume`. A running turn is waited for, not cut (unlike stop):
     /// so the farewell lands **below** the agent's last reply.
     pub(super) async fn user_exit(&mut self, msg: &InboundMsg, key: &ThreadKey, root_ts: &str, ctx: &LogCtx) {
+        self.end_agent(msg, key, root_ts, ctx, true).await;
+    }
+
+    /// What `exit` does, also used when the agent that asked this thread ends it (`end_ask`). Then
+    /// `tell` is false: the gateway has ended the exchange already, and the asker is the one who
+    /// ended it, so nothing goes back.
+    pub(in crate::bridge) async fn end_agent(&mut self, msg: &InboundMsg, key: &ThreadKey, root_ts: &str, ctx: &LogCtx, tell: bool) {
         let farewell = Some((msg.channel.clone(), root_ts.to_string()));
         // An exchange between agents through this thread ends here, whichever end it is
-        self.tell_asker(key, "exited", String::new());
-        if let Some(up) = &self.ask_gateway {
-            let _ = up.send(crate::bridge::gateway::link::LinkFrame::AskEnded {
-                channel: msg.channel.clone(),
-                thread_ts: root_ts.to_string(),
-            });
+        if tell {
+            self.tell_asker(key, "exited", String::new());
+            if let Some(up) = &self.ask_gateway {
+                let _ = up.send(crate::bridge::gateway::link::LinkFrame::AskEnded {
+                    channel: msg.channel.clone(),
+                    thread_ts: root_ts.to_string(),
+                });
+            }
+        } else {
+            // Nothing is owed any more: the request was answered, or the asker gave up on it
+            let waiting = self.ledger.from_agent_ids(key);
+            self.ledger.disposed(key, &waiting);
+            if self.threads.get(root_ts).is_some_and(|e| !e.ask_owed.is_empty()) {
+                self.set_owed(root_ts, Vec::new());
+            }
         }
         let sid = self.threads.get(root_ts).and_then(|e| e.agent_id.clone());
         let name = sid

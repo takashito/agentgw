@@ -153,17 +153,29 @@ impl Mcp {
             }),
             serde_json::json!({
                 "name": "ask_channel",
-                "description": "Ask the Claude in another Slack channel to do something, in a new thread there (or a follow-up in a thread you asked before, with thread_ts). The Owner may have to press Run first. Its reply arrives later as a message in your thread; do not poll or wait. Use list_channels to find the right channel.",
+                "description": "Ask the Claude in another Slack channel to do something, in a new thread there (or a follow-up in a thread you asked before, with thread_ts). It starts at once. Its reply arrives later as a message in your thread; do not poll or wait. Use list_channels to find the right channel. When the exchange is done, close that thread with end_ask.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "channel_id": { "type": "string", "description": "The channel to ask (C...), as list_channels or a <#C...> link gives it." },
-                        "text": { "type": "string", "description": "The request, standard Markdown. Say everything the other Claude needs: it does not see your conversation." },
+                        "text": { "type": "string", "description": "The request, standard Markdown. The other Claude does not see your conversation. For a task tracked in an issue (e.g. Linear), write a short summary and the issue's link and ID; the details and background belong in the issue, which the other Claude reads. For a question or a check with no issue, write the question itself, with what the other Claude needs to answer it." },
                         "title": { "type": "string", "description": "A few words naming the request, shown on top of it in Slack so people can tell what each thread is about." },
                         "thread_ts": { "type": "string", "description": "Only for a follow-up: the thread_ts of the thread you asked before (from the earlier result or the reply's from_thread)." },
                         "message_ids": { "type": "array", "items": { "type": "string" }, "description": "The inbound message_id(s) this call answers, as with reply — marks them answered once the ask is posted." },
                     },
                     "required": ["channel_id", "text"],
+                },
+            }),
+            serde_json::json!({
+                "name": "end_ask",
+                "description": "Close a thread you asked with ask_channel, once you are done with it (the request is finished, or no longer wanted). Its agent ends the way `exit` ends it — after any turn it is in, not in the middle — and a line there says you closed it. Only threads asked from this thread can be closed. No more follow-ups go to it afterwards; ask in a new thread if you need more.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "channel_id": { "type": "string", "description": "The channel you asked (C...)." },
+                        "thread_ts": { "type": "string", "description": "The thread_ts of the thread you asked (from ask_channel's result or the reply's from_thread)." },
+                    },
+                    "required": ["channel_id", "thread_ts"],
                 },
             }),
             serde_json::json!({
@@ -319,7 +331,10 @@ pub fn server_instructions() -> String {
      yet): name it with `set_thread_title` once its topic is clear, and again \
      whenever the topic moves on. \
      To get work done by the Claude in another channel, use ask_channel (find the channel with \
-     list_channels); its reply comes back as a message, so end your turn instead of waiting."
+     list_channels); its reply comes back as a message, so end your turn instead of waiting. \
+     For a task tracked in an issue, the ask is a short summary with the issue's link (details live \
+     in the issue); a question or a check needs no issue. Close the thread you asked with end_ask \
+     once you are done with it."
         .into()
 }
 
@@ -537,6 +552,7 @@ mod tests {
                 "fetch_messages",
                 "set_thread_title",
                 "ask_channel",
+                "end_ask",
                 "list_channels",
                 "set_channel_info",
                 "create_channel",
@@ -613,6 +629,7 @@ mod tests {
         assert_eq!(req("fetch_messages"), ["channel"]);
         assert_eq!(req("set_thread_title"), ["channel_id", "thread_ts", "title"]);
         assert_eq!(req("ask_channel"), ["channel_id", "text"]);
+        assert_eq!(req("end_ask"), ["channel_id", "thread_ts"]);
         assert!(req("list_channels").is_empty());
         assert_eq!(req("set_channel_info"), ["channel_id"]);
         assert_eq!(req("create_channel"), ["name"]);
@@ -631,6 +648,7 @@ mod tests {
     fn instructions_tell_the_agent_not_to_wait_for_an_ask() {
         let i = server_instructions();
         assert!(i.contains("ask_channel") && i.contains("end your turn instead of waiting"), "{i}");
+        assert!(i.contains("end_ask") && i.contains("needs no issue"), "{i}");
         assert!(i.starts_with("Slack bridge — reply to the Slack thread"), "the existing words stay first");
     }
 }

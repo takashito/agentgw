@@ -549,7 +549,7 @@ impl Bridge {
         }
     }
 
-    fn set_owed(&mut self, root: &str, owed: Vec<String>) {
+    pub(in crate::bridge) fn set_owed(&mut self, root: &str, owed: Vec<String>) {
         let Some(e) = self.threads.entries.get_mut(root) else { return };
         e.ask_owed = owed;
         if let Err(err) = self.threads.save() {
@@ -2586,7 +2586,7 @@ impl crate::mcp::ToolExecutor for ToolExec {
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
         let (slack, dir, dispo, ask) = (self.slack.clone(), self.state_dir.clone(), self.dispo.clone(), self.ask.clone());
         Box::pin(async move {
-            if matches!(tool.as_str(), "ask_channel" | "list_channels" | "set_channel_info" | "create_channel" | "join_channel") {
+            if matches!(tool.as_str(), "ask_channel" | "end_ask" | "list_channels" | "set_channel_info" | "create_channel" | "join_channel") {
                 return execute_ask_tool(slack.as_ref(), &dir, &session_id, &tool, &args, ask.as_ref(), &dispo).await;
             }
             execute_tool(slack.as_ref(), &dir, &session_id, &tool, &args, &dispo).await
@@ -2594,7 +2594,7 @@ impl crate::mcp::ToolExecutor for ToolExec {
     }
 }
 
-/// The tools that need the gateway's answer: `ask_channel`, `list_channels`, and the channel tools
+/// The tools that need the gateway's answer: `ask_channel`, `end_ask`, `list_channels`, and the channel tools
 /// `set_channel_info`, `create_channel` and `join_channel`.
 ///
 /// The asking thread is the caller's own, looked up from its session — never taken from the
@@ -2651,6 +2651,13 @@ pub async fn execute_ask_tool(
         return Err("this session has no thread".into());
     };
     let (from_channel, from_thread) = (entry.channel_id.clone().unwrap_or_default(), root.clone());
+    if tool == "end_ask" {
+        let (Some(to_channel), Some(to_thread)) = (opt("channel_id"), opt("thread_ts")) else {
+            return Err("channel_id and thread_ts are required".into());
+        };
+        let out = ask.ask(|req_id| LinkFrame::EndAsk { req_id, from_channel, from_thread, to_channel, to_thread }).await?;
+        return Ok(out.to_string());
+    }
     let (Some(to_channel), Some(text)) = (opt("channel_id"), opt("text")) else {
         return Err("channel_id and text are required".into());
     };
@@ -3322,7 +3329,7 @@ mod tests {
         let (api, _dir, tx, mut rx) = harness();
         let dir = dir_with_session("covers");
         let args = serde_json::json!({"channel_id": "C2", "text": "check", "message_ids": ["1.5"]});
-        let (refusing, _) = answering(Err("still waiting for the Owner to press Run".into()));
+        let (refusing, _) = answering(Err("this exchange has ended; ask again in a new thread".into()));
         assert!(execute_ask_tool(&api, &dir, "sid", "ask_channel", &args, Some(&refusing), &tx).await.is_err());
         assert!(rx.try_recv().is_err(), "a refusal answers nothing");
         let (ok, seen) = answering(Ok(serde_json::json!({"thread_ts": "2.1", "status": "delivered"})));
