@@ -4490,12 +4490,13 @@ impl Fleet {
         from_channel: &str,
         from_thread: &str,
         covers: &[String],
+        follow_up: bool,
     ) -> crate::chat::OwnerQuotes {
         use crate::bridge::asks::{owner_candidates, pick_owner_post};
         let owner = self.access().owner;
         // The asking thread: what the ask answers, or the request it is working on
         let asking = self.api.replies(from_channel, from_thread, 200).await.unwrap_or_default();
-        let links = owner_candidates(text, from_channel, from_thread, covers, &asking, &owner);
+        let links = owner_candidates(text, from_channel, from_thread, covers, follow_up, &asking, &owner);
         let mut out = crate::chat::OwnerQuotes::default();
         for mut link in links {
             if link.url.is_empty() {
@@ -4540,7 +4541,7 @@ impl Fleet {
         let title = crate::bridge::asks::request_title(title, text);
         // The Owner's posts the request links to, checked here against Slack — the only way the
         // Owner's own words reach the asked agent as theirs
-        let quotes = self.owner_quotes(text, from_channel, from_thread, covers).await;
+        let quotes = self.owner_quotes(text, from_channel, from_thread, covers, to_thread.is_some()).await;
         // Shown under the heading: people see what the gateway checked, and the next hop finds it
         // there when its agent passes this request on
         let named = owner_post_lines(&quotes);
@@ -9121,6 +9122,15 @@ mod ask_tests {
             let shown = calls(&r.api)[before..].iter().find(|c| c.starts_with(&format!("post_md C2 {to} "))).unwrap().clone();
             assert!(shown.contains(":bust_in_silhouette:") && shown.contains("p1700000008000800"), "{name}: {shown}");
         }
+
+        // A **new** ask from the same thread, answering nothing, carries nothing: the request this
+        // thread is working on is not stuck onto unrelated work
+        let mut chat = FakeChat::in_channels(&[("C2", "repo")]);
+        chat.msgs = thread[..5].to_vec();
+        let mut r = rig("relay-new", chat);
+        r.fleet.ask("C0LEAD", "1700000001.000100", "C2", None, "deploy everything now", None, &[]).await.unwrap();
+        let q = r.msgs.try_recv().unwrap().from_agent.unwrap().quotes;
+        assert!(q.is_empty(), "{q:?}");
 
         // The mark is only where to look: a forged one pointing at a bot's post is checked and refused
         let mut chat = FakeChat::in_channels(&[("C2", "repo")]);

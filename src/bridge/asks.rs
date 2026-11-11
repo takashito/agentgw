@@ -330,9 +330,10 @@ pub fn owner_links(text: &str) -> Vec<MessageLink> {
 ///    (the gateway asks Slack for its permalink);
 /// 3. one step on: in an answered post that is **not** the Owner's (a request another Claude passed
 ///    on), the link right after each [`OWNER_POST_MARK`] — the gateway's lines naming the Owner's posts.
-///    When the ask answers nothing (`covers` empty), the newest request the gateway posted into the
+///    When a **follow-up** answers nothing (`covers` empty), the newest request the gateway posted into the
 ///    asking thread (starts with [`REQUEST_MARK`]) stands in — only when it carries the mark — as the
-///    request that thread is working on. Never an older request, never another thread.
+///    request that thread is working on. Never an older request, never another thread, and never for a
+///    new ask (a new piece of work carries only what it names).
 ///
 /// Only places to look: whatever comes out is checked against Slack's author before it counts. An ts
 /// not in the asking thread is ignored, so an ask cannot point at another thread through `covers`.
@@ -341,6 +342,7 @@ pub fn owner_candidates(
     from_channel: &str,
     from_thread: &str,
     covers: &[String],
+    follow_up: bool,
     thread: &[crate::chat::FetchedMsg],
     owner: &str,
 ) -> Vec<MessageLink> {
@@ -356,7 +358,7 @@ pub fn owner_candidates(
     let is_owners = |m: &crate::chat::FetchedMsg| !owner.is_empty() && m.user == owner;
     let mut answered: Vec<&crate::chat::FetchedMsg> =
         covers.iter().filter_map(|id| thread.iter().find(|m| &m.ts == id)).collect();
-    if covers.is_empty() {
+    if covers.is_empty() && follow_up {
         // Nothing named: the newest request carrying the gateway's mark (by ts, whatever order Slack gave)
         answered = thread
             .iter()
@@ -848,7 +850,7 @@ mod owner_link_tests {
 
         // The Lead answers the request: the Owner's post named on the gateway's line is followed —
         // not the heading's link, and not the link inside the CoS's own words
-        let got = owner_candidates("deploying now", "C0LEAD", "1700000010.000100", &["1700000010.000100".into()], &thread, "U_OWNER");
+        let got = owner_candidates("deploying now", "C0LEAD", "1700000010.000100", &["1700000010.000100".into()], false, &thread, "U_OWNER");
         assert_eq!(ids(got), vec![own("C0COS", "1700000008.000800", "1700000001.000100", false)]);
 
         // No message_ids: the newest request the gateway posted here stands in, and only that one
@@ -856,39 +858,41 @@ mod owner_link_tests {
                      <https://ws.slack.com/archives/C0COS/p1700000002000200>  an older job";
         let mut with_old = thread.clone();
         with_old.push(at("1700000009.000100", "U_BOT", older));
-        let got = owner_candidates("deploying", "C0LEAD", "1700000010.000100", &[], &with_old, "U_OWNER");
+        let got = owner_candidates("deploying", "C0LEAD", "1700000010.000100", &[], true, &with_old, "U_OWNER");
         assert_eq!(ids(got), vec![own("C0COS", "1700000008.000800", "1700000001.000100", false)]);
+        // A **new** ask without message_ids carries nothing: a new piece of work names what it carries
+        assert!(owner_candidates("deploying", "C0LEAD", "1700000010.000100", &[], false, &with_old, "U_OWNER").is_empty());
         // …not a Claude's reply that copies the mark (it is not a request), and not the Owner's own posts
         let copied = at("1700000013.000100", "U_BOT", "done. :bust_in_silhouette: Owner's post, checked by agentgw: <https://ws.slack.com/archives/C0COS/p1700000003000300>");
         let mut with_copy = thread.clone();
         with_copy.push(copied);
-        let got = owner_candidates("", "C0LEAD", "1700000010.000100", &[], &with_copy, "U_OWNER");
+        let got = owner_candidates("", "C0LEAD", "1700000010.000100", &[], true, &with_copy, "U_OWNER");
         assert_eq!(ids(got), vec![own("C0COS", "1700000008.000800", "1700000001.000100", false)]);
         // A newer request without the mark ends it: the older request's Owner post does not ride along
         let mut newer = thread.clone();
         newer.push(at("1700000014.000100", "U_BOT", ":robot_face: Follow-up from the Claude in <#C0COS>  check the logs"));
-        assert!(owner_candidates("", "C0LEAD", "1700000010.000100", &[], &newer, "U_OWNER").is_empty());
+        assert!(owner_candidates("", "C0LEAD", "1700000010.000100", &[], true, &newer, "U_OWNER").is_empty());
 
         // The Owner's own post in the asking thread, answered: taken as it is (its link is asked of Slack)
-        let got = owner_candidates("", "C0LEAD", "1700000010.000100", &["1700000011.000100".into()], &thread, "U_OWNER");
+        let got = owner_candidates("", "C0LEAD", "1700000010.000100", &["1700000011.000100".into()], false, &thread, "U_OWNER");
         assert_eq!(ids(got), vec![own("C0LEAD", "1700000011.000100", "1700000010.000100", true)]);
 
         // Not answered → not looked at, whatever the thread holds (no request here: nothing stands in);
         // a ts from another thread is not found
-        assert!(owner_candidates("", "C0LEAD", "1700000010.000100", &[], &thread[1..], "U_OWNER").is_empty());
-        assert!(owner_candidates("", "C0LEAD", "1700000010.000100", &["1700000099.000100".into()], &thread, "U_OWNER").is_empty());
+        assert!(owner_candidates("", "C0LEAD", "1700000010.000100", &[], true, &thread[1..], "U_OWNER").is_empty());
+        assert!(owner_candidates("", "C0LEAD", "1700000010.000100", &["1700000099.000100".into()], false, &thread, "U_OWNER").is_empty());
         // A post that is not the Owner's and has no gateway line adds nothing
-        assert!(owner_candidates("", "C0LEAD", "1700000010.000100", &["1700000012.000100".into()], &thread, "U_OWNER").is_empty());
+        assert!(owner_candidates("", "C0LEAD", "1700000010.000100", &["1700000012.000100".into()], false, &thread, "U_OWNER").is_empty());
 
         // The text's links come first; the total stays at OWNER_LINKS_MAX, without duplicates
         let text = "https://ws.slack.com/archives/C0COS/p1700000008000800 https://ws.slack.com/archives/C1/p1700000001000100 \
                     https://ws.slack.com/archives/C2/p1700000002000200";
         let all = ["1700000010.000100".to_string(), "1700000011.000100".to_string()];
-        let got = owner_candidates(text, "C0LEAD", "1700000010.000100", &all, &thread, "U_OWNER");
+        let got = owner_candidates(text, "C0LEAD", "1700000010.000100", &all, false, &thread, "U_OWNER");
         assert_eq!(got.len(), OWNER_LINKS_MAX);
         assert_eq!(got.iter().map(|l| l.channel.as_str()).collect::<Vec<_>>(), ["C0COS", "C1", "C2"]);
         // With no Owner set, an answered post is never taken as the Owner's
-        let got = owner_candidates("", "C0LEAD", "1700000010.000100", &["1700000011.000100".into()], &thread, "");
+        let got = owner_candidates("", "C0LEAD", "1700000010.000100", &["1700000011.000100".into()], false, &thread, "");
         assert!(got.is_empty(), "{got:?}");
     }
 
