@@ -302,8 +302,12 @@ pub mod link {
         },
         /// machine → gateway: put the bot into a public channel (`join_channel`). Answered with [`LinkFrame::AskAnswer`].
         JoinChannel { req_id: String, channel_id: String },
+        /// machine → gateway: add apps, bots or the Owner to a channel the bot is in (`invite_to_channel`).
+        /// `users` are IDs or names. Answered with [`LinkFrame::AskAnswer`].
+        InviteToChannel { req_id: String, channel_id: String, users: Vec<String> },
         /// gateway → machine: the answer to an agent's ask ([`LinkFrame::AskChannel`], [`LinkFrame::ListChannels`],
-        /// [`LinkFrame::SetChannelInfo`], [`LinkFrame::CreateChannel`], [`LinkFrame::JoinChannel`]),
+        /// [`LinkFrame::SetChannelInfo`], [`LinkFrame::CreateChannel`], [`LinkFrame::JoinChannel`],
+        /// [`LinkFrame::InviteToChannel`]),
         /// as the JSON the tool returns, or why not.
         AskAnswer {
             req_id: String,
@@ -3639,6 +3643,15 @@ impl Fleet {
                     }
                 });
             }
+            link::LinkFrame::InviteToChannel { req_id, channel_id, users } => {
+                let (fleet, machine) = (self.clone(), bridge_id.to_string());
+                tokio::spawn(async move {
+                    let result = fleet.invite_to_channel(&channel_id, &users).await;
+                    if !fleet.send_frame(&machine, &link::LinkFrame::AskAnswer { req_id, result }).await {
+                        rlog("info", &format!("{machine}: could not return the invite (link dropped)"));
+                    }
+                });
+            }
             link::LinkFrame::AskChannel {
                 req_id,
                 from_channel,
@@ -4967,6 +4980,77 @@ impl Fleet {
         self.api.join_channel(channel).await.map_err(|e| format!("joining {channel}: {e}"))?;
         rlog("info", &format!("joined {channel} for an agent"));
         self.channel_row(channel).await
+    }
+
+    /// Add members to a channel for an agent (`invite_to_channel`).
+    ///
+    /// **The stop on who:** only apps and bots (Linear and the like) and the Owner. An agent that picks a
+    /// person by mistake would pull them into a channel they never asked for, and a person can be
+    /// asked to join by the Owner instead. Only channels the bot is in, at most [`MAX`] at a time.
+    /// Every name is checked before anyone is invited, so a refusal invites nobody.
+    pub(crate) async fn invite_to_channel(&self, channel: &str, users: &[String]) -> Result<serde_json::Value, String> {
+        const MAX: usize = 10;
+        let users: Vec<&str> = users.iter().map(|u| u.trim()).filter(|u| !u.is_empty()).collect();
+        if users.is_empty() {
+            return Err("give at least one user ID or name".into());
+        }
+        if users.len() > MAX {
+            return Err(format!("at most {MAX} at a time"));
+        }
+        if !self.api.is_member(channel).await? {
+            return Err(format!("the bot is not in {channel}"));
+        }
+        let owner = self.access().owner;
+        let mut who = Vec::new();
+        for u in users {
+            let b = self.resolve_invitee(u).await?;
+            if b.deleted {
+                return Err(format!("{} ({}) is a deactivated account", b.name, b.id));
+            }
+            if !b.is_bot && b.id != owner {
+                return Err(format!(
+                    "{} ({}) is a person, not an app or bot. Agents may invite only apps, bots and the Owner; \
+                     ask the Owner to invite people. Nobody was invited.",
+                    b.name, b.id
+                ));
+            }
+            who.push(b);
+        }
+        let row = |b: &crate::chat::UserBrief| serde_json::json!({"id": b.id, "name": b.name, "is_bot": b.is_bot});
+        let (mut invited, mut already) = (Vec::new(), Vec::new());
+        for b in &who {
+            match self.api.invite_to_channel(channel, &b.id).await {
+                Ok(()) => invited.push(row(b)),
+                Err(e) if e.contains("already_in_channel") => already.push(row(b)),
+                Err(e) => {
+                    let done: Vec<_> = invited.iter().map(|r| r["name"].clone()).collect();
+                    return Err(format!("inviting {} ({}) to {channel}: {e} (invited before this: {done:?})", b.name, b.id));
+                }
+            }
+            rlog("info", &format!("{} ({}) invited to {channel} for an agent", b.name, b.id));
+        }
+        Ok(serde_json::json!({"channel": channel, "invited": invited, "already_in": already}))
+    }
+
+    /// An invitee as given: a `U…`/`W…` ID (bare, `<@U…>` or `@U…`), or a name that must match exactly one member.
+    async fn resolve_invitee(&self, given: &str) -> Result<crate::chat::UserBrief, String> {
+        let bare = given.trim_start_matches("<@").trim_end_matches('>').trim_start_matches('@');
+        let bare = bare.split('|').next().unwrap_or(bare);
+        let looks_like_id = bare.len() >= 8
+            && (bare.starts_with('U') || bare.starts_with('W'))
+            && bare.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
+        if looks_like_id {
+            return self.api.user_brief(bare).await.map_err(|e| format!("looking up {bare}: {e}"));
+        }
+        let mut found = self.api.find_users(bare).await.map_err(|e| format!("looking for {bare:?}: {e}"))?;
+        match found.len() {
+            0 => Err(format!("no member, app or bot named {bare:?}; give its user ID (U…) instead")),
+            1 => Ok(found.remove(0)),
+            _ => {
+                let ids: Vec<String> = found.iter().map(|b| format!("{} ({}, {})", b.name, b.id, if b.is_bot { "bot" } else { "person" })).collect();
+                Err(format!("{bare:?} matches more than one: {}; give the user ID", ids.join(", ")))
+            }
+        }
     }
 
     /// The channels an agent may ask: every channel the bot is in, with the machine and folder that
@@ -9201,6 +9285,40 @@ mod ask_tests {
         let calls = r.api.calls.lock().unwrap().clone();
         assert!(calls.contains(&"create_channel home-lead".to_string()), "{calls:?}");
         assert!(calls.contains(&"join_channel C7".to_string()), "{calls:?}");
+    }
+
+    #[tokio::test]
+    async fn the_gateway_invites_apps_and_the_owner_but_not_other_people() {
+        use crate::chat::UserBrief;
+        let u = |id: &str, name: &str, is_bot: bool| UserBrief { id: id.into(), name: name.into(), is_bot, deleted: false };
+        let mut chat = FakeChat::in_channels(&[("C1", "agentgw")]);
+        chat.users = vec![
+            u("U0LINEAR1", "Linear", true),
+            u("U_OWNER", "owner", false),
+            u("U0ALICE01", "alice", false),
+            u("U0TWIN001", "twin", true),
+            u("U0TWIN002", "twin", false),
+            UserBrief { deleted: true, ..u("U0GONE001", "gone", true) },
+        ];
+        let r = rig("invite", chat);
+        let invites = |r: &Rig| calls(&r.api).into_iter().filter(|c| c.starts_with("invite ")).collect::<Vec<_>>();
+        // By mention and by name (any case); the Owner is allowed
+        let out = r.fleet.invite_to_channel("C1", &["<@U0LINEAR1>".into(), "Owner".into()]).await.unwrap();
+        assert_eq!(out["invited"][0]["id"], "U0LINEAR1", "{out}");
+        assert_eq!(invites(&r), ["invite C1 U0LINEAR1", "invite C1 U_OWNER"]);
+        // A person who is not the Owner stops the whole call before anyone is invited
+        let e = r.fleet.invite_to_channel("C1", &["Linear".into(), "U0ALICE01".into()]).await.unwrap_err();
+        assert!(e.contains("person") && e.contains("Nobody was invited"), "{e}");
+        assert_eq!(invites(&r).len(), 2);
+        // A name that fits two, one that fits none, a deactivated one, a channel the bot is not in
+        assert!(r.fleet.invite_to_channel("C1", &["twin".into()]).await.unwrap_err().contains("U0TWIN002"));
+        assert!(r.fleet.invite_to_channel("C1", &["nobody".into()]).await.unwrap_err().contains("no member"));
+        assert!(r.fleet.invite_to_channel("C1", &["U0GONE001".into()]).await.unwrap_err().contains("deactivated"));
+        assert!(r.fleet.invite_to_channel("C9", &["Linear".into()]).await.unwrap_err().contains("not in C9"));
+        assert!(r.fleet.invite_to_channel("C1", &[" ".into()]).await.unwrap_err().contains("at least one"));
+        let many: Vec<String> = (0..11).map(|_| "Linear".to_string()).collect();
+        assert!(r.fleet.invite_to_channel("C1", &many).await.unwrap_err().contains("at most"));
+        assert_eq!(invites(&r).len(), 2, "no refusal invites anyone");
     }
 
     #[tokio::test]

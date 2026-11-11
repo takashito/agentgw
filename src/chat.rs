@@ -266,6 +266,16 @@ pub fn deletion_notice(deleted_ts: &str, text: &str, had_files: bool) -> String 
 
 // ── what reads return ──
 
+/// A workspace member as far as deciding whether an agent may invite them: an app or bot, or a person.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct UserBrief {
+    pub id: String,
+    /// The handle or display name, for saying who it is.
+    pub name: String,
+    pub is_bot: bool,
+    pub deleted: bool,
+}
+
 /// Only what **the event doesn't tell us** about an existing message.
 /// Returned by [`Chat::message_at`].
 pub struct MessageAt {
@@ -418,6 +428,12 @@ pub trait Chat: Send + Sync + 'static {
     async fn create_channel(&self, name: &str) -> Result<String, String>;
     /// Put the bot into a public channel (`conversations.join`). Joining one it is already in is fine.
     async fn join_channel(&self, channel: &str) -> Result<(), String>;
+    /// Add one member to a channel the bot is in (`conversations.invite`).
+    async fn invite_to_channel(&self, channel: &str, user: &str) -> Result<(), String>;
+    /// One member by ID (`users.info`).
+    async fn user_brief(&self, user: &str) -> Result<UserBrief, String>;
+    /// The members (not deleted) whose handle, display name or real name is `name`, ignoring case (`users.list`).
+    async fn find_users(&self, name: &str) -> Result<Vec<UserBrief>, String>;
     /// Every channel the bot is a member of, as (id, name). The gateway needs it for `status`: a channel
     /// nobody was assigned is **its own**, and until someone types in it there is nothing else to learn it from.
     async fn bot_channels(&self) -> Result<Vec<(String, String)>, String>;
@@ -535,6 +551,8 @@ pub mod fake {
         pub set_info: Mutex<std::collections::HashMap<String, (Option<String>, Option<String>)>>,
         /// Channels `channel_gone` says are gone.
         pub gone: Vec<String>,
+        /// The workspace's members, for `user_brief` and `find_users`.
+        pub users: Vec<UserBrief>,
     }
 
     impl FakeChat {
@@ -741,6 +759,16 @@ pub mod fake {
         async fn join_channel(&self, c: &str) -> Result<(), String> {
             self.record(format!("join_channel {c}"))?;
             Ok(())
+        }
+        async fn invite_to_channel(&self, c: &str, u: &str) -> Result<(), String> {
+            self.record(format!("invite {c} {u}"))?;
+            Ok(())
+        }
+        async fn user_brief(&self, u: &str) -> Result<UserBrief, String> {
+            self.users.iter().find(|b| b.id == u).cloned().ok_or_else(|| "user_not_found".to_string())
+        }
+        async fn find_users(&self, name: &str) -> Result<Vec<UserBrief>, String> {
+            Ok(self.users.iter().filter(|b| !b.deleted && b.name.eq_ignore_ascii_case(name)).cloned().collect())
         }
         async fn channel_display_name(&self, c: &str) -> Option<String> {
             self.record(format!("channel_name {c}")).ok()?;

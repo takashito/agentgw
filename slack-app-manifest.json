@@ -29,6 +29,7 @@
         "assistant:write",
         "channels:history",
         "channels:read",
+        "channels:write.invites",
         "channels:write.topic",
         "chat:write",
         "files:read",

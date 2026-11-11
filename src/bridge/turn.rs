@@ -2628,7 +2628,7 @@ impl crate::mcp::ToolExecutor for ToolExec {
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
         let (slack, dir, dispo, ask) = (self.slack.clone(), self.state_dir.clone(), self.dispo.clone(), self.ask.clone());
         Box::pin(async move {
-            if matches!(tool.as_str(), "ask_channel" | "end_ask" | "list_channels" | "set_channel_info" | "create_channel" | "join_channel") {
+            if matches!(tool.as_str(), "ask_channel" | "end_ask" | "list_channels" | "set_channel_info" | "create_channel" | "join_channel" | "invite_to_channel") {
                 return execute_ask_tool(slack.as_ref(), &dir, &session_id, &tool, &args, ask.as_ref(), &dispo).await;
             }
             execute_tool(slack.as_ref(), &dir, &session_id, &tool, &args, &dispo).await
@@ -2637,7 +2637,7 @@ impl crate::mcp::ToolExecutor for ToolExec {
 }
 
 /// The tools that need the gateway's answer: `ask_channel`, `end_ask`, `list_channels`, and the channel tools
-/// `set_channel_info`, `create_channel` and `join_channel`.
+/// `set_channel_info`, `create_channel`, `join_channel` and `invite_to_channel`.
 ///
 /// The asking thread is the caller's own, looked up from its session — never taken from the
 /// arguments, so an agent cannot ask on another thread's behalf.
@@ -2686,6 +2686,22 @@ pub async fn execute_ask_tool(
             return Err("channel_id is required".into());
         };
         let out = ask.ask(|req_id| LinkFrame::JoinChannel { req_id, channel_id }).await?;
+        return Ok(out.to_string());
+    }
+    if tool == "invite_to_channel" {
+        let Some(channel_id) = opt("channel_id") else {
+            return Err("channel_id is required".into());
+        };
+        // One name alone is fine too, so an agent that forgets the array still gets through
+        let users: Vec<String> = match &args["users"] {
+            serde_json::Value::Array(a) => a.iter().filter_map(|v| v.as_str()).map(str::to_string).collect(),
+            serde_json::Value::String(s) => vec![s.clone()],
+            _ => Vec::new(),
+        };
+        if users.iter().all(|u| u.trim().is_empty()) {
+            return Err("users is required: user IDs (U...) or names".into());
+        }
+        let out = ask.ask(|req_id| LinkFrame::InviteToChannel { req_id, channel_id, users }).await?;
         return Ok(out.to_string());
     }
     let threads = bridge::Threads::load(&crate::state_dir::StateDir::at(state_dir));
@@ -3345,7 +3361,8 @@ mod tests {
                     | crate::bridge::gateway::link::LinkFrame::ListChannels { req_id, .. }
                     | crate::bridge::gateway::link::LinkFrame::SetChannelInfo { req_id, .. }
                     | crate::bridge::gateway::link::LinkFrame::CreateChannel { req_id, .. }
-                    | crate::bridge::gateway::link::LinkFrame::JoinChannel { req_id, .. } => req_id.clone(),
+                    | crate::bridge::gateway::link::LinkFrame::JoinChannel { req_id, .. }
+                    | crate::bridge::gateway::link::LinkFrame::InviteToChannel { req_id, .. } => req_id.clone(),
                     _ => continue,
                 };
                 s2.lock().unwrap().push(f);
@@ -3429,6 +3446,25 @@ mod tests {
         assert!(matches!(&seen[1], LinkFrame::JoinChannel { channel_id, .. } if channel_id == "C9"), "{seen:?}");
         let err = execute_ask_tool(&api, &dir, "sid", "create_channel", &serde_json::json!({}), Some(&gw), &tx).await.unwrap_err();
         assert!(err.contains("name"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn invite_to_channel_asks_the_gateway() {
+        use crate::bridge::gateway::link::LinkFrame;
+        let (api, _dir, tx, _rx) = harness();
+        let dir = dir_with_session("invite");
+        let (gw, seen) = answering(Ok(serde_json::json!({"invited": [{"id": "U9"}]})));
+        let args = serde_json::json!({"channel_id": "C2", "users": ["Linear", "U9"]});
+        execute_ask_tool(&api, &dir, "sid", "invite_to_channel", &args, Some(&gw), &tx).await.unwrap();
+        // A single name not in an array still goes through
+        let one = serde_json::json!({"channel_id": "C2", "users": "Linear"});
+        execute_ask_tool(&api, &dir, "sid", "invite_to_channel", &one, Some(&gw), &tx).await.unwrap();
+        let got = seen.lock().unwrap().clone();
+        assert!(matches!(&got[0], LinkFrame::InviteToChannel { channel_id, users, .. } if channel_id == "C2" && users == &["Linear", "U9"]), "{got:?}");
+        assert!(matches!(&got[1], LinkFrame::InviteToChannel { users, .. } if users == &["Linear"]), "{got:?}");
+        let none = serde_json::json!({"channel_id": "C2", "users": []});
+        assert!(execute_ask_tool(&api, &dir, "sid", "invite_to_channel", &none, Some(&gw), &tx).await.unwrap_err().contains("users"));
+        assert_eq!(seen.lock().unwrap().len(), 2, "a refused call asks nothing");
     }
 
     #[tokio::test]

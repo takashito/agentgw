@@ -1080,6 +1080,18 @@ impl dyn Chat {
 /// and for the overall deadline of prefetching on receive.
 pub const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// A `users.info` / `users.list` member, read from raw JSON. An app's bot user is `is_bot`;
+/// Slackbot is not, but nobody needs to invite it.
+fn user_brief_of(u: &serde_json::Value) -> crate::chat::UserBrief {
+    let s = |v: &serde_json::Value| v.as_str().filter(|x| !x.is_empty()).map(str::to_string);
+    crate::chat::UserBrief {
+        id: s(&u["id"]).unwrap_or_default(),
+        name: s(&u["profile"]["display_name"]).or_else(|| s(&u["real_name"])).or_else(|| s(&u["name"])).unwrap_or_default(),
+        is_bot: u["is_bot"].as_bool() == Some(true),
+        deleted: u["deleted"].as_bool() == Some(true),
+    }
+}
+
 #[async_trait::async_trait]
 impl crate::chat::Chat for Api {
     async fn post_message(
@@ -1223,6 +1235,41 @@ impl crate::chat::Chat for Api {
     async fn join_channel(&self, channel: &str) -> Result<(), String> {
         let req = SlackApiConversationsJoinRequest::new(channel.into());
         self.client.open_session(&self.token).conversations_join(&req).await.map(|_| ()).map_err(|e| e.to_string())
+    }
+    async fn invite_to_channel(&self, channel: &str, user: &str) -> Result<(), String> {
+        let req = SlackApiConversationsInviteRequest::new(channel.into(), vec![user.into()]);
+        self.client.open_session(&self.token).conversations_invite(&req).await.map(|_| ()).map_err(|e| e.to_string())
+    }
+    async fn user_brief(&self, user: &str) -> Result<crate::chat::UserBrief, String> {
+        let v = self.get_json("users.info", &[("user", user)]).await?;
+        Ok(user_brief_of(&v["user"]))
+    }
+    async fn find_users(&self, name: &str) -> Result<Vec<crate::chat::UserBrief>, String> {
+        /// Pages of 200; a workspace bigger than this is not what this tool is for.
+        const MAX_PAGES: usize = 10;
+        let want = name.trim().trim_start_matches('@').to_lowercase();
+        let mut found = Vec::new();
+        let mut cursor = String::new();
+        for _ in 0..MAX_PAGES {
+            let mut params = vec![("limit", "200")];
+            if !cursor.is_empty() {
+                params.push(("cursor", cursor.as_str()));
+            }
+            let page = self.get_json("users.list", &params).await?;
+            for u in page["members"].as_array().into_iter().flatten() {
+                let names = [&u["name"], &u["real_name"], &u["profile"]["display_name"], &u["profile"]["real_name"]];
+                let hit = names.iter().any(|n| n.as_str().is_some_and(|n| n.to_lowercase() == want));
+                let b = user_brief_of(u);
+                if hit && !b.deleted {
+                    found.push(b);
+                }
+            }
+            cursor = page["response_metadata"]["next_cursor"].as_str().unwrap_or_default().to_string();
+            if cursor.is_empty() {
+                break;
+            }
+        }
+        Ok(found)
     }
     async fn bot_channels(&self) -> Result<Vec<(String, String)>, String> {
         Api::bot_channels(self).await

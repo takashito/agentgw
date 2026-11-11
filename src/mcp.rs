@@ -226,6 +226,18 @@ impl Mcp {
                     "required": ["channel_id"],
                 },
             }),
+            serde_json::json!({
+                "name": "invite_to_channel",
+                "description": "Add apps or bots (such as Linear) to a Slack channel the bot is in, e.g. so Linear can sync a thread there. Give each by user ID (U...) or by name (an app's name as Slack shows it, e.g. \"Linear\"); a name must match exactly one member, or the error lists the matches with their IDs. Only apps, bots and the Owner can be added: a person is refused (ask the Owner to invite people), and if any one is refused nobody is invited. Returns who was invited and who was already in.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "channel_id": { "type": "string", "description": "The channel (C...), as list_channels or a <#C...> link gives it." },
+                        "users": { "type": "array", "items": { "type": "string" }, "description": "Who to add, at most 10: user IDs (U...) or names." },
+                    },
+                    "required": ["channel_id", "users"],
+                },
+            }),
         ]
     }
 
@@ -556,7 +568,8 @@ mod tests {
                 "list_channels",
                 "set_channel_info",
                 "create_channel",
-                "join_channel"
+                "join_channel",
+                "invite_to_channel"
             ]
         );
         for t in &tools {
@@ -634,6 +647,7 @@ mod tests {
         assert_eq!(req("set_channel_info"), ["channel_id"]);
         assert_eq!(req("create_channel"), ["name"]);
         assert_eq!(req("join_channel"), ["channel_id"]);
+        assert_eq!(req("invite_to_channel"), ["channel_id", "users"]);
     }
 
     #[test]

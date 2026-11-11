@@ -387,6 +387,7 @@ impl FromRelay {
             | F::SetChannelInfo { .. }
             | F::CreateChannel { .. }
             | F::JoinChannel { .. }
+            | F::InviteToChannel { .. }
             | F::AgentReply { .. }
             | F::NeedsHuman { .. }
             | F::AskEnded { .. }
