@@ -2543,6 +2543,52 @@ fn ask_heading(title: Option<&str>, from_channel: &str, line_link: &str, follow_
     }
 }
 
+/// `📤 Asked #pve-lan: title` — once the request is posted, only the title links to it.
+fn asked_line(to: &str, title: &str, link: &str, follow_up: bool) -> String {
+    let label = if follow_up {
+        crate::t!("Follow-up to {to}:", "{to} に追加の依頼:")
+    } else {
+        crate::t!("Asked {to}:", "{to} に依頼:")
+    };
+    let title = if link.is_empty() {
+        format!("**{title}**")
+    } else {
+        // A link inside the link text would break the outer one: keep only its words
+        format!("[**{}**]({link})", link_text(title))
+    };
+    format!(":outbox_tray: **{label}** {title}")
+}
+
+/// `text` made safe as link text: Markdown links `[words](url)` and Slack links `<url|words>` become
+/// their words, and stray brackets go.
+fn link_text(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        if c == '[' {
+            if let Some(close) = rest.find("](") {
+                if let Some(end) = rest[close..].find(')') {
+                    out.push_str(&rest[1..close]);
+                    rest = &rest[close + end + 1..];
+                    continue;
+                }
+            }
+        } else if c == '<' {
+            if let Some(end) = rest.find('>') {
+                let inner = &rest[1..end];
+                out.push_str(inner.split_once('|').map_or(inner, |(_, words)| words));
+                rest = &rest[end + 1..];
+                continue;
+            }
+        }
+        if c != '[' && c != ']' {
+            out.push(c);
+        }
+        rest = &rest[c.len_utf8()..];
+    }
+    out
+}
+
 /// How long a machine may be away before the threads waiting on its asks are told it went offline.
 /// Longer than a restart or an update takes.
 pub const ASK_OFFLINE_GRACE_MS: u64 = 120_000;
@@ -4681,15 +4727,8 @@ impl Fleet {
         self.rewrite(from_channel, line, &text).await;
     }
 
-    /// `📤 Asked #pve-lan: title` — once the request is posted, the words themselves link to it.
     fn asked_line(&self, to: &str, title: &str, link: &str, follow_up: bool) -> String {
-        let what = if follow_up {
-            crate::t!("Follow-up to {to}: {title}", "{to} に追加の依頼: {title}")
-        } else {
-            crate::t!("Asked {to}: {title}", "{to} に依頼: {title}")
-        };
-        let what = if link.is_empty() { format!("**{what}**") } else { format!("[**{what}**]({link})") };
-        format!(":outbox_tray: {what}")
+        asked_line(to, title, link, follow_up)
     }
 
     /// `#name` for a channel, as plain words (a `<#C…>` would be a second link beside the one that matters).
@@ -8482,6 +8521,31 @@ mod tests {
             ("0.65.0", "0.65.0+e1a48c9", "x86_64-unknown-linux-musl")
         );
         let _ = std::fs::remove_dir_all(dir.path());
+    }
+
+    #[test]
+    fn the_asked_line_links_only_the_title() {
+        let url = "https://example.slack.com/archives/C1/p1";
+        assert_eq!(asked_line("#repo", "Fix the login", "", false), ":outbox_tray: **Asked #repo:** **Fix the login**");
+        assert_eq!(
+            asked_line("#repo", "Fix the login", url, false),
+            format!(":outbox_tray: **Asked #repo:** [**Fix the login**]({url})")
+        );
+        assert_eq!(
+            asked_line("#repo", "Fix the login", url, true),
+            format!(":outbox_tray: **Follow-up to #repo:** [**Fix the login**]({url})")
+        );
+    }
+
+    #[test]
+    fn a_link_in_the_title_does_not_nest_inside_the_asked_link() {
+        let url = "https://example.slack.com/archives/C1/p1";
+        assert_eq!(
+            asked_line("#repo", "ABC-1 [Fix the login](https://tracker.example/ABC-1) now", url, false),
+            format!(":outbox_tray: **Asked #repo:** [**ABC-1 Fix the login now**]({url})")
+        );
+        assert_eq!(link_text("see <https://x.example|the doc> and <https://y.example>"), "see the doc and https://y.example");
+        assert_eq!(link_text("a [b] c"), "a b c");
     }
 
     #[test]
