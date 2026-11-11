@@ -225,10 +225,42 @@ pub fn request_title(title: Option<&str>, text: &str) -> String {
                 .trim()
                 .to_string()
         });
+    // Before cutting it short: a link cut in half could not be turned back into its words
+    let raw = link_text(&raw);
     if raw.chars().count() <= 60 {
         return raw;
     }
     raw.chars().take(59).chain(['…']).collect()
+}
+
+/// `text` made safe as link text: Markdown links `[words](url)` and Slack links `<url|words>` become
+/// their words, and stray brackets go.
+pub fn link_text(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        if c == '[' {
+            if let Some(close) = rest.find("](") {
+                if let Some(end) = rest[close..].find(')') {
+                    out.push_str(&rest[1..close]);
+                    rest = &rest[close + end + 1..];
+                    continue;
+                }
+            }
+        } else if c == '<' {
+            if let Some(end) = rest.find('>') {
+                let inner = &rest[1..end];
+                out.push_str(inner.split_once('|').map_or(inner, |(_, words)| words));
+                rest = &rest[end + 1..];
+                continue;
+            }
+        }
+        if c != '[' && c != ']' {
+            out.push(c);
+        }
+        rest = &rest[c.len_utf8()..];
+    }
+    out
 }
 
 /// How many linked posts one request may have checked (each costs a Slack call).
@@ -694,6 +726,13 @@ mod title_tests {
         let t = request_title(None, &"あ".repeat(100));
         assert_eq!(t.chars().count(), 60);
         assert!(t.ends_with('…'));
+    }
+
+    #[test]
+    fn a_link_in_the_title_becomes_its_words_before_the_cut() {
+        let long = format!("ABC-1 [Check the notice](https://tracker.example/team/issue/ABC-1/{})", "x".repeat(80));
+        assert_eq!(request_title(Some(&long), "body"), "ABC-1 Check the notice");
+        assert_eq!(request_title(None, "ABC-2 <https://tracker.example/ABC-2|Fix it>\nmore"), "ABC-2 Fix it");
     }
 }
 

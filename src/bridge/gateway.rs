@@ -2558,39 +2558,9 @@ fn asked_line(to: &str, title: &str, link: &str, follow_up: bool) -> String {
         format!("**{title}**")
     } else {
         // A link inside the link text would break the outer one: keep only its words
-        format!("[**{}**]({link})", link_text(title))
+        format!("[**{}**]({link})", crate::bridge::asks::link_text(title))
     };
     format!(":outbox_tray: **{label}** {title}")
-}
-
-/// `text` made safe as link text: Markdown links `[words](url)` and Slack links `<url|words>` become
-/// their words, and stray brackets go.
-fn link_text(text: &str) -> String {
-    let mut out = String::new();
-    let mut rest = text;
-    while let Some(c) = rest.chars().next() {
-        if c == '[' {
-            if let Some(close) = rest.find("](") {
-                if let Some(end) = rest[close..].find(')') {
-                    out.push_str(&rest[1..close]);
-                    rest = &rest[close + end + 1..];
-                    continue;
-                }
-            }
-        } else if c == '<' {
-            if let Some(end) = rest.find('>') {
-                let inner = &rest[1..end];
-                out.push_str(inner.split_once('|').map_or(inner, |(_, words)| words));
-                rest = &rest[end + 1..];
-                continue;
-            }
-        }
-        if c != '[' && c != ']' {
-            out.push(c);
-        }
-        rest = &rest[c.len_utf8()..];
-    }
-    out
 }
 
 /// How long a machine may be away before the threads waiting on its asks are told it went offline.
@@ -8572,8 +8542,8 @@ mod tests {
             asked_line("#repo", "ABC-1 [Fix the login](https://tracker.example/ABC-1) now", url, false),
             format!(":outbox_tray: **Asked #repo:** [**ABC-1 Fix the login now**]({url})")
         );
-        assert_eq!(link_text("see <https://x.example|the doc> and <https://y.example>"), "see the doc and https://y.example");
-        assert_eq!(link_text("a [b] c"), "a b c");
+        assert_eq!(crate::bridge::asks::link_text("see <https://x.example|the doc> and <https://y.example>"), "see the doc and https://y.example");
+        assert_eq!(crate::bridge::asks::link_text("a [b] c"), "a b c");
     }
 
     #[test]
