@@ -2259,11 +2259,10 @@ impl Bridge {
         self.stall.remove(&key);
         self.presence_remove(&key, &Reason::Turn);
         // An answer to a request from another channel's agent goes back to it
+        // A reply marked `needs_human` says so itself: the asker gets it with the mark and tells its
+        // own person. No separate "a person is needed" notice goes up the chain for it — that only
+        // repeated the reply, once per thread above.
         self.answer_asker(&key, &root, &d, posted_in_asker);
-        if let Some(b) = d.body.as_ref().filter(|b| b.needs_human && !b.ts.is_empty()) {
-            // A post in the asking thread is not in this channel: point at this thread instead
-            self.needs_human(&d.channel_id, &root, if posted_in_asker { &root } else { &b.ts });
-        }
         let before = self.ledger.pending(&key).len();
         if d.message_ids.is_empty() {
             self.ledger.dispose_all(&key); // no ids = the whole thread is done

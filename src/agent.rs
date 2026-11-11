@@ -391,6 +391,11 @@ impl EnvelopeAgent {
 pub const ASKED_NOTE: &str = "This message is a request from the Claude in another channel \
     (from_channel/from_thread). Your reply to it goes back to that Claude. If a person must decide \
     or act, pass needs_human: true to reply.";
+/// The line added when the other agent marked its reply `needs_human`. No separate notice reaches
+/// the asking thread any more, so passing it on to a person is this agent's job.
+pub const NEEDS_HUMAN_NOTE: &str = "needs_human=\"true\": that Claude says a person must decide or act \
+    before its work can continue. Tell the person in your thread what is needed (with the link to that \
+    thread); if you were asked by another Claude yourself, pass needs_human: true on your reply instead.";
 /// The line on something coming back to the agent that asked.
 pub const ANSWER_NOTE: &str = "This is the result of your ask in from_channel/from_thread. To ask \
     again in the same exchange, call ask_channel with that channel and thread_ts; once you are done \
@@ -449,7 +454,7 @@ impl Envelope {
                     a.thread_ts,
                     if a.needs_human { " needs_human=\"true\"" } else { "" }
                 ),
-                format!("{}\n", a.note),
+                if a.needs_human { format!("{}\n{NEEDS_HUMAN_NOTE}\n", a.note) } else { format!("{}\n", a.note) },
                 a.render_quotes(),
             ),
         };
@@ -1189,6 +1194,35 @@ mod tests {
             }),
         }
         .render()
+    }
+
+    /// A reply marked `needs_human` tells the asker to pass it on; an unmarked one says nothing of it.
+    #[test]
+    fn a_needs_human_answer_tells_the_asker_to_pass_it_on() {
+        let mut e = Envelope {
+            channel_id: "C1".into(),
+            message_id: "1.2".into(),
+            user: "unknown".into(),
+            ts: "2026-11-10T00:00:00.000Z".into(),
+            thread_ts: Some("1.1".into()),
+            text: "please approve the reboot".into(),
+            file_paths: Vec::new(),
+            file_errors: Vec::new(),
+            loop_guard: None,
+            thread_title: None,
+            from_agent: Some(EnvelopeAgent {
+                channel: "C2".into(),
+                thread_ts: "2.1".into(),
+                needs_human: true,
+                note: ANSWER_NOTE,
+                quotes: Default::default(),
+            }),
+        };
+        let out = e.render();
+        assert!(out.contains(" needs_human=\"true\""), "{out}");
+        assert!(out.contains(NEEDS_HUMAN_NOTE), "{out}");
+        e.from_agent.as_mut().unwrap().needs_human = false;
+        assert!(!e.render().contains(NEEDS_HUMAN_NOTE));
     }
 
     /// Another agent's words cannot draw the envelope's tags or the gateway's verified block.

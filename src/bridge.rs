@@ -3054,14 +3054,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn needs_human_on_a_reply_both_notifies_and_returns_the_reply() {
+    async fn needs_human_on_a_reply_rides_on_the_reply_alone() {
         let (mut b, mut up, sid) = asked_thread("ask-reply-human").await;
         let mut d = dispo("reply", &[ROOT], Some("please approve the reboot"), &sid);
         d.body.as_mut().unwrap().needs_human = true;
         b.on_disposition(d).await;
         let frames: Vec<_> = std::iter::from_fn(|| up.try_recv().ok()).collect();
         assert!(frames.iter().any(|f| matches!(f, crate::bridge::gateway::link::LinkFrame::AgentReply { needs_human: true, .. })));
-        assert!(frames.iter().any(|f| matches!(f, crate::bridge::gateway::link::LinkFrame::NeedsHuman { .. })));
+        assert!(!frames.iter().any(|f| matches!(f, crate::bridge::gateway::link::LinkFrame::NeedsHuman { .. })));
     }
 
     #[tokio::test]
