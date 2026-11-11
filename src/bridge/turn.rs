@@ -2720,6 +2720,10 @@ pub async fn execute_ask_tool(
         return Err("channel_id and text are required".into());
     };
     let (to_thread, title) = (opt("thread_ts"), opt("title"));
+    let ids: Vec<String> = args["message_ids"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
     let out = ask
         .ask(|req_id| LinkFrame::AskChannel {
             req_id,
@@ -2729,12 +2733,9 @@ pub async fn execute_ask_tool(
             to_thread,
             text,
             title,
+            covers: ids.clone(),
         })
         .await?;
-    let ids: Vec<String> = args["message_ids"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-        .unwrap_or_default();
     let c = LogCtx {
         session_id: Some(session_id.to_string()),
         thread_key: Some(ThreadKey::new(&from_channel, &from_thread)),
