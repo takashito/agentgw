@@ -10,9 +10,10 @@
 #
 # **This is for the first install.** Later versions arrive with `update`, like every other machine.
 #
-# Run it in an **administrator** PowerShell (Windows PowerShell 5.1 or PowerShell 7): the scheduled task runs as you whether or not you are
-# logged in, and Windows asks for your password once to allow that (Get-Credential hands it to Task
-# Scheduler; agentgw never sees it).
+# No administrator rights needed: winget installs psmux for you alone, and everything else goes under
+# your profile. The scheduled task runs as you whether or not you are logged in, so Windows asks for
+# your password once (Get-Credential hands it to Task Scheduler; agentgw never sees it). That needs
+# the right to "log on as a batch job", which administrators have by default.
 #
 # Environment:
 #   AGENTGW_STATE_DIR  state directory (default: %LOCALAPPDATA%\agentgw)
@@ -43,8 +44,6 @@ $cpu = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $
 $arch = if ($cpu -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
 $triple = "$arch-pc-windows-gnullvm"
 
-$admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $admin) { Fail 'Open PowerShell with "Run as administrator" and run this again.' }
 
 Say "`nagentgw install - Windows ($triple)`n"
 
@@ -137,7 +136,9 @@ if ($linked) {
 
 # 6. The scheduled task (asks for your Windows password) - then started
 & $exe install
-if ($LASTEXITCODE -ne 0) { Fail 'agentgw install failed' }
+if ($LASTEXITCODE -ne 0) {
+    Fail 'agentgw install failed. If Windows refused the task ("access is denied"), your account may lack the right to run tasks while logged off; try once more from PowerShell started with "Run as administrator".'
+}
 Start-Sleep 5
 & $exe status
 Say "`nDone. On the gateway, ``agentgw status`` lists this machine once it has connected."
