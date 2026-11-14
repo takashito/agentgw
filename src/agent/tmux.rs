@@ -101,6 +101,15 @@ fn by_name_on_windows(id: &str, name: Option<&str>) -> String {
     }
 }
 
+/// The key that puts a line break into Claude Code's input box without sending it (Ctrl+J, a line
+/// feed). Used between typed lines on Windows.
+const NEWLINE_KEY: &str = "C-j";
+
+/// The lines of a delivery as they are typed: split on `\n`, a `\r` before it dropped.
+fn typed_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l))
+}
+
 const SETTLE_BEFORE_ENTER: std::time::Duration = std::time::Duration::from_millis(200);
 /// Tells one delivery's paste buffer from another's. Only uniqueness matters, so it never resets.
 static DELIVERY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -164,14 +173,25 @@ impl Tmux {
     /// second then failed outright with `no buffer …` and the message was never handed over
     /// (seen on a real machine 2026-10-08).
     ///
-    /// **On Windows the text is typed (`send-keys -l`), not pasted.** psmux 3.4.0 lists a named
+    /// **On Windows the text is typed (`send-keys -l`), not pasted**, one line at a time with
+    /// [`NEWLINE_KEY`] between them: psmux types a newline inside `-l` text as the two characters
+    /// `\n` (measured 2026-11-14 — the agent saw the two characters where the line break was).
+    ///
+    /// Not pasted, because psmux 3.4.0 lists a named
     /// buffer and then answers `no buffer` when asked to paste it, at any length; an unnamed one
     /// pastes, but not reliably the one just set (measured 2026-11-14). Typed, 7KB over 82 lines
     /// reached Claude and was answered, and a newline did not submit early.
     pub fn deliver(&self, w: &Window, text: &str) -> Result<(), String> {
         let t = w.as_str();
         if cfg!(windows) {
-            (self.run)(&["send-keys", "-t", t, "-l", "--", text])?;
+            for (i, line) in typed_lines(text).enumerate() {
+                if i > 0 {
+                    (self.run)(&["send-keys", "-t", t, NEWLINE_KEY])?;
+                }
+                if !line.is_empty() {
+                    (self.run)(&["send-keys", "-t", t, "-l", "--", line])?;
+                }
+            }
         } else {
             let n = DELIVERY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let buffer = format!("agentgw-deliver-{t}-{n}");
@@ -348,6 +368,12 @@ impl Tmux {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_lines_split_on_line_feeds_and_drop_carriage_returns() {
+        assert_eq!(typed_lines("a\r\nb\n\nc").collect::<Vec<_>>(), ["a", "b", "", "c"]);
+        assert_eq!(typed_lines("one").collect::<Vec<_>>(), ["one"]);
+    }
 
     fn recording() -> (std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>, Tmux) {
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
