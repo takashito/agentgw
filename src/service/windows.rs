@@ -292,6 +292,10 @@ pub fn status(task: &str, dir: &StateDir) -> i32 {
         (true, Some(pid)) => println!("{}", crate::t!("● running (pid {pid})", "● 動いています(pid {pid})")),
         (true, None) => println!("{}", crate::t!("○ installed, not running", "○ 入っていますが動いていません")),
     }
+    // What `serve` found starts in its own session (written at its start-up)
+    if let Ok(shells) = std::fs::read_to_string(dir.join("shells.txt")) {
+        println!("{}", crate::t!("Shells: {}", "シェル: {}", shells.trim()));
+    }
     0
 }
 

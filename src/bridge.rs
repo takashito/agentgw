@@ -244,6 +244,8 @@ pub struct Bridge {
     /// The hooks settings handed to every agent, rendered once at start-up and **written out on
     /// every spawn** (see `write_agent_files`): the temp area it lives in gets swept.
     hooks_settings: serde_json::Value,
+    /// See `Config::shells_problem`
+    shells_problem: Option<String>,
     mcp_port: u16,
     mcp_token: String,
     /// Our own Slack user id. Text commands are checked after stripping our own mention.
@@ -304,6 +306,8 @@ struct Config {
     /// The hooks settings handed to every agent, rendered once at start-up and **written out on
     /// every spawn** (see `write_agent_files`): the temp area it lives in gets swept.
     hooks_settings: serde_json::Value,
+    /// Windows: the agents have no shell that starts here (`agent::shells`). Said in the online notice
+    shells_problem: Option<String>,
     mcp_port: u16,
     mcp_token: String,
     bot_user_id: Option<String>,
@@ -464,6 +468,7 @@ impl Bridge {
             spawn_watching: Default::default(),
             narration: HashMap::new(),
             hooks_settings: config.hooks_settings,
+            shells_problem: config.shells_problem,
             mcp_port: config.mcp_port,
             mcp_token: config.mcp_token,
             bot_user_id: config.bot_user_id,
@@ -501,6 +506,7 @@ impl Bridge {
         let (deliv_tx, deliv_rx) = mpsc::channel(64);
         let config = Config {
             hooks_settings: serde_json::Value::Null,
+            shells_problem: None,
             mcp_port: 0,
             mcp_token: String::new(),
             bot_user_id: Some("U_BOT".into()),
@@ -528,7 +534,10 @@ impl Bridge {
     async fn announce_online(&mut self) {
         let pools: Vec<String> = self.access.pool_targets(&Host::home(), &self.machine_name);
         // The machine's own name — the one `route`, `status` and `pwd <machine>` all use
-        let text = online_notice(&self.machine_name, crate::build_label::LABEL, &pools, 0);
+        let mut text = online_notice(&self.machine_name, crate::build_label::LABEL, &pools, 0);
+        if let Some(problem) = &self.shells_problem {
+            text = format!("{text}\n⚠️ {problem}");
+        }
         self.post_notice(&text, &LogCtx::default()).await;
     }
 
@@ -1388,6 +1397,17 @@ impl Bridge {
         if let Some(fleet) = &fleet {
             *fleet.bot_user_id.lock().await = bot_user_id.clone();
         }
+        // Windows: which shells start here (see `agent::shells`) — shapes the agents' settings
+        #[cfg(windows)]
+        let shells = {
+            let s = crate::agent::shells::probe();
+            LogCtx::default().info("bridge", &format!("shells: {}", s.summary()));
+            // For `status`, which runs in another session and cannot see what starts in this one
+            let _ = std::fs::write(dir.join("shells.txt"), s.summary());
+            Some(s)
+        };
+        #[cfg(not(windows))]
+        let shells: Option<crate::agent::shells::Shells> = None;
         let mut b = Bridge::new(
             Deps {
                 slack: api.clone(),
@@ -1396,7 +1416,8 @@ impl Bridge {
                 dir,
             },
             Config {
-                hooks_settings: HookIntake::settings_json(hook_port, &hook_token),
+                hooks_settings: HookIntake::settings_json(hook_port, &hook_token, shells.as_ref()),
+                shells_problem: shells.as_ref().and_then(|s| s.problem()),
                 mcp_port,
                 mcp_token,
                 bot_user_id,

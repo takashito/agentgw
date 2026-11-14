@@ -5,6 +5,7 @@
 
 pub mod claude;
 pub mod screen;
+pub mod shells;
 pub mod tmux;
 
 

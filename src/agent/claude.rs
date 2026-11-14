@@ -2071,8 +2071,9 @@ impl HookIntake {
         Ok((port, token))
     }
 
-    /// Builds the hooks settings for an agent.
-    pub fn settings_json(port: u16, token: &str) -> serde_json::Value {
+    /// Builds the hooks settings for an agent. `shells` is what [`crate::agent::shells::probe`]
+    /// found — Windows only; elsewhere `None`, and the settings are as they always were.
+    pub fn settings_json(port: u16, token: &str, shells: Option<&crate::agent::shells::Shells>) -> serde_json::Value {
         let base = format!("http://127.0.0.1:{port}/hook");
         let http_ = |kind: &str, timeout: u32| {
             serde_json::json!([{ "matcher": "", "hooks": [{
@@ -2084,7 +2085,7 @@ impl HookIntake {
                 "allowedEnvVars": ["AGENTGW_SESSION_ID"],
             }]}])
         };
-        serde_json::json!({
+        let mut settings = serde_json::json!({
             // Agents are Slack-driven sessions. Only one --settings takes effect, so it lives here too.
             "disableRemoteControl": true,
             // Without it, a folder with a .mcp.json opens "New MCP server found in this project" at
@@ -2100,13 +2101,30 @@ impl HookIntake {
             "hooks": {
                 // Only SessionStart has Claude Code ignore http, so it uses curl. Headers are not carried,
                 // so session_id is taken from the body (measured in the spike).
-                "SessionStart": [{ "matcher": "", "hooks": [{
-                    "type": "command",
-                    "timeout": 10,
-                    "command": format!(
-                        "{CURL} -sS --max-time 5 -X POST -H 'content-type: application/json' \
-                         -H 'x-agentgw-token: {token}' --data-binary @- {base}/session_start || true"
-                    ),
+                "SessionStart": [{ "matcher": "", "hooks": [match shells {
+                    None => serde_json::json!({
+                        "type": "command",
+                        "timeout": 10,
+                        "command": format!(
+                            "{CURL} -sS --max-time 5 -X POST -H 'content-type: application/json' \
+                             -H 'x-agentgw-token: {token}' --data-binary @- {base}/session_start || true"
+                        ),
+                    }),
+                    // Windows: PowerShell, not Git Bash, which may not be installed. Written for 5.1
+                    // and 7 alike: stdin read as UTF-8 and posted as bytes (5.1 would read it in the
+                    // OEM code page and post a string as ISO-8859-1)
+                    Some(_) => serde_json::json!({
+                        "type": "command",
+                        "shell": "powershell",
+                        "timeout": 10,
+                        "command": format!(
+                            "[Console]::InputEncoding = [Text.Encoding]::UTF8; try {{ \
+                             $b = [Text.Encoding]::UTF8.GetBytes([Console]::In.ReadToEnd()); \
+                             Invoke-RestMethod -Method Post -Uri '{base}/session_start' \
+                             -Headers @{{ 'x-agentgw-token' = '{token}' }} -ContentType 'application/json' \
+                             -Body $b -TimeoutSec 5 | Out-Null }} catch {{ }}"
+                        ),
+                    }),
                 }]}],
                 "UserPromptSubmit": http_("user_prompt", 5),
                 // Reporting hooks get a short timeout — so a slow Bridge does not stall the agent's turn.
@@ -2125,12 +2143,18 @@ impl HookIntake {
                 "PermissionRequest": http_("perm", 125),
                 "Stop": http_("stop", 15),
             }
-        })
+        });
+        // The `pwsh` Claude Code would take does not start here: turn the PowerShell tool off
+        // rather than leave the agent a tool that always fails
+        if shells.is_some_and(|s| s.powershell_tool_off()) {
+            settings["env"] = serde_json::json!({ "CLAUDE_CODE_USE_POWERSHELL_TOOL": "0" });
+        }
+        settings
     }
 
     pub fn write_settings(dir: &StateDir, port: u16, token: &str) -> std::io::Result<PathBuf> {
         // Generated files, so they go to a temporary area, not state ([`StateDir::runtime_dir`])
-        dir.write_runtime_json("worker-hooks.json", &Self::settings_json(port, token))
+        dir.write_runtime_json("worker-hooks.json", &Self::settings_json(port, token, None))
     }
 
     /// Hook responses have a JSON body.
@@ -2677,9 +2701,32 @@ mod tests {
         d
     }
 
+    /// Windows: SessionStart runs in PowerShell (Git Bash is optional there), and a PowerShell tool
+    /// whose `pwsh` does not start is turned off. Elsewhere neither appears
+    #[test]
+    fn windows_settings_follow_the_shells_that_start() {
+        use crate::agent::shells::{Probe, Shells};
+        let store = Shells {
+            git_bash: Probe::Works("bash.exe".into()),
+            pwsh: Probe::Fails("WindowsApps\\pwsh.exe".into(), "denied".into()),
+            powershell: Probe::Works("powershell.exe".into()),
+        };
+        let v = HookIntake::settings_json(8791, "tok", Some(&store));
+        let ss = &v["hooks"]["SessionStart"][0]["hooks"][0];
+        assert_eq!(ss["shell"], "powershell");
+        let cmd = ss["command"].as_str().unwrap();
+        assert!(cmd.contains("Invoke-RestMethod") && cmd.contains("http://127.0.0.1:8791/hook/session_start"), "{cmd}");
+        assert!(cmd.contains("'x-agentgw-token' = 'tok'"), "{cmd}");
+        assert_eq!(v["env"]["CLAUDE_CODE_USE_POWERSHELL_TOOL"], "0");
+        let fine = Shells { pwsh: Probe::Absent, ..store };
+        assert!(HookIntake::settings_json(8791, "tok", Some(&fine)).get("env").is_none());
+        let plain = HookIntake::settings_json(8791, "tok", None);
+        assert!(plain.get("env").is_none() && plain["hooks"]["SessionStart"][0]["hooks"][0].get("shell").is_none());
+    }
+
     #[test]
     fn worker_hooks_has_the_load_bearing_shape() {
-        let v = HookIntake::settings_json(8791, "tok");
+        let v = HookIntake::settings_json(8791, "tok", None);
         // Only one --settings takes effect → disableRemoteControl must live alongside
         assert_eq!(v["disableRemoteControl"], true);
         // A folder's .mcp.json would otherwise stop the worker on an approval dialog
