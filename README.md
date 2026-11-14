@@ -244,50 +244,50 @@ where each one is reachable.
 
 ### Windows machines
 
-A Windows PC can join as a **machine** (the gateway stays on macOS or Linux). Windows has no ssh server to
-log in to, so instead of `add-machine user@host` you run the installer on the PC yourself.
+Windows is supported as a machine; the gateway requires macOS or Linux. Windows does not run an SSH server by default, so a Windows machine is installed on the machine itself with `install.ps1` rather than with `add-machine user@host`.
 
-**What it needs**
+**Requirements**
 
-- Windows 11, ARM64 or x86_64 (tested on ARM64; the x86_64 binary is built the same way but not yet tried on real hardware).
-- [Claude Code](https://docs.claude.com/en/docs/claude-code), the standalone CLI (`irm https://claude.ai/install.ps1 | iex`), signed in once with `claude`.
-- [psmux](https://github.com/marlocarlo/psmux), tmux for Windows — the installer adds it with `winget` if it is missing.
-- The gateway on a tailnet the PC can reach, or `AGENTGW_LINK_PUBLIC_URL` set on the gateway. The PC dials out; it opens no ports.
+| | |
+|---|---|
+| **OS** | Windows 11, ARM64 or x86_64 |
+| **Claude Code** | The standalone CLI ([install](https://docs.claude.com/en/docs/claude-code)), signed in |
+| **psmux** | [psmux](https://github.com/marlocarlo/psmux) (tmux for Windows). Installed with `winget` if missing |
+| **Network** | The machine must reach the gateway over Tailscale or at `AGENTGW_LINK_PUBLIC_URL`. No inbound ports are opened |
 
-**1. On the gateway**, make a connection string for the new machine:
+**Installation**
 
-```bash
-agentgw add-machine --print win-box
-```
+1. On the gateway, generate a connection string for the new machine:
 
-It records the machine and prints a connection string. Treat it like a password: it lets a machine join your gateway.
+   ```bash
+   agentgw add-machine --print win-box
+   ```
 
-**2. On the PC**, open PowerShell with **Run as administrator** (Windows PowerShell 5.1 or PowerShell 7) and run:
+   The connection string grants access to the gateway. Keep it secret.
 
-```powershell
-irm https://raw.githubusercontent.com/takashito/agentgw/main/scripts/install.ps1 -OutFile install.ps1
-powershell -ExecutionPolicy Bypass -File install.ps1
-```
+2. On the Windows machine, in PowerShell started with **Run as administrator** (Windows PowerShell 5.1 or PowerShell 7):
 
-It checks psmux and Claude Code, downloads the binary for your CPU (checking its checksum), asks for the
-machine's name and the connection string (typed hidden), and registers the service. Windows then asks for
-your password once.
+   ```powershell
+   irm https://raw.githubusercontent.com/takashito/agentgw/main/scripts/install.ps1 -OutFile install.ps1
+   powershell -ExecutionPolicy Bypass -File install.ps1
+   ```
 
-**3. Hand it a channel** — in that channel: `@agentgw route win-box:C:\Users\you\dev\app`.
+   The installer checks psmux and Claude Code, downloads the binary for the CPU and verifies its checksum, prompts for the machine name and the connection string, and registers the service.
 
-How it runs on Windows:
+3. Route a channel to the machine: `@agentgw route win-box:C:\path\to\project`.
 
-- **The service is a scheduled task** (`com.agentgw.bridge`) that starts at boot and runs as you **whether
-  or not you are logged in**. That needs an administrator to register it, and your Windows password, which
-  goes straight to Task Scheduler — agentgw never sees it. Inside the task, `agentgw supervise` keeps the
-  service running and restarts it if it stops.
-- **`restart`, `shutdown`, `start`, `status`, `uninstall` and `update` work as on the other machines.**
-  Later versions arrive with `update`; the installer is for the first time only.
-- **Shells.** Agents use Git Bash for the Bash tool when it is installed, and run the PowerShell tool in
-  PowerShell 7 when a working one is installed, otherwise in the Windows PowerShell 5.1 every Windows has.
-  The Microsoft Store build of PowerShell 7 can't start while nobody is logged in, so it doesn't count.
-  agentgw checks which shells start when the service starts; `agentgw status` on the PC shows the result,
-  and the online notice in Slack says if something is missing.
+**Service**
+
+agentgw runs as a scheduled task, `com.agentgw.bridge`, that starts at boot and runs whether or not the user is signed in. Registering it requires administrator rights and the account password; the password is passed to Task Scheduler and is not stored by agentgw. `restart`, `shutdown`, `start`, `status`, `uninstall` and `update` behave as on macOS and Linux. Updates are delivered by `update`; `install.ps1` is needed only for the first installation.
+
+**Shells**
+
+| Claude Code tool | Shell |
+|---|---|
+| Bash | Git Bash, when installed |
+| PowerShell | PowerShell 7 when available, otherwise Windows PowerShell 5.1 |
+
+The Microsoft Store edition of PowerShell 7 cannot start without an interactive sign-in and is not used. agentgw detects the available shells when the service starts; `agentgw status` reports the result.
 
 ## Slack commands
 
@@ -355,7 +355,7 @@ Every machine uses the same layout.
 | `$TMPDIR/agentgw-agentgw/` | Hook and MCP config handed to agents (regenerated on start) |
 | tmux session `agentgw-workers` | One window per agent |
 
-On Windows the binary is `%USERPROFILE%\.local\bin\agentgw.exe` and the state is in `%LOCALAPPDATA%\agentgw\`, laid out the same way, plus `logs\supervise.log` and `logs\agentgw.out.log` from the task and `shells.txt` with the result of the shell check. Agents run in the psmux server `agentgw`.
+On Windows, the binary is `%USERPROFILE%\.local\bin\agentgw.exe` and the state directory is `%LOCALAPPDATA%\agentgw\`, with the same layout plus `logs\supervise.log` and `logs\agentgw.out.log` (scheduled task output) and `shells.txt` (detected shells). Agents run in the psmux server `agentgw`.
 
 </details>
 
@@ -374,7 +374,7 @@ On Windows the binary is `%USERPROFILE%\.local\bin\agentgw.exe` and the state is
 
 - **Slack and Claude Code only.** No other chat platforms or agent CLIs.
 - **One owner per install.** It isn't a multi-user service: other people can follow a thread and add context, but can't start work or run commands.
-- **Windows as a machine only.** The gateway runs on macOS or Linux. Windows machines are tested on ARM64 only so far.
+- **Windows as a machine only.** The gateway requires macOS or Linux. The Windows x86_64 build has not yet been tested on hardware.
 - **One process per Slack app.** Two agentgw gateways on the same app token split Slack's events between them — give each its own app.
 
 ## Troubleshooting
@@ -388,7 +388,7 @@ On Windows the binary is `%USERPROFILE%\.local\bin\agentgw.exe` and the state is
 | Only some messages get answered | Another process is using the same app token |
 | A machine shows as offline | `agentgw status` on the gateway; `service.err.log` on that machine |
 | An agent can't use new tool options after an upgrade | Run `/mcp` in that agent — it keeps the tool list it started with |
-| A Windows machine doesn't come up | `agentgw status` on the PC, then `%LOCALAPPDATA%\agentgw\logs\supervise.log` |
+| A Windows machine does not connect | `agentgw status` on that machine, then `%LOCALAPPDATA%\agentgw\logs\supervise.log` |
 | "This shell can't reach your systemd user session" | Your Linux user has no running systemd instance to talk to: `loginctl enable-linger $USER`, then log in again |
 
 ## Development

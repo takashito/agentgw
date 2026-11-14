@@ -237,39 +237,50 @@ agentgw add-machine user@host -n                # 前回の経路を使わず、
 
 ### Windows のマシン
 
-Windows の PC も**マシン**として加われます(ゲートウェイは macOS か Linux のまま)。Windows には ssh で入れないので、`add-machine user@host` の代わりに、PC の上で自分でインストーラを回します。
+Windows はマシンとして使えます(ゲートウェイには macOS か Linux が必要です)。Windows は既定で SSH サーバーを持たないため、`add-machine user@host` ではなく、そのマシンの上で `install.ps1` を実行してインストールします。
 
 **必要なもの**
 
-- Windows 11。ARM64 か x86_64(試したのは ARM64。x86_64 のバイナリも同じ作り方で焼いていますが、実機ではまだ動かしていません)。
-- [Claude Code](https://docs.claude.com/ja/docs/claude-code) の単体の CLI(`irm https://claude.ai/install.ps1 | iex`)。一度 `claude` を起動してサインインしておく。
-- [psmux](https://github.com/marlocarlo/psmux)(Windows 版の tmux)— 無ければインストーラが `winget` で入れます。
-- ゲートウェイが PC から届く tailnet に居るか、ゲートウェイに `AGENTGW_LINK_PUBLIC_URL` が設定してあること。つなぎに行くのは PC の側で、PC はポートを開けません。
+| | |
+|---|---|
+| **OS** | Windows 11(ARM64 / x86_64) |
+| **Claude Code** | 単体の CLI([インストール](https://docs.claude.com/ja/docs/claude-code))。サインイン済みであること |
+| **psmux** | [psmux](https://github.com/marlocarlo/psmux)(Windows 版 tmux)。無ければ `winget` で導入されます |
+| **ネットワーク** | マシンから Tailscale 経由、または `AGENTGW_LINK_PUBLIC_URL` でゲートウェイに届くこと。受信用のポートは開きません |
 
-**1. ゲートウェイで**、新しいマシン用の接続文字列を作ります:
+**インストール**
 
-```bash
-agentgw add-machine --print win-box
-```
+1. ゲートウェイで、新しいマシン用の接続文字列を作ります。
 
-マシンを記録して、接続文字列を表示します。パスワードと同じに扱ってください(これでゲートウェイに参加できます)。
+   ```bash
+   agentgw add-machine --print win-box
+   ```
 
-**2. PC で**、PowerShell を**管理者として実行**で開き(Windows PowerShell 5.1 でも PowerShell 7 でも可)、次を打ちます:
+   接続文字列はゲートウェイへの参加を許可するものです。外部に漏らさないでください。
 
-```powershell
-irm https://raw.githubusercontent.com/takashito/agentgw/main/scripts/install.ps1 -OutFile install.ps1
-powershell -ExecutionPolicy Bypass -File install.ps1
-```
+2. Windows のマシンで、**管理者として実行**した PowerShell(Windows PowerShell 5.1 / PowerShell 7)から実行します。
 
-psmux と Claude Code を確かめ、CPU に合うバイナリを落として(チェックサムも照合)、マシンの名前と接続文字列(入力は表示されません)を訊き、サービスを登録します。最後に Windows がパスワードを1回訊きます。
+   ```powershell
+   irm https://raw.githubusercontent.com/takashito/agentgw/main/scripts/install.ps1 -OutFile install.ps1
+   powershell -ExecutionPolicy Bypass -File install.ps1
+   ```
 
-**3. チャンネルを任せる** — そのチャンネルで `@agentgw route win-box:C:\Users\you\dev\app`。
+   インストーラは psmux と Claude Code を確認し、CPU に合うバイナリをダウンロードしてチェックサムを検証したうえで、マシン名と接続文字列の入力を求め、サービスを登録します。
 
-Windows での動き方:
+3. チャンネルをマシンに割り当てます: `@agentgw route win-box:C:\path\to\project`
 
-- **サービスはタスク スケジューラのタスク**(`com.agentgw.bridge`)です。起動時に立ち上がり、**ログインしていてもいなくても**あなたとして動きます。そのため登録には管理者と Windows のパスワードが要ります。パスワードはタスク スケジューラに直接渡り、agentgw は見ません。タスクの中では `agentgw supervise` がサービスを見張り、止まったら起こし直します。
-- **`restart` / `shutdown` / `start` / `status` / `uninstall` / `update` はほかのマシンと同じ**です。新しい版は `update` で届きます。インストーラは最初の1回だけ。
-- **シェル。** エージェントの Bash ツールは、Git Bash が入っていればそれを使います。PowerShell ツールは、動く PowerShell 7 が入っていればそれで、無ければどの Windows にもある Windows PowerShell 5.1 で動きます。Microsoft Store 版の PowerShell 7 は誰もログインしていないと起動できないので数えません。どのシェルが動くかはサービスの起動時に確かめ、PC で `agentgw status` を打つと結果が出ます。足りない物があれば Slack の起動通知にも出ます。
+**サービス**
+
+agentgw はスケジュールタスク `com.agentgw.bridge` として動作します。起動時に開始し、ユーザーのサインインの有無にかかわらず動き続けます。登録には管理者権限とアカウントのパスワードが必要です。パスワードはタスク スケジューラに渡され、agentgw は保存しません。`restart` / `shutdown` / `start` / `status` / `uninstall` / `update` は macOS・Linux と同じように動作します。以後の更新は `update` で配布され、`install.ps1` は初回のインストールにだけ使います。
+
+**シェル**
+
+| Claude Code のツール | シェル |
+|---|---|
+| Bash | Git Bash(インストールされている場合) |
+| PowerShell | PowerShell 7(利用できる場合)、なければ Windows PowerShell 5.1 |
+
+Microsoft Store 版の PowerShell 7 は対話的なサインインなしでは起動できないため、使用しません。利用できるシェルはサービスの起動時に検出され、`agentgw status` で確認できます。
 
 ## Slack のコマンド
 
@@ -337,7 +348,7 @@ agentgw の表示は英語です。日本語にするには `~/.local/state/agen
 | `$TMPDIR/agentgw-agentgw/` | エージェントに渡す hook と MCP の設定(起動のたびに作り直す) |
 | tmux のセッション `agentgw-workers` | エージェント1つ = 窓1つ |
 
-Windows では本体が `%USERPROFILE%\.local\bin\agentgw.exe`、状態は `%LOCALAPPDATA%\agentgw\` に同じ形で置かれます。加えて、タスクが書く `logs\supervise.log` と `logs\agentgw.out.log`、シェルを確かめた結果の `shells.txt` があります。エージェントは psmux のサーバー `agentgw` の中で動きます。
+Windows では、本体は `%USERPROFILE%\.local\bin\agentgw.exe`、状態ディレクトリは `%LOCALAPPDATA%\agentgw\` です。構成は同じで、加えて `logs\supervise.log` と `logs\agentgw.out.log`(スケジュールタスクの出力)、`shells.txt`(検出したシェル)があります。エージェントは psmux のサーバー `agentgw` の中で動きます。
 
 </details>
 
@@ -356,7 +367,7 @@ Windows では本体が `%USERPROFILE%\.local\bin\agentgw.exe`、状態は `%LOC
 
 - **Slack と Claude Code だけ。** ほかのチャットやエージェントの CLI には対応していません。
 - **Owner は1人。** 複数人で使うサービスではありません。ほかの人はスレッドを追って文脈を足せますが、作業を始めたりコマンドを打ったりはできません。
-- **Windows はマシンとしてだけ。** ゲートウェイは macOS か Linux で動かします。Windows のマシンで試したのは、いまのところ ARM64 だけです。
+- **Windows はマシンとしてのみ対応。** ゲートウェイには macOS か Linux が必要です。Windows の x86_64 版は実機での検証がまだです。
 - **Slack アプリ1つにプロセス1つ。** 同じ app トークンでゲートウェイを2つ動かすと、Slack がイベントを振り分けます。アプリを分けてください。
 
 ## 困ったとき
@@ -370,7 +381,7 @@ Windows では本体が `%USERPROFILE%\.local\bin\agentgw.exe`、状態は `%LOC
 | 一部のメッセージにしか返事が来ない | 同じ app トークンを別のプロセスも使っている |
 | マシンがオフラインになる | ゲートウェイの `agentgw status`、そのマシンの `service.err.log` |
 | 更新後、エージェントが新しいツールの引数を使えない | そのエージェントで `/mcp` を打つ(起動時のツール一覧を持ち続けているため) |
-| Windows のマシンが立ち上がらない | PC で `agentgw status`、次に `%LOCALAPPDATA%\agentgw\logs\supervise.log` |
+| Windows のマシンがつながらない | そのマシンで `agentgw status`、次に `%LOCALAPPDATA%\agentgw\logs\supervise.log` |
 | 「このシェルからは systemd のユーザーセッションに届かない」と出る | そのユーザーの systemd が常駐していません。`loginctl enable-linger $USER` を実行してログインし直す |
 
 ## 開発
