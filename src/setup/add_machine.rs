@@ -529,7 +529,7 @@ async fn add_child(
 
     let state_prefix = remote_state_prefix(
         std::env::var("AGENTGW_STATE_DIR").ok().as_deref(),
-        &std::env::var("HOME").unwrap_or_default(),
+        &crate::state_dir::home_env().unwrap_or_default(),
     );
 
     // 6. Try them in order. **The machine is installed on the first pass** and only restarted after that

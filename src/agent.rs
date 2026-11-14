@@ -100,9 +100,28 @@ impl Pid {
 
     /// Looks only at `kill`'s exit code. `output()` keeps `-0`'s "No such process" out of
     /// the log.
+    #[cfg(unix)]
     fn signal(&self, sig: &str) -> bool {
         std::process::Command::new("kill")
             .args([sig, &self.0.to_string()])
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    /// Windows has no signals. `-0` asks `tasklist` whether the pid is there; anything else ends the
+    /// process **and its children** with `taskkill /T /F`. There is no gentle stop to try first: a
+    /// console program (the pane's shell, claude) only goes with `/F`, so TERM and -9 are the same here.
+    #[cfg(windows)]
+    fn signal(&self, sig: &str) -> bool {
+        let pid = self.0.to_string();
+        if sig == "-0" {
+            return std::process::Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+                .output()
+                .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")));
+        }
+        std::process::Command::new("taskkill")
+            .args(["/PID", &pid, "/T", "/F"])
             .output()
             .is_ok_and(|o| o.status.success())
     }

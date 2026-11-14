@@ -1597,8 +1597,8 @@ impl Host {
     /// ponytail: `access.workerHome` isn't typed yet (it's round-tripped as an unknown field).
     /// Once setup starts writing it, read it here first
     pub fn home() -> String {
-        match std::env::var("HOME") {
-            Ok(h) if !h.is_empty() => h,
+        match crate::state_dir::home_env() {
+            Some(h) if !h.is_empty() => h,
             _ => std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| ".".to_string()),

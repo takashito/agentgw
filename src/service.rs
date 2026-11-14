@@ -328,7 +328,7 @@ impl Service {
     }
 
     pub(crate) fn home() -> PathBuf {
-        std::env::var("HOME").map(PathBuf::from).unwrap_or_default()
+        crate::state_dir::home_env().map(PathBuf::from).unwrap_or_default()
     }
 
     /// Where this OS keeps the job definition file.

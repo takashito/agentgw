@@ -30,14 +30,15 @@ impl StateDir {
     }
 
     /// Parent of the state directory (`$XDG_STATE_HOME` → `~/.local/state`). The rename migration looks here too.
+    /// On Windows it is `%LOCALAPPDATA%` — per user, and not roamed to other PCs.
     pub fn default_base() -> PathBuf {
+        #[cfg(windows)]
+        if let Ok(dir) = std::env::var("LOCALAPPDATA") {
+            return PathBuf::from(dir);
+        }
         std::env::var("XDG_STATE_HOME")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                PathBuf::from(std::env::var("HOME").unwrap_or_default())
-                    .join(".local")
-                    .join("state")
-            })
+            .unwrap_or_else(|_| PathBuf::from(home_env().unwrap_or_default()).join(".local").join("state"))
     }
 
     /// From an explicit path (tests, and when the CLI points somewhere else).
@@ -55,7 +56,7 @@ impl StateDir {
 
     /// The home directory. Default place where agents for channels with no route start.
     pub fn home() -> String {
-        std::env::var("HOME").unwrap_or_else(|_| "/".to_string())
+        home_env().unwrap_or_else(|| "/".to_string())
     }
 
     pub fn read_json_or(&self, name: &str, default: serde_json::Value) -> serde_json::Value {
@@ -190,6 +191,16 @@ impl StateDir {
 // `StateDir`'s methods are the only entry point. What follows are helpers called only through
 // `impl StateDir`, used directly only where files outside the state directory are touched
 // (transcripts / plists given by absolute path).
+
+/// The user's home directory as the environment gives it: `HOME` on Unix, `USERPROFILE` on Windows
+/// (which has no `HOME` unless something like Git Bash set one). `None` when it is not set.
+pub fn home_env() -> Option<String> {
+    #[cfg(windows)]
+    let key = "USERPROFILE";
+    #[cfg(not(windows))]
+    let key = "HOME";
+    std::env::var(key).ok()
+}
 
 fn read_json_at(path: &Path, default: serde_json::Value) -> serde_json::Value {
     std::fs::read_to_string(path)

@@ -240,7 +240,7 @@ impl Claude {
         if cfg!(test) {
             return Ok(Vec::new());
         }
-        let home = std::env::var("HOME").map_err(|e| format!("HOME: {e}"))?;
+        let home = crate::state_dir::home_env().ok_or("the home directory is not set")?;
         let path = std::path::Path::new(&home).join(".claude.json");
         let config: serde_json::Value = match std::fs::read_to_string(&path) {
             Ok(text) => serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?,
@@ -1649,10 +1649,11 @@ impl Transcript {
     pub fn project_dir(cwd: &str) -> Option<std::path::PathBuf> {
         let name: String = cwd
             .chars()
-            .map(|c| if c == '/' || c == '.' { '-' } else { c })
+            // On Windows the drive colon and the backslashes go too (`C:\Users\x` → `C--Users-x`; to be checked against a real Windows machine)
+            .map(|c| if c == '/' || c == '.' || (cfg!(windows) && (c == '\\' || c == ':')) { '-' } else { c })
             .collect();
         Some(
-            std::path::Path::new(&std::env::var("HOME").ok()?)
+            std::path::Path::new(&crate::state_dir::home_env()?)
                 .join(".claude/projects")
                 .join(name),
         )
@@ -1661,7 +1662,7 @@ impl Transcript {
     /// Exhaustive search of `~/.claude/projects/<project>/<sid>.jsonl`.
     /// Projects are only one level deep, so two readdirs are enough.
     fn find(sid: &str) -> Option<Self> {
-        let root = std::path::Path::new(&std::env::var("HOME").ok()?).join(".claude/projects");
+        let root = std::path::Path::new(&crate::state_dir::home_env()?).join(".claude/projects");
         for e in std::fs::read_dir(root).ok()? {
             let Ok(e) = e else { continue };
             let p = e.path().join(format!("{sid}.jsonl"));

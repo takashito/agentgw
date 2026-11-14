@@ -68,7 +68,7 @@ impl Bridge {
         );
         // $HOME is for folding paths into `~`. Host::home() is
         // "where an agent without a route starts", a different thing, so don't mix them here
-        let home = std::env::var("HOME").unwrap_or_default();
+        let home = crate::state_dir::home_env().unwrap_or_default();
         // `self` cannot be carried into a 'static spawn — build the whole picture here and move it in.
         // Count only **usable** pool entries (starting ones "don't exist yet"; given-up slots are already gone)
         let waiting: Vec<(String, u64)> = self
