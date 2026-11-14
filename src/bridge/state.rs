@@ -1226,7 +1226,7 @@ impl Access {
                         "set_repo expects a channel id (C…/G…), got \"{channel}\""
                     ));
                 }
-                if !path.starts_with('/') {
+                if !is_absolute_path(&path) {
                     return Err(crate::t!(
                         "The project path must be absolute: \"{path}\"",
                         "プロジェクトのパスは絶対パスで指定してください: \"{path}\""
@@ -1417,19 +1417,43 @@ pub fn is_machine_name(s: &str) -> bool {
         && cs.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
 }
 
+/// A Windows absolute path: a drive letter, a colon, then a separator (`C:\x`, `C:/x`) or nothing.
+/// Told by its shape rather than by the OS this runs on — the gateway answers for a Windows machine
+/// from Linux.
+pub fn is_windows_absolute(p: &str) -> bool {
+    let b = p.as_bytes();
+    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b.len() == 2 || b[2] == b'\\' || b[2] == b'/')
+}
+
+/// Absolute on the machine it names: `/…`, or `C:\…` on Windows.
+pub fn is_absolute_path(p: &str) -> bool {
+    p.starts_with('/') || is_windows_absolute(p)
+}
+
 /// A project path as typed → the absolute path to store. No shell ever sees it (tmux gets it as is),
 /// so `~` and `./` are resolved against `home` — the home directory of the machine running the agents.
-/// A trailing `/` is dropped.
+/// A trailing `/` is dropped. **A Windows home (`C:\Users\x`) joins with `\`**, and there `~\x` and
+/// `.\x` work as well as `~/x` and `./x`.
 pub fn absolute_project_path(typed: &str, home: &str) -> String {
-    let home = home.trim_end_matches('/');
+    let windows = is_windows_absolute(home);
+    let is_sep = |c: char| c == '/' || (windows && c == '\\');
+    let sep = if windows { "\\" } else { "/" };
+    // On Windows, a typed `/` is the same separator; store one kind
+    let native = |s: &str| if windows { s.replace('/', "\\") } else { s.to_string() };
+    let home = home.trim_end_matches(is_sep);
     let abs = match typed.strip_prefix('~') {
         Some("") => home.to_string(),
-        Some(rest) if rest.starts_with('/') => format!("{home}{rest}"),
-        _ if typed.starts_with('/') => typed.to_string(),
-        _ => format!("{home}/{}", typed.strip_prefix("./").unwrap_or(typed)),
+        Some(rest) if rest.starts_with(is_sep) => format!("{home}{}", native(rest)),
+        _ if is_absolute_path(typed) => native(typed),
+        _ => {
+            let rel = typed.strip_prefix("./").or_else(|| typed.strip_prefix(".\\").filter(|_| windows)).unwrap_or(typed);
+            format!("{home}{sep}{}", native(rel))
+        }
     };
-    match abs.trim_end_matches('/') {
+    match abs.trim_end_matches(is_sep) {
         "" => "/".to_string(),
+        // A bare drive is its root
+        p if windows && p.len() == 2 => format!("{p}\\"),
         p => p.to_string(),
     }
 }
@@ -3043,6 +3067,26 @@ mod tests {
         ] {
             assert_eq!(absolute_project_path(typed, "/home/me"), want, "{typed}");
         }
+    }
+
+    /// A Windows machine's home is `C:\Users\me`: absolute paths keep their drive, the rest joins
+    /// with `\` (2026-11-14: `route 3dwin` was refused because `C:\Users\me` did not start with `/`)
+    #[test]
+    fn project_paths_on_a_windows_machine() {
+        for (typed, want) in [
+            (r"D:\work\app", r"D:\work\app"),
+            (r"D:\work\app\", r"D:\work\app"),
+            ("D:/work/app", r"D:\work\app"),
+            ("~", r"C:\Users\me"),
+            (r"~\dev\x", r"C:\Users\me\dev\x"),
+            ("~/dev/x", r"C:\Users\me\dev\x"),
+            (r".\dev\x", r"C:\Users\me\dev\x"),
+            ("dev", r"C:\Users\me\dev"),
+            ("C:", r"C:\"),
+        ] {
+            assert_eq!(absolute_project_path(typed, r"C:\Users\me"), want, "{typed}");
+        }
+        assert!(is_absolute_path(r"C:\Users\me") && is_absolute_path("/srv") && !is_absolute_path("dev"));
     }
 
     #[test]
