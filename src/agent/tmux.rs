@@ -57,8 +57,8 @@ fn tmux_bin() -> String {
     "tmux".to_string()
 }
 
-/// How `set-option -w` and `paste-buffer` must point at a window. psmux 3.4.0 answers
-/// "can't find window" when those two are given a window id (`@4`), while `send-keys`,
+/// How `set-option -w` must point at a window. psmux 3.4.0 answers "can't find window" when it
+/// (and `paste-buffer`, no longer used there) is given a window id (`@4`), while `send-keys`,
 /// `capture-pane` and `kill-window` take the id fine; `session:name` works for all (measured
 /// 2026-11-14). Real tmux keeps the id — it does not move when a window is renamed.
 fn by_name_on_windows(id: &str, name: Option<&str>) -> String {
@@ -83,7 +83,16 @@ impl Tmux {
     pub fn real() -> Tmux {
         Tmux {
             run: Box::new(|args| {
-                let out = std::process::Command::new(tmux_bin())
+                let mut cmd = std::process::Command::new(tmux_bin());
+                // psmux puts these in its panes, and a psmux client that sees them acts on **the
+                // session it is in**, whatever `-t` says (measured 2026-11-14: a test run from
+                // inside a psmux pane typed into that pane's Claude). agentgw's own windows are
+                // reached by name only, so never let it inherit them
+                #[cfg(windows)]
+                for var in ["TMUX", "TMUX_PANE", "PSMUX_CLAUDE_TEAMMATE_MODE"] {
+                    cmd.env_remove(var);
+                }
+                let out = cmd
                     .args(args)
                     .output()
                     .map_err(|e| format!("tmux {args:?}: {e}"))?;
@@ -111,14 +120,22 @@ impl Tmux {
     /// shared name the first paste's `-d` deleted the buffer the second was about to paste — the
     /// second then failed outright with `no buffer …` and the message was never handed over
     /// (seen on a real machine 2026-10-08).
+    ///
+    /// **On Windows the text is typed (`send-keys -l`), not pasted.** psmux 3.4.0 lists a named
+    /// buffer and then answers `no buffer` when asked to paste it, at any length; an unnamed one
+    /// pastes, but not reliably the one just set (measured 2026-11-14). Typed, 7KB over 82 lines
+    /// reached Claude and was answered, and a newline did not submit early.
     pub fn deliver(&self, w: &Window, text: &str) -> Result<(), String> {
         let t = w.as_str();
-        let n = DELIVERY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let buffer = format!("agentgw-deliver-{t}-{n}");
-        // `--` guards against text starting with `-`
-        (self.run)(&["set-buffer", "-b", &buffer, "--", text])?;
-        let paste_to = by_name_on_windows(t, self.name_of(t).as_deref());
-        (self.run)(&["paste-buffer", "-p", "-d", "-b", &buffer, "-t", &paste_to])?;
+        if cfg!(windows) {
+            (self.run)(&["send-keys", "-t", t, "-l", "--", text])?;
+        } else {
+            let n = DELIVERY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let buffer = format!("agentgw-deliver-{t}-{n}");
+            // `--` guards against text starting with `-`
+            (self.run)(&["set-buffer", "-b", &buffer, "--", text])?;
+            (self.run)(&["paste-buffer", "-p", "-d", "-b", &buffer, "-t", t])?;
+        }
         std::thread::sleep(SETTLE_BEFORE_ENTER);
         (self.run)(&["send-keys", "-t", t, "Enter"])?;
         Ok(())
@@ -268,15 +285,6 @@ impl Tmux {
                 })
             })
             .collect()
-    }
-
-    /// The name of the window with this id, from the listing. Only Windows asks (see
-    /// [`by_name_on_windows`]); elsewhere it costs nothing.
-    fn name_of(&self, id: &str) -> Option<String> {
-        if !cfg!(windows) {
-            return None;
-        }
-        self.rows().into_iter().find(|r| r.id == id).map(|r| r.name)
     }
 
     /// The pid of the process running in the window. **Looked up from the list-windows listing** —
