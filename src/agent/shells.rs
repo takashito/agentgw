@@ -37,19 +37,31 @@ impl Probe {
     }
 }
 
-/// The three shells, as found by [`probe`].
+/// The shells, as found by [`probe`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Shells {
     pub git_bash: Probe,
+    /// The `pwsh` installed on the machine (any build)
     pub pwsh: Probe,
     pub powershell: Probe,
+    /// agentgw's own `pwsh.exe`, which is Windows PowerShell 5.1 ([`pwsh_shim_dir`]). First on the
+    /// agents' PATH, so Claude Code takes it for its PowerShell tool and `powershell` hooks
+    pub agents_pwsh: Probe,
 }
 
 impl Shells {
-    /// Turn Claude Code's PowerShell tool off: there is a `pwsh` it may pick, and it does not start.
-    /// With no `pwsh` at all the tool falls back to 5.1 and works, so it stays on.
+    /// Turn Claude Code's PowerShell tool off: agentgw's own `pwsh.exe` is not there, and the
+    /// `pwsh` Claude Code would find instead does not start. With no `pwsh` at all the tool falls
+    /// back to 5.1 and works, so it stays on.
     pub fn powershell_tool_off(&self) -> bool {
-        matches!(self.pwsh, Probe::Fails(..))
+        !self.agents_pwsh.works() && matches!(self.pwsh, Probe::Fails(..))
+    }
+
+    /// Run the SessionStart hook in PowerShell (else Git Bash). PowerShell when the one Claude
+    /// Code would run it in starts — agentgw's own 5.1 `pwsh.exe`, or no `pwsh` to find at all —
+    /// or when there is no Git Bash to fall back on.
+    pub fn hook_in_powershell(&self) -> bool {
+        !self.powershell_tool_off() || !self.git_bash.works()
     }
 
     /// When the agents are left without any working shell tool — no Git Bash, and the PowerShell
@@ -76,10 +88,11 @@ impl Shells {
             Probe::Absent => format!("{name} —"),
         };
         format!(
-            "{} · {} · {}{}",
+            "{} · {} · {} · {}{}",
             one("Git Bash", &self.git_bash),
             one("pwsh", &self.pwsh),
             one("Windows PowerShell 5.1", &self.powershell),
+            one("agents' pwsh (5.1)", &self.agents_pwsh),
             if self.powershell_tool_off() { " → PowerShell tool off" } else { "" }
         )
     }
@@ -138,6 +151,34 @@ fn on_path(name: &str) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
+/// Where agentgw keeps its own `pwsh.exe`: a copy of Windows PowerShell 5.1's `powershell.exe`
+/// under that name (it runs as 5.1 Desktop under any name — measured 2026-11-14).
+///
+/// Claude Code picks the PowerShell for its tool in a fixed order — a `pwsh.exe` on PATH, then
+/// `Program Files\PowerShell\7`, then the Store build's alias in `%LOCALAPPDATA%` (looked at
+/// directly, PATH or not), and 5.1 only when none of those exists (read from its code, 2.1.325).
+/// There is no setting for it. With the Store build installed it never gets to 5.1, and the Store
+/// build does not start outside a desktop. A `pwsh.exe` that is 5.1, first on PATH, is the one
+/// way to have it use 5.1 — and only agentgw's psmux has it on PATH; the user's own is untouched.
+pub fn pwsh_shim_dir() -> PathBuf {
+    crate::state_dir::StateDir::resolve().join("pwsh-shim")
+}
+
+/// Puts agentgw's `pwsh.exe` in place (again when Windows PowerShell's file has changed size,
+/// after an update). Returns why not when it cannot.
+pub fn ensure_pwsh_shim() -> Result<PathBuf, String> {
+    let source = env_path("SystemRoot", &["System32", "WindowsPowerShell", "v1.0", "powershell.exe"])
+        .ok_or("SystemRoot is not set")?;
+    let dir = pwsh_shim_dir();
+    let shim = dir.join("pwsh.exe");
+    let size = |p: &Path| std::fs::metadata(p).map(|m| m.len()).ok();
+    if size(&shim).is_none() || size(&shim) != size(&source) {
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        std::fs::copy(&source, &shim).map_err(|e| format!("{}: {e}", shim.display()))?;
+    }
+    Ok(shim)
+}
+
 /// Tries the shells. Slow-ish (each PowerShell takes about a second to start), so it runs once,
 /// at start-up.
 pub fn probe() -> Shells {
@@ -165,10 +206,15 @@ pub fn probe() -> Shells {
         .collect();
 
     let ps_args = ["-NoProfile", "-NonInteractive", "-Command", "exit 0"];
+    let agents_pwsh = match ensure_pwsh_shim() {
+        Ok(shim) => probe_kind(&[shim], &ps_args),
+        Err(why) => Probe::Fails(pwsh_shim_dir().display().to_string(), why),
+    };
     Shells {
         git_bash: probe_kind(&bash, &["-c", "exit 0"]),
         pwsh: probe_kind(&pwsh, &ps_args),
         powershell: probe_kind(&powershell, &ps_args),
+        agents_pwsh,
     }
 }
 
@@ -176,8 +222,31 @@ pub fn probe() -> Shells {
 mod tests {
     use super::*;
 
+    /// Without agentgw's own pwsh (it could not be put in place)
     fn shells(git_bash: Probe, pwsh: Probe) -> Shells {
-        Shells { git_bash, pwsh, powershell: Probe::Works("powershell.exe".into()) }
+        Shells {
+            git_bash,
+            pwsh,
+            powershell: Probe::Works("powershell.exe".into()),
+            agents_pwsh: Probe::Fails("pwsh-shim".into(), "could not copy".into()),
+        }
+    }
+
+    #[test]
+    fn with_agentgws_own_pwsh_the_tool_and_the_hook_use_powershell_5_1() {
+        let store = Probe::Fails("WindowsApps\\pwsh.exe".into(), "Access is denied".into());
+        let s = Shells { agents_pwsh: Probe::Works("pwsh-shim\\pwsh.exe".into()), ..shells(Probe::Absent, store) };
+        assert!(!s.powershell_tool_off());
+        assert!(s.hook_in_powershell());
+        assert!(s.problem().is_none());
+    }
+
+    #[test]
+    fn without_it_the_hook_goes_to_git_bash_when_pwsh_is_broken() {
+        let store = Probe::Fails("pwsh.exe".into(), "denied".into());
+        assert!(!shells(Probe::Works("bash".into()), store.clone()).hook_in_powershell());
+        assert!(shells(Probe::Absent, store).hook_in_powershell(), "nothing else to run it in");
+        assert!(shells(Probe::Works("bash".into()), Probe::Absent).hook_in_powershell(), "5.1 is what it finds");
     }
 
     #[test]
@@ -200,7 +269,7 @@ mod tests {
     #[test]
     fn the_summary_says_what_started() {
         let s = shells(Probe::Absent, Probe::Fails("p".into(), "denied".into())).summary();
-        assert!(s.contains("Git Bash —") && s.contains("pwsh ✗ (p: denied)") && s.contains("5.1 ✓"), "{s}");
+        assert!(s.contains("Git Bash —") && s.contains("pwsh ✗ (p: denied)") && s.contains("Windows PowerShell 5.1 ✓"), "{s}");
         assert!(s.ends_with("PowerShell tool off"), "{s}");
     }
 }

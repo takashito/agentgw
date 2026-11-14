@@ -78,16 +78,22 @@ fn psmux_conf() -> Option<String> {
     .clone()
 }
 
-/// PATH without the Store's app-alias folders (`...\WindowsApps`). psmux runs each window's command
-/// through the first `pwsh` it finds, whatever the default shell says, and the Store's `pwsh`
-/// alias fails outside a desktop; with none to find it uses the shell above.
+/// The PATH agentgw's psmux and the agents in it get: **the `pwsh.exe` that is Windows PowerShell
+/// 5.1 first** (`agent::shells::pwsh_shim_dir`, when it is there), and the Store's app-alias
+/// folders (`...\WindowsApps`) left out.
+///
+/// psmux runs each window's command through the first `pwsh` it finds, and Claude Code's
+/// PowerShell tool and `powershell` hooks take a `pwsh.exe` on PATH before anything else — both
+/// reach the Store build otherwise, which does not start outside a desktop.
 #[cfg(windows)]
-fn path_without_store_aliases() -> Option<std::ffi::OsString> {
+pub(crate) fn agents_path() -> Option<std::ffi::OsString> {
     let path = std::env::var_os("PATH")?;
-    let kept = std::env::split_paths(&path).filter(|p| {
-        !p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("WindowsApps"))
-    });
-    std::env::join_paths(kept).ok()
+    let shim = crate::agent::shells::pwsh_shim_dir();
+    let kept = std::env::split_paths(&path)
+        .filter(|p| !p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("WindowsApps")))
+        .filter(|p| *p != shim);
+    let first = shim.join("pwsh.exe").is_file().then_some(shim.clone());
+    std::env::join_paths(first.into_iter().chain(kept)).ok()
 }
 
 /// How `set-option -w` must point at a window. psmux 3.4.0 answers "can't find window" when it
@@ -140,7 +146,7 @@ impl Tmux {
                     if let Some(conf) = psmux_conf() {
                         cmd.args(["-f", &conf]);
                     }
-                    if let Some(path) = path_without_store_aliases() {
+                    if let Some(path) = agents_path() {
                         cmd.env("PATH", path);
                     }
                 }
@@ -258,25 +264,19 @@ impl Tmux {
     pub fn spawn(&self, window: &str, cwd: &str, line: &str) -> Result<Window, String> {
         // Create the session first if missing (has-session returns non-zero for "missing", so ignore the Err)
         let (x, y) = WINDOW_SIZE;
+        // Windows: the agents' PATH goes with every window. The psmux server keeps the environment
+        // it started with, which may be from an older agentgw — across restarts it is not restarted
+        #[cfg(windows)]
+        let window_env: Vec<String> = agents_path()
+            .map(|p| vec!["-e".to_string(), format!("PATH={}", p.to_string_lossy())])
+            .unwrap_or_default();
+        #[cfg(not(windows))]
+        let window_env: Vec<String> = Vec::new();
         let id = if (self.run)(&["has-session", "-t", TMUX_SESSION]).is_err() {
-            let id = (self.run)(&[
-                "new-session",
-                "-d",
-                "-s",
-                TMUX_SESSION,
-                "-x",
-                x,
-                "-y",
-                y,
-                "-n",
-                window,
-                "-c",
-                cwd,
-                "-P",
-                "-F",
-                "#{window_id}",
-                line,
-            ])?;
+            let mut args = vec!["new-session", "-d", "-s", TMUX_SESSION, "-x", x, "-y", y];
+            args.extend(window_env.iter().map(String::as_str));
+            args.extend(["-n", window, "-c", cwd, "-P", "-F", "#{window_id}", line]);
+            let id = (self.run)(&args)?;
             self.pin_session_size(&[("window-size", "manual")]);
             id
         } else {
@@ -284,20 +284,10 @@ impl Tmux {
             // windows already there (no reflow under a working agent) — only new windows get the size.
             let size = format!("{x}x{y}");
             self.pin_session_size(&[("window-size", "manual"), ("default-size", &size)]);
-            (self.run)(&[
-                "new-window",
-                "-d",
-                "-t",
-                TMUX_SESSION,
-                "-n",
-                window,
-                "-c",
-                cwd,
-                "-P",
-                "-F",
-                "#{window_id}",
-                line,
-            ])?
+            let mut args = vec!["new-window", "-d", "-t", TMUX_SESSION];
+            args.extend(window_env.iter().map(String::as_str));
+            args.extend(["-n", window, "-c", cwd, "-P", "-F", "#{window_id}", line]);
+            (self.run)(&args)?
         };
         let id = id.trim().to_string();
         // Lock out renaming so the name fallback keeps working (spawn succeeds even if this fails)
