@@ -9,7 +9,7 @@
 # other side). It links the Mac build fine too (Mach-O 64-bit executable arm64).
 # Tools needed: brew install zig cargo-zigbuild && rustup target add <triple>
 # The Windows builds are `-gnullvm`, not `-msvc`: zig links them with no Windows SDK, and `ring`
-# builds with zig's clang (measured on dock 2026-11-14). `-msvc` would want clang-cl and lib.exe.
+# builds with zig's clang (measured 2026-11-14). `-msvc` would want clang-cl and lib.exe.
 #
 # **The triples are hard-coded.** This repo assumes shipping from one Mac; to add a target,
 # add it here (each one adds about 80 seconds).

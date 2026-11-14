@@ -3070,7 +3070,7 @@ mod tests {
     }
 
     /// A Windows machine's home is `C:\Users\me`: absolute paths keep their drive, the rest joins
-    /// with `\` (2026-11-14: `route 3dwin` was refused because `C:\Users\me` did not start with `/`)
+    /// with `\` (2026-11-14: `route <machine>` was refused because `C:\Users\me` did not start with `/`)
     #[test]
     fn project_paths_on_a_windows_machine() {
         for (typed, want) in [
