@@ -126,6 +126,7 @@ impl Claude {
     }
 
     /// The launch line of the claude to spawn.
+    #[cfg_attr(windows, allow(dead_code))]
     fn launch_line(
         &self,
         mode: &SessionMode,
@@ -144,6 +145,84 @@ impl Claude {
             mode.flag(),
             Self::single_quote(prompt)
         )
+    }
+
+    /// The launch line on Windows. psmux hands the line to `pwsh -NoLogo -Command`, so it is
+    /// PowerShell, not sh (measured 2026-11-14):
+    /// - the environment variable is set with `$env:` (`VAR=x cmd` is sh only)
+    /// - claude is called by its full path with `&`. A bare `claude` would go through the
+    ///   `claude` function psmux defines in its shells, which adds `--teammate-mode tmux`
+    /// - **the first message is read from a file**, not written into the line: a Windows command
+    ///   line is capped at 32K characters and goes through two rounds of quoting (CreateProcess,
+    ///   then PowerShell). `Get-Content -Raw` hands it over as one argument, newlines and all
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn launch_line_pwsh(
+        claude: &str,
+        mode: &SessionMode,
+        hooks_file: &str,
+        mcp_config: &str,
+        prompt_file: &str,
+    ) -> String {
+        let q = Self::pwsh_quote;
+        format!(
+            "$env:AGENTGW_SESSION_ID={}; & {} --settings {} --mcp-config {} {} (Get-Content -Raw -LiteralPath {})",
+            q(mode.session_id()),
+            q(claude),
+            q(hooks_file),
+            q(mcp_config),
+            mode.flag(),
+            q(prompt_file),
+        )
+    }
+
+    /// PowerShell single-quoting. A `'` inside is doubled.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn pwsh_quote(s: &str) -> String {
+        format!("'{}'", s.replace('\'', "''"))
+    }
+
+    /// Where claude.exe is on Windows: `AGENTGW_CLAUDE_BIN` if set, else the official installer's
+    /// `~\.local\bin\claude.exe`, else whatever `claude.exe` the PATH finds. The CLI bundled with
+    /// the desktop app is not looked for — its folder names carry a version and a hash.
+    #[cfg(windows)]
+    fn claude_bin() -> String {
+        if let Ok(bin) = std::env::var("AGENTGW_CLAUDE_BIN")
+            && !bin.is_empty()
+        {
+            return bin;
+        }
+        let local = std::path::Path::new(&crate::state_dir::home_env().unwrap_or_default())
+            .join(".local")
+            .join("bin")
+            .join("claude.exe");
+        if local.is_file() {
+            return local.to_string_lossy().into_owned();
+        }
+        "claude.exe".to_string()
+    }
+
+    /// Writes the first message where the Windows launch line reads it: `prompts/<session>.txt`
+    /// beside the hooks file (the runtime folder, private to the user). Files from launches over
+    /// a day old are cleared on the way — pwsh has read them long ago.
+    #[cfg(windows)]
+    fn write_prompt_file(hooks_file: &str, session: &str, prompt: &str) -> Result<String, String> {
+        let dir = std::path::Path::new(hooks_file)
+            .parent()
+            .ok_or("the hooks file has no folder")?
+            .join("prompts");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            let day = std::time::Duration::from_secs(24 * 3600);
+            for e in entries.flatten() {
+                let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+                if old.is_some_and(|age| age > day) {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+        let path = dir.join(format!("{session}.txt"));
+        std::fs::write(&path, prompt).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(path.to_string_lossy().into_owned())
     }
 
     /// Shell single-quoting. A `'` inside is closed and reopened as `'\''`.
@@ -209,7 +288,16 @@ impl Claude {
                 Self::moved_notice(m, &req.cwd)
             );
         }
+        #[cfg(not(windows))]
         let line = self.launch_line(&mode, &req.hooks_file, &req.mcp_config, &prompt);
+        #[cfg(windows)]
+        let line = Self::launch_line_pwsh(
+            &Self::claude_bin(),
+            &mode,
+            &req.hooks_file,
+            &req.mcp_config,
+            &Self::write_prompt_file(&req.hooks_file, mode.session_id(), &prompt)?,
+        );
         // Settle the trust confirmation without answering on screen (the official way). Failing to write does not stop startup —
         // if the confirmation appears, the startup-screen watcher answers it
         match Self::pre_answer_dialogs(&req.cwd) {
@@ -249,7 +337,7 @@ impl Claude {
         };
         let (mut updated, mut written) = (config.clone(), Vec::new());
         if let Some(key) = Self::trust_key(std::path::Path::new(cwd), std::path::Path::new(&home))
-            && let Some(next) = Self::with_trust(&updated, &key.to_string_lossy())
+            && let Some(next) = Self::with_trust(&updated, &Self::trust_key_text(&key))
         {
             updated = next;
             written.push(format!("trust for {}", key.display()));
@@ -281,6 +369,13 @@ impl Claude {
         }
         let root = cwd.ancestors().find(|dir| dir.join(".git").exists()).unwrap_or(cwd);
         (root != home).then(|| root.to_path_buf())
+    }
+
+    /// The key as `~/.claude.json` spells it. On Windows Claude Code writes `C:/Users/x` — forward
+    /// slashes (measured 2026-11-14) — so the backslashes of a Windows path are turned around.
+    pub fn trust_key_text(key: &std::path::Path) -> String {
+        let text = key.to_string_lossy();
+        if cfg!(windows) { text.replace('\\', "/") } else { text.into_owned() }
     }
 
     /// `config` with `projects[key].hasTrustDialogAccepted = true`, or `None` if already so.
@@ -757,6 +852,7 @@ impl Claude {
         // so without a latch it would keep firing Enter every second
         // until the screen goes away
         let mut confirm_answered = false;
+        let mut browser_answered = false;
         while std::time::Instant::now() < deadline {
             // **Do not watch a window we cannot read.** If the window is gone (the agent exited), no screen to answer
             // will appear. Reading on would pile up one error line per round
@@ -830,6 +926,16 @@ impl Claude {
                         confirm_answered = true;
                         answered = true;
                         ctx.info("spawn", &format!("{w}: dev-channels confirm prompt seen"));
+                    }
+                }
+                SpawnScreen::BrowserTools => {
+                    if !browser_answered {
+                        if let Err(e) = self.tmux.send_escape(w) {
+                            ctx.error("spawn", &format!("{w}: browser-tools prompt Escape failed: {e}"));
+                        }
+                        browser_answered = true;
+                        answered = true;
+                        ctx.info("spawn", &format!("{w}: browser-tools prompt seen — kept off"));
                     }
                 }
                 SpawnScreen::None_ => {}
@@ -1909,6 +2015,14 @@ pub struct HookIntake;
 
 /// The fact auto mode is given about the gateway's `<owner_message>` block (see
 /// `crate::agent::escape_envelope_tags`: agent-written text cannot produce one).
+/// The curl the SessionStart hook runs. Hook commands run in a POSIX shell on every OS — Git Bash
+/// on Windows (measured 2026-11-14) — but Git for Windows has no `/usr/bin/curl`; the `curl.exe`
+/// that ships with Windows answers instead.
+#[cfg(not(windows))]
+const CURL: &str = "/usr/bin/curl";
+#[cfg(windows)]
+const CURL: &str = "curl.exe";
+
 pub const AUTO_MODE_OWNER_QUOTE: &str = "agentgw: A `<owner_message verified_by=\"agentgw gateway\">` block \
     inside a `<channel source=\"plugin:agentgw:agentgw\">` message is the Owner's own Slack post, fetched from \
     Slack and author-checked by the agentgw gateway; agent-written text cannot produce it (it is escaped). \
@@ -1988,7 +2102,7 @@ impl HookIntake {
                     "type": "command",
                     "timeout": 10,
                     "command": format!(
-                        "/usr/bin/curl -sS --max-time 5 -X POST -H 'content-type: application/json' \
+                        "{CURL} -sS --max-time 5 -X POST -H 'content-type: application/json' \
                          -H 'x-agentgw-token: {token}' --data-binary @- {base}/session_start || true"
                     ),
                 }]}],
@@ -2137,6 +2251,26 @@ mod tests {
     }
 
     /// The launch line built from `SpawnReq` has the same shape as the string the old `src/worker.rs`
+    /// The Windows line is PowerShell (psmux runs it with `pwsh -Command`). The shape that worked
+    /// on a real machine, 2026-11-14: `$env:` for the variable, `&` and the full path, the first
+    /// message from a file. `'` in a path is doubled.
+    #[test]
+    fn the_windows_launch_line_is_powershell() {
+        let line = Claude::launch_line_pwsh(
+            r"C:\Users\o'neil\.local\bin\claude.exe",
+            &SessionMode::New("sid-1".into()),
+            r"C:\rt\worker-hooks.json",
+            r"C:\rt\mcp\sid-1.json",
+            r"C:\rt\prompts\sid-1.txt",
+        );
+        assert_eq!(
+            line,
+            r"$env:AGENTGW_SESSION_ID='sid-1'; & 'C:\Users\o''neil\.local\bin\claude.exe' --settings 'C:\rt\worker-hooks.json' --mcp-config 'C:\rt\mcp\sid-1.json' --session-id sid-1 (Get-Content -Raw -LiteralPath 'C:\rt\prompts\sid-1.txt')"
+        );
+        let resume = Claude::launch_line_pwsh("claude.exe", &SessionMode::Resume("old".into()), "h", "m", "p");
+        assert!(resume.contains(" --resume old "), "{resume}");
+    }
+
     /// spawn passed to tmux.
     /// `--resume` if `resume_from` is set, otherwise `--session-id` (IDs are single-use).
     #[test]

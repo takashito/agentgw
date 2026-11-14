@@ -38,6 +38,36 @@ pub(crate) fn target(window: &str) -> String {
     }
 }
 
+/// The tmux to run: `AGENTGW_TMUX_BIN` if set, else `tmux`. On Windows that is psmux's `tmux.exe`,
+/// which winget puts in `%LOCALAPPDATA%\Microsoft\WinGet\Links` — looked for there directly too,
+/// since a service's PATH need not carry that folder.
+fn tmux_bin() -> String {
+    if let Ok(bin) = std::env::var("AGENTGW_TMUX_BIN")
+        && !bin.is_empty()
+    {
+        return bin;
+    }
+    #[cfg(windows)]
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        let links = std::path::Path::new(&local).join("Microsoft").join("WinGet").join("Links").join("tmux.exe");
+        if links.is_file() {
+            return links.to_string_lossy().into_owned();
+        }
+    }
+    "tmux".to_string()
+}
+
+/// How `set-option -w` and `paste-buffer` must point at a window. psmux 3.4.0 answers
+/// "can't find window" when those two are given a window id (`@4`), while `send-keys`,
+/// `capture-pane` and `kill-window` take the id fine; `session:name` works for all (measured
+/// 2026-11-14). Real tmux keeps the id — it does not move when a window is renamed.
+fn by_name_on_windows(id: &str, name: Option<&str>) -> String {
+    match name {
+        Some(name) if cfg!(windows) => format!("{TMUX_SESSION}:{name}"),
+        _ => id.to_string(),
+    }
+}
+
 const SETTLE_BEFORE_ENTER: std::time::Duration = std::time::Duration::from_millis(200);
 /// Tells one delivery's paste buffer from another's. Only uniqueness matters, so it never resets.
 static DELIVERY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -53,7 +83,7 @@ impl Tmux {
     pub fn real() -> Tmux {
         Tmux {
             run: Box::new(|args| {
-                let out = std::process::Command::new("tmux")
+                let out = std::process::Command::new(tmux_bin())
                     .args(args)
                     .output()
                     .map_err(|e| format!("tmux {args:?}: {e}"))?;
@@ -87,7 +117,8 @@ impl Tmux {
         let buffer = format!("agentgw-deliver-{t}-{n}");
         // `--` guards against text starting with `-`
         (self.run)(&["set-buffer", "-b", &buffer, "--", text])?;
-        (self.run)(&["paste-buffer", "-p", "-d", "-b", &buffer, "-t", t])?;
+        let paste_to = by_name_on_windows(t, self.name_of(t).as_deref());
+        (self.run)(&["paste-buffer", "-p", "-d", "-b", &buffer, "-t", &paste_to])?;
         std::thread::sleep(SETTLE_BEFORE_ENTER);
         (self.run)(&["send-keys", "-t", t, "Enter"])?;
         Ok(())
@@ -190,8 +221,9 @@ impl Tmux {
         };
         let id = id.trim().to_string();
         // Lock out renaming so the name fallback keeps working (spawn succeeds even if this fails)
+        let named = by_name_on_windows(&id, Some(window));
         for opt in ["automatic-rename", "allow-rename"] {
-            if let Err(e) = (self.run)(&["set-option", "-w", "-t", &id, opt, "off"]) {
+            if let Err(e) = (self.run)(&["set-option", "-w", "-t", &named, opt, "off"]) {
                 crate::log::LogCtx::default()
                     .error("worker", &format!("could not turn off {opt} on {id}: {e}"));
             }
@@ -236,6 +268,15 @@ impl Tmux {
                 })
             })
             .collect()
+    }
+
+    /// The name of the window with this id, from the listing. Only Windows asks (see
+    /// [`by_name_on_windows`]); elsewhere it costs nothing.
+    fn name_of(&self, id: &str) -> Option<String> {
+        if !cfg!(windows) {
+            return None;
+        }
+        self.rows().into_iter().find(|r| r.id == id).map(|r| r.name)
     }
 
     /// The pid of the process running in the window. **Looked up from the list-windows listing** —

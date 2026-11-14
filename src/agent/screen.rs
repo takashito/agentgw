@@ -107,6 +107,11 @@ const LOGIN_PROMPTS: Prompts = &[(&[""], &["select login method:"])];
 /// stripped to `yes, i trust…`.
 const TRUST_PROMPTS: Prompts = &[(&[""], &["yes, i trust this folder"])];
 
+/// "Claude in Chrome extension detected" — shown at startup when the Chrome extension is installed
+/// (seen on a Windows machine 2026-11-14, Claude Code 2.1.325). Its default is "No, keep browser
+/// tools off" and Esc means the same, so it is answered with Esc.
+const BROWSER_TOOLS_PROMPTS: Prompts = &[(&[""], &["claude in chrome extension detected"])];
+
 /// Screens that can appear in a freshly started window. **Until someone answers, claude reads
 /// not a single character of the prompt.**
 ///
@@ -123,6 +128,8 @@ pub enum SpawnScreen {
     LoginRequired,
     /// Usage-limit modal. Enter does not dismiss it
     UsageLimited,
+    /// "Use my browser?" for the Chrome extension. Esc keeps browser tools off
+    BrowserTools,
     None_,
 }
 
@@ -159,6 +166,9 @@ impl<'a> Pane<'a> {
         }
         if shows_prompt(self.0, TRUST_PROMPTS) {
             return SpawnScreen::Trust;
+        }
+        if shows_prompt(self.0, BROWSER_TOOLS_PROMPTS) {
+            return SpawnScreen::BrowserTools;
         }
         // Plain substring match here only. There is no real capture of this screen, and anchoring
         // on a guessed decoration would hurt more by **missing the real one**
@@ -1616,6 +1626,20 @@ Enter to select \u{b7} \u{2191}/\u{2193} to navigate \u{b7} ctrl+g to edit in VS
     pub(crate) const LOGIN_PANE: &str = " Claude Code can be used with your Claude subscription\u{2026}\n \
 Select login method:\n \u{276f} 1. Claude account with subscription \u{b7} Pro, Max, Team, or Enterprise\n \
   2. Anthropic Console account \u{b7} API usage billing";
+
+    /// Captured on a Windows machine through psmux, 2026-11-14 (Claude Code 2.1.325)
+    #[test]
+    fn spawn_screen_reads_the_browser_tools_prompt() {
+        let pane = "\u{2500}\u{2500}\u{2500}\n  Claude in Chrome extension detected\n  Claude will use your Chrome \
+                    browser by default — navigating sites, filling forms, and capturing screenshots in your existing session.\n\
+                    \n  \u{276f} No, keep browser tools off\n    Yes, use my browser\n\n  Enter to confirm · Esc to keep browser tools off\n";
+        assert_eq!(Pane::new(pane).spawn_screen(), SpawnScreen::BrowserTools);
+        // A sentence that mentions it in passing is not the prompt
+        assert_eq!(
+            Pane::new("● I read about the Claude in Chrome extension detected message.").spawn_screen(),
+            SpawnScreen::None_
+        );
+    }
 
     #[test]
     fn spawn_screen_reads_the_real_trust_dialog() {
