@@ -1,4 +1,4 @@
-# `cargo dist` = build what we ship. **Both the Mac and the Linux builds** in one command.
+# `cargo dist` = build what we ship: **Mac, Linux and Windows (ARM64 and x86_64)** in one command.
 #
 # This is an alias, not a default (`[build] target`). An array in `[build] target` becomes
 # **the default for every cargo command**, so `cargo build` and `cargo test` would also try
@@ -8,8 +8,10 @@
 # zigbuild is there to get musl through (static linking = works with any glibc version on the
 # other side). It links the Mac build fine too (Mach-O 64-bit executable arm64).
 # Tools needed: brew install zig cargo-zigbuild && rustup target add <triple>
+# The Windows builds are `-gnullvm`, not `-msvc`: zig links them with no Windows SDK, and `ring`
+# builds with zig's clang (measured on dock 2026-11-14). `-msvc` would want clang-cl and lib.exe.
 #
 # **The triples are hard-coded.** This repo assumes shipping from one Mac; to add a target,
 # add it here (each one adds about 80 seconds).
 [alias]
-dist = "zigbuild --release --target aarch64-apple-darwin --target x86_64-unknown-linux-musl"
+dist = "zigbuild --release --target aarch64-apple-darwin --target x86_64-unknown-linux-musl --target aarch64-pc-windows-gnullvm --target x86_64-pc-windows-gnullvm"

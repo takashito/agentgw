@@ -30,8 +30,112 @@ use crate::mcp;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
+
+/// The process signals the main loop listens to. The contract is SIGTERM / SIGINT = graceful
+/// shutdown, SIGHUP = reread access / threads, SIGUSR1 = maintenance restart. One field per signal,
+/// so the loop's `select!` can wait on all of them at once.
+struct Signals {
+    term: os_signal::Terminate,
+    int: os_signal::Interrupt,
+    hup: os_signal::Hangup,
+    usr1: os_signal::User1,
+}
+
+impl Signals {
+    fn new() -> std::io::Result<Self> {
+        Ok(Signals {
+            term: os_signal::terminate()?,
+            int: os_signal::interrupt()?,
+            hup: os_signal::hangup()?,
+            usr1: os_signal::user1()?,
+        })
+    }
+}
+
+#[cfg(unix)]
+mod os_signal {
+    use tokio::signal::unix::{Signal, SignalKind, signal};
+
+    /// One Unix signal.
+    pub struct One(Signal);
+
+    impl One {
+        fn of(kind: SignalKind) -> std::io::Result<Self> {
+            Ok(One(signal(kind)?))
+        }
+        pub async fn recv(&mut self) {
+            self.0.recv().await;
+        }
+    }
+
+    pub type Terminate = One;
+    pub type Interrupt = One;
+    pub type Hangup = One;
+    pub type User1 = One;
+    pub fn terminate() -> std::io::Result<One> {
+        One::of(SignalKind::terminate())
+    }
+    pub fn interrupt() -> std::io::Result<One> {
+        One::of(SignalKind::interrupt())
+    }
+    pub fn hangup() -> std::io::Result<One> {
+        One::of(SignalKind::hangup())
+    }
+    pub fn user1() -> std::io::Result<One> {
+        One::of(SignalKind::user_defined1())
+    }
+}
+
+/// Windows has no signals, only console events. Closing the console or shutting the system down
+/// is a terminate; Ctrl+C is an interrupt. **There is no hangup or user1** — those never fire
+/// here, and reload / restart reach a Windows Bridge another way.
+#[cfg(windows)]
+mod os_signal {
+    use tokio::signal::windows::{CtrlC, CtrlClose, CtrlShutdown, ctrl_c, ctrl_close, ctrl_shutdown};
+
+    pub struct Terminate {
+        close: CtrlClose,
+        shutdown: CtrlShutdown,
+    }
+    pub fn terminate() -> std::io::Result<Terminate> {
+        Ok(Terminate { close: ctrl_close()?, shutdown: ctrl_shutdown()? })
+    }
+    impl Terminate {
+        pub async fn recv(&mut self) {
+            tokio::select! {
+                _ = self.close.recv() => {}
+                _ = self.shutdown.recv() => {}
+            }
+        }
+    }
+
+    pub struct Interrupt(CtrlC);
+    pub fn interrupt() -> std::io::Result<Interrupt> {
+        Ok(Interrupt(ctrl_c()?))
+    }
+    impl Interrupt {
+        pub async fn recv(&mut self) {
+            self.0.recv().await;
+        }
+    }
+
+    /// A signal Windows does not have: never fires.
+    pub struct Never;
+    impl Never {
+        pub async fn recv(&mut self) {
+            std::future::pending::<()>().await
+        }
+    }
+    pub type Hangup = Never;
+    pub type User1 = Never;
+    pub fn hangup() -> std::io::Result<Never> {
+        Ok(Never)
+    }
+    pub fn user1() -> std::io::Result<Never> {
+        Ok(Never)
+    }
+}
 
 /// How often progress messages are pushed to Slack. The board also throttles to once a second per thread on its own.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(500);
@@ -1327,10 +1431,7 @@ impl Bridge {
         // tokio's signal is in features = ["full"] (no new dependency).
         // slack-morphism grabs TERM_SIGNALS first via signal-hook, but the registry
         // allows several receivers per signal, so both get it
-        let mut sigterm = signal(SignalKind::terminate())?;
-        let mut sigint = signal(SignalKind::interrupt())?;
-        let mut sighup = signal(SignalKind::hangup())?;
-        let mut sigusr1 = signal(SignalKind::user_defined1())?;
+        let mut signals = Signals::new()?;
         let mut flush = tokio::time::interval(FLUSH_INTERVAL);
         /// One step of the flush tick, timed. Over [`SLOW_STEP_MS`] it adds its name to `$slow`.
         /// `$slow` is passed in because a macro body cannot see the caller's locals.
@@ -1397,9 +1498,9 @@ impl Bridge {
                         );
                     }
                 }
-                _ = sigterm.recv() => b.shutdown("signal:SIGTERM").await,
-                _ = sigint.recv() => b.shutdown("signal:SIGINT").await,
-                _ = sighup.recv() => b.reload_from_disk(),
+                _ = signals.term.recv() => b.shutdown("signal:SIGTERM").await,
+                _ = signals.int.recv() => b.shutdown("signal:SIGINT").await,
+                _ = signals.hup.recv() => b.reload_from_disk(),
                 // The fleet side wrote access.json (route / set-home / owner). Same as SIGHUP
                 Some(()) = reload_rx.recv() => b.reload_from_disk(),
                 // The gateway decided which machine a thread belongs to. Writing it is this loop's
@@ -1418,7 +1519,7 @@ impl Bridge {
                 Some(()) = relink_rx.recv() => b.announce_online().await,
                 // A restart request from the operator. Joins the same path as Slack's `restart`,
                 // skipping the checklist, status and marker since there's no requester thread
-                _ = sigusr1.recv() => b.maintenance_restart("SIGUSR1", None, &LogCtx::default()).await,
+                _ = signals.usr1.recv() => b.maintenance_restart("SIGUSR1", None, &LogCtx::default()).await,
                 // `update` put a new binary where this one was started from. The same restart as
                 // `restart`: agents keep running, and the service manager starts the new file
                 Some(why) = updated_rx.recv() => b.maintenance_restart(&why, None, &LogCtx::default()).await,

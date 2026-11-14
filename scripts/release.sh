@@ -33,7 +33,8 @@ tag="v$ver"
 staging="$(mktemp -d)"
 trap 'rm -rf "$staging"' EXIT
 found=0
-for out in "$build_dir"/*/release/agentgw; do
+# A Windows build is agentgw.exe; its asset keeps the same `agentgw-<triple>` name (the triple says Windows)
+for out in "$build_dir"/*/release/agentgw "$build_dir"/*/release/agentgw.exe; do
   [ -f "$out" ] || continue
   triple="$(basename "$(dirname "$(dirname "$out")")")"
   cp "$out" "$staging/agentgw-$triple"

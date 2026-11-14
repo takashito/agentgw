@@ -2201,8 +2201,13 @@ pub fn local_builds(root: &std::path::Path) -> Result<(String, BTreeMap<String, 
     if let Ok(dir) = std::fs::read_dir(root.join("target")) {
         for d in dir.flatten() {
             let triple = d.file_name().to_string_lossy().to_string();
-            let bin = d.path().join("release").join("agentgw");
-            if triple != "release" && triple != "debug" && bin.is_file() {
+            // A Windows build is `agentgw.exe`
+            let release = d.path().join("release");
+            let bin = [release.join("agentgw"), release.join("agentgw.exe")].into_iter().find(|b| b.is_file());
+            if let Some(bin) = bin
+                && triple != "release"
+                && triple != "debug"
+            {
                 found.insert(triple, bin);
             }
         }
@@ -8627,6 +8632,12 @@ mod tests {
             found.keys().cloned().collect::<Vec<_>>(),
             ["aarch64-apple-darwin", "x86_64-unknown-linux-musl"]
         );
+        // A Windows build is agentgw.exe, and is found under its triple too
+        let win = root.join("target/aarch64-pc-windows-gnullvm/release");
+        std::fs::create_dir_all(&win).unwrap();
+        std::fs::write(win.join("agentgw.exe"), "agentgw-build:0.65.0+aaa\0").unwrap();
+        let (_, found) = local_builds(&root).unwrap();
+        assert_eq!(found["aarch64-pc-windows-gnullvm"], win.join("agentgw.exe"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

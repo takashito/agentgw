@@ -60,14 +60,17 @@ fn valid_id(id: &str) -> bool {
 }
 
 /// Written 600: the folder sits in the state directory, beside the tokens.
+/// On Windows there are no mode bits: the state directory sits under the user's profile, whose
+/// default ACL already keeps other users out.
 fn open_private(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
 
 impl Store {

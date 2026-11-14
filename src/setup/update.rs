@@ -59,6 +59,8 @@ pub fn this_triple() -> Option<&'static str> {
         ("linux", "aarch64") => "aarch64-unknown-linux-musl",
         ("macos", "aarch64") => "aarch64-apple-darwin",
         ("macos", "x86_64") => "x86_64-apple-darwin",
+        ("windows", "aarch64") => "aarch64-pc-windows-gnullvm",
+        ("windows", "x86_64") => "x86_64-pc-windows-gnullvm",
         _ => return None,
     })
 }
@@ -122,6 +124,8 @@ fn check_and_rename(new: &Path, sum_text: &str, target: &Path, want: Want) -> Re
     if got != expected {
         return Err(format!("checksum mismatch (expected {expected}, got {got})"));
     }
+    // Windows runs any .exe: there is no bit to set
+    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(new, std::fs::Permissions::from_mode(0o755))

@@ -33,8 +33,10 @@ fail=0 drop=0
 say() { printf '%s\n' "$*"; }
 
 # 1. artifacts are this commit
-artifacts=(target/*/release/agentgw)
-if [ ! -e "${artifacts[0]}" ]; then
+shopt -s nullglob
+artifacts=(target/*/release/agentgw target/*/release/agentgw.exe)
+shopt -u nullglob
+if [ "${#artifacts[@]}" -eq 0 ]; then
   say "✗ no cargo dist output (target/<triple>/release/agentgw) — run cargo dist first"; exit 1
 fi
 native=""
