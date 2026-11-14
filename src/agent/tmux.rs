@@ -78,9 +78,9 @@ fn psmux_conf() -> Option<String> {
     .clone()
 }
 
-/// The PATH agentgw's psmux and the agents in it get: **the `pwsh.exe` that is Windows PowerShell
-/// 5.1 first** (`agent::shells::pwsh_shim_dir`, when it is there), and the Store's app-alias
-/// folders (`...\WindowsApps`) left out.
+/// The PATH agentgw's psmux and the agents in it get: **the `pwsh.exe` to use first** — PowerShell
+/// 7 when it starts, else agentgw's own one that is 5.1 (`agent::shells::agents_pwsh_dir`) — and
+/// the Store's app-alias folders (`...\WindowsApps`) left out.
 ///
 /// psmux runs each window's command through the first `pwsh` it finds, and Claude Code's
 /// PowerShell tool and `powershell` hooks take a `pwsh.exe` on PATH before anything else — both
@@ -88,12 +88,11 @@ fn psmux_conf() -> Option<String> {
 #[cfg(windows)]
 pub(crate) fn agents_path() -> Option<std::ffi::OsString> {
     let path = std::env::var_os("PATH")?;
-    let shim = crate::agent::shells::pwsh_shim_dir();
+    let first = crate::agent::shells::agents_pwsh_dir();
     let kept = std::env::split_paths(&path)
         .filter(|p| !p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("WindowsApps")))
-        .filter(|p| *p != shim);
-    let first = shim.join("pwsh.exe").is_file().then_some(shim.clone());
-    std::env::join_paths(first.into_iter().chain(kept)).ok()
+        .filter(|p| Some(p.as_path()) != first);
+    std::env::join_paths(first.map(std::path::Path::to_path_buf).into_iter().chain(kept)).ok()
 }
 
 /// How `set-option -w` must point at a window. psmux 3.4.0 answers "can't find window" when it

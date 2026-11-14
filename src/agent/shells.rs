@@ -44,8 +44,9 @@ pub struct Shells {
     /// The `pwsh` installed on the machine (any build)
     pub pwsh: Probe,
     pub powershell: Probe,
-    /// agentgw's own `pwsh.exe`, which is Windows PowerShell 5.1 ([`pwsh_shim_dir`]). First on the
-    /// agents' PATH, so Claude Code takes it for its PowerShell tool and `powershell` hooks
+    /// The `pwsh.exe` put first on the agents' PATH, so Claude Code takes it for its PowerShell
+    /// tool and `powershell` hooks: PowerShell 7 when it starts, else agentgw's own one that is
+    /// Windows PowerShell 5.1 ([`pwsh_shim_dir`])
     pub agents_pwsh: Probe,
 }
 
@@ -92,7 +93,7 @@ impl Shells {
             one("Git Bash", &self.git_bash),
             one("pwsh", &self.pwsh),
             one("Windows PowerShell 5.1", &self.powershell),
-            one("agents' pwsh (5.1)", &self.agents_pwsh),
+            one("agents' pwsh", &self.agents_pwsh),
             if self.powershell_tool_off() { " → PowerShell tool off" } else { "" }
         )
     }
@@ -179,6 +180,14 @@ pub fn ensure_pwsh_shim() -> Result<PathBuf, String> {
     Ok(shim)
 }
 
+/// The folder of the `pwsh.exe` the agents get first on PATH, set by [`probe`]: PowerShell 7's
+/// when it starts, else agentgw's 5.1 one.
+static AGENTS_PWSH_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+pub fn agents_pwsh_dir() -> Option<&'static Path> {
+    AGENTS_PWSH_DIR.get().map(PathBuf::as_path)
+}
+
 /// Tries the shells. Slow-ish (each PowerShell takes about a second to start), so it runs once,
 /// at start-up.
 pub fn probe() -> Shells {
@@ -206,13 +215,24 @@ pub fn probe() -> Shells {
         .collect();
 
     let ps_args = ["-NoProfile", "-NonInteractive", "-Command", "exit 0"];
-    let agents_pwsh = match ensure_pwsh_shim() {
-        Ok(shim) => probe_kind(&[shim], &ps_args),
-        Err(why) => Probe::Fails(pwsh_shim_dir().display().to_string(), why),
+    let pwsh = probe_kind(&pwsh, &ps_args);
+    // **PowerShell 7 if it starts, else 5.1.** Claude Code does not check whether the 7 it finds
+    // starts, so agentgw puts the right one first on the agents' PATH
+    let agents_pwsh = match &pwsh {
+        Probe::Works(seven) => Probe::Works(seven.clone()),
+        _ => match ensure_pwsh_shim() {
+            Ok(shim) => probe_kind(&[shim], &ps_args),
+            Err(why) => Probe::Fails(pwsh_shim_dir().display().to_string(), why),
+        },
     };
+    if let Probe::Works(chosen) = &agents_pwsh
+        && let Some(dir) = Path::new(chosen).parent()
+    {
+        let _ = AGENTS_PWSH_DIR.set(dir.to_path_buf());
+    }
     Shells {
         git_bash: probe_kind(&bash, &["-c", "exit 0"]),
-        pwsh: probe_kind(&pwsh, &ps_args),
+        pwsh,
         powershell: probe_kind(&powershell, &ps_args),
         agents_pwsh,
     }
