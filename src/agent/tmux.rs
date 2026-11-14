@@ -57,6 +57,33 @@ fn tmux_bin() -> String {
     "tmux".to_string()
 }
 
+/// The name of agentgw's psmux server on Windows (`-L`), so its windows never mix with a psmux
+/// the user has open.
+#[cfg(windows)]
+const WINDOWS_SERVER: &str = "agentgw";
+
+/// PATH with agentgw's private PowerShell 7 in front, for the psmux server agentgw starts.
+///
+/// psmux runs every window's command through the `pwsh` it finds on PATH. On a machine with only
+/// the Store build that is an app-execution alias, and **it cannot start outside a desktop**
+/// ("Access is denied" in session 0, measured 2026-11-14) — so under the scheduled task no window
+/// would ever open. `install.ps1` unpacks the ZIP build into `%LOCALAPPDATA%\agentgw\pwsh`
+/// (`AGENTGW_PWSH_DIR` overrides); only agentgw's psmux sees it, the user's PATH is left alone.
+/// `None` when it is not there (the PATH is passed through as it is).
+#[cfg(windows)]
+fn path_with_private_pwsh() -> Option<std::ffi::OsString> {
+    let dir = match std::env::var("AGENTGW_PWSH_DIR") {
+        Ok(d) if !d.is_empty() => std::path::PathBuf::from(d),
+        _ => std::path::Path::new(&std::env::var("LOCALAPPDATA").ok()?).join("agentgw").join("pwsh"),
+    };
+    if !dir.join("pwsh.exe").is_file() {
+        return None;
+    }
+    let mut parts = vec![dir];
+    parts.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+    std::env::join_paths(parts).ok()
+}
+
 /// How `set-option -w` must point at a window. psmux 3.4.0 answers "can't find window" when it
 /// (and `paste-buffer`, no longer used there) is given a window id (`@4`), while `send-keys`,
 /// `capture-pane` and `kill-window` take the id fine; `session:name` works for all (measured
@@ -89,8 +116,15 @@ impl Tmux {
                 // inside a psmux pane typed into that pane's Claude). agentgw's own windows are
                 // reached by name only, so never let it inherit them
                 #[cfg(windows)]
-                for var in ["TMUX", "TMUX_PANE", "PSMUX_CLAUDE_TEAMMATE_MODE"] {
-                    cmd.env_remove(var);
+                {
+                    for var in ["TMUX", "TMUX_PANE", "PSMUX_CLAUDE_TEAMMATE_MODE"] {
+                        cmd.env_remove(var);
+                    }
+                    // agentgw's own psmux server, apart from the one the user works in
+                    cmd.args(["-L", WINDOWS_SERVER]);
+                    if let Some(path) = path_with_private_pwsh() {
+                        cmd.env("PATH", path);
+                    }
                 }
                 let out = cmd
                     .args(args)

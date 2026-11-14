@@ -47,6 +47,17 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        // What the Windows scheduled task runs: keeps one `serve` going (launchd / systemd do this elsewhere)
+        "supervise" => {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            // The task passes the state directory as an argument (a task action cannot set
+            // variables); supervise hands it to serve as AGENTGW_STATE_DIR
+            let dir = match rest.iter().position(|a| a == "--state-dir").and_then(|i| rest.get(i + 1)) {
+                Some(d) => agentgw::state_dir::StateDir::at(d),
+                None => agentgw::state_dir::StateDir::resolve(),
+            };
+            std::process::exit(agentgw::service::windows::supervise(&dir));
+        }
         // Write one connection string into .env (on the machine that connects to the gateway)
         "link" => {
             let rest: Vec<String> = std::env::args().skip(2).collect();

@@ -87,25 +87,53 @@ mod os_signal {
     }
 }
 
-/// Windows has no signals, only console events. Closing the console or shutting the system down
-/// is a terminate; Ctrl+C is an interrupt. **There is no hangup or user1** — those never fire
-/// here, and reload / restart reach a Windows Bridge another way.
+/// Windows has no signals to send a background process. Console close / system shutdown / Ctrl+C
+/// still count, and the rest arrive as **request files** that `agentgw restart` / `shutdown` leave
+/// in the state directory (`crate::service::windows`), looked for once a second.
 #[cfg(windows)]
 mod os_signal {
+    use crate::service::windows::{Request, take};
+    use crate::state_dir::StateDir;
     use tokio::signal::windows::{CtrlC, CtrlClose, CtrlShutdown, ctrl_c, ctrl_close, ctrl_shutdown};
+
+    /// A request file, looked for every second.
+    pub struct Polled {
+        dir: StateDir,
+        what: Request,
+        tick: tokio::time::Interval,
+    }
+    impl Polled {
+        /// A request left from before this process started is stale (a restart that timed out
+        /// and was forced): dropped, or a fresh serve would act on it at once.
+        fn of(what: Request) -> Self {
+            let dir = StateDir::resolve();
+            crate::service::windows::clear(&dir, what);
+            Polled { dir, what, tick: tokio::time::interval(std::time::Duration::from_secs(1)) }
+        }
+        pub async fn recv(&mut self) {
+            loop {
+                self.tick.tick().await;
+                if take(&self.dir, self.what) {
+                    return;
+                }
+            }
+        }
+    }
 
     pub struct Terminate {
         close: CtrlClose,
         shutdown: CtrlShutdown,
+        asked: Polled,
     }
     pub fn terminate() -> std::io::Result<Terminate> {
-        Ok(Terminate { close: ctrl_close()?, shutdown: ctrl_shutdown()? })
+        Ok(Terminate { close: ctrl_close()?, shutdown: ctrl_shutdown()?, asked: Polled::of(Request::Shutdown) })
     }
     impl Terminate {
         pub async fn recv(&mut self) {
             tokio::select! {
                 _ = self.close.recv() => {}
                 _ = self.shutdown.recv() => {}
+                _ = self.asked.recv() => {}
             }
         }
     }
@@ -120,20 +148,13 @@ mod os_signal {
         }
     }
 
-    /// A signal Windows does not have: never fires.
-    pub struct Never;
-    impl Never {
-        pub async fn recv(&mut self) {
-            std::future::pending::<()>().await
-        }
+    pub type Hangup = Polled;
+    pub type User1 = Polled;
+    pub fn hangup() -> std::io::Result<Polled> {
+        Ok(Polled::of(Request::Reload))
     }
-    pub type Hangup = Never;
-    pub type User1 = Never;
-    pub fn hangup() -> std::io::Result<Never> {
-        Ok(Never)
-    }
-    pub fn user1() -> std::io::Result<Never> {
-        Ok(Never)
+    pub fn user1() -> std::io::Result<Polled> {
+        Ok(Polled::of(Request::Restart))
     }
 }
 

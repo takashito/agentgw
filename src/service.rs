@@ -8,6 +8,8 @@
 
 use std::path::{Path, PathBuf};
 
+pub mod windows;
+
 /// Default label. Override with `AGENTGW_SERVICE_LABEL` (to run a dev instance alongside).
 pub const DEFAULT_LABEL: &str = "com.agentgw.bridge";
 /// The same thing for systemd.
@@ -508,7 +510,7 @@ impl Service {
 
     /// Whether this platform has a service manager we drive (launchd / systemd). Says why not when it hasn't.
     pub(crate) fn supported() -> bool {
-        if cfg!(target_os = "macos") || cfg!(target_os = "linux") {
+        if cfg!(target_os = "macos") || cfg!(target_os = "linux") || cfg!(windows) {
             return true;
         }
         eprintln!(
@@ -537,6 +539,19 @@ impl Service {
     pub fn run(cmd: &str, rest: &[String]) -> i32 {
         if !Self::supported() {
             return 2;
+        }
+        if cfg!(windows) {
+            let (task, dir) = (Self::label(), crate::state_dir::StateDir::resolve());
+            return match cmd {
+                "start" => windows::start(&task),
+                "shutdown" => windows::shutdown(&task, &dir),
+                "status" => windows::status(&task, &dir),
+                "restart" => windows::restart(&task, &dir),
+                other => {
+                    eprintln!("{}", crate::t!("Unknown command: {other}", "知らないサブコマンドです: {other}"));
+                    2
+                }
+            };
         }
         let mac = cfg!(target_os = "macos");
         let job = Self::job_path();

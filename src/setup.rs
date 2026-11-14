@@ -564,6 +564,19 @@ pub fn run(cmd: &str, rest: &[String]) -> i32 {
     if !Service::supported() {
         return 2;
     }
+    if cfg!(windows) {
+        let (task, dir) = (Service::label(), StateDir::resolve());
+        return match cmd {
+            "install" => match ensure_config(&dir) {
+                Ok(()) => crate::service::windows::install(&task, &dir),
+                Err(e) => {
+                    eprintln!("install: {e}");
+                    1
+                }
+            },
+            _ => crate::service::windows::uninstall(&task, &dir),
+        };
+    }
     let mac = cfg!(target_os = "macos");
     let job = Service::job_path();
     match cmd {

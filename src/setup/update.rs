@@ -132,6 +132,15 @@ fn check_and_rename(new: &Path, sum_text: &str, target: &Path, want: Want) -> Re
             .map_err(|e| format!("cannot make the download executable: {e}"))?;
     }
     sign(new);
+    // Windows decides what runs by the name: a download without `.exe` is renamed to one first
+    let named;
+    let new = if cfg!(windows) && new.extension().is_none_or(|e| !e.eq_ignore_ascii_case("exe")) {
+        named = new.with_extension("exe");
+        std::fs::rename(new, &named).map_err(|e| format!("cannot name the download .exe: {e}"))?;
+        named.as_path()
+    } else {
+        new
+    };
     let (flag, want) = match want {
         Want::Version(v) => ("--version", v),
         Want::Build(b) => ("--build", b),
@@ -144,6 +153,9 @@ fn check_and_rename(new: &Path, sum_text: &str, target: &Path, want: Want) -> Re
     if said != format!("agentgw {want}") {
         return Err(format!("the download says {said:?}, not agentgw {want}"));
     }
+    if cfg!(windows) {
+        return replace_running_exe(new, target);
+    }
     // Keep the old one. A hard link, so `target` never stops existing: the service manager may
     // start it at any moment
     let prev = target.with_file_name("agentgw.prev");
@@ -154,6 +166,35 @@ fn check_and_rename(new: &Path, sum_text: &str, target: &Path, want: Want) -> Re
             .map_err(|e| format!("cannot keep the old binary as {}: {e}", prev.display()))?;
     }
     std::fs::rename(new, target).map_err(|e| format!("cannot put the new binary in place: {e}"))
+}
+
+/// Windows will not write over a running .exe, nor delete one — but it will rename one. So the
+/// running file is renamed to `agentgw.prev.exe` and the new one takes its name; `supervise`
+/// starts the next `serve` from that name. An older `agentgw.prev.exe` may still be running too
+/// (the `supervise` loop started before the last update keeps its file open), so when it cannot
+/// be removed it is moved aside to `agentgw.old-<n>.exe`, and those are cleared whenever they can be.
+fn replace_running_exe(new: &Path, target: &Path) -> Result<(), String> {
+    let dir = target.parent().ok_or("the binary has no folder")?;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            if e.file_name().to_string_lossy().starts_with("agentgw.old-") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    let prev = dir.join("agentgw.prev.exe");
+    if prev.exists() && std::fs::remove_file(&prev).is_err() {
+        let aside = dir.join(format!("agentgw.old-{}.exe", std::process::id()));
+        std::fs::rename(&prev, &aside).map_err(|e| format!("cannot move {} aside: {e}", prev.display()))?;
+    }
+    if target.exists() {
+        std::fs::rename(target, &prev).map_err(|e| format!("cannot keep the old binary as {}: {e}", prev.display()))?;
+    }
+    std::fs::rename(new, target).map_err(|e| {
+        // Put the old one back so there is still a binary to start
+        let _ = std::fs::rename(&prev, target);
+        format!("cannot put the new binary in place: {e}")
+    })
 }
 
 /// macOS only, and the same rule as `install.sh`: the `agentgw dev` certificate if there is one
@@ -269,7 +310,7 @@ pub async fn self_replace(tag: &str, build: &str) -> Result<(), String> {
     let (bin_url, sum_url) = asset_urls(tag, triple);
     let sum = curl(&["-fsSL", "--max-time", "60", &sum_url]).await?;
     // Next to the target, so the rename stays on one filesystem
-    let new = target.with_file_name("agentgw.new");
+    let new = target.with_file_name(if cfg!(windows) { "agentgw.new.exe" } else { "agentgw.new" });
     let new_s = new.to_string_lossy().to_string();
     curl(&["-fsSL", "--max-time", "600", "-o", &new_s, &bin_url]).await?;
     let version = version_of(tag).to_string();

@@ -296,6 +296,7 @@ pub async fn cli(args: &[String]) -> i32 {
     let mut from = None;
     let mut access = ssh::Access::default();
     let mut fresh = false;
+    let mut print = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -307,6 +308,9 @@ pub async fn cli(args: &[String]) -> i32 {
             "-p" | "--password" => access.ask_password = true,
             // Work the route out again instead of taking the one that worked last time
             "-n" | "--new" => fresh = true,
+            // For a machine nothing here can log in to (Windows has no ssh server): only print
+            // the connection string, to paste on that machine
+            "--print" => print = true,
             s if s.starts_with("-i=") => access.identity = Some(s["-i=".len()..].to_string()),
             s if s.starts_with("--identity=") => access.identity = Some(s["--identity=".len()..].to_string()),
             s if s.starts_with("--name=") => name = Some(s["--name=".len()..].to_string()),
@@ -342,6 +346,18 @@ pub async fn cli(args: &[String]) -> i32 {
         );
         return 2;
     };
+    if print {
+        return match print_connection(name.as_deref().unwrap_or(&target)) {
+            Ok(msg) => {
+                println!("{msg}");
+                0
+            }
+            Err(why) => {
+                eprintln!("add-machine: {why}");
+                1
+            }
+        };
+    }
     // Every ssh / scp from here on uses these (set once, before anything connects)
     ssh::use_access(access);
     match add_child(&target, name.as_deref(), from.as_deref(), fresh).await {
@@ -354,6 +370,66 @@ pub async fn cli(args: &[String]) -> i32 {
             1
         }
     }
+}
+
+/// The direct route a machine on the tailnet would take, **without measuring it** (there is no way
+/// into the machine to measure from): a URL written by hand first, then what Tailscale serves in
+/// front of us, then the link port on the tailnet name. The URL and the kind of link.
+pub fn route_for_unreachable_machine(
+    by_hand: Option<&str>,
+    listen: Option<&str>,
+    serve_json: Option<&str>,
+    tailnet_name: &str,
+) -> Option<(String, &'static str)> {
+    if let Some(url) = by_hand.map(str::trim).filter(|u| !u.is_empty()) {
+        return Some((url.trim_end_matches('/').to_string(), crate::bridge::state::Link::PUBLIC));
+    }
+    for e in crate::bridge::gateway::entrances(listen.unwrap_or_default(), serve_json) {
+        if e.front.is_some() {
+            let name = e.at.rsplit_once(':').map(|(h, _)| h).unwrap_or(e.at.as_str());
+            return Some((format!("wss://{name}"), crate::bridge::state::Link::TAILSCALE));
+        }
+    }
+    (!tailnet_name.is_empty())
+        .then(|| (format!("ws://{tailnet_name}:{}", link_port(listen)), crate::bridge::state::Link::TAILSCALE))
+}
+
+/// `add-machine --print <name>`: records the machine with the route above and prints the
+/// connection string, for `install.ps1` on that machine. Whether the route really works is told
+/// by the machine itself: it shows up in `agentgw status` here once it links.
+fn print_connection(child: &str) -> Result<String, String> {
+    let dir = StateDir::resolve();
+    let inlet = ensure_inlet(&dir)?;
+    let env = RelayCli::env_of(&dir);
+    let listen = env.get("AGENTGW_LINK_LISTEN").map(String::as_str);
+    let (tailnet, _) = tailnet_identity(ssh::tailscale_json().as_deref());
+    let (url, kind) = route_for_unreachable_machine(
+        env.get("AGENTGW_LINK_PUBLIC_URL").map(String::as_str),
+        listen,
+        ssh::tailscale_serve_json().as_deref(),
+        &tailnet,
+    )
+    .ok_or_else(|| {
+        crate::t!(
+            "No route to offer: this gateway is not on a tailnet and has no AGENTGW_LINK_PUBLIC_URL.",
+            "渡せる経路がありません: このゲートウェイは tailnet に居らず、AGENTGW_LINK_PUBLIC_URL もありません。"
+        )
+    })?;
+    let link = crate::bridge::state::Link { kind: kind.to_string(), link_url: url.clone(), ..Default::default() };
+    if remember_link(&dir, child, link) {
+        // The gateway opens the addresses its records ask for
+        crate::service::Service::run_quiet("restart", &[]);
+    }
+    let conn = link::encode_connection(&link::Invite {
+        url: dial_url(&Transport::Direct { url: url.clone() }),
+        api_token: inlet.token.clone(),
+    });
+    Ok(crate::t!(
+        "Connection string for `{child}` (it will dial {url}):\n\n{conn}\n\n\
+         Paste it when install.ps1 asks, on that machine. It is a secret: it lets a machine join this gateway.",
+        "`{child}` 用の接続文字列({url} につなぎます):\n\n{conn}\n\n\
+         そのマシンで install.ps1 に訊かれたら貼ってください。秘密です(これでこのゲートウェイに参加できます)。"
+    ))
 }
 
 /// A step that finished. **Every line has the same shape**, so the eye follows the sequence instead of
@@ -1058,6 +1134,21 @@ fn dist_artifact(triple: &str) -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--print` cannot measure, so it takes the first route in a fixed order
+    #[test]
+    fn a_machine_that_cannot_be_reached_gets_the_first_route_in_order() {
+        let tailnet = "dock.example.ts.net";
+        assert_eq!(
+            route_for_unreachable_machine(Some(" wss://gw.example.com/ "), None, None, tailnet),
+            Some(("wss://gw.example.com".to_string(), crate::bridge::state::Link::PUBLIC))
+        );
+        assert_eq!(
+            route_for_unreachable_machine(None, Some("127.0.0.1:8787"), None, tailnet),
+            Some(("ws://dock.example.ts.net:8787".to_string(), crate::bridge::state::Link::TAILSCALE))
+        );
+        assert_eq!(route_for_unreachable_machine(None, None, None, ""), None);
+    }
 
     /// `machines` shows where each machine can be reached **on the interface the link uses**. A machine
     /// with tailscale that links over the LAN is at its LAN address — naming its tailnet there would
