@@ -6,7 +6,7 @@
 
 [![Release](https://img.shields.io/github/v/release/takashito/agentgw?style=flat-square&labelColor=black)](https://github.com/takashito/agentgw/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square&labelColor=black)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey?style=flat-square&labelColor=black)](#requirements)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey?style=flat-square&labelColor=black)](#requirements)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584?style=flat-square&labelColor=black&logo=rust)](https://www.rust-lang.org/)
 
 [Quick start](#quick-start) · [Slack app](#slack-app-setup) · [Adding machines](#adding-machines) · [Commands](#slack-commands) · [Security](#security) · [日本語](README.ja.md)
@@ -143,9 +143,9 @@ Only the gateway reads Slack's event stream. Other machines get the bot token ov
 
 | | |
 |---|---|
-| **OS** | macOS or Linux. Prebuilt binaries: Apple Silicon Mac, x86_64 Linux. Other targets build from source. |
+| **OS** | macOS or Linux for the gateway; macOS, Linux or [Windows](#windows-machines) for the other machines. Prebuilt binaries: Apple Silicon Mac, x86_64 Linux, Windows on ARM64 and x86_64. Other targets build from source. |
 | **Claude Code** | [Installed](https://docs.claude.com/en/docs/claude-code) and signed in on every machine |
-| **tmux** | Installed by the installer if missing |
+| **tmux** | Installed by the installer if missing (on Windows, [psmux](https://github.com/marlocarlo/psmux)) |
 | **Slack** | A workspace where you can create an app — [one click](#slack-app-setup) |
 
 ## Quick start
@@ -217,7 +217,7 @@ agentgw add-machine user@host -p                # let ssh ask for a password (on
 agentgw add-machine user@host -n                # measure the route again instead of reusing the last one
 ```
 
-Then hand it a channel — in that channel: `@agentgw pwd build-box:~/dev/app`.
+Then hand it a channel — in that channel: `@agentgw route build-box:~/dev/app`.
 
 `add-machine` checks the remote OS, sends the matching binary and the installer, links the machine, starts the service and **watches until the link comes up** (the machine's own log and the gateway's view, either one). Run it again later to bring that machine to the gateway's version.
 
@@ -241,6 +241,53 @@ address a machine turns out to need.
 
 `agentgw status` on the gateway lists each machine and how it is connected, and `machines` in Slack shows
 where each one is reachable.
+
+### Windows machines
+
+A Windows PC can join as a **machine** (the gateway stays on macOS or Linux). Windows has no ssh server to
+log in to, so instead of `add-machine user@host` you run the installer on the PC yourself.
+
+**What it needs**
+
+- Windows 11, ARM64 or x86_64 (tested on ARM64; the x86_64 binary is built the same way but not yet tried on real hardware).
+- [Claude Code](https://docs.claude.com/en/docs/claude-code), the standalone CLI (`irm https://claude.ai/install.ps1 | iex`), signed in once with `claude`.
+- [psmux](https://github.com/marlocarlo/psmux), tmux for Windows — the installer adds it with `winget` if it is missing.
+- The gateway on a tailnet the PC can reach, or `AGENTGW_LINK_PUBLIC_URL` set on the gateway. The PC dials out; it opens no ports.
+
+**1. On the gateway**, make a connection string for the new machine:
+
+```bash
+agentgw add-machine --print win-box
+```
+
+It records the machine and prints a connection string. Treat it like a password: it lets a machine join your gateway.
+
+**2. On the PC**, open PowerShell with **Run as administrator** (Windows PowerShell 5.1 or PowerShell 7) and run:
+
+```powershell
+irm https://raw.githubusercontent.com/takashito/agentgw/main/scripts/install.ps1 -OutFile install.ps1
+powershell -ExecutionPolicy Bypass -File install.ps1
+```
+
+It checks psmux and Claude Code, downloads the binary for your CPU (checking its checksum), asks for the
+machine's name and the connection string (typed hidden), and registers the service. Windows then asks for
+your password once.
+
+**3. Hand it a channel** — in that channel: `@agentgw route win-box:C:\Users\you\dev\app`.
+
+How it runs on Windows:
+
+- **The service is a scheduled task** (`com.agentgw.bridge`) that starts at boot and runs as you **whether
+  or not you are logged in**. That needs an administrator to register it, and your Windows password, which
+  goes straight to Task Scheduler — agentgw never sees it. Inside the task, `agentgw supervise` keeps the
+  service running and restarts it if it stops.
+- **`restart`, `shutdown`, `start`, `status`, `uninstall` and `update` work as on the other machines.**
+  Later versions arrive with `update`; the installer is for the first time only.
+- **Shells.** Agents use Git Bash for the Bash tool when it is installed, and run the PowerShell tool in
+  PowerShell 7 when a working one is installed, otherwise in the Windows PowerShell 5.1 every Windows has.
+  The Microsoft Store build of PowerShell 7 can't start while nobody is logged in, so it doesn't count.
+  agentgw checks which shells start when the service starts; `agentgw status` on the PC shows the result,
+  and the online notice in Slack says if something is missing.
 
 ## Slack commands
 
@@ -304,8 +351,11 @@ Every machine uses the same layout.
 | └ `inbox/` | Downloaded Slack attachments |
 | `~/Library/LaunchAgents/com.agentgw.bridge.plist` | Service definition (macOS) |
 | `~/.config/systemd/user/agentgw-bridge.service` | Service definition (Linux) |
+| Scheduled task `com.agentgw.bridge` | Service definition (Windows) |
 | `$TMPDIR/agentgw-agentgw/` | Hook and MCP config handed to agents (regenerated on start) |
 | tmux session `agentgw-workers` | One window per agent |
+
+On Windows the binary is `%USERPROFILE%\.local\bin\agentgw.exe` and the state is in `%LOCALAPPDATA%\agentgw\`, laid out the same way, plus `logs\supervise.log` and `logs\agentgw.out.log` from the task and `shells.txt` with the result of the shell check. Agents run in the psmux server `agentgw`.
 
 </details>
 
@@ -324,7 +374,7 @@ Every machine uses the same layout.
 
 - **Slack and Claude Code only.** No other chat platforms or agent CLIs.
 - **One owner per install.** It isn't a multi-user service: other people can follow a thread and add context, but can't start work or run commands.
-- **macOS and Linux only.** No Windows. Prebuilt binaries cover Apple Silicon and x86_64 Linux.
+- **Windows as a machine only.** The gateway runs on macOS or Linux. Windows machines are tested on ARM64 only so far.
 - **One process per Slack app.** Two agentgw gateways on the same app token split Slack's events between them — give each its own app.
 
 ## Troubleshooting
@@ -338,6 +388,7 @@ Every machine uses the same layout.
 | Only some messages get answered | Another process is using the same app token |
 | A machine shows as offline | `agentgw status` on the gateway; `service.err.log` on that machine |
 | An agent can't use new tool options after an upgrade | Run `/mcp` in that agent — it keeps the tool list it started with |
+| A Windows machine doesn't come up | `agentgw status` on the PC, then `%LOCALAPPDATA%\agentgw\logs\supervise.log` |
 | "This shell can't reach your systemd user session" | Your Linux user has no running systemd instance to talk to: `loginctl enable-linger $USER`, then log in again |
 
 ## Development
@@ -346,7 +397,7 @@ Every machine uses the same layout.
 cargo build && cargo test
 AGENTGW_STATE_DIR=$HOME/.local/state/agentgw-dev ./target/debug/agentgw serve
 
-cargo dist              # release binaries: macOS (arm64) and Linux (x86_64, musl)
+cargo dist              # release binaries: macOS (arm64), Linux (x86_64, musl), Windows (arm64, x86_64)
 ./scripts/release.sh    # upload them as a GitHub release
 ```
 

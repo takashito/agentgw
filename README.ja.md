@@ -6,7 +6,7 @@
 
 [![Release](https://img.shields.io/github/v/release/takashito/agentgw?style=flat-square&labelColor=black)](https://github.com/takashito/agentgw/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square&labelColor=black)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey?style=flat-square&labelColor=black)](#必要なもの)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey?style=flat-square&labelColor=black)](#必要なもの)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584?style=flat-square&labelColor=black&logo=rust)](https://www.rust-lang.org/)
 
 [はじめかた](#はじめかた) · [Slack アプリ](#slack-アプリ) · [マシンを足す](#マシンを足す) · [コマンド](#slack-のコマンド) · [セキュリティ](#セキュリティ) · [English](README.md)
@@ -143,9 +143,9 @@ Slack のイベントを読むのはゲートウェイだけです。ほかの�
 
 | | |
 |---|---|
-| **OS** | macOS か Linux。配布バイナリは Apple Silicon の Mac と x86_64 の Linux。それ以外はソースからビルド |
+| **OS** | ゲートウェイは macOS か Linux。ほかのマシンは macOS・Linux・[Windows](#windows-のマシン)。配布バイナリは Apple Silicon の Mac、x86_64 の Linux、Windows の ARM64 と x86_64。それ以外はソースからビルド |
 | **Claude Code** | すべてのマシンに[インストール](https://docs.claude.com/ja/docs/claude-code)して、サインインしておく |
-| **tmux** | 無ければインストーラが入れる |
+| **tmux** | 無ければインストーラが入れる(Windows では [psmux](https://github.com/marlocarlo/psmux)) |
 | **Slack** | アプリを作れるワークスペース — [ワンクリックで作れます](#slack-アプリ) |
 
 ## はじめかた
@@ -217,7 +217,7 @@ agentgw add-machine user@host -p                # ssh にパスワードを訊�
 agentgw add-machine user@host -n                # 前回の経路を使わず、もう一度測り直す
 ```
 
-そのあと、任せたいチャンネルで `@agentgw pwd build-box:~/dev/app`。
+そのあと、任せたいチャンネルで `@agentgw route build-box:~/dev/app`。
 
 `add-machine` は相手の OS を見て、合うバイナリとインストーラを届け、ゲートウェイにつなぎ、サービスを起動し、**リンクが立つまで見張ります**(マシン自身のログと、ゲートウェイから見えるかの両方。どちらかが先に言えばそこで終わり)。あとでもう一度打てば、そのマシンをゲートウェイと同じ版に揃えます。
 
@@ -233,6 +233,43 @@ agentgw add-machine user@host -n                # 前回の経路を使わず、
 `install` は受け口の場所を訊きません。ゲートウェイは loopback だけで立ち上がり、**必要なアドレスは `add-machine` が開きます**。
 
 ゲートウェイで `agentgw status` を打つと、マシンごとのつなぎ方が出ます。Slack の `machines` では、どのアドレスで届くかも見られます。
+
+
+### Windows のマシン
+
+Windows の PC も**マシン**として加われます(ゲートウェイは macOS か Linux のまま)。Windows には ssh で入れないので、`add-machine user@host` の代わりに、PC の上で自分でインストーラを回します。
+
+**必要なもの**
+
+- Windows 11。ARM64 か x86_64(試したのは ARM64。x86_64 のバイナリも同じ作り方で焼いていますが、実機ではまだ動かしていません)。
+- [Claude Code](https://docs.claude.com/ja/docs/claude-code) の単体の CLI(`irm https://claude.ai/install.ps1 | iex`)。一度 `claude` を起動してサインインしておく。
+- [psmux](https://github.com/marlocarlo/psmux)(Windows 版の tmux)— 無ければインストーラが `winget` で入れます。
+- ゲートウェイが PC から届く tailnet に居るか、ゲートウェイに `AGENTGW_LINK_PUBLIC_URL` が設定してあること。つなぎに行くのは PC の側で、PC はポートを開けません。
+
+**1. ゲートウェイで**、新しいマシン用の接続文字列を作ります:
+
+```bash
+agentgw add-machine --print win-box
+```
+
+マシンを記録して、接続文字列を表示します。パスワードと同じに扱ってください(これでゲートウェイに参加できます)。
+
+**2. PC で**、PowerShell を**管理者として実行**で開き(Windows PowerShell 5.1 でも PowerShell 7 でも可)、次を打ちます:
+
+```powershell
+irm https://raw.githubusercontent.com/takashito/agentgw/main/scripts/install.ps1 -OutFile install.ps1
+powershell -ExecutionPolicy Bypass -File install.ps1
+```
+
+psmux と Claude Code を確かめ、CPU に合うバイナリを落として(チェックサムも照合)、マシンの名前と接続文字列(入力は表示されません)を訊き、サービスを登録します。最後に Windows がパスワードを1回訊きます。
+
+**3. チャンネルを任せる** — そのチャンネルで `@agentgw route win-box:C:\Users\you\dev\app`。
+
+Windows での動き方:
+
+- **サービスはタスク スケジューラのタスク**(`com.agentgw.bridge`)です。起動時に立ち上がり、**ログインしていてもいなくても**あなたとして動きます。そのため登録には管理者と Windows のパスワードが要ります。パスワードはタスク スケジューラに直接渡り、agentgw は見ません。タスクの中では `agentgw supervise` がサービスを見張り、止まったら起こし直します。
+- **`restart` / `shutdown` / `start` / `status` / `uninstall` / `update` はほかのマシンと同じ**です。新しい版は `update` で届きます。インストーラは最初の1回だけ。
+- **シェル。** エージェントの Bash ツールは、Git Bash が入っていればそれを使います。PowerShell ツールは、動く PowerShell 7 が入っていればそれで、無ければどの Windows にもある Windows PowerShell 5.1 で動きます。Microsoft Store 版の PowerShell 7 は誰もログインしていないと起動できないので数えません。どのシェルが動くかはサービスの起動時に確かめ、PC で `agentgw status` を打つと結果が出ます。足りない物があれば Slack の起動通知にも出ます。
 
 ## Slack のコマンド
 
@@ -296,8 +333,11 @@ agentgw の表示は英語です。日本語にするには `~/.local/state/agen
 | └ `inbox/` | ダウンロードした Slack の添付 |
 | `~/Library/LaunchAgents/com.agentgw.bridge.plist` | サービスの定義(macOS) |
 | `~/.config/systemd/user/agentgw-bridge.service` | サービスの定義(Linux) |
+| タスク スケジューラのタスク `com.agentgw.bridge` | サービスの定義(Windows) |
 | `$TMPDIR/agentgw-agentgw/` | エージェントに渡す hook と MCP の設定(起動のたびに作り直す) |
 | tmux のセッション `agentgw-workers` | エージェント1つ = 窓1つ |
+
+Windows では本体が `%USERPROFILE%\.local\bin\agentgw.exe`、状態は `%LOCALAPPDATA%\agentgw\` に同じ形で置かれます。加えて、タスクが書く `logs\supervise.log` と `logs\agentgw.out.log`、シェルを確かめた結果の `shells.txt` があります。エージェントは psmux のサーバー `agentgw` の中で動きます。
 
 </details>
 
@@ -316,7 +356,7 @@ agentgw の表示は英語です。日本語にするには `~/.local/state/agen
 
 - **Slack と Claude Code だけ。** ほかのチャットやエージェントの CLI には対応していません。
 - **Owner は1人。** 複数人で使うサービスではありません。ほかの人はスレッドを追って文脈を足せますが、作業を始めたりコマンドを打ったりはできません。
-- **macOS と Linux だけ。** Windows は非対応。配布バイナリは Apple Silicon と x86_64 の Linux。
+- **Windows はマシンとしてだけ。** ゲートウェイは macOS か Linux で動かします。Windows のマシンで試したのは、いまのところ ARM64 だけです。
 - **Slack アプリ1つにプロセス1つ。** 同じ app トークンでゲートウェイを2つ動かすと、Slack がイベントを振り分けます。アプリを分けてください。
 
 ## 困ったとき
@@ -330,6 +370,7 @@ agentgw の表示は英語です。日本語にするには `~/.local/state/agen
 | 一部のメッセージにしか返事が来ない | 同じ app トークンを別のプロセスも使っている |
 | マシンがオフラインになる | ゲートウェイの `agentgw status`、そのマシンの `service.err.log` |
 | 更新後、エージェントが新しいツールの引数を使えない | そのエージェントで `/mcp` を打つ(起動時のツール一覧を持ち続けているため) |
+| Windows のマシンが立ち上がらない | PC で `agentgw status`、次に `%LOCALAPPDATA%\agentgw\logs\supervise.log` |
 | 「このシェルからは systemd のユーザーセッションに届かない」と出る | そのユーザーの systemd が常駐していません。`loginctl enable-linger $USER` を実行してログインし直す |
 
 ## 開発
@@ -338,7 +379,7 @@ agentgw の表示は英語です。日本語にするには `~/.local/state/agen
 cargo build && cargo test
 AGENTGW_STATE_DIR=$HOME/.local/state/agentgw-dev ./target/debug/agentgw serve
 
-cargo dist              # 配布バイナリ: macOS(arm64)と Linux(x86_64、musl)
+cargo dist              # 配布バイナリ: macOS(arm64)、Linux(x86_64、musl)、Windows(arm64、x86_64)
 ./scripts/release.sh    # GitHub の release に上げる
 ```
 
