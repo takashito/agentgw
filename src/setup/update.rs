@@ -132,11 +132,16 @@ fn check_and_rename(new: &Path, sum_text: &str, target: &Path, want: Want) -> Re
             .map_err(|e| format!("cannot make the download executable: {e}"))?;
     }
     sign(new);
-    // Windows decides what runs by the name: a download without `.exe` is renamed to one first
+    // Windows decides what runs by the name: a download without `.exe` is **copied** next to the
+    // target as one. Not renamed: a file just written is often held by the virus scanner for a
+    // moment, and renaming it is refused ("Access is denied", seen on a real machine 2026-11-14);
+    // reading it is allowed. The copy lands beside `target`, so the last rename stays on one disk
     let named;
     let new = if cfg!(windows) && new.extension().is_none_or(|e| !e.eq_ignore_ascii_case("exe")) {
-        named = new.with_extension("exe");
-        std::fs::rename(new, &named).map_err(|e| format!("cannot name the download .exe: {e}"))?;
+        named = target.with_file_name("agentgw.new.exe");
+        retry_while_held(|| std::fs::copy(new, &named).map(|_| ()))
+            .map_err(|e| format!("cannot copy the download to {}: {e}", named.display()))?;
+        let _ = std::fs::remove_file(new);
         named.as_path()
     } else {
         new
@@ -168,6 +173,21 @@ fn check_and_rename(new: &Path, sum_text: &str, target: &Path, want: Want) -> Re
     std::fs::rename(new, target).map_err(|e| format!("cannot put the new binary in place: {e}"))
 }
 
+/// Runs a file operation again for a few seconds while Windows says "Access is denied" — the
+/// answer while a virus scanner still has a just-written file open. Anything else fails at once.
+fn retry_while_held(mut op: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
+    let mut tries = 0;
+    loop {
+        match op() {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && tries < 10 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Windows will not write over a running .exe, nor delete one — but it will rename one. So the
 /// running file is renamed to `agentgw.prev.exe` and the new one takes its name; `supervise`
 /// starts the next `serve` from that name. An older `agentgw.prev.exe` may still be running too
@@ -188,9 +208,10 @@ fn replace_running_exe(new: &Path, target: &Path) -> Result<(), String> {
         std::fs::rename(&prev, &aside).map_err(|e| format!("cannot move {} aside: {e}", prev.display()))?;
     }
     if target.exists() {
-        std::fs::rename(target, &prev).map_err(|e| format!("cannot keep the old binary as {}: {e}", prev.display()))?;
+        retry_while_held(|| std::fs::rename(target, &prev))
+            .map_err(|e| format!("cannot keep the old binary as {}: {e}", prev.display()))?;
     }
-    std::fs::rename(new, target).map_err(|e| {
+    retry_while_held(|| std::fs::rename(new, target)).map_err(|e| {
         // Put the old one back so there is still a binary to start
         let _ = std::fs::rename(&prev, target);
         format!("cannot put the new binary in place: {e}")
