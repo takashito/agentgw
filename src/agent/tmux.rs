@@ -62,26 +62,32 @@ fn tmux_bin() -> String {
 #[cfg(windows)]
 const WINDOWS_SERVER: &str = "agentgw";
 
-/// PATH with agentgw's private PowerShell 7 in front, for the psmux server agentgw starts.
-///
-/// psmux runs every window's command through the `pwsh` it finds on PATH. On a machine with only
-/// the Store build that is an app-execution alias, and **it cannot start outside a desktop**
-/// ("Access is denied" in session 0, measured 2026-11-14) — so under the scheduled task no window
-/// would ever open. `install.ps1` unpacks the ZIP build into `%LOCALAPPDATA%\agentgw\pwsh`
-/// (`AGENTGW_PWSH_DIR` overrides); only agentgw's psmux sees it, the user's PATH is left alone.
-/// `None` when it is not there (the PATH is passed through as it is).
+/// agentgw's psmux settings on Windows, used instead of the user's `~/.psmux.conf`: **Windows
+/// PowerShell 5.1 as the shell**. The user's own psmux may well use `pwsh`, and on a machine with
+/// only the Store build of PowerShell 7 that cannot start outside a desktop ("Access is denied" in
+/// session 0, where the scheduled task runs). 5.1 is on every Windows and starts there (measured
+/// 2026-11-14: Claude started and answered under the task).
 #[cfg(windows)]
-fn path_with_private_pwsh() -> Option<std::ffi::OsString> {
-    let dir = match std::env::var("AGENTGW_PWSH_DIR") {
-        Ok(d) if !d.is_empty() => std::path::PathBuf::from(d),
-        _ => std::path::Path::new(&std::env::var("LOCALAPPDATA").ok()?).join("agentgw").join("pwsh"),
-    };
-    if !dir.join("pwsh.exe").is_file() {
-        return None;
-    }
-    let mut parts = vec![dir];
-    parts.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
-    std::env::join_paths(parts).ok()
+fn psmux_conf() -> Option<String> {
+    static CONF: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CONF.get_or_init(|| {
+        let path = std::env::temp_dir().join("agentgw-psmux.conf");
+        std::fs::write(&path, "set -g default-shell powershell\n").ok()?;
+        Some(path.to_string_lossy().into_owned())
+    })
+    .clone()
+}
+
+/// PATH without the Store's app-alias folders (`...\WindowsApps`). psmux runs each window's command
+/// through the first `pwsh` it finds, whatever the default shell says, and the Store's `pwsh`
+/// alias fails outside a desktop; with none to find it uses the shell above.
+#[cfg(windows)]
+fn path_without_store_aliases() -> Option<std::ffi::OsString> {
+    let path = std::env::var_os("PATH")?;
+    let kept = std::env::split_paths(&path).filter(|p| {
+        !p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("WindowsApps"))
+    });
+    std::env::join_paths(kept).ok()
 }
 
 /// How `set-option -w` must point at a window. psmux 3.4.0 answers "can't find window" when it
@@ -120,9 +126,12 @@ impl Tmux {
                     for var in ["TMUX", "TMUX_PANE", "PSMUX_CLAUDE_TEAMMATE_MODE"] {
                         cmd.env_remove(var);
                     }
-                    // agentgw's own psmux server, apart from the one the user works in
+                    // agentgw's own psmux server and settings, apart from the ones the user works with
                     cmd.args(["-L", WINDOWS_SERVER]);
-                    if let Some(path) = path_with_private_pwsh() {
+                    if let Some(conf) = psmux_conf() {
+                        cmd.args(["-f", &conf]);
+                    }
+                    if let Some(path) = path_without_store_aliases() {
                         cmd.env("PATH", path);
                     }
                 }

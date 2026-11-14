@@ -6,8 +6,8 @@
 //! - A task set to "run whether the user is logged on or not" runs in session 0 as the user. The
 //!   user's profile, `~/.claude/.credentials.json` and psmux all work there — **as long as psmux
 //!   does not reach the Store build of `pwsh`**, which cannot start outside a desktop. agentgw's
-//!   psmux gets a private PowerShell 7 (the ZIP build) first on its PATH instead (see
-//!   `agent::tmux`).
+//!   psmux uses Windows PowerShell 5.1 and does not see the Store aliases (see `agent::tmux`).
+//!   Registering the task needs no administrator shell (measured from a normal one).
 //! - Task Scheduler restarts a failed task after a minute at the soonest, too slow for a
 //!   maintenance restart. So the task runs `supervise`, which starts `serve` again within a second.
 //! - Windows has no SIGUSR1 / SIGHUP / SIGTERM to send to a background process. `restart`,

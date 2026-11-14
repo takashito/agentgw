@@ -1,5 +1,5 @@
-# Install agentgw on Windows as a machine: check psmux and Claude Code -> a private PowerShell 7 for
-# agentgw -> fetch the binary -> connect to the gateway -> register the scheduled task and start it.
+# Install agentgw on Windows as a machine: check psmux and Claude Code -> fetch the binary
+# -> connect to the gateway -> register the scheduled task and start it.
 #
 #   powershell -ExecutionPolicy Bypass -File install.ps1 [-From <agentgw.exe>] [-Name <name>] [-ConnectionFile <file>]
 #
@@ -66,24 +66,7 @@ if (-not (Test-Path (Join-Path $HOME '.claude\.credentials.json'))) {
     Say '  ! Claude Code has no sign-in yet. Run `claude` once and sign in before the first agent starts.'
 }
 
-# 3. A PowerShell 7 of agentgw's own. psmux starts every window through `pwsh`, and the Store build
-#    cannot start while you are logged out. Only agentgw's psmux sees this one; your PATH is untouched.
-$pwDir = Join-Path $env:LOCALAPPDATA 'agentgw\pwsh'
-if (-not (Test-Path (Join-Path $pwDir 'pwsh.exe'))) {
-    $psArch = if ($arch -eq 'aarch64') { 'arm64' } else { 'x64' }
-    $rel = Invoke-RestMethod 'https://api.github.com/repos/PowerShell/PowerShell/releases/latest'
-    $asset = $rel.assets | Where-Object { $_.name -like "PowerShell-*-win-$psArch.zip" } | Select-Object -First 1
-    if (-not $asset) { Fail "no PowerShell ZIP for win-$psArch in the latest release" }
-    Say "  - downloading $($asset.name) for agentgw"
-    $zip = Join-Path $env:TEMP $asset.name
-    Invoke-WebRequest $asset.browser_download_url -OutFile $zip -UseBasicParsing
-    New-Item -ItemType Directory -Force $pwDir | Out-Null
-    Expand-Archive $zip -DestinationPath $pwDir -Force
-    Remove-Item $zip
-}
-Ok "PowerShell for agentgw: $((& (Join-Path $pwDir 'pwsh.exe') -NoProfile -Command '$PSVersionTable.PSVersion.ToString()' | Out-String).Trim()) ($pwDir)"
-
-# 4. The agentgw binary
+# 3. The agentgw binary
 New-Item -ItemType Directory -Force $bin | Out-Null
 $new = Join-Path $bin 'agentgw.new.exe'
 if ($From) {
@@ -108,7 +91,7 @@ if (Test-Path $exe) {
 Move-Item $new $exe -Force
 Ok "installed $exe - $((& $exe --build | Out-String).Trim())"
 
-# 5. Connect to the gateway (once)
+# 4. Connect to the gateway (once)
 $env:AGENTGW_STATE_DIR = $stateDir
 $envFile = Join-Path $stateDir '.env'
 $linked = (Test-Path $envFile) -and (Select-String -Path $envFile -Pattern '^AGENTGW_BRIDGE_ROLE=machine' -Quiet)
@@ -134,7 +117,7 @@ if ($linked) {
     if ($ConnectionFile) { Remove-Item $ConnectionFile -Force }
 }
 
-# 6. The scheduled task (asks for your Windows password) - then started
+# 5. The scheduled task (asks for your Windows password) - then started
 & $exe install
 if ($LASTEXITCODE -ne 0) {
     Fail 'agentgw install failed. If Windows refused the task ("access is denied"), your account may lack the right to run tasks while logged off; try once more from PowerShell started with "Run as administrator".'

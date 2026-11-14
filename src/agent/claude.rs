@@ -147,14 +147,16 @@ impl Claude {
         )
     }
 
-    /// The launch line on Windows. psmux hands the line to `pwsh -NoLogo -Command`, so it is
-    /// PowerShell, not sh (measured 2026-11-14):
+    /// The launch line on Windows. psmux hands the line to PowerShell (`-Command`), so it is
+    /// PowerShell, not sh, and it must read the same in Windows PowerShell 5.1, which agentgw's
+    /// psmux uses (see `agent::tmux`), and in PowerShell 7 (measured 2026-11-14):
     /// - the environment variable is set with `$env:` (`VAR=x cmd` is sh only)
     /// - claude is called by its full path with `&`. A bare `claude` would go through the
     ///   `claude` function psmux defines in its shells, which adds `--teammate-mode tmux`
     /// - **the first message is read from a file**, not written into the line: a Windows command
     ///   line is capped at 32K characters and goes through two rounds of quoting (CreateProcess,
-    ///   then PowerShell). `Get-Content -Raw` hands it over as one argument, newlines and all
+    ///   then PowerShell). `Get-Content -Raw` hands it over as one argument, newlines and all;
+    ///   `-Encoding UTF8` because 5.1 would read a file without a BOM as the ANSI code page
     #[cfg_attr(not(windows), allow(dead_code))]
     fn launch_line_pwsh(
         claude: &str,
@@ -165,7 +167,7 @@ impl Claude {
     ) -> String {
         let q = Self::pwsh_quote;
         format!(
-            "$env:AGENTGW_SESSION_ID={}; & {} --settings {} --mcp-config {} {} (Get-Content -Raw -LiteralPath {})",
+            "$env:AGENTGW_SESSION_ID={}; & {} --settings {} --mcp-config {} {} (Get-Content -Raw -Encoding UTF8 -LiteralPath {})",
             q(mode.session_id()),
             q(claude),
             q(hooks_file),
@@ -2265,7 +2267,7 @@ mod tests {
         );
         assert_eq!(
             line,
-            r"$env:AGENTGW_SESSION_ID='sid-1'; & 'C:\Users\o''neil\.local\bin\claude.exe' --settings 'C:\rt\worker-hooks.json' --mcp-config 'C:\rt\mcp\sid-1.json' --session-id sid-1 (Get-Content -Raw -LiteralPath 'C:\rt\prompts\sid-1.txt')"
+            r"$env:AGENTGW_SESSION_ID='sid-1'; & 'C:\Users\o''neil\.local\bin\claude.exe' --settings 'C:\rt\worker-hooks.json' --mcp-config 'C:\rt\mcp\sid-1.json' --session-id sid-1 (Get-Content -Raw -Encoding UTF8 -LiteralPath 'C:\rt\prompts\sid-1.txt')"
         );
         let resume = Claude::launch_line_pwsh("claude.exe", &SessionMode::Resume("old".into()), "h", "m", "p");
         assert!(resume.contains(" --resume old "), "{resume}");
