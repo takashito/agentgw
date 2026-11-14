@@ -457,7 +457,9 @@ pub mod link {
     /// like a plausible blob. Silently ending up with a machine holding half a secret is the worst outcome,
     /// so the refusal names what's missing.
     pub fn decode_connection(raw: &str) -> Result<Invite, String> {
-        let text = raw.trim();
+        // A byte-order mark is not part of it: Windows PowerShell puts one in front of what it pipes
+        // to a program (seen on a real machine 2026-11-14), and `trim` does not count it as space
+        let text = raw.trim().trim_start_matches('\u{feff}').trim();
         let Some(body) = text.strip_prefix(PREFIX) else {
             return Err(format!(
                 "not a connection string — it must start with \"{PREFIX}\" (did the paste lose its beginning?)"
@@ -723,6 +725,8 @@ pub mod link {
             assert_eq!(decode_connection(&s).unwrap(), conn());
             // Drop the whitespace and newlines that come along with a paste
             assert_eq!(decode_connection(&format!("\n  {s}  \n")).unwrap(), conn());
+            // What Windows PowerShell pipes: a byte-order mark first, CRLF last
+            assert_eq!(decode_connection(&format!("\u{feff}{s}\r\n")).unwrap(), conn());
         }
 
         /// The version comes first, so a future format is refused rather than misread.

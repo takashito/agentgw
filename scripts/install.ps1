@@ -111,6 +111,8 @@ if ($linked) {
         $conn = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
     }
     if (-not $conn) { Fail 'no connection string given' }
+    # Without this, Windows PowerShell 5.1 pipes with a byte-order mark in front
+    $OutputEncoding = New-Object Text.UTF8Encoding $false
     $conn | & $exe link --name $Name -
     if ($LASTEXITCODE -ne 0) { Fail 'agentgw link failed' }
     Ok "connected as $Name"
