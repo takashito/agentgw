@@ -7,7 +7,8 @@
 //!   user's profile, `~/.claude/.credentials.json` and psmux all work there — **as long as psmux
 //!   does not reach the Store build of `pwsh`**, which cannot start outside a desktop. agentgw's
 //!   psmux uses Windows PowerShell 5.1 and does not see the Store aliases (see `agent::tmux`).
-//!   Registering the task needs no administrator shell (measured from a normal one).
+//!   Registering it needs an administrator shell, for the boot trigger alone (measured: without
+//!   a trigger a normal shell registers it; with `-AtStartup`, "Access is denied").
 //! - Task Scheduler restarts a failed task after a minute at the soonest, too slow for a
 //!   maintenance restart. So the task runs `supervise`, which starts `serve` again within a second.
 //! - Windows has no SIGUSR1 / SIGHUP / SIGTERM to send to a background process. `restart`,

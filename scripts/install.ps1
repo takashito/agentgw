@@ -10,10 +10,11 @@
 #
 # **This is for the first install.** Later versions arrive with `update`, like every other machine.
 #
-# No administrator rights needed: winget installs psmux for you alone, and everything else goes under
-# your profile. The scheduled task runs as you whether or not you are logged in, so Windows asks for
-# your password once (Get-Credential hands it to Task Scheduler; agentgw never sees it). That needs
-# the right to "log on as a batch job", which administrators have by default.
+# Run it in an **administrator** PowerShell (Windows PowerShell 5.1 or PowerShell 7). The task starts
+# at boot, and Windows lets only an administrator register a boot trigger (measured 2026-11-14: the
+# same task with no trigger registered from a normal shell; with the boot trigger, "Access is denied").
+# The task then runs as you whether or not you are logged in, so Windows asks for your password once
+# (Get-Credential hands it to Task Scheduler; agentgw never sees it).
 #
 # Environment:
 #   AGENTGW_STATE_DIR  state directory (default: %LOCALAPPDATA%\agentgw)
@@ -44,6 +45,11 @@ $cpu = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $
 $arch = if ($cpu -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
 $triple = "$arch-pc-windows-gnullvm"
 
+
+$admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $admin) {
+    Fail 'Open PowerShell with "Run as administrator" and run this again (Windows lets only an administrator register a task that starts at boot).'
+}
 
 Say "`nagentgw install - Windows ($triple)`n"
 
@@ -122,7 +128,7 @@ if ($linked) {
 # 5. The scheduled task (asks for your Windows password) - then started
 & $exe install
 if ($LASTEXITCODE -ne 0) {
-    Fail 'agentgw install failed. If Windows refused the task ("access is denied"), your account may lack the right to run tasks while logged off; try once more from PowerShell started with "Run as administrator".'
+    Fail 'agentgw install failed (see above)'
 }
 Start-Sleep 5
 & $exe status
