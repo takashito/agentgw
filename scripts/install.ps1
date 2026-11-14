@@ -21,7 +21,9 @@
 #   AGENTGW_TAG        release tag to fetch (default: the latest release)
 param(
     [string]$From,
-    [string]$Name
+    [string]$Name,
+    # A file holding the connection string, instead of pasting it (deleted once it is used)
+    [string]$ConnectionFile
 )
 $ErrorActionPreference = 'Stop'
 
@@ -115,11 +117,16 @@ if ($linked) {
         if (-not $Name) { $Name = $default }
     }
     Say "  On the gateway, run:  agentgw add-machine --print $Name"
-    $conn = Read-Host '  Paste the connection string' -MaskInput
+    if ($ConnectionFile) {
+        $conn = (Get-Content -Raw $ConnectionFile).Trim()
+    } else {
+        $conn = Read-Host '  Paste the connection string' -MaskInput
+    }
     if (-not $conn) { Fail 'no connection string given' }
     $conn | & $exe link --name $Name -
     if ($LASTEXITCODE -ne 0) { Fail 'agentgw link failed' }
     Ok "connected as $Name"
+    if ($ConnectionFile) { Remove-Item $ConnectionFile -Force }
 }
 
 # 6. The scheduled task (asks for your Windows password) — then started
