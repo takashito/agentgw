@@ -8,7 +8,9 @@
 //!
 //! Three places use a shell, and only two are agentgw's to choose:
 //! - the psmux window that starts the agent — always Windows PowerShell 5.1 (`agent::tmux`)
-//! - the SessionStart hook — Claude Code offers `bash` or `powershell`; agentgw asks for PowerShell
+//! - the SessionStart hook — Claude Code offers `bash` or `powershell`. Git Bash when it starts:
+//!   a `powershell` hook runs in the `pwsh` Claude Code finds, which may be the Store build that
+//!   cannot start (measured: the hook never arrived). PowerShell only without Git Bash
 //! - the agent's own tools — Claude Code picks: the Bash tool needs Git Bash, and the PowerShell
 //!   tool takes `pwsh.exe` (7) when it finds one, else `powershell.exe` (5.1). There is no setting
 //!   to choose the executable; there is one to turn the tool off, used when the `pwsh` it would

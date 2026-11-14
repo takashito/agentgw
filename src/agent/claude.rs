@@ -2102,7 +2102,8 @@ impl HookIntake {
                 // Only SessionStart has Claude Code ignore http, so it uses curl. Headers are not carried,
                 // so session_id is taken from the body (measured in the spike).
                 "SessionStart": [{ "matcher": "", "hooks": [match shells {
-                    None => serde_json::json!({
+                    // Git Bash where it starts (and everywhere but Windows): curl in a POSIX shell
+                    None | Some(crate::agent::shells::Shells { git_bash: crate::agent::shells::Probe::Works(_), .. }) => serde_json::json!({
                         "type": "command",
                         "timeout": 10,
                         "command": format!(
@@ -2110,9 +2111,12 @@ impl HookIntake {
                              -H 'x-agentgw-token: {token}' --data-binary @- {base}/session_start || true"
                         ),
                     }),
-                    // Windows: PowerShell, not Git Bash, which may not be installed. Written for 5.1
-                    // and 7 alike: stdin read as UTF-8 and posted as bytes (5.1 would read it in the
-                    // OEM code page and post a string as ISO-8859-1)
+                    // Windows without Git Bash: PowerShell. **Not first choice**: Claude Code runs a
+                    // `powershell` hook with the `pwsh` it finds, like its PowerShell tool, and the
+                    // Store build of that does not start under the scheduled task — the hook never
+                    // arrived (measured 2026-11-14), while the Git Bash one did. There is no choosing
+                    // 5.1 for it. Written for 5.1 and 7 alike: stdin read as UTF-8 and posted as bytes
+                    // (5.1 would read it in the OEM code page and post a string as ISO-8859-1)
                     Some(_) => serde_json::json!({
                         "type": "command",
                         "shell": "powershell",
@@ -2712,12 +2716,16 @@ mod tests {
             powershell: Probe::Works("powershell.exe".into()),
         };
         let v = HookIntake::settings_json(8791, "tok", Some(&store));
+        // Git Bash starts: the hook stays in it (a `powershell` hook would take the broken pwsh)
+        assert!(v["hooks"]["SessionStart"][0]["hooks"][0].get("shell").is_none());
+        assert_eq!(v["env"]["CLAUDE_CODE_USE_POWERSHELL_TOOL"], "0");
+        let no_bash = Shells { git_bash: Probe::Absent, pwsh: Probe::Absent, ..store.clone() };
+        let v = HookIntake::settings_json(8791, "tok", Some(&no_bash));
         let ss = &v["hooks"]["SessionStart"][0]["hooks"][0];
         assert_eq!(ss["shell"], "powershell");
         let cmd = ss["command"].as_str().unwrap();
         assert!(cmd.contains("Invoke-RestMethod") && cmd.contains("http://127.0.0.1:8791/hook/session_start"), "{cmd}");
         assert!(cmd.contains("'x-agentgw-token' = 'tok'"), "{cmd}");
-        assert_eq!(v["env"]["CLAUDE_CODE_USE_POWERSHELL_TOOL"], "0");
         let fine = Shells { pwsh: Probe::Absent, ..store };
         assert!(HookIntake::settings_json(8791, "tok", Some(&fine)).get("env").is_none());
         let plain = HookIntake::settings_json(8791, "tok", None);
