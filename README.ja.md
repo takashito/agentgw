@@ -2,117 +2,117 @@
 
 <h1>agentgw</h1>
 
-<p><b>自分のすべてのマシンの Claude Code の入り口を、Slack に。開けておく端末も、行き来する多重化ツールも要らない。</b></p>
+<p><b>手持ちのすべてのマシンで動く Claude Code を、Slack から操作。ターミナルを開きっぱなしにする必要も、tmux や cmux で画面を切り替える必要もありません。</b></p>
 
 [![Release](https://img.shields.io/github/v/release/takashito/agentgw?style=flat-square&labelColor=black)](https://github.com/takashito/agentgw/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square&labelColor=black)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey?style=flat-square&labelColor=black)](#必要なもの)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey?style=flat-square&labelColor=black)](#動作要件)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584?style=flat-square&labelColor=black&logo=rust)](https://www.rust-lang.org/)
 
-[はじめかた](#はじめかた) · [Slack アプリ](#slack-アプリ) · [マシンを足す](#マシンを足す) · [コマンド](#slack-のコマンド) · [セキュリティ](#セキュリティ) · [English](README.md)
+[クイックスタート](#クイックスタート) · [Slack アプリ](#slack-アプリの設定) · [マシンの追加](#マシンの追加) · [コマンド](#slack-コマンド) · [セキュリティ](#セキュリティ) · [English](README.md)
 
 </div>
 
-agentgw は、1つの Slack ボットと、自分のすべてのマシンの Claude Code をつなぐ小さなサービスです。チャンネルに書くと、**そのチャンネルを受け持つマシンで**、そのプロジェクトのディレクトリを使って Claude Code のエージェントが起動し、スレッドに返事を書きます。途中経過はその場で見え、許可が要るときは Slack で答えられます。
+agentgw は、1つの Slack ボットと、手持ちの各マシン上の Claude Code をつなぐ軽量なサービスです。チャンネルに投稿すると、**そのチャンネルを担当するマシン**のプロジェクトディレクトリで Claude Code のエージェントが起動し、スレッドで返信します。作業の進み具合はリアルタイムで表示され、ツールの実行許可も Slack 上で承認できます。
 
 <p align="center">
-  <img src="assets/thread.svg" width="780" alt="Slack のスレッド: agentgw に不安定なテストの修正を頼むと、Claude Code が使うツールが進捗として並び、Allow と Deny のボタンつきの許可の確認が出て、最後にエージェントが修正内容を返す。">
+  <img src="assets/thread.svg" width="780" alt="Slack のスレッド: agentgw に不安定なテストの修正を依頼すると、Claude Code が実行したツールが進捗として表示され、Allow / Deny ボタン付きの許可確認を経て、エージェントが修正内容を返信する。">
 </p>
 
-## なぜ agentgw か
+## なぜ agentgw なのか
 
-agentgw は、自分のマシンの上で**公式の Claude Code CLI** を動かします。Claude Code 自身の Remote Control と比べて、次のことができます。
+agentgw は、各マシン上で**公式の Claude Code CLI** をそのまま動かします。Claude Code 標準の Remote Control と比べて、次のような違いがあります。
 
-### 🚀 どのマシンでも、いつでも新しいセッションを始められる
+### 🚀 どのマシンでも、いつでも新しいセッションを開始
 
-Slack に書けば、そのチャンネルを受け持つマシンで新しい Claude Code のセッションが始まります。前もって何かを起動しておく必要はありません(プロジェクトごとに `claude remote-control` を開けておく必要も無い)。agentgw はつながっているどのマシンでもサービスとして動いています。
+Slack に投稿するだけで、そのチャンネルを担当するマシンで新しい Claude Code セッションが始まります。事前の起動は不要で、プロジェクトごとに `claude remote-control` を立ち上げておく必要もありません。agentgw は接続されたすべてのマシンで常駐サービスとして動いています。
 
-### ↩️ 過去のセッションを、いつでも続きから
+### ↩️ 過去のセッションをいつでも再開
 
-エージェントが静かになって片付けられたあとでも、そのスレッドに返信すれば、同じマシンで同じ会話の続きから再開します。何日あとでもかまいません。
+アイドル状態のエージェントが終了したあとでも、スレッドに返信すれば同じマシンで会話の続きから再開できます。何日経っていても問題ありません。
 
-### 🔎 全セッションを探せて、リンクで渡せる
+### 🔎 すべてのセッションを検索・共有
 
-どのマシンのどのセッションも、1つの Slack ワークスペースに残ります。過去の作業を Slack の検索でまとめて探せ、ほかのセッションの結果は、スレッドやメッセージのリンクを貼るだけで、今話しているエージェントに読ませられます。別のマシンで動いたセッションでもかまいません。
+どのマシンのセッションも、1つの Slack ワークスペースに記録されます。過去の作業は Slack の検索でまとめて探せます。別のセッションの結果をエージェントに読ませたいときは、スレッドやメッセージのリンクを貼るだけです。別のマシンで動いたセッションでも構いません。
 
-### 💬 Slack がそのまま操作画面
+### 💬 Slack がそのまま操作画面に
 
-どのマシンのエージェントも1か所に集まるので、cmux や herdr で端末を行き来する必要がありません。🛑 のリアクションでエージェントを止め、メッセージを編集すれば依頼の修正、消せば取り消しになり、ファイルもどちら向きにも受け渡せます。
+すべてのマシンのエージェントが1か所に集まるため、cmux や herdr でターミナルを切り替える必要がありません。🛑 リアクションでエージェントを停止でき、メッセージを編集すれば指示の修正、削除すれば取り消しになります。ファイルのやり取りも双方向にできます。
 
-### ⚡ すぐ応え、使わなければ自分で片付く
+### ⚡ 素早く応答し、使わなければ自動で終了
 
-チャンネルで `warm` を on にすると、そのプロジェクトで待機用のエージェントを先に起こしておくので、新しいスレッドにすぐ応えます(既定は off で、スレッドが立ってから起動します)。使われていないエージェントは自動で片付けます。
+チャンネルで `warm` を on にすると、そのプロジェクト用の待機エージェントを事前に起動しておくため、新しいスレッドにすぐ応答できます(デフォルトは off で、スレッドが作られてから起動します)。使われていないエージェントは自動で終了します。
 
-## できること
+## 機能
 
 <table>
 <tr>
 <td width="50%" valign="top">
 
-**🧵 スレッド1つにセッション1つ**<br>
-スレッドごとにエージェント(`tmux` の中で動く本物の Claude Code)が付きます。続きは返信するだけ。agentgw を再起動・更新してもセッションは続きます。
+**🧵 1スレッド = 1セッション**<br>
+スレッドごとにエージェント(`tmux` 上で動く本物の Claude Code)が割り当てられます。続けるにはスレッドに返信するだけ。agentgw の再起動やアップデートをまたいでもセッションは維持されます。
 
 </td>
 <td width="50%" valign="top">
 
-**🖧 複数台を Slack アプリ1つで**<br>
-Slack につながるのは**ゲートウェイ**1台。ほかの**マシン**はゲートウェイへ外向きにつなぐので、ポート開放は要りません。`route <マシン>:<パス>` で、チャンネルをマシンに任せ、そのマシンのどのフォルダで作業するかを決めます。
+**🖧 複数マシンを1つの Slack アプリで**<br>
+Slack に接続するのは**ゲートウェイ**1台だけです。ほかの**マシン**はゲートウェイへ外向きに接続するので、ポート開放は不要です。`route <マシン>:<パス>` で、チャンネルを担当するマシンと作業フォルダを指定します。
 
 </td>
 </tr>
 <tr>
 <td valign="top">
 
-**🚀 マシンを足すのはコマンド1つ**<br>
-`agentgw add-machine user@host` が ssh でバイナリを届け、サービスを入れ、ゲートウェイにつなぎ、ゲートウェイから見えるまで待ちます。
+**🚀 マシンの追加はコマンド1つ**<br>
+`agentgw add-machine user@host` を実行すると、ssh 経由でバイナリを転送し、サービスを登録してゲートウェイに接続し、ゲートウェイから認識されるまで待ちます。
 
 </td>
 <td valign="top">
 
-**🔌 つなぎ方は自分で決まる**<br>
-まず直結(例: Tailscale 経由)を試し、つながらなければゲートウェイが ssh トンネルを張り続けます。
-
-</td>
-</tr>
-<tr>
-<td valign="top">
-
-**👀 進捗がその場で見える**<br>
-ターンごとに1つのメッセージが、ツールを使うたびに更新されます(読んだファイル、打ったコマンド、加えた変更)。終わると畳まれます。
-
-</td>
-<td valign="top">
-
-**🔐 許可はボタンで**<br>
-`manual` モードでは、ツールを使う前に、スレッドに **Allow** と **Deny** のボタンつきの確認が出ます。
+**🔌 接続経路は自動で選択**<br>
+まず直接接続(Tailscale 経由など)を試し、つながらない場合はゲートウェイが ssh トンネルを張って維持します。
 
 </td>
 </tr>
 <tr>
 <td valign="top">
 
-**🎛️ チャットから操れる**<br>
-モデル・effort・権限モード、compact、使用状況、🛑 のリアクションで停止。`resume` でセッションを手元の端末に引き継げます。
+**👀 進捗をリアルタイムに表示**<br>
+ターンごとに1つのメッセージが、ツールの実行に合わせて更新されます(読んだファイル、実行したコマンド、加えた変更)。完了すると折りたたまれます。
 
 </td>
 <td valign="top">
 
-**📦 バイナリ1つ**<br>
-マシンごとに Rust のバイナリが1つだけ。`launchd` のエージェントか `systemd` のユーザーユニットとして動きます。
+**🔐 ボタンで実行を許可**<br>
+`manual` モードでは、ツールを実行する前に **Allow** / **Deny** ボタン付きの確認がスレッドに表示されます。
 
 </td>
 </tr>
 <tr>
 <td valign="top">
 
-**🔔 ボットの投稿で作業を始める**<br>
-`allow-bot` で通したボットの投稿(監視の通知や CI の失敗など)から、調査を始められます。ボット同士が延々と応答し合わないよう止める仕組みも入っています。
+**🎛️ チャットから操作**<br>
+モデル、effort、権限モードの切り替え、compact、使用量の確認、🛑 リアクションでの停止ができます。`resume` でセッションを手元のターミナルに引き継ぐこともできます。
 
 </td>
 <td valign="top">
 
-**🔑 マシンごとのサインイン**<br>
-各マシンが自分の Claude Code のサインインを確かめ、切れたら知らせます。そのマシンが受け持つチャンネルで `login` と送れば、サインインし直せます。
+**📦 シングルバイナリ**<br>
+各マシンに置くのは Rust 製のバイナリ1つだけです。`launchd` のエージェント、または `systemd` のユーザーユニットとして動作します。
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+**🔔 ボットの投稿をきっかけに作業を開始**<br>
+`allow-bot` で許可したボットの投稿(監視アラートや CI の失敗通知など)から調査を始められます。ボット同士が延々と応答し合うのを防ぐ仕組みも備えています。
+
+</td>
+<td valign="top">
+
+**🔑 マシンごとのサインイン管理**<br>
+各マシンが Claude Code のサインイン状態を確認し、切れた場合は通知します。そのマシンが担当するチャンネルで `login` と送れば、再サインインできます。
 
 </td>
 </tr>
@@ -130,57 +130,57 @@ flowchart LR
     C2 --> W2["Claude Code のエージェント<br/>(tmux)"]
 ```
 
-1. **チャンネルかスレッドに書く。**
-2. **ゲートウェイ**が Slack の Socket Mode で受け取り、そのチャンネルを受け持つマシンに渡す。担当が決まっていなければゲートウェイが自分で受ける。
-3. **そのマシン**がスレッドのエージェントに渡す。まだ無ければ、チャンネルのプロジェクトのディレクトリで起動する。
-4. **エージェント**が agentgw の MCP ツールで返事を書く。途中経過と許可の確認もスレッドに出る。
+1. **チャンネルまたはスレッドに投稿します。**
+2. **ゲートウェイ**が Slack の Socket Mode でメッセージを受け取り、そのチャンネルを担当するマシンに転送します。担当マシンが未設定なら、ゲートウェイ自身が処理します。
+3. **担当マシン**がスレッドのエージェントにメッセージを渡します。エージェントがまだなければ、チャンネルのプロジェクトディレクトリで起動します。
+4. **エージェント**が agentgw の MCP ツールを使ってスレッドに返信します。進捗や許可の確認もスレッドに表示されます。
 
-エージェントが使える MCP サーバーは、そのマシンで普通に `claude` を起動したときと同じです(ユーザーの設定、プラグイン、claude.ai のコネクタ、ディレクトリの `.mcp.json`)。これに agentgw の分が加わります。`.mcp.json` のサーバーは確認なしで承認します(確認の画面が出るとエージェントが止まるため)。
+エージェントが使える MCP サーバーは、そのマシンで普通に `claude` を起動したときと同じです(ユーザー設定、プラグイン、claude.ai のコネクタ、ディレクトリの `.mcp.json`)。これに agentgw の MCP サーバーが加わります。`.mcp.json` のサーバーは確認なしで承認されます(確認ダイアログが出るとエージェントが止まってしまうためです)。
 
-Slack のイベントを読むのはゲートウェイだけです。ほかのマシンは bot トークンを接続のたびに受け取り、メモリにだけ置きます。app トークンはゲートウェイから出ません。
+Slack のイベントストリームを読むのはゲートウェイだけです。ほかのマシンは接続時に bot トークンを受け取り、メモリ上にだけ保持します。app トークンがゲートウェイの外に出ることはありません。
 
-## 必要なもの
+## 動作要件
 
 | | |
 |---|---|
-| **OS** | ゲートウェイは macOS か Linux。ほかのマシンは macOS・Linux・[Windows](#windows-のマシン)。配布バイナリは Apple Silicon の Mac、x86_64 の Linux、Windows の ARM64 と x86_64。それ以外はソースからビルド |
-| **Claude Code** | すべてのマシンに[インストール](https://docs.claude.com/ja/docs/claude-code)して、サインインしておく |
-| **tmux** | 無ければインストーラが入れる(Windows では [psmux](https://github.com/marlocarlo/psmux)) |
-| **Slack** | アプリを作れるワークスペース — [ワンクリックで作れます](#slack-アプリ) |
+| **OS** | ゲートウェイ: macOS または Linux。その他のマシン: macOS、Linux、[Windows](#windows-マシン)。ビルド済みバイナリは Apple Silicon Mac、x86_64 Linux、Windows(ARM64 / x86_64)向けを提供。それ以外の環境はソースからビルドしてください |
+| **Claude Code** | すべてのマシンに[インストール](https://docs.claude.com/ja/docs/claude-code)し、サインインしておくこと |
+| **tmux** | 未インストールならインストーラが導入します(Windows では [psmux](https://github.com/marlocarlo/psmux)) |
+| **Slack** | アプリを作成できるワークスペース([ワンクリックで作成できます](#slack-アプリの設定)) |
 
-## はじめかた
+## クイックスタート
 
-**1. Slack アプリを作る**
+**1. Slack アプリを作成する**
 
 [![Slack アプリを作る](https://img.shields.io/badge/Slack_アプリを作る-4A154B?style=for-the-badge&logo=slack&logoColor=white)](https://api.slack.com/apps?new_app=1&manifest_json=%7B%22%5Fmetadata%22%3A%7B%22major%5Fversion%22%3A1%2C%22minor%5Fversion%22%3A1%7D%2C%22display%5Finformation%22%3A%7B%22background%5Fcolor%22%3A%22%23262626%22%2C%22description%22%3A%22Run%20Claude%20Code%20on%20your%20own%20machines%20and%20drive%20it%20from%20Slack%22%2C%22name%22%3A%22agentgw%22%7D%2C%22features%22%3A%7B%22agent%5Fview%22%3A%7B%22agent%5Fdescription%22%3A%22Run%20Claude%20Code%20on%20your%20own%20machines%20and%20drive%20it%20from%20Slack%22%7D%2C%22app%5Fhome%22%3A%7B%22home%5Ftab%5Fenabled%22%3Afalse%2C%22messages%5Ftab%5Fenabled%22%3Atrue%2C%22messages%5Ftab%5Fread%5Fonly%5Fenabled%22%3Afalse%7D%2C%22bot%5Fuser%22%3A%7B%22always%5Fonline%22%3Atrue%2C%22display%5Fname%22%3A%22agentgw%22%7D%7D%2C%22oauth%5Fconfig%22%3A%7B%22scopes%22%3A%7B%22bot%22%3A%5B%22app%5Fmentions%3Aread%22%2C%22assistant%3Awrite%22%2C%22channels%3Ahistory%22%2C%22channels%3Aread%22%2C%22channels%3Awrite%2Einvites%22%2C%22channels%3Awrite%2Etopic%22%2C%22chat%3Awrite%22%2C%22files%3Aread%22%2C%22files%3Awrite%22%2C%22groups%3Ahistory%22%2C%22groups%3Aread%22%2C%22im%3Ahistory%22%2C%22im%3Aread%22%2C%22im%3Awrite%22%2C%22mpim%3Ahistory%22%2C%22mpim%3Aread%22%2C%22reactions%3Aread%22%2C%22reactions%3Awrite%22%2C%22users%3Aread%22%5D%7D%7D%2C%22settings%22%3A%7B%22event%5Fsubscriptions%22%3A%7B%22bot%5Fevents%22%3A%5B%22agent%5Fsession%5Fstopped%22%2C%22agent%5Fsession%5Ftitle%5Fchanged%22%2C%22app%5Fmention%22%2C%22app%5Fhome%5Fopened%22%2C%22member%5Fjoined%5Fchannel%22%2C%22message%2Echannels%22%2C%22message%2Egroups%22%2C%22message%2Eim%22%2C%22message%2Empim%22%2C%22reaction%5Fadded%22%2C%22reaction%5Fremoved%22%5D%7D%2C%22interactivity%22%3A%7B%22is%5Fenabled%22%3Atrue%7D%2C%22socket%5Fmode%5Fenabled%22%3Atrue%2C%22token%5Frotation%5Fenabled%22%3Afalse%7D%7D)
 
-ワークスペースを選んで **Create** を押し、トークンを2つ用意します。**Install to Workspace** → *Bot User OAuth Token*(`xoxb-…`)と、**Basic Information → App-Level Tokens** → `connections:write` の権限のトークン(`xapp-…`)。
+ワークスペースを選んで **Create** をクリックし、次の2つのトークンを取得します。**Install to Workspace** で発行される *Bot User OAuth Token*(`xoxb-…`)と、**Basic Information → App-Level Tokens** で `connections:write` スコープを付けて発行するトークン(`xapp-…`)です。
 
-**2. ゲートウェイにするマシンに入れる**
+**2. ゲートウェイをインストールする**
 
-常に動いているマシンを選んでください(家のサーバー、NAS、小さな VM など)。すべてがゲートウェイを通るので、ゲートウェイが眠るとどのマシンも応えなくなります。持ち歩くノート PC は、ゲートウェイにつなぐマシンの1台にするのがおすすめです。スリープすると外れ、起きると戻り、ほかのマシンには影響しません。
+常時稼働しているマシン(自宅サーバー、NAS、小さな VM など)を選んでください。すべての通信がゲートウェイを経由するため、ゲートウェイがスリープするとすべてのマシンが応答しなくなります。持ち歩くノート PC は、ゲートウェイではなく接続先のマシンの1台にするのがおすすめです。スリープ中は切断され、復帰すると自動で再接続されます。ほかのマシンには影響しません。
 
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/takashito/agentgw/main/scripts/install.sh)"
 ```
 
-バイナリを取ってきてサービスを入れ、トークンを2つ訊きます。
+バイナリをダウンロードしてサービスを登録し、2つのトークンの入力を求めます。
 
 > [!NOTE]
-> `curl … | bash` ではなく `bash -c "$(curl …)"` で実行してください。パイプで渡すと端末が無くなり、トークンを訊けません。
+> `curl … | bash` ではなく `bash -c "$(curl …)"` で実行してください。パイプで渡すと標準入力が端末から切り離され、インストーラがトークンを入力できなくなります。
 
 **3. サインインする**
 
-ボットに **`login`** と DM します。そのマシンの Claude Code を**あなたの** Claude のアカウントでサインインさせます(サインイン用のリンクが届くので、表示されたコードを DM に貼り返す)。サインインした人が **Owner**(ボットが仕事を受ける唯一の人)になります。
+ボットに **`login`** と DM を送ります。そのマシンの Claude Code が、**自分の** Claude アカウントでサインインされます(サインイン用のリンクが届くので、表示されたコードを DM に貼り付けてください)。サインインした人が **Owner** になり、ボットは Owner の指示だけを受け付けます。
 
-> API キーを使っている場合: そのマシンの Claude Code に API キーが設定されていれば、エージェントはそれで動きます。agentgw 自身はモデルの認証情報を一切扱いません。
+> API キーを使う場合: マシンの Claude Code に API キーが設定されていれば、エージェントはそれを使います。agentgw 自体がモデルの認証情報を扱うことはありません。
 
-**4. 使う**
+**4. 使ってみる**
 
-チャンネルでボットにメンションする(か DM する)。スレッドごとにセッションが分かれます。
+チャンネルでボットをメンションする(または DM を送る)だけです。スレッドごとに別のセッションになります。
 
 <details>
-<summary><b>ソースから入れる</b></summary>
+<summary><b>ソースからビルドする</b></summary>
 
 ```bash
 git clone https://github.com/takashito/agentgw.git && cd agentgw
@@ -190,199 +190,198 @@ cargo build --release
 
 </details>
 
-## Slack アプリ
+## Slack アプリの設定
 
-上のボタンを押すと、Slack の「マニフェストからアプリを作成」画面が、[`slack-app-manifest.json`](slack-app-manifest.json) の内容(権限、イベント、Socket Mode、Interactivity、DM のタブ)を入れた状態で開きます。インストーラもトークンを訊くときに同じリンクを出し、ブラウザで開きます。
+上のボタンを押すと、Slack の「Create an app from a manifest」画面が [`slack-app-manifest.json`](slack-app-manifest.json) の内容(スコープ、イベント、Socket Mode、Interactivity、DM タブ)が入力済みの状態で開きます。インストーラもトークンの入力時に同じリンクを表示し、ブラウザで開きます。
 
 <details>
-<summary><b>手で設定する場合</b></summary>
+<summary><b>手動で設定する場合</b></summary>
 
-[api.slack.com/apps](https://api.slack.com/apps) で **From a manifest** を選び、[`slack-app-manifest.json`](slack-app-manifest.json) を貼ってください。抜けていても何も言われずに動かなくなるのは次の3つです。
+[api.slack.com/apps](https://api.slack.com/apps) で **From a manifest** を選び、[`slack-app-manifest.json`](slack-app-manifest.json) の内容を貼り付けてください。次の3つは、設定が漏れていてもエラーが出ないまま動かなくなるので注意してください。
 
-- **Socket Mode** を On — agentgw は外から受ける口を開けません
-- **Interactivity** を On — Socket Mode でも要ります。無いと Allow / Deny のボタンが届きません
-- **App Home → Messages Tab** を On、読み取り専用にしない — 無いとボットに DM できず、`login` が打てません
+- **Socket Mode** を有効にする(agentgw は外部からの接続を受け付けるエンドポイントを公開しません)
+- **Interactivity** を有効にする(Socket Mode でも必要です。無効だと Allow / Deny ボタンが反応しません)
+- **App Home → Messages Tab** を有効にし、読み取り専用にしない(無効だとボットに DM を送れず、`login` を実行できません)
 
 </details>
 
-## マシンを足す
+## マシンの追加
 
-ゲートウェイで:
+ゲートウェイで実行します。
 
 ```bash
-agentgw add-machine user@host                   # ssh で入れる相手なら何でも(~/.ssh/config の別名も可)
-agentgw add-machine user@host --name build-box  # マシンの名前を決める(既定はホスト名)
-agentgw add-machine user@host -i ~/.ssh/id_ed25519  # 使う秘密鍵
-agentgw add-machine user@host -p                # ssh にパスワードを訊かせる(1回だけ)
-agentgw add-machine user@host -n                # 前回の経路を使わず、もう一度測り直す
+agentgw add-machine user@host                   # ssh で接続できるホストならどれでも(~/.ssh/config のエイリアスも可)
+agentgw add-machine user@host --name build-box  # マシン名を指定(デフォルトはホスト名)
+agentgw add-machine user@host -i ~/.ssh/id_ed25519  # 使用する秘密鍵
+agentgw add-machine user@host -p                # ssh のパスワード認証を使う(入力は1回だけ)
+agentgw add-machine user@host -n                # 前回の経路を使わず、接続経路を測り直す
 ```
 
-そのあと、任せたいチャンネルで `@agentgw route build-box:~/dev/app`。
+追加したら、担当させたいチャンネルで `@agentgw route build-box:~/dev/app` を実行します。
 
-`add-machine` は相手の OS を見て、合うバイナリとインストーラを届け、ゲートウェイにつなぎ、サービスを起動し、**リンクが立つまで見張ります**(マシン自身のログと、ゲートウェイから見えるかの両方。どちらかが先に言えばそこで終わり)。あとでもう一度打てば、そのマシンをゲートウェイと同じ版に揃えます。
+`add-machine` は接続先の OS を判別し、対応するバイナリとインストーラを転送してゲートウェイに接続し、サービスを起動したうえで、**接続が確立するまで監視します**(マシン側のログとゲートウェイ側の認識のどちらか早い方で判定)。あとで再度実行すると、そのマシンをゲートウェイと同じバージョンに揃えます。
 
-つなぎ方は、推測ではなく**測って**決めます。候補は**マシンの側から**一度にまとめて訊き、見るのは「そこでゲートウェイ自身が答えるか」です(`/status` はトークン無しだと `unauthorized` と答えます。ほかの何かがそう答えることはありません)。ゲートウェイがまだ開いていないアドレスは、訊いている間だけ開き、その経路に決まったら本当に開きます。
+接続経路は推測ではなく**実測で**決めます。候補はすべて**マシン側から**同時に試し、その経路でゲートウェイ自身が応答するかを確認します(トークンなしで `/status` にアクセスするとゲートウェイは `unauthorized` を返すので、他のサービスと区別できます)。ゲートウェイがまだ待ち受けていないアドレスは確認の間だけ一時的に開き、その経路に決まった時点で正式に待ち受けます。
 
-| つなぎ方 | どうつなぐか | 使うとき |
+| 接続方式 | 方法 | 使われる条件 |
 |---|---|---|
-| **直結** | マシンがゲートウェイにつなぐ — Tailscale の名前・LAN のアドレス、指定してあれば `AGENTGW_LINK_PUBLIC_URL` | マシンから訊いたときにゲートウェイが答えた場合 |
-| **ssh トンネル** | ゲートウェイがマシンへ `ssh -N -R` を張り続け、マシンは自分の loopback につなぐ | 直結でどれも答えなかった場合 |
+| **直接接続** | マシンからゲートウェイへ接続(Tailscale のホスト名、LAN のアドレス、または設定されていれば `AGENTGW_LINK_PUBLIC_URL`) | マシンから試したときにゲートウェイが応答した |
+| **ssh トンネル** | ゲートウェイがマシンに対して `ssh -N -R` を張り続け、マシンは自分のループバックアドレスに接続 | 直接接続の候補がどれも応答しなかった |
 
-複数つながるときはどれにするか訊かれます(1つだけなら黙ってそれ)。**測定で分かるのは「誰が答えたか」だけで、本当に張れるかは張ってみるまで分かりません。** なので測った結果は「順番」として扱い、上から順に設定して見張り、最初に張れた1本を採ります(最後は ssh トンネル)。張れた経路はゲートウェイが覚えていて、次の `add-machine` はそこから始まります — `-n` で測り直します。
+複数の経路が使える場合はどれを使うか尋ねられます(1つだけならそのまま採用します)。**実測でわかるのは「どこで応答があったか」までで、実際に接続を維持できるかはつないでみるまでわかりません。** そのため実測結果は優先順位として扱い、上から順に設定して監視し、最初に接続できた経路を採用します(ssh トンネルは最後)。採用された経路はゲートウェイが記録し、次回の `add-machine` はその経路から試します。`-n` を付けると測り直します。
 
-`install` は受け口の場所を訊きません。ゲートウェイは loopback だけで立ち上がり、**必要なアドレスは `add-machine` が開きます**。
+`install` は待ち受けアドレスを尋ねません。ゲートウェイは最初はループバックアドレスだけで待ち受け、**必要なアドレスは `add-machine` が追加します**。
 
-ゲートウェイで `agentgw status` を打つと、マシンごとのつなぎ方が出ます。Slack の `machines` では、どのアドレスで届くかも見られます。
+ゲートウェイで `agentgw status` を実行すると、各マシンの接続方式を確認できます。Slack の `machines` コマンドでは、各マシンにどのアドレスで到達できるかも確認できます。
 
+### Windows マシン
 
-### Windows のマシン
+Windows はマシンとして利用できます(ゲートウェイには macOS か Linux が必要です)。Windows には標準で SSH サーバーがないため、`add-machine user@host` ではなく、Windows 側で `install.ps1` を実行してインストールします。
 
-Windows はマシンとして使えます(ゲートウェイには macOS か Linux が必要です)。Windows は既定で SSH サーバーを持たないため、`add-machine user@host` ではなく、そのマシンの上で `install.ps1` を実行してインストールします。
-
-**必要なもの**
+**動作要件**
 
 | | |
 |---|---|
 | **OS** | Windows 11(ARM64 / x86_64) |
-| **Claude Code** | 単体の CLI([インストール](https://docs.claude.com/ja/docs/claude-code))。サインイン済みであること |
-| **psmux** | [psmux](https://github.com/marlocarlo/psmux)(Windows 版 tmux)。無ければ `winget` で導入されます |
-| **ネットワーク** | マシンから Tailscale 経由、または `AGENTGW_LINK_PUBLIC_URL` でゲートウェイに届くこと。受信用のポートは開きません |
+| **Claude Code** | スタンドアロン版の CLI([インストール](https://docs.claude.com/ja/docs/claude-code))。サインイン済みであること |
+| **psmux** | [psmux](https://github.com/marlocarlo/psmux)(Windows 版 tmux)。未インストールなら `winget` で導入されます |
+| **ネットワーク** | Tailscale 経由、または `AGENTGW_LINK_PUBLIC_URL` でゲートウェイに到達できること。受信ポートの開放は不要です |
 
-**インストール**
+**インストール手順**
 
-1. ゲートウェイで、新しいマシン用の接続文字列を作ります。
+1. ゲートウェイで、追加するマシン用の接続文字列を生成します。
 
    ```bash
    agentgw add-machine --print win-box
    ```
 
-   接続文字列はゲートウェイへの参加を許可するものです。外部に漏らさないでください。
+   接続文字列があればゲートウェイに参加できてしまうため、他人に知られないよう扱ってください。
 
-2. Windows のマシンで、**管理者として実行**した PowerShell(Windows PowerShell 5.1 / PowerShell 7)から実行します。
+2. Windows で、**管理者として実行**した PowerShell(Windows PowerShell 5.1 / PowerShell 7 のどちらでも可)から次を実行します。
 
    ```powershell
    irm https://raw.githubusercontent.com/takashito/agentgw/main/scripts/install.ps1 -OutFile install.ps1
    powershell -ExecutionPolicy Bypass -File install.ps1
    ```
 
-   インストーラは psmux と Claude Code を確認し、CPU に合うバイナリをダウンロードしてチェックサムを検証したうえで、マシン名と接続文字列の入力を求め、サービスを登録します。
+   インストーラは psmux と Claude Code を確認し、CPU に合ったバイナリをダウンロードしてチェックサムを検証します。その後、マシン名と接続文字列を入力するとサービスが登録されます。
 
 3. チャンネルをマシンに割り当てます: `@agentgw route win-box:C:\path\to\project`
 
 **サービス**
 
-agentgw はスケジュールタスク `com.agentgw.bridge` として動作します。起動時に開始し、ユーザーのサインインの有無にかかわらず動き続けます。登録には管理者権限とアカウントのパスワードが必要です。パスワードはタスク スケジューラに渡され、agentgw は保存しません。`restart` / `shutdown` / `start` / `status` / `uninstall` / `update` は macOS・Linux と同じように動作します。以後の更新は `update` で配布され、`install.ps1` は初回のインストールにだけ使います。
+agentgw はタスクスケジューラのタスク `com.agentgw.bridge` として動作します。OS の起動時に開始され、ユーザーがサインインしているかどうかに関係なく動き続けます。登録には管理者権限とアカウントのパスワードが必要です。パスワードはタスクスケジューラに渡されるだけで、agentgw が保存することはありません。`restart` / `shutdown` / `start` / `status` / `uninstall` / `update` は macOS・Linux と同じように使えます。以降のアップデートは `update` で配信されるので、`install.ps1` を使うのは初回だけです。
 
 **シェル**
 
-| Claude Code のツール | シェル |
+| Claude Code のツール | 使われるシェル |
 |---|---|
 | Bash | Git Bash(インストールされている場合) |
-| PowerShell | PowerShell 7(利用できる場合)、なければ Windows PowerShell 5.1 |
+| PowerShell | PowerShell 7(利用可能な場合)。なければ Windows PowerShell 5.1 |
 
-Microsoft Store 版の PowerShell 7 は対話的なサインインなしでは起動できないため、使用しません。利用できるシェルはサービスの起動時に検出され、`agentgw status` で確認できます。
+Microsoft Store 版の PowerShell 7 は、ユーザーがサインインしていない状態では起動できないため使用しません。利用できるシェルはサービス起動時に検出され、`agentgw status` で確認できます。
 
-## Slack のコマンド
+## Slack コマンド
 
-ボットにメンションする(`@agentgw <コマンド>`)か、ボットが作業中のスレッドに打ちます。
+ボットをメンションする(`@agentgw <コマンド>`)か、ボットが作業中のスレッドに投稿します。
 
-| コマンド | すること |
+| コマンド | 内容 |
 |---|---|
-| `stop` | 実行中のターンを止める(🛑 のリアクションでも可) |
-| `exit` · `bye` · `done` | このスレッドのエージェントを終える。次に書けば再開する |
-| `compact` | コンテキストを圧縮する(進捗バー付き) |
-| `model [fable\|opus\|sonnet\|haiku]` | モデルを見る・切り替える |
-| `effort [low\|medium\|high\|xhigh\|max\|…]` | effort を見る・決める |
-| `mode [manual\|plan\|edit\|auto]` | 権限モードを見る・切り替える |
-| `context` | このエージェントのコンテキストの使用量 |
-| `resume` | このセッションを手元の端末で続けるコマンド |
-| `usage` | Claude のサブスクリプションの使用状況 |
-| `status` | 版・動いているスレッド・待機中のエージェント |
-| `route` | このチャンネルとほかのチャンネルを受け持つマシンを見る |
-| `machines` | ゲートウェイと各マシン。どうつながっていて、どのアドレスから来ているか、どの版が動いているか |
-| `rename-machine <今の名前> <新しい名前>` | マシンの名前を変える。受け持つチャンネルとスレッドも新しい名前に付いていく。つながっているマシンだけ |
-| `update [版]` | 最新の release をゲートウェイに、次に各マシンへ1台ずつ入れる(ゲートウェイの端末で `agentgw update` でも同じ)。release せずに試すときは、`cargo dist` の後にリポのフォルダで `agentgw update local`(ゲートウェイでもマシンでも) |
-| `pwd` | このスレッドの作業ディレクトリを見る |
-| `cd <パス>` · `cd <マシン>[:<パス>]` | **このスレッド**をそのフォルダへ移す。マシン名を書くとそのマシンへ(会話ごと)。フォルダが無ければ、作るかどうかをボタンで訊く |
-| `route <パス>` · `route <マシン>[:<パス>]` | **このチャンネル**の作業ディレクトリとマシンを決める(次に立つスレッドの既定)。フォルダが無ければ、作るかどうかをボタンで訊く。「はい」なら、このスレッドで動いているセッションも移す |
-| `warm on\|off` | このチャンネルのエージェントを前もって起動しておくか(既定は off) |
-| `set-home` | 通知(online / offline / エラー)をこのチャンネルに出す |
-| `allow-bot @bot` · `remove-bot @bot` | ほかのボットの投稿から作業を始められるようにする / やめる |
-| `login` · `logout` | Claude Code を自分のアカウントでサインイン(DM で)· サインアウトして全エージェントを止める |
-| `help` | コマンドの一覧 |
+| `stop` | 実行中のターンを停止(🛑 リアクションでも可) |
+| `exit` · `bye` · `done` | このスレッドのエージェントを終了。次に投稿すると再開 |
+| `compact` | コンテキストを圧縮(進捗バー付き) |
+| `model [fable\|opus\|sonnet\|haiku]` | モデルの確認・切り替え |
+| `effort [low\|medium\|high\|xhigh\|max\|…]` | effort の確認・設定 |
+| `mode [manual\|plan\|edit\|auto]` | 権限モードの確認・切り替え |
+| `context` | このエージェントのコンテキスト使用量 |
+| `resume` | このセッションを手元のターミナルで再開するためのコマンドを表示 |
+| `usage` | Claude サブスクリプションの使用量 |
+| `status` | バージョン、稼働中のスレッド、待機中のエージェント |
+| `route` | このチャンネルとほかのチャンネルの担当マシンを表示 |
+| `machines` | ゲートウェイと各マシンの一覧(接続方式、接続元アドレス、動作中のバージョン) |
+| `rename-machine <現在の名前> <新しい名前>` | マシン名を変更。担当チャンネルとスレッドも引き継がれます。接続中のマシンのみ |
+| `update [バージョン]` | 最新のリリースをゲートウェイに、続いて各マシンに1台ずつインストール(ゲートウェイのターミナルで `agentgw update` を実行しても同じ)。リリース前のビルドを試すには、リポジトリのディレクトリで `cargo dist` を実行したあと `agentgw update local`(ゲートウェイ・マシンのどちらでも可) |
+| `pwd` | このスレッドの作業ディレクトリを表示 |
+| `cd <パス>` · `cd <マシン>[:<パス>]` | **このスレッド**の作業ディレクトリを変更。マシン名を指定するとそのマシンに会話ごと移動。フォルダがなければ作成するかボタンで確認 |
+| `route <パス>` · `route <マシン>[:<パス>]` | **このチャンネル**の作業ディレクトリと担当マシンを設定(以降に作られるスレッドに適用)。フォルダがなければ作成するかボタンで確認し、「はい」ならこのスレッドで動いているセッションも移動 |
+| `warm on\|off` | このチャンネルのエージェントを事前に起動しておくか(デフォルトは off) |
+| `set-home` | 通知(online / offline / エラー)の投稿先をこのチャンネルにする |
+| `allow-bot @bot` · `remove-bot @bot` | ほかのボットの投稿から作業を開始できるようにする / 解除する |
+| `login` · `logout` | Claude Code に自分のアカウントでサインイン(DM で実行)· サインアウトしてすべてのエージェントを停止 |
+| `help` | コマンド一覧 |
 
-チャンネルごとの Claude は、`ask_channel` ツールで互いに仕事を頼み合う。依頼は相手のチャンネルですぐに始まり、返事は依頼したスレッドに戻る。終わったら、依頼した Claude が `end_ask` でそのスレッドを閉じる。やり取りはすべて Slack に残る。
+チャンネルごとの Claude は、`ask_channel` ツールで互いに作業を依頼できます。依頼は相手のチャンネルですぐに開始され、返答は依頼元のスレッドに届きます。完了したら、依頼した側の Claude が `end_ask` でスレッドを閉じます。やり取りはすべて Slack に残ります。
 
 ## CLI
 
 ```bash
-agentgw status               # 役割、マシンとそのつなぎ方、チャンネルの担当
-agentgw add-machine <ssh>    # マシンを加える・版を揃える
-agentgw restart              # 新しいバイナリに入れ替える(動いているエージェントはそのまま)
-agentgw shutdown             # サービスとエージェントを止める
-agentgw start              # サービスを起こす
-agentgw uninstall          # サービスの定義を消す(トークンと状態は残る)
+agentgw status               # 役割、マシンと接続方式、チャンネルの担当
+agentgw add-machine <ssh>    # マシンの追加・バージョンの更新
+agentgw restart              # 新しいバイナリに切り替え(動作中のエージェントはそのまま)
+agentgw shutdown             # サービスとエージェントを停止
+agentgw start                # サービスを起動
+agentgw uninstall            # サービスの登録を削除(トークンと状態は残ります)
 agentgw --version
 ```
 
-agentgw の表示は英語です。日本語にするには `~/.local/state/agentgw/.env` に `AGENTGW_LANG=ja` を書いて `agentgw restart` してください(Slack・CLI・インストーラのすべてが日本語になります)。
+agentgw の表示言語はデフォルトで英語です。日本語にするには、`~/.local/state/agentgw/.env` に `AGENTGW_LANG=ja` を追加して `agentgw restart` を実行してください(Slack、CLI、インストーラのすべてが日本語になります)。
 
 <details>
-<summary><b>置かれるファイル</b></summary>
+<summary><b>ファイルの配置</b></summary>
 
-どのマシンも同じ形です。
+どのマシンでも構成は同じです。
 
-| 場所 | 中身 |
+| パス | 内容 |
 |---|---|
-| `~/.local/bin/agentgw` | 本体 |
-| `~/.local/state/agentgw/` | 状態の置き場(`AGENTGW_STATE_DIR` で変えられる) |
-| ├ `.env` | 設定とトークン(権限 600) |
-| ├ `access.json` | Owner、通知先、チャンネルの担当、作業ディレクトリ、待機中のエージェント |
-| ├ `threads.json` | Slack のスレッドとセッションの対応 |
-| ├ `plugin-debug.log` | 全体のログ(大きくなると `.1` に回す) |
-| ├ `logs/` | スレッドごと・セッションごとのログと、`service.out.log` / `service.err.log` |
-| └ `inbox/` | ダウンロードした Slack の添付 |
-| `~/Library/LaunchAgents/com.agentgw.bridge.plist` | サービスの定義(macOS) |
-| `~/.config/systemd/user/agentgw-bridge.service` | サービスの定義(Linux) |
-| タスク スケジューラのタスク `com.agentgw.bridge` | サービスの定義(Windows) |
-| `$TMPDIR/agentgw-agentgw/` | エージェントに渡す hook と MCP の設定(起動のたびに作り直す) |
-| tmux のセッション `agentgw-workers` | エージェント1つ = 窓1つ |
+| `~/.local/bin/agentgw` | バイナリ |
+| `~/.local/state/agentgw/` | 状態ディレクトリ(`AGENTGW_STATE_DIR` で変更可能) |
+| ├ `.env` | 設定とトークン(パーミッション 600) |
+| ├ `access.json` | Owner、通知先、チャンネルの担当、作業ディレクトリ、待機エージェントの設定 |
+| ├ `threads.json` | Slack のスレッドとセッションの対応表 |
+| ├ `plugin-debug.log` | メインのログ(`.1` にローテーション) |
+| ├ `logs/` | スレッドごと・セッションごとのログと `service.out.log` / `service.err.log` |
+| └ `inbox/` | ダウンロードした Slack の添付ファイル |
+| `~/Library/LaunchAgents/com.agentgw.bridge.plist` | サービス定義(macOS) |
+| `~/.config/systemd/user/agentgw-bridge.service` | サービス定義(Linux) |
+| タスクスケジューラのタスク `com.agentgw.bridge` | サービス定義(Windows) |
+| `$TMPDIR/agentgw-agentgw/` | エージェントに渡す hook と MCP の設定(起動のたびに再生成) |
+| tmux セッション `agentgw-workers` | エージェントごとに1ウィンドウ |
 
-Windows では、本体は `%USERPROFILE%\.local\bin\agentgw.exe`、状態ディレクトリは `%LOCALAPPDATA%\agentgw\` です。構成は同じで、加えて `logs\supervise.log` と `logs\agentgw.out.log`(スケジュールタスクの出力)、`shells.txt`(検出したシェル)があります。エージェントは psmux のサーバー `agentgw` の中で動きます。
+Windows では、バイナリは `%USERPROFILE%\.local\bin\agentgw.exe`、状態ディレクトリは `%LOCALAPPDATA%\agentgw\` です。構成は同じで、加えて `logs\supervise.log` と `logs\agentgw.out.log`(スケジュールタスクの出力)、`shells.txt`(検出したシェル)があります。エージェントは psmux のサーバー `agentgw` 上で動きます。
 
 </details>
 
 ## セキュリティ
 
-- **作業を始められるのも、コマンドを打てるのも Owner だけ**(最初に `login` で Claude Code をサインインさせた人)。動いているスレッドでのほかの人の発言は、文脈としてだけエージェントに渡ります。誰かのアカウントで動く共有のボットではありません。
-- **エージェントは自分の認証情報で動きます** — 自分の Claude のサブスクリプションか、そのマシンの Claude Code に設定した API キー。agentgw はモデルの認証情報を一切扱いません。サインインは Claude Code 自身のサインインの手順で行います。サインインはマシンごとに持ち、切れたときはそのマシンが受け持つチャンネルで `login` と送ります。
-- **エージェントは agentgw を入れたユーザーの権限で動き**、そのユーザーにできることは何でもできます。`root` ではなく専用のユーザーで入れてください(例: `agentgw add-machine agent@host`)。
-- **トークンは手元にだけ置きます。** `.env` に権限 600 で。ほかのマシンは app トークンを受け取らず、bot トークンもメモリにだけ置きます。
-- **ゲートウェイとマシンの接続の鍵はパスワードと同じです。** 持っている人はマシンとして参加し、そのマシン宛のメッセージを受け取れます。`add-machine` は ssh の標準入力で渡し、コマンドラインには載せません。
-- **ツールの使用は前もって確認できます。** `manual` モードでは、ツールを使うたびに Slack で確認を待ちます。1回だけ許可・このスレッドでは許可・このチャンネルでは許可・拒否 から選べます。
-- **マシンはポートを開けません。** ゲートウェイは既定では `127.0.0.1:8787` だけを開き、`add-machine` がそのマシンに必要だと分かったアドレス(LAN か tailnet のアドレス。`0.0.0.0` にはしません)だけを足します。そこに TLS はないので、LAN・Tailscale・ssh トンネルの内側に置いてください。
-- **macOS の署名。** 端末から実行すると、インストーラが自己署名の署名用の身元を一度だけ作ります。これで更新しても macOS の許可が消えません。
+- **作業の開始やコマンドの実行ができるのは Owner だけです**(最初に `login` で Claude Code にサインインした人)。稼働中のスレッドでのほかの人の発言は、文脈としてエージェントに渡されるだけです。他人のアカウントで動く共有ボットではありません。
+- **エージェントは自分の認証情報で動きます。** 自分の Claude サブスクリプション、またはそのマシンの Claude Code に設定した API キーを使います。agentgw はモデルの認証情報を扱わず、サインインは Claude Code 自身の手順で行います。サインイン状態はマシンごとに管理され、切れた場合はそのマシンが担当するチャンネルで `login` を送ってください。
+- **エージェントは agentgw をインストールしたユーザーの権限で動作し**、そのユーザーにできることはすべて実行できます。`root` ではなく専用のユーザーでインストールしてください(例: `agentgw add-machine agent@host`)。
+- **トークンはローカルにのみ保存されます。** `.env` にパーミッション 600 で保存します。ほかのマシンには app トークンは渡らず、bot トークンもメモリ上にだけ保持されます。
+- **ゲートウェイとマシンをつなぐ接続用シークレットは、パスワードと同様に扱ってください。** これを知っている人はマシンとして参加し、そのマシン宛てのメッセージを受け取れます。`add-machine` はシークレットを ssh の標準入力で渡し、コマンドラインには載せません。
+- **ツールの実行を事前に確認できます。** `manual` モードでは、ツールを実行するたびに Slack で承認を待ちます。今回だけ許可、このスレッドでは許可、このチャンネルでは許可、拒否から選べます。
+- **マシン側でポートを開く必要はありません。** ゲートウェイはデフォルトで `127.0.0.1:8787` だけで待ち受け、`add-machine` は各マシンに必要なアドレス(LAN または tailnet のアドレス。`0.0.0.0` は使いません)だけを追加します。この通信には TLS がないため、LAN、Tailscale、ssh トンネルなど信頼できるネットワークの内側で使ってください。
+- **macOS のコード署名。** ターミナルから実行すると、インストーラが自己署名のコード署名用 ID を一度だけ作成します。これにより、アップデート後も macOS の権限設定が維持されます。
 
-## できないこと
+## 制限事項
 
-- **Slack と Claude Code だけ。** ほかのチャットやエージェントの CLI には対応していません。
-- **Owner は1人。** 複数人で使うサービスではありません。ほかの人はスレッドを追って文脈を足せますが、作業を始めたりコマンドを打ったりはできません。
-- **Windows はマシンとしてのみ対応。** ゲートウェイには macOS か Linux が必要です。Windows の x86_64 版は実機での検証がまだです。
-- **Slack アプリ1つにプロセス1つ。** 同じ app トークンでゲートウェイを2つ動かすと、Slack がイベントを振り分けます。アプリを分けてください。
+- **Slack と Claude Code のみ対応しています。** ほかのチャットツールやエージェント CLI には対応していません。
+- **Owner は1人だけです。** マルチユーザー向けのサービスではありません。ほかの人もスレッドを見て文脈を追加できますが、作業の開始やコマンドの実行はできません。
+- **Windows はマシンとしてのみ対応しています。** ゲートウェイには macOS か Linux が必要です。Windows の x86_64 版は実機での動作確認がまだです。
+- **1つの Slack アプリにつき1プロセスです。** 同じ app トークンで2つのゲートウェイを動かすと、Slack のイベントが両者に振り分けられてしまいます。ゲートウェイごとに別のアプリを用意してください。
 
-## 困ったとき
+## トラブルシューティング
 
-| 症状 | 見るところ |
+| 症状 | 確認する場所 |
 |---|---|
-| Slack で何も起きない | `agentgw status`、次に `~/.local/state/agentgw/plugin-debug.log` |
-| サービスが起きない・再起動を繰り返す | `~/.local/state/agentgw/logs/service.err.log` |
-| Allow / Deny を押しても何も起きない | Slack アプリで **Interactivity** を On に |
-| ボットに DM できない | Slack アプリで **App Home → Messages Tab** を On に |
-| 一部のメッセージにしか返事が来ない | 同じ app トークンを別のプロセスも使っている |
-| マシンがオフラインになる | ゲートウェイの `agentgw status`、そのマシンの `service.err.log` |
-| 更新後、エージェントが新しいツールの引数を使えない | そのエージェントで `/mcp` を打つ(起動時のツール一覧を持ち続けているため) |
-| Windows のマシンがつながらない | そのマシンで `agentgw status`、次に `%LOCALAPPDATA%\agentgw\logs\supervise.log` |
-| 「このシェルからは systemd のユーザーセッションに届かない」と出る | そのユーザーの systemd が常駐していません。`loginctl enable-linger $USER` を実行してログインし直す |
+| Slack で何も反応しない | `agentgw status`、次に `~/.local/state/agentgw/plugin-debug.log` |
+| サービスが起動しない、再起動を繰り返す | `~/.local/state/agentgw/logs/service.err.log` |
+| Allow / Deny ボタンを押しても反応しない | Slack アプリの **Interactivity** を有効にする |
+| ボットに DM を送れない | Slack アプリの **App Home → Messages Tab** を有効にする |
+| 一部のメッセージにしか返信がない | 同じ app トークンを別のプロセスも使っている |
+| マシンがオフラインになる | ゲートウェイで `agentgw status`、そのマシンの `service.err.log` |
+| アップデート後、エージェントが新しいツールのオプションを使えない | そのエージェントで `/mcp` を実行する(起動時のツール一覧を保持し続けるため) |
+| Windows マシンが接続されない | そのマシンで `agentgw status`、次に `%LOCALAPPDATA%\agentgw\logs\supervise.log` |
+| 「This shell can't reach your systemd user session」(日本語表示では「このシェルからは systemd のユーザーセッションに届かない」)と表示される | そのユーザーの systemd インスタンスが動いていません。`loginctl enable-linger $USER` を実行してログインし直してください |
 
 ## 開発
 
@@ -390,13 +389,13 @@ Windows では、本体は `%USERPROFILE%\.local\bin\agentgw.exe`、状態ディ
 cargo build && cargo test
 AGENTGW_STATE_DIR=$HOME/.local/state/agentgw-dev ./target/debug/agentgw serve
 
-cargo dist              # 配布バイナリ: macOS(arm64)、Linux(x86_64、musl)、Windows(arm64、x86_64)
-./scripts/release.sh    # GitHub の release に上げる
+cargo dist              # 配布用バイナリ: macOS(arm64)、Linux(x86_64、musl)、Windows(arm64、x86_64)
+./scripts/release.sh    # GitHub のリリースとしてアップロード
 ```
 
-`cargo dist` には [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild)、zig、対象ごとの `rustup target add` が要ります。本番と並べて開発用を動かすときは、`AGENTGW_STATE_DIR` と **Slack アプリの両方**を分けてください。
+`cargo dist` には [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild)、zig、ターゲットごとの `rustup target add` が必要です。本番環境と並行して開発用インスタンスを動かす場合は、`AGENTGW_STATE_DIR` に加えて **Slack アプリも別に**用意してください。
 
-Issue と Pull Request を歓迎します。不具合や質問は [Issue](https://github.com/takashito/agentgw/issues) へ。
+Issue や Pull Request は歓迎します。バグ報告や質問は [Issue](https://github.com/takashito/agentgw/issues) からどうぞ。
 
 ## ライセンス
 
