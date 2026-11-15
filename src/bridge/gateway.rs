@@ -1227,8 +1227,14 @@ impl<'a> Event<'a> {
 
     /// **The bot itself was brought into a channel** (not a person joining one the bot is in). DMs
     /// have no join event, but a DM id is refused anyway: a DM is always the gateway's.
+    ///
+    /// Read from the "has joined the channel" message (`channel_join`) as well as from
+    /// `member_joined_channel`: **an app may not be sent the latter at all** — one running for months
+    /// had none in its logs, while the message came every time. Either one asks only once (`JoinBook`).
     pub fn is_the_bot_joining(&self, bot_user_id: Option<&str>) -> bool {
-        self.name == "member_joined_channel"
+        let joined = self.name == "member_joined_channel"
+            || (self.name == "message" && self.str_at("subtype") == Some("channel_join"));
+        joined
             && bot_user_id.is_some()
             && self.user() == bot_user_id
             && self.channel().is_some_and(|c| !crate::chat::slack::SlackId::is_dm(c))
@@ -7054,6 +7060,28 @@ mod tests {
         fleet.on_event("member_joined_channel", &bot_joined("U_BOT")).await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(frames.try_recv().is_err(), "the bot's join is the gateway's");
+        assert!(!posts(&api).contains("post_blocks"), "{}", posts(&api));
+    }
+
+    /// The "has joined the channel" message is what Slack reliably sends; it asks as the event does.
+    #[tokio::test]
+    async fn the_bots_join_message_asks_too() {
+        let (fleet, api) = joining_fleet("join-message").await;
+        let (c, mut frames) = conn();
+        fleet.links.register("mac", c);
+        let joined = |user: &str| serde_json::json!({
+            "type": "message", "subtype": "channel_join", "user": user, "channel": "C1", "ts": "5.5",
+            "text": format!("<@{user}> has joined the channel"),
+        });
+        fleet.on_event("message", &joined("U_BOT")).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(frames.try_recv().is_err(), "the bot's join is the gateway's");
+        assert!(posts(&api).contains("post_blocks C1 -"), "{}", posts(&api));
+        // A person's join message is not the bot's
+        let (fleet, api) = joining_fleet("join-message-person").await;
+        fleet.links.register("mac", conn().0);
+        fleet.on_event("message", &joined("U_PERSON")).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(!posts(&api).contains("post_blocks"), "{}", posts(&api));
     }
 
