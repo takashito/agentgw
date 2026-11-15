@@ -307,6 +307,11 @@ struct Sticky {
     last_flush_ms: Option<u64>,
     /// A permission wait expired. The note stays until the next round.
     perm_timed_out: bool,
+    /// Opened under an answer by work that went on after it. Narration here is **held** until a
+    /// tool follows it: then it introduces that work and is drawn above it. Narration that no tool
+    /// follows is the agent summing up its reply for its terminal, and is never drawn.
+    after_answer: bool,
+    held: Vec<String>,
 }
 
 /// thread_key → the progress message in flight. One per thread (no pagination).
@@ -364,7 +369,13 @@ impl StickyBoard {
             Some(false) if !by_tool => false,
             _ => {
                 self.settled.remove(key);
-                self.stickies.insert(key.clone(), Sticky::default());
+                self.stickies.insert(
+                    key.clone(),
+                    Sticky {
+                        after_answer: true,
+                        ..Sticky::default()
+                    },
+                );
                 true
             }
         }
@@ -432,14 +443,19 @@ impl StickyBoard {
                     cur_agent.launched_name = agent.launched_name.clone();
                 }
             }
-            _ => s.items.push(RenderItem::Tool {
-                id: tool_use_id.to_string(),
-                name: name.to_string(),
-                summary: summary.to_string(),
-                status,
-                agent: agent.clone(),
-                diff,
-            }),
+            _ => {
+                // Held narration introduced this tool: it goes above it
+                let held = std::mem::take(&mut s.held);
+                s.items.extend(held.into_iter().map(|text| RenderItem::Narration { text }));
+                s.items.push(RenderItem::Tool {
+                    id: tool_use_id.to_string(),
+                    name: name.to_string(),
+                    summary: summary.to_string(),
+                    status,
+                    agent: agent.clone(),
+                    diff,
+                });
+            }
         }
         s.dirty = true;
     }
@@ -454,7 +470,7 @@ impl StickyBoard {
         // Narration right after the answer is **dropped**. It is the agent summing up what it just
         // replied, for its terminal: it used to be kept and drawn above the next tool, which put the
         // reply's own words a second time under the reply. Narration after a real tool has opened a
-        // new progress message is drawn as usual (`settled` is gone by then)
+        // new progress message is held until another tool follows it (`Sticky::after_answer`)
         if self.settled.get(key) == Some(&true) {
             return;
         }
@@ -462,6 +478,10 @@ impl StickyBoard {
             return;
         }
         let s = self.stickies.entry(key.clone()).or_default();
+        if s.after_answer {
+            s.held.push(text.to_string());
+            return;
+        }
         s.items.push(RenderItem::Narration {
             text: text.to_string(),
         });
@@ -1872,7 +1892,9 @@ mod tests {
         // or the reply's words appear a second time under the reply
         b.push_narration(&k, "Slack に返信しました。要点は…");
         b.tool_at(&k, "t2", "Read", "/x", ToolStatus::Done);
-        b.push_narration(&k, "ついでに調べました");
+        b.push_narration(&k, "ついでに調べます");
+        b.tool_at(&k, "t3", "Grep", "foo", ToolStatus::Done);
+        b.push_narration(&k, "まとめると以上です");
         let dirty = b.take_dirty(99_000);
         assert_eq!(dirty.len(), 1);
         assert_eq!(dirty[0].1, None, "返事の下に**新しく**出す(編集ではない)");
@@ -1882,8 +1904,13 @@ mod tests {
             text_of(&dirty[0].2)
         );
         assert!(
-            text_of(&dirty[0].2).contains("● ついでに調べました"),
-            "ツールのあとの地の文は出す: {}",
+            text_of(&dirty[0].2).contains("● ついでに調べます"),
+            "次のツールを前置きする地の文は出す: {}",
+            text_of(&dirty[0].2)
+        );
+        assert!(
+            !text_of(&dirty[0].2).contains("まとめると"),
+            "後にツールが続かない地の文(まとめ)は出さない: {}",
             text_of(&dirty[0].2)
         );
         assert!(text_of(&dirty[0].2).contains("Read"), "{}", text_of(&dirty[0].2));
@@ -1981,6 +2008,53 @@ mod tests {
         b.on_turn_start(&k);
         b.tool_at(&k, "w1", "ScheduleWakeup", "", ToolStatus::Done);
         assert!(b.take_dirty(100_000).is_empty(), "予約の行は出さない");
+    }
+
+    /// The live case behind the second report: reply → booking → **one real tool** (adding a
+    /// link to the issue) → the agent sums up its reply for its terminal → the turn ends. The tool
+    /// rightly opened a progress message under the answer, and the summary that followed it was
+    /// drawn there -- the reply's words a second time, right under the reply.
+    ///
+    /// Under an answer, narration is **held until a tool follows it** (then it introduces that
+    /// work and is drawn above it). What is still held when the round ends is the summing up, and
+    /// it is dropped.
+    #[test]
+    fn the_summing_up_after_work_that_followed_a_reply_is_not_drawn() {
+        let k = ThreadKey::parse("k");
+        let mut b = StickyBoard::default();
+        b.on_turn_start(&k);
+        b.tool_at(&k, "t1", "Bash", "ls", ToolStatus::Done);
+        b.set_posted(&k, "999.1");
+        let _ = b.take_dirty(10_000);
+        assert!(matches!(b.settle(&k, "reply"), StickyAction::Keep));
+        b.tool_at(&k, "w", "ScheduleWakeup", "", ToolStatus::Done);
+        b.tool_at(&k, "t2", "mcp__claude_ai_Linear__save_issue", "HOME-19", ToolStatus::Pending);
+        b.tool_at(&k, "t2", "mcp__claude_ai_Linear__save_issue", "HOME-19", ToolStatus::Done);
+        b.push_narration(&k, "依頼を出しました。要点は…");
+        let dirty = b.take_dirty(99_000);
+        assert_eq!(dirty.len(), 1, "本物のツールは返事の下に付箋を開く");
+        assert!(
+            !text_of(&dirty[0].2).contains("要点"),
+            "ツールのあとの返事のまとめを付箋に載せない: {}",
+            text_of(&dirty[0].2)
+        );
+        assert!(!text_of(&dirty[0].2).contains("ScheduleWakeup"), "{}", text_of(&dirty[0].2));
+        b.on_turn_end(&k);
+        if let Some((_, last)) = b.take_final(&k) {
+            assert!(!text_of(&last).contains("要点"), "{}", text_of(&last));
+        }
+
+        // Narration that a tool follows introduces that work: drawn, above it
+        let mut c = StickyBoard::default();
+        c.on_turn_start(&k);
+        c.set_posted(&k, "999.2");
+        assert!(matches!(c.settle(&k, "reply"), StickyAction::Keep));
+        c.tool_at(&k, "t1", "Read", "/a", ToolStatus::Done);
+        c.push_narration(&k, "もう一つ調べます");
+        c.tool_at(&k, "t2", "Read", "/b", ToolStatus::Done);
+        let text = text_of(&c.take_dirty(99_000)[0].2);
+        let (said, read_b) = (text.find("● もう一つ調べます"), text.rfind("/b"));
+        assert!(said.is_some() && said < read_b, "{text}");
     }
 
     #[test]
