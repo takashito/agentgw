@@ -217,7 +217,7 @@ agentgw add-machine user@host -p                # let ssh ask for a password (on
 agentgw add-machine user@host -n                # measure the route again instead of reusing the last one
 ```
 
-Then hand it a channel — in that channel: `@agentgw route build-box:~/dev/app`.
+Then hand it a channel — in that channel, mention the bot and type `route build-box:~/dev/app`.
 
 `add-machine` checks the remote OS, sends the matching binary and the installer, links the machine, starts the service and **watches until the link comes up** (the machine's own log and the gateway's view, either one). Run it again later to bring that machine to the gateway's version.
 
@@ -274,7 +274,7 @@ Windows is supported as a machine; the gateway requires macOS or Linux. Windows 
 
    The installer checks psmux and Claude Code, downloads the binary for the CPU and verifies its checksum, prompts for the machine name and the connection string, and registers the service.
 
-3. Route a channel to the machine: `@agentgw route win-box:C:\path\to\project`.
+3. Route a channel to the machine: in that channel, mention the bot and type `route win-box:C:\path\to\project`.
 
 **Service**
 
@@ -291,7 +291,7 @@ The Microsoft Store edition of PowerShell 7 cannot start without an interactive 
 
 ## Slack commands
 
-Mention the bot (`@agentgw <command>`), or type in a thread it's working in.
+Mention the bot followed by the command (the bot is named `agentgw` unless the Slack app was renamed), or type in a thread it's working in.
 
 | Command | What it does |
 |---|---|
@@ -317,6 +317,8 @@ Mention the bot (`@agentgw <command>`), or type in a thread it's working in.
 | `allow-bot @bot` · `remove-bot @bot` | Let another bot's messages start work |
 | `login` · `logout` | Sign Claude Code in to your account (by DM) · sign out and stop all agents |
 | `help` | All commands |
+
+When the bot is added to a channel that has no machine yet, it asks the Owner in that channel which machine should handle it, with one button per connected machine and a **Later** button. The chosen machine works in its home folder; `route <machine>:<path>` picks another folder. When only the gateway is connected, the gateway takes the channel without asking. A channel that an agent creates with `create_channel`, or brings the bot into with `join_channel`, goes to that agent's machine without asking. A channel that already has a machine keeps it.
 
 The Claudes in different channels ask each other for work with the `ask_channel` tool. A request starts in the other channel at once, its reply comes back to the thread that asked, and the asking Claude closes the thread it asked with `end_ask` once it is done. The whole exchange stays in Slack.
 
