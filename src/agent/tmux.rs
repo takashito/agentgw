@@ -253,6 +253,18 @@ impl Tmux {
         self.send_enter(w)
     }
 
+    /// Drops `keys` from the tmux server's global environment, which every new window starts from.
+    ///
+    /// **The server outlives the Bridge** (it is kept across restarts so the agents live on), so
+    /// it still holds whatever environment the Bridge that first started it had — from older builds,
+    /// the Slack tokens. Keeping them out of the Bridge's own environment is not enough while that
+    /// server runs. No server yet, or a tmux that refuses: nothing to drop, so failures are ignored.
+    pub fn forget_env(&self, keys: &[&str]) {
+        for key in keys {
+            let _ = (self.run)(&["set-environment", "-g", "-u", key]);
+        }
+    }
+
     /// Kills the whole window. **By window_id (`@N`)** — names move on rename.
     pub fn kill_window(&self, w: &Window) -> Result<(), String> {
         (self.run)(&["kill-window", "-t", w.as_str()]).map(|_| ())
@@ -394,6 +406,29 @@ mod tests {
             }),
         };
         (calls, tmux)
+    }
+
+    /// The secrets are dropped from the server's global environment — the one new windows start from.
+    #[test]
+    fn forget_env_unsets_each_key_globally() {
+        let (calls, tmux) = recording();
+        tmux.forget_env(&["SLACK_APP_TOKEN", "SLACK_BOT_TOKEN"]);
+        assert_eq!(
+            calls.lock().unwrap().clone(),
+            [
+                vec!["set-environment", "-g", "-u", "SLACK_APP_TOKEN"],
+                vec!["set-environment", "-g", "-u", "SLACK_BOT_TOKEN"],
+            ]
+        );
+    }
+
+    /// No server running yet: tmux fails, and that is fine — there is nothing to drop.
+    #[test]
+    fn forget_env_ignores_a_missing_server() {
+        let tmux = Tmux {
+            run: Box::new(|_| Err("no server running".to_string())),
+        };
+        tmux.forget_env(&["SLACK_APP_TOKEN"]);
     }
 
     /// A detached session stays at tmux's default 80x24 unless told otherwise, and the agent's

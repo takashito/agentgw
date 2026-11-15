@@ -321,6 +321,23 @@ pub(crate) fn sweep_write_leftovers(dir: &Path) {
     }
 }
 
+/// The `.env` keys that hold a secret (the Slack tokens, the link key between gateway and
+/// machines). **They stay inside the Bridge and are never put in its process environment** —
+/// everything the Bridge starts inherits that environment, the tmux server included, and from
+/// there every agent's shell. An agent once started a program that reads `SLACK_APP_TOKEN` from
+/// the environment, and it connected to Slack as this app: Slack then split the events between
+/// the two and about a third of them never reached the Bridge.
+pub const SECRET_ENV_KEYS: [&str; 3] = ["SLACK_APP_TOKEN", "SLACK_BOT_TOKEN", "AGENTGW_LINK_TOKEN"];
+
+/// Whether a `.env` key holds a secret. The known ones, and by name anything that looks like one,
+/// so a key added later is kept out by default.
+pub fn is_secret_env(key: &str) -> bool {
+    SECRET_ENV_KEYS.contains(&key)
+        || key.ends_with("_TOKEN")
+        || key.contains("SECRET")
+        || key.contains("PASSWORD")
+}
+
 fn parse_env(text: &str) -> Vec<(String, String)> {
     text.lines()
         .filter_map(|line| {
@@ -403,6 +420,25 @@ SPACES = padded ";
                 ("SPACES".to_string(), "padded".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn secrets_are_told_apart_from_settings() {
+        for k in SECRET_ENV_KEYS {
+            assert!(is_secret_env(k), "{k}");
+        }
+        assert!(is_secret_env("SOME_FUTURE_TOKEN"));
+        assert!(is_secret_env("LINEAR_CLIENT_SECRET"));
+        for k in [
+            "AGENTGW_BRIDGE_ID",
+            "AGENTGW_BRIDGE_ROLE",
+            "AGENTGW_LINK_LISTEN",
+            "AGENTGW_TUNNELS",
+            "AGENTGW_STATE_DIR",
+            "AGENTGW_LANG",
+        ] {
+            assert!(!is_secret_env(k), "{k}");
+        }
     }
 
     #[test]

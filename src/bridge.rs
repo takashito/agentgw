@@ -1043,14 +1043,34 @@ impl Bridge {
         let dir = crate::state_dir::StateDir::resolve();
         // **Before anything reads it.** An older `.env` is folded into the shape below first
         crate::setup::migrate_env(&dir);
-        for (k, v) in dir.load_env()? {
-            // Safe: single-threaded section at start-up, before any spawn
-            unsafe { std::env::set_var(k, v) };
+        // **Secrets stay in here, out of the process environment** (see `SECRET_ENV_KEYS`): the
+        // agents' shells inherit it through tmux. One that came in from outside is taken and removed
+        let mut secrets: HashMap<String, String> = HashMap::new();
+        for (k, v) in std::env::vars() {
+            if crate::state_dir::is_secret_env(&k) {
+                // Safe: single-threaded section at start-up, before any spawn
+                unsafe { std::env::remove_var(&k) };
+                secrets.insert(k, v);
+            }
         }
+        for (k, v) in dir.load_env()? {
+            if crate::state_dir::is_secret_env(&k) {
+                secrets.insert(k, v);
+            } else {
+                // Safe: single-threaded section at start-up, before any spawn
+                unsafe { std::env::set_var(k, v) };
+            }
+        }
+        // And out of the tmux server an older build started with them in its environment
+        let mut forget: Vec<&str> = crate::state_dir::SECRET_ENV_KEYS.to_vec();
+        forget.extend(secrets.keys().map(String::as_str));
+        forget.sort_unstable();
+        forget.dedup();
+        crate::agent::tmux::Tmux::real().forget_env(&forget);
         // Upstream (direct or via the gateway) and downstream (accepting machines). **A config with both doesn't start**
         // (silently connecting both makes Slack start load-balancing, bringing split-brain straight back)
         let wiring = machine::Wiring::resolve(
-            |k| std::env::var(k).ok(),
+            |k| secrets.get(k).cloned().or_else(|| std::env::var(k).ok()),
             &bridge::Access::load(&dir),
             machine::address_of,
         )?;
