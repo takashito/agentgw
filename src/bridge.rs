@@ -1228,6 +1228,7 @@ impl Bridge {
                 reads: Default::default(),
                 departed: Default::default(),
                 ask_capable: Default::default(),
+                joins: Default::default(),
             });
             // One listener per address: loopback for whatever terminates TLS in front, the LAN address
             // for machines on the same network

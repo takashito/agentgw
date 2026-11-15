@@ -1418,6 +1418,42 @@ pub fn folder_offer_blocks(question: &str, value: &str) -> serde_json::Value {
     ])
 }
 
+/// The buttons on "which machine should handle this channel?".
+pub const JOIN_PICK: &str = "join-pick";
+pub const JOIN_LATER: &str = "join-later";
+/// Slack allows 25 elements in one `actions` block; one of them is "later".
+pub const JOIN_MAX_BUTTONS: usize = 24;
+
+/// The question and one button per machine, then "later". `machines` is (label, value) — the value
+/// is what the press hands back, so a machine's name never has to fit in an `action_id`.
+/// **The ids are numbered**, which keeps them unique within the message whatever the names are.
+/// Only the first [`JOIN_MAX_BUTTONS`] get a button; the caller names the rest in the question.
+pub fn join_offer_blocks(question: &str, machines: &[(String, String)], later_value: &str) -> serde_json::Value {
+    let mut buttons: Vec<serde_json::Value> = machines
+        .iter()
+        .take(JOIN_MAX_BUTTONS)
+        .enumerate()
+        .map(|(i, (label, value))| {
+            serde_json::json!({
+                "type": "button",
+                "action_id": format!("perm:{JOIN_PICK}:{i}"),
+                "text": {"type": "plain_text", "text": label},
+                "value": value,
+            })
+        })
+        .collect();
+    buttons.push(serde_json::json!({
+        "type": "button",
+        "action_id": format!("perm:{JOIN_LATER}:0"),
+        "text": {"type": "plain_text", "text": crate::t!("Later", "あとで")},
+        "value": later_value,
+    }));
+    serde_json::json!([
+        {"type": "markdown", "text": question},
+        {"type": "actions", "elements": buttons},
+    ])
+}
+
 /// Block Kit buttons. Only **the fact that it was pressed** is passed to the main loop; no decision is made here
 /// (Slack resends if event handling does not return within 3 seconds).
 /// Slack sends `hello` on every connection, carrying **the number of connections the app currently holds**
@@ -2423,6 +2459,27 @@ mod tests {
         let again = serde_json::to_string(&parsed).unwrap();
         assert!(again.contains("perm:mkdir-yes:folder") && again.contains("perm:mkdir-no:folder"), "{again}");
         assert!(again.contains("\\\"path\\\""), "the offer rides in the button: {again}");
+    }
+
+    #[test]
+    fn the_join_offer_is_blocks_slack_accepts_with_unique_ids() {
+        let machines = vec![("gw (gateway)".to_string(), "v-gw".to_string()), ("a:b".to_string(), "v-ab".to_string())];
+        let blocks = join_offer_blocks("Which?", &machines, "v-later");
+        let parsed: Vec<SlackBlock> = serde_json::from_value(blocks.clone()).expect("valid blocks");
+        assert_eq!(parsed.len(), 2);
+        let els = blocks[1]["elements"].as_array().unwrap();
+        let ids: Vec<&str> = els.iter().map(|e| e["action_id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["perm:join-pick:0", "perm:join-pick:1", "perm:join-later:0"]);
+        assert_eq!(els[1]["value"], "v-ab");
+        assert_eq!(els[2]["value"], "v-later");
+    }
+
+    #[test]
+    fn the_join_offer_caps_at_slacks_limit() {
+        let many: Vec<_> = (0..30).map(|i| (format!("m{i}"), format!("m{i}"))).collect();
+        let blocks = join_offer_blocks("Q", &many, "later");
+        assert_eq!(blocks[1]["elements"].as_array().unwrap().len(), JOIN_MAX_BUTTONS + 1);
+        let _: Vec<SlackBlock> = serde_json::from_value(blocks).expect("valid blocks");
     }
 
     #[test]

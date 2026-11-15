@@ -1529,6 +1529,112 @@ impl FolderOffer {
     }
 }
 
+/// The answer to "which machine should handle this channel?", asked when the bot is brought into a
+/// channel that has no machine. Like [`FolderOffer`] it travels inside the button, so a restart
+/// between the question and the press loses nothing.
+///
+/// `deny_unknown_fields`: a [`FolderOffer`] also has `channel` and `machine`, and must never read as one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JoinOffer {
+    pub channel: String,
+    /// `None` = "later": leave the channel with the gateway.
+    pub machine: Option<String>,
+}
+
+impl JoinOffer {
+    pub fn encode(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    pub fn decode(value: &str) -> Option<Self> {
+        serde_json::from_str(value).ok()
+    }
+}
+
+/// How to address the bot in a hint: a real mention, so Slack shows whatever the app is named.
+/// **Outside the code span** — Slack does not resolve a mention inside backticks.
+fn mention(bot: Option<&str>) -> String {
+    bot.map(|b| format!("<@{b}> ")).unwrap_or_default()
+}
+
+/// "Offline: `a`, `b` — …" for the machines that can't be picked now. Empty when there are none.
+fn offline_line(bot: Option<&str>, offline: &[String]) -> String {
+    if offline.is_empty() {
+        return String::new();
+    }
+    let names = offline.iter().map(|m| format!("`{m}`")).collect::<Vec<_>>().join(", ");
+    let at = mention(bot);
+    format!(
+        "\n{}",
+        crate::t!(
+            "Offline: {names} — once connected, choose one with {at}`route <machine>`.",
+            "オフライン: {names} — つながったら {at}`route <マシン>` で選べます。"
+        )
+    )
+}
+
+/// The question posted when the bot joins a channel with no machine.
+pub fn join_question(owner: &str, bot: Option<&str>, offline: &[String]) -> String {
+    let at = mention(bot);
+    let ask = crate::t!(
+        "<@{owner}> Which machine should handle this channel? It works in that machine's home folder; for another folder, use {at}`route <machine>:<path>`.",
+        "<@{owner}> このチャンネルをどのマシンに任せますか? 作業ディレクトリはそのマシンのホームです。別のフォルダにするときは {at}`route <マシン>:<パス>` を使ってください。"
+    );
+    ask + &offline_line(bot, offline)
+}
+
+/// The question once "later" is pressed.
+pub fn join_later_text(gateway: &str, bot: Option<&str>) -> String {
+    let at = mention(bot);
+    crate::t!(
+        "For now **{gateway}** (the gateway) handles this channel. Choose a machine any time with {at}`route <machine>`.",
+        "ひとまずゲートウェイ(**{gateway}**)が受けます。{at}`route <マシン>` でいつでも決められます。"
+    )
+}
+
+/// The question when a machine was set some other way before the press.
+pub fn join_already_text(machine: &str, bot: Option<&str>) -> String {
+    let at = mention(bot);
+    crate::t!(
+        "**{machine}** already handles this channel. To change it, use {at}`route <machine>`.",
+        "このチャンネルはすでに **{machine}** が受け持っています。変えるときは {at}`route <マシン>` を使ってください。"
+    )
+}
+
+/// The question once a machine is picked; the handover itself is reported in its thread.
+pub fn join_picked_text(machine: &str) -> String {
+    crate::t!(
+        "Handing this channel to **{machine}**…",
+        "このチャンネルを **{machine}** に任せます…"
+    )
+}
+
+/// Why a channel got its machine without a question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimReason {
+    /// An agent on that machine created or joined the channel.
+    AgentJoined,
+    /// It was the only machine there was to pick.
+    OnlyChoice,
+}
+
+/// The one line posted when a channel got its machine without a question.
+pub fn join_claimed_text(machine: &str, why: ClaimReason, bot: Option<&str>, offline: &[String]) -> String {
+    let at = mention(bot);
+    let head = match why {
+        ClaimReason::AgentJoined => crate::t!(
+            "This channel is handled by **{machine}**, whose agent brought the bot in. To change it, use {at}`route <machine>`.",
+            "このチャンネルは **{machine}** が受け持ちます(そのマシンのエージェントがボットを入れたため)。変えるときは {at}`route <マシン>` を使ってください。"
+        ),
+        ClaimReason::OnlyChoice => crate::t!(
+            "This channel is handled by **{machine}**, the only machine connected. To change it, use {at}`route <machine>`.",
+            "このチャンネルは **{machine}** が受け持ちます(いま選べるマシンがほかに無いため)。変えるときは {at}`route <マシン>` を使ってください。"
+        ),
+    };
+    head + &offline_line(bot, offline)
+}
+
 // ─── decisions: dedup → gate → decide ────────────────────────────────────────────
 
 /// Loop-breaker threshold — once this many bot posts in a row land in one thread,
@@ -2004,6 +2110,36 @@ mod tests {
         };
         assert_eq!(FolderOffer::decode(&offer.encode()), Some(offer));
         assert_eq!(FolderOffer::decode(""), None);
+    }
+
+    #[test]
+    fn a_join_offer_round_trips_and_neither_offer_reads_as_the_other() {
+        let o = JoinOffer { channel: "C1".into(), machine: Some("a:b".into()) };
+        assert_eq!(JoinOffer::decode(&o.encode()), Some(o.clone()));
+        assert_eq!(FolderOffer::decode(&o.encode()), None);
+        let later = JoinOffer { channel: "C1".into(), machine: None };
+        assert_eq!(JoinOffer::decode(&later.encode()), Some(later));
+        let folder = FolderOffer {
+            channel: "C1".into(),
+            thread_ts: "1.1".into(),
+            path: "/x".into(),
+            for_thread: false,
+            machine: Some("mac".into()),
+        };
+        assert_eq!(JoinOffer::decode(&folder.encode()), None);
+    }
+
+    #[test]
+    fn join_texts_mention_the_bot_outside_the_code_and_name_offline_machines() {
+        let q = join_question("U_OWNER", Some("U_BOT"), &["pc".into()]);
+        assert!(q.contains("<@U_OWNER>") && q.contains("<@U_BOT> `route") && q.contains("`pc`"), "{q}");
+        assert!(!q.contains("@agentgw"), "{q}");
+        let plain = join_question("U_OWNER", None, &[]);
+        assert!(!plain.contains("<@U_BOT>") && !plain.contains('\n'), "{plain}");
+        let c = join_claimed_text("mac", ClaimReason::OnlyChoice, Some("U_BOT"), &[]);
+        assert!(c.contains("**mac**") && c.contains("<@U_BOT> `route"), "{c}");
+        assert!(join_later_text("gw", Some("U_BOT")).contains("**gw**"));
+        assert!(join_already_text("pc", None).contains("**pc**"));
     }
 
 

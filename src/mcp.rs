@@ -204,7 +204,7 @@ impl Mcp {
             }),
             serde_json::json!({
                 "name": "create_channel",
-                "description": "Create a public Slack channel. The bot is in it from the start, so it shows up in list_channels and can be asked with ask_channel; until a machine and folder are assigned to it, the gateway's Claude answers there. Optionally set its topic and purpose in the same call. People are not added: tell the Owner the channel's name so they can join.",
+                "description": "Create a public Slack channel. The bot is in it from the start, so it shows up in list_channels and can be asked with ask_channel. Your machine handles it, starting in that machine's home folder (the Owner can move it with `route`). Optionally set its topic and purpose in the same call. People are not added: tell the Owner the channel's name so they can join.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -217,7 +217,7 @@ impl Mcp {
             }),
             serde_json::json!({
                 "name": "join_channel",
-                "description": "Put the bot into an existing public Slack channel, so it shows up in list_channels and can be asked with ask_channel. Private channels need a person to invite the bot.",
+                "description": "Put the bot into an existing public Slack channel, so it shows up in list_channels and can be asked with ask_channel. If this brings the bot in and the channel has no machine yet, your machine handles it, starting in that machine's home folder. Private channels need a person to invite the bot.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

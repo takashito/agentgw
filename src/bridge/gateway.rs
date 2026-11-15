@@ -1225,6 +1225,15 @@ impl<'a> Event<'a> {
                 .mentions_bot()
     }
 
+    /// **The bot itself was brought into a channel** (not a person joining one the bot is in). DMs
+    /// have no join event, but a DM id is refused anyway: a DM is always the gateway's.
+    pub fn is_the_bot_joining(&self, bot_user_id: Option<&str>) -> bool {
+        self.name == "member_joined_channel"
+            && bot_user_id.is_some()
+            && self.user() == bot_user_id
+            && self.channel().is_some_and(|c| !crate::chat::slack::SlackId::is_dm(c))
+    }
+
     /// Whether the gateway may speak up about this event.
     ///
     /// Reactions and joins aren't addressed to anyone. Never answer a bot's words
@@ -2529,6 +2538,33 @@ pub struct Fleet {
     /// Machines that said they take asks (in their `MachineVersion`). Memory only: every machine says
     /// it again on each connect.
     pub ask_capable: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// What the gateway knows about the bot being brought into channels (see [`JoinBook`]).
+    pub joins: JoinBook,
+}
+
+/// The bot being brought into channels. **Memory only**: a restart forgets which channels were asked
+/// about, and a channel the bot is invited to again with no machine is simply asked about again.
+pub struct JoinBook {
+    /// Channels asked about in this process — Slack can send the same join twice.
+    asked: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Channel → the machine whose agent created or joined it. Such a channel goes to that machine
+    /// without a question, and its join event must not ask one.
+    by_agent: std::sync::Mutex<HashMap<String, String>>,
+    /// How long a join waits before asking. **The join event can beat the API's own answer**, so an
+    /// agent's `create_channel` may not have named its machine yet when the event arrives.
+    settle: std::time::Duration,
+}
+
+impl Default for JoinBook {
+    fn default() -> Self {
+        Self::settled_after(std::time::Duration::from_secs(3))
+    }
+}
+
+impl JoinBook {
+    pub fn settled_after(settle: std::time::Duration) -> Self {
+        Self { asked: Default::default(), by_agent: Default::default(), settle }
+    }
 }
 
 /// The line on top of an ask: what is asked, who asks, and a link to **where** it was asked.
@@ -2938,6 +2974,17 @@ impl Fleet {
         let ev = Event::new(name, raw);
         let channel = ev.channel();
         let bot_user_id = self.bot_user_id.lock().await.clone();
+
+        // The bot was brought into a channel: the gateway decides who handles it. Nothing downstream
+        // reads a join, so not forwarding it changes nothing there. **Off the event loop** — it
+        // waits a moment before asking (see `JoinBook::settle`)
+        if ev.is_the_bot_joining(bot_user_id.as_deref())
+            && let Some(ch) = channel
+        {
+            let (fleet, ch) = (self.clone(), ch.to_string());
+            tokio::spawn(async move { fleet.on_bot_joined(&ch).await });
+            return;
+        }
 
         // What the gateway answers itself (commands and name-claims) comes **before the delivery decision**. Once answered, stop —
         // forwarding `pwd <machine>` would send the instruction to change the destination to the old destination
@@ -3385,6 +3432,126 @@ impl Fleet {
         }
     }
 
+    /// The bot was brought into `channel`. A channel that already has a machine, or that an agent
+    /// brought it into, is left alone. Otherwise the Owner is asked which machine takes it — unless
+    /// there is only one to pick, which then takes it without a question.
+    async fn on_bot_joined(self: &Arc<Self>, channel: &str) {
+        let Some(owner) = self.owner() else {
+            rlog("info", &format!("bot joined {channel}: no Owner to ask, left with the gateway"));
+            return;
+        };
+        if !self.joins.asked.lock().unwrap().insert(channel.to_string()) {
+            return;
+        }
+        tokio::time::sleep(self.joins.settle).await;
+        if let Some(machine) = self.access().routes.get(channel).and_then(|r| r.bridge.clone()) {
+            rlog("info", &format!("bot joined {channel}, which {machine} already handles"));
+            return;
+        }
+        if let Some(machine) = self.joins.by_agent.lock().unwrap().get(channel).cloned() {
+            rlog("info", &format!("bot joined {channel}, brought in by an agent on {machine}"));
+            return;
+        }
+        let bot = self.bot_user_id.lock().await.clone();
+        // The gateway first, then the machines connected now
+        let mut online = vec![self.self_id.clone()];
+        online.extend(self.machines().into_iter().filter(|m| *m != self.self_id));
+        let offline: Vec<String> =
+            self.access().machines.keys().filter(|m| !online.contains(m)).cloned().collect();
+        if online.len() == 1 {
+            self.claim_for(channel, &online[0], crate::bridge::state::ClaimReason::OnlyChoice, &offline)
+                .await;
+            return;
+        }
+        let mut question = crate::bridge::state::join_question(&owner, bot.as_deref(), &offline);
+        let max = crate::chat::slack::JOIN_MAX_BUTTONS;
+        if online.len() > max {
+            let rest = online[max..].iter().map(|m| format!("`{m}`")).collect::<Vec<_>>().join(", ");
+            question.push('\n');
+            question.push_str(&crate::t!(
+                "Also connected: {rest} — choose one with `route`.",
+                "ほかにつながっているマシン: {rest} — `route` で選べます。"
+            ));
+        }
+        let value = |machine: Option<&str>| {
+            crate::bridge::state::JoinOffer { channel: channel.to_string(), machine: machine.map(str::to_string) }
+                .encode()
+        };
+        let buttons: Vec<(String, String)> = online
+            .iter()
+            .map(|m| {
+                let label = if *m == self.self_id {
+                    crate::t!("{m} (gateway)", "{m}(ゲートウェイ)")
+                } else {
+                    m.clone()
+                };
+                (label, value(Some(m)))
+            })
+            .collect();
+        let blocks = crate::chat::slack::join_offer_blocks(&question, &buttons, &value(None));
+        match self.api.post_blocks(channel, &question, blocks, None).await {
+            Ok(_) => rlog("info", &format!("bot joined {channel}: asked the Owner which machine takes it")),
+            Err(e) => rlog("error", &format!("bot joined {channel}: could not ask which machine takes it: {e}")),
+        }
+    }
+
+    /// Give `channel` to `machine` in its home folder without a question, and say so in one line.
+    /// **Never over a machine the channel already has**: the quiet answer (`thread_ts` empty) only
+    /// records a channel no other machine holds (`on_project_set`).
+    async fn claim_for(
+        self: &Arc<Self>,
+        channel: &str,
+        machine: &str,
+        why: crate::bridge::state::ClaimReason,
+        offline: &[String],
+    ) {
+        if self.access().routes.get(channel).is_some_and(|r| r.bridge.is_some()) {
+            return;
+        }
+        if !self.machines().iter().any(|m| m == machine) {
+            rlog("info", &format!("{channel}: {machine} is not connected — left with the gateway"));
+            return;
+        }
+        self.assign_project(channel, "", machine, None, false, false).await;
+        rlog("info", &format!("{channel} → {machine} without asking ({why:?})"));
+        let bot = self.bot_user_id.lock().await.clone();
+        let line = crate::bridge::state::join_claimed_text(machine, why, bot.as_deref(), offline);
+        if let Err(e) = self.api.post_markdown(channel, &line, None).await {
+            rlog("error", &format!("could not post to {channel}: {e}"));
+        }
+    }
+
+    /// An agent on `machine` created `channel` or brought the bot into it: that machine takes it.
+    async fn agent_brought_in(self: &Arc<Self>, channel: &str, machine: &str) {
+        self.joins.by_agent.lock().unwrap().insert(channel.to_string(), machine.to_string());
+        self.claim_for(channel, machine, crate::bridge::state::ClaimReason::AgentJoined, &[])
+            .await;
+    }
+
+    /// A press on "which machine should handle this channel?". Only the Owner's counts, and a
+    /// channel that got a machine in the meantime keeps it.
+    async fn on_join_answer(self: &Arc<Self>, click: PermClick, offer: crate::bridge::state::JoinOffer) {
+        if self.owner().as_deref() != Some(click.by.as_str()) {
+            rlog("info", &format!("join offer: ignored a press by {}", click.by));
+            return;
+        }
+        let bot = self.bot_user_id.lock().await.clone();
+        let channel = &offer.channel;
+        let current = self.access().routes.get(channel).and_then(|r| r.bridge.clone());
+        let text = match (&offer.machine, &current) {
+            (_, Some(holder)) => crate::bridge::state::join_already_text(holder, bot.as_deref()),
+            (None, None) => crate::bridge::state::join_later_text(&self.self_id, bot.as_deref()),
+            (Some(machine), None) => crate::bridge::state::join_picked_text(machine),
+        };
+        if let Err(e) = self.api.update_markdown(channel, &click.message_ts, &text).await {
+            rlog("error", &format!("join offer: could not update the message: {e}"));
+        }
+        if let (Some(machine), None) = (&offer.machine, &current) {
+            // The answer lands in the question's thread, worded as `route` words it
+            self.assign_project(channel, &click.message_ts, machine, None, false, false).await;
+        }
+    }
+
     /// Have the machine already running a thread move it into a folder there. Only that machine can
     /// type into the agent, so this is the same press a Yes on its own offer would be.
     async fn cd_on_machine(
@@ -3657,7 +3824,7 @@ impl Fleet {
             link::LinkFrame::CreateChannel { req_id, name, topic, purpose } => {
                 let (fleet, machine) = (self.clone(), bridge_id.to_string());
                 tokio::spawn(async move {
-                    let result = fleet.create_channel(&name, topic.as_deref(), purpose.as_deref()).await;
+                    let result = fleet.create_channel(&machine, &name, topic.as_deref(), purpose.as_deref()).await;
                     if !fleet.send_frame(&machine, &link::LinkFrame::AskAnswer { req_id, result }).await {
                         rlog("info", &format!("{machine}: could not return the new channel (link dropped)"));
                     }
@@ -3666,7 +3833,7 @@ impl Fleet {
             link::LinkFrame::JoinChannel { req_id, channel_id } => {
                 let (fleet, machine) = (self.clone(), bridge_id.to_string());
                 tokio::spawn(async move {
-                    let result = fleet.join_channel(&channel_id).await;
+                    let result = fleet.join_channel(&machine, &channel_id).await;
                     if !fleet.send_frame(&machine, &link::LinkFrame::AskAnswer { req_id, result }).await {
                         rlog("info", &format!("{machine}: could not return the joined channel (link dropped)"));
                     }
@@ -4308,6 +4475,15 @@ impl Fleet {
     }
 
     async fn on_click(self: &Arc<Self>, action: serde_json::Value, body: serde_json::Value) {
+        // "Which machine should handle this channel?" is the gateway's own question: only it can
+        // hand a channel over
+        if let Some(click) = crate::chat::slack::perm_click_from_relay(&action, &body)
+            && [crate::chat::slack::JOIN_PICK, crate::chat::slack::JOIN_LATER].contains(&click.action.as_str())
+            && let Some(offer) = crate::bridge::state::JoinOffer::decode(&click.value)
+        {
+            self.on_join_answer(click, offer).await;
+            return;
+        }
         // An offer from a command that named a machine stays here: only the gateway can hand a
         // channel over, and the machine that has this thread may not be the one named
         if let Some(click) = crate::chat::slack::perm_click_from_relay(&action, &body)
@@ -5000,15 +5176,19 @@ impl Fleet {
     }
 
     /// Create a public channel for an agent (`create_channel`). The bot is in it from the start, so it shows
-    /// in `list_channels` and the gateway's agent answers there until it is assigned to a machine.
+    /// in `list_channels`.
+    ///
+    /// **The machine whose agent asked (`by`) takes the channel**, so nobody is asked which one should.
     pub(crate) async fn create_channel(
-        &self,
+        self: &Arc<Self>,
+        by: &str,
         name: &str,
         topic: Option<&str>,
         purpose: Option<&str>,
     ) -> Result<serde_json::Value, String> {
         let id = self.api.create_channel(name).await.map_err(|e| format!("creating #{name}: {e}"))?;
-        rlog("info", &format!("channel #{name} ({id}) created by an agent"));
+        rlog("info", &format!("channel #{name} ({id}) created by an agent on {by}"));
+        self.agent_brought_in(&id, by).await;
         if topic.is_some() || purpose.is_some() {
             // The channel exists either way; say what did not stick rather than hide the new ID
             if let Err(e) = self.set_channel_info(&id, topic, purpose).await {
@@ -5019,9 +5199,26 @@ impl Fleet {
     }
 
     /// Put the bot into a public channel for an agent (`join_channel`).
-    pub(crate) async fn join_channel(&self, channel: &str) -> Result<serde_json::Value, String> {
-        self.api.join_channel(channel).await.map_err(|e| format!("joining {channel}: {e}"))?;
-        rlog("info", &format!("joined {channel} for an agent"));
+    ///
+    /// When this brings the bot in, **the machine whose agent asked (`by`) takes the channel**. A
+    /// channel the bot was already in keeps whatever it had — an agent does not take over a channel
+    /// the Owner left with the gateway. Not knowing whether it was in counts as "it was".
+    pub(crate) async fn join_channel(self: &Arc<Self>, by: &str, channel: &str) -> Result<serde_json::Value, String> {
+        let was_in = self.api.is_member(channel).await.unwrap_or(true);
+        if !was_in {
+            // Before the join, so its event never finds the channel unclaimed
+            self.joins.by_agent.lock().unwrap().insert(channel.to_string(), by.to_string());
+        }
+        if let Err(e) = self.api.join_channel(channel).await {
+            if !was_in {
+                self.joins.by_agent.lock().unwrap().remove(channel);
+            }
+            return Err(format!("joining {channel}: {e}"));
+        }
+        rlog("info", &format!("joined {channel} for an agent on {by}"));
+        if !was_in {
+            self.agent_brought_in(channel, by).await;
+        }
         self.channel_row(channel).await
     }
 
@@ -6798,6 +6995,208 @@ mod tests {
         assert!(posts(&api).is_empty(), "{}", posts(&api));
     }
 
+    // ── the bot brought into a channel ──────────────────────────────────────────
+
+    fn bot_joined(user: &str) -> serde_json::Value {
+        serde_json::json!({"type": "member_joined_channel", "user": user, "channel": "C1", "channel_type": "C", "team": "T1"})
+    }
+
+    async fn joining_fleet(name: &str) -> (Arc<Fleet>, Arc<crate::chat::fake::FakeChat>) {
+        let (fleet, api) = fleet_with_owner(name);
+        *fleet.bot_user_id.lock().await = Some("U_BOT".into());
+        (fleet, api)
+    }
+
+    fn join_press(action: &str, machine: Option<&str>, by: &str) -> (serde_json::Value, serde_json::Value) {
+        let value = crate::bridge::state::JoinOffer { channel: "C1".into(), machine: machine.map(Into::into) }.encode();
+        (
+            serde_json::json!({"action_id": format!("perm:{action}:0"), "value": value}),
+            serde_json::json!({"user": {"id": by}, "container": {"message_ts": "9.9"}}),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_bot_joining_an_unrouted_channel_asks_the_owner_with_a_button_per_machine() {
+        let (fleet, api) = joining_fleet("join-ask").await;
+        let (c, _frames) = conn();
+        fleet.links.register("mac", c);
+        fleet.edit_access(|a| { a.machines.insert("pc".into(), Default::default()); }).await;
+
+        fleet.on_bot_joined("C1").await;
+
+        let said = posts(&api);
+        assert!(said.starts_with("post_blocks C1 -"), "{said}");
+        assert!(said.contains("<@U_OWNER>") && said.contains("<@U_BOT>"), "{said}");
+        assert!(said.contains("perm:join-pick:0") && said.contains("perm:join-pick:1") && said.contains("perm:join-later:0"), "{said}");
+        assert!(said.contains("parent (gateway)") && said.contains("`pc`"), "the offline one is named, not a button: {said}");
+        assert!(!said.contains("@agentgw"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn the_join_question_is_asked_once() {
+        let (fleet, api) = joining_fleet("join-once").await;
+        fleet.links.register("mac", conn().0);
+        fleet.on_bot_joined("C1").await;
+        fleet.on_bot_joined("C1").await;
+        assert_eq!(posts(&api).matches("post_blocks").count(), 1, "{}", posts(&api));
+    }
+
+    #[tokio::test]
+    async fn a_join_event_is_taken_by_the_gateway_and_a_person_joining_says_nothing() {
+        let (fleet, api) = joining_fleet("join-event").await;
+        let (c, mut frames) = conn();
+        fleet.links.register("mac", c);
+        fleet.edit_access(|a| a.set_bridge("C1", "mac")).await;
+        // A person: forwarded as before, nothing asked
+        fleet.on_event("member_joined_channel", &bot_joined("U_PERSON")).await;
+        assert!(frames.try_recv().is_ok(), "a person's join still goes to the machine");
+        // The bot: not forwarded; the channel has a machine, so nothing is asked either
+        fleet.on_event("member_joined_channel", &bot_joined("U_BOT")).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(frames.try_recv().is_err(), "the bot's join is the gateway's");
+        assert!(!posts(&api).contains("post_blocks"), "{}", posts(&api));
+    }
+
+    #[tokio::test]
+    async fn with_only_the_gateway_to_pick_it_takes_the_channel_without_asking() {
+        let (fleet, api) = joining_fleet("join-only").await;
+        fleet.edit_access(|a| { a.machines.insert("pc".into(), Default::default()); }).await;
+
+        fleet.on_bot_joined("C1").await;
+
+        assert_eq!(fleet.access().routes["C1"].bridge.as_deref(), Some("parent"));
+        let said = posts(&api);
+        assert!(!said.contains("post_blocks"), "{said}");
+        assert!(said.contains("post_md C1 - ") && said.contains("**parent**") && said.contains("`pc`"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn no_owner_means_no_question() {
+        let dir = StateDir::at(std::env::temp_dir().join(format!("slack-relay-join-noowner-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(dir.path());
+        let api = Arc::new(crate::chat::fake::FakeChat::default());
+        let (fleet, _rx) = a_fleet_with(dir, api.clone());
+        fleet.links.register("mac", conn().0);
+        fleet.on_bot_joined("C1").await;
+        assert!(posts(&api).is_empty(), "{}", posts(&api));
+    }
+
+    #[tokio::test]
+    async fn the_owners_pick_routes_the_channel_to_that_machine_in_its_home() {
+        let (fleet, api) = joining_fleet("join-pick").await;
+        let (c, mut frames) = conn();
+        fleet.links.register("mac", c);
+        let (a, b) = join_press("join-pick", Some("mac"), "U_OWNER");
+        fleet.on_click(a, b).await;
+        let told = link::decode(&frames.try_recv().expect("mac was told")).unwrap();
+        assert!(
+            matches!(&told, link::LinkFrame::SetProject { channel, thread_ts, path, thread_only: false, create: false }
+                if channel == "C1" && thread_ts == "9.9" && path == "~"),
+            "{told:?}"
+        );
+        assert!(posts(&api).contains("update_md C1 9.9 Handing this channel to **mac**"), "{}", posts(&api));
+    }
+
+    #[tokio::test]
+    async fn a_strangers_pick_does_nothing() {
+        let (fleet, api) = joining_fleet("join-stranger").await;
+        let (c, mut frames) = conn();
+        fleet.links.register("mac", c);
+        let (a, b) = join_press("join-pick", Some("mac"), "U_OTHER");
+        fleet.on_click(a, b).await;
+        assert!(frames.try_recv().is_err());
+        assert!(posts(&api).is_empty(), "{}", posts(&api));
+    }
+
+    #[tokio::test]
+    async fn later_leaves_the_channel_with_the_gateway() {
+        let (fleet, api) = joining_fleet("join-later").await;
+        let (c, mut frames) = conn();
+        fleet.links.register("mac", c);
+        let (a, b) = join_press("join-later", None, "U_OWNER");
+        fleet.on_click(a, b).await;
+        assert!(frames.try_recv().is_err());
+        assert!(!fleet.access().routes.contains_key("C1"));
+        assert!(posts(&api).contains("update_md C1 9.9") && posts(&api).contains("**parent**"), "{}", posts(&api));
+    }
+
+    #[tokio::test]
+    async fn a_pick_after_the_channel_got_a_route_changes_nothing() {
+        let (fleet, api) = joining_fleet("join-stale").await;
+        let (c, mut frames) = conn();
+        fleet.links.register("mac", c);
+        fleet.edit_access(|a| a.set_bridge("C1", "pc")).await;
+        let (a, b) = join_press("join-pick", Some("mac"), "U_OWNER");
+        fleet.on_click(a, b).await;
+        assert!(frames.try_recv().is_err(), "mac was not told");
+        assert_eq!(fleet.access().routes["C1"].bridge.as_deref(), Some("pc"));
+        assert!(posts(&api).contains("**pc** already handles"), "{}", posts(&api));
+    }
+
+    #[tokio::test]
+    async fn a_pick_of_a_machine_that_went_away_says_so() {
+        let (fleet, api) = joining_fleet("join-gone").await;
+        let (a, b) = join_press("join-pick", Some("mac"), "U_OWNER");
+        fleet.on_click(a, b).await;
+        assert!(posts(&api).contains("post C1 9.9"), "the refusal lands in the question's thread: {}", posts(&api));
+    }
+
+    #[tokio::test]
+    async fn picking_the_gateway_routes_the_channel_here() {
+        let (fleet, _api) = joining_fleet("join-here").await;
+        fleet.links.register("mac", conn().0);
+        let (a, b) = join_press("join-pick", Some("parent"), "U_OWNER");
+        fleet.on_click(a, b).await;
+        assert_eq!(fleet.access().routes["C1"].bridge.as_deref(), Some("parent"));
+    }
+
+    #[tokio::test]
+    async fn a_channel_an_agent_creates_goes_to_its_machine_without_a_question() {
+        let (fleet, api) = joining_fleet("join-agent-create").await;
+        let (c, mut frames) = conn();
+        fleet.links.register("mac", c);
+        fleet.create_channel("mac", "new-one", None, None).await.unwrap();
+        let id = "CNEW_new-one";
+        let told = link::decode(&frames.try_recv().expect("mac was told")).unwrap();
+        assert!(
+            matches!(&told, link::LinkFrame::SetProject { channel, thread_ts, path, .. } if channel == id && thread_ts.is_empty() && path == "~"),
+            "{told:?}"
+        );
+        // Its join event, arriving now, asks nothing
+        fleet.on_bot_joined(id).await;
+        let said = posts(&api);
+        assert!(!said.contains("post_blocks"), "{said}");
+        assert!(said.contains(&format!("post_md {id} - ")) && said.contains("**mac**"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn an_agent_joining_takes_the_channel_only_when_it_brings_the_bot_in() {
+        // The bot is in C1 already (and C1 has no machine); C7 is new to it
+        let dir = StateDir::at(std::env::temp_dir().join(format!("slack-relay-join-agent-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(dir.path());
+        let api = Arc::new(crate::chat::fake::FakeChat::in_channels(&[("C1", "old")]));
+        let (fleet, _rx) = a_fleet_with(dir, api);
+        let (c, mut frames) = conn();
+        fleet.links.register("mac", c);
+        fleet.join_channel("mac", "C1").await.unwrap();
+        assert!(frames.try_recv().is_err(), "a channel the bot was in is left alone");
+        assert!(!fleet.access().routes.contains_key("C1"));
+        fleet.join_channel("mac", "C7").await.unwrap();
+        let told = link::decode(&frames.try_recv().expect("mac was told")).unwrap();
+        assert!(matches!(&told, link::LinkFrame::SetProject { channel, .. } if channel == "C7"), "{told:?}");
+    }
+
+    #[tokio::test]
+    async fn an_agent_never_takes_a_channel_that_has_a_machine() {
+        let (fleet, _api) = joining_fleet("join-agent-routed").await;
+        let (c, mut frames) = conn();
+        fleet.links.register("mac", c);
+        fleet.edit_access(|a| a.set_bridge("C1", "pc")).await;
+        fleet.agent_brought_in("C1", "mac").await;
+        assert!(frames.try_recv().is_err());
+        assert_eq!(fleet.access().routes["C1"].bridge.as_deref(), Some("pc"));
+    }
+
     /// `cd <machine>:<path>` on the machine a thread is already on: it has to really change folder.
     #[tokio::test]
     async fn a_thread_on_the_named_machine_is_told_to_change_folder() {
@@ -6874,6 +7273,7 @@ mod tests {
             reads: Default::default(),
             departed: Default::default(),
             ask_capable: Default::default(),
+            joins: JoinBook::settled_after(std::time::Duration::ZERO),
         });
         (fleet, msg_rx)
     }
@@ -8995,6 +9395,7 @@ mod ask_tests {
             reads: Default::default(),
             departed: Default::default(),
             ask_capable: Default::default(),
+            joins: JoinBook::settled_after(std::time::Duration::ZERO),
         });
         Rig { fleet, api, msgs, _notes: notes }
     }
@@ -9481,9 +9882,9 @@ mod ask_tests {
     async fn the_gateway_creates_and_joins_channels() {
         // The fake does not add the new channel to the bot's list, so setting its topic must not hinge on `is_member`
         let r = rig("create", FakeChat::in_channels(&[("C1", "cos"), ("CNEW_home-lead", "home-lead")]));
-        let out = r.fleet.create_channel("home-lead", Some("role=lead team=home linear=HOME"), None).await.unwrap();
+        let out = r.fleet.create_channel("parent", "home-lead", Some("role=lead team=home linear=HOME"), None).await.unwrap();
         assert_eq!((out["id"].as_str(), out["topic"].as_str()), (Some("CNEW_home-lead"), Some("role=lead team=home linear=HOME")));
-        let out = r.fleet.join_channel("C7").await.unwrap();
+        let out = r.fleet.join_channel("parent", "C7").await.unwrap();
         assert_eq!(out["id"], "C7");
         let calls = r.api.calls.lock().unwrap().clone();
         assert!(calls.contains(&"create_channel home-lead".to_string()), "{calls:?}");
