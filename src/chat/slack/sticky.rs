@@ -316,9 +316,6 @@ pub struct StickyBoard {
     /// Settled thread → **whether follow-up work after the answer may open a new progress message**.
     /// `true` is a round answered with reply/edit; `false` is a round that went silent via no_reply/react or an interruption.
     settled: std::collections::HashMap<ThreadKey, bool>,
-    /// Narration that arrived after settling. **Kept, not drawn** (`push_narration` /
-    /// `open_after_answer` below put it in and take it out).
-    held: std::collections::HashMap<ThreadKey, Vec<String>>,
     /// Threads whose turn is over (the agent stopped). The harness asks it to keep talking after
     /// that -- "your previous response had no visible output" -- so text and even tool calls trickle
     /// in for a while, aimed at its terminal, not at the thread. Nothing that arrives now may draw
@@ -350,7 +347,7 @@ impl StickyBoard {
     ///
     /// A new progress message may be opened **only when a real tool runs**
     /// (= proof that work continues after the answer). Only tool rows reach here; narration after
-    /// settling is diverted to the held buffer by `push_narration` and never arrives.
+    /// an answer is dropped by `push_narration` and never arrives.
     ///
     /// Returns "whether this row may be drawn".
     /// `by_tool` = whether this row is a tool. **A round settled in silence resumes only on a tool** —
@@ -367,16 +364,7 @@ impl StickyBoard {
             Some(false) if !by_tool => false,
             _ => {
                 self.settled.remove(key);
-                let mut s = Sticky::default();
-                // Show the held narration **above** the follow-up work
-                s.items.extend(
-                    self.held
-                        .remove(key)
-                        .into_iter()
-                        .flatten()
-                        .map(|text| RenderItem::Narration { text }),
-                );
-                self.stickies.insert(key.clone(), s);
+                self.stickies.insert(key.clone(), Sticky::default());
                 true
             }
         }
@@ -386,19 +374,13 @@ impl StickyBoard {
     pub fn on_turn_start(&mut self, key: &ThreadKey) {
         self.stickies.insert(key.clone(), Sticky::default());
         self.settled.remove(key);
-        self.held.remove(key); // do not carry over to the next turn (a safety net for anything not dropped at turn end)
         self.closed.remove(key);
     }
 
-    /// The turn ended. Held narration nobody showed by now **was a closing remark**,
-    /// so drop it. Keeping it until the next message
-    /// arrives would leave it behind forever for threads where no message ever comes again.
-    ///
-    /// The round also **closes here**: text and tool calls keep trickling in for a while afterwards
+    /// The turn ended. The round **closes here**: text and tool calls keep trickling in for a while afterwards
     /// (the harness asks the agent to keep talking once the answer went out as a tool call alone),
     /// and none of it is addressed to the thread. Only `on_turn_start` opens it again.
     pub fn on_turn_end(&mut self, key: &ThreadKey) {
-        self.held.remove(key);
         self.closed.insert(key.clone());
     }
 
@@ -469,16 +451,11 @@ impl StickyBoard {
         if self.closed.contains(key) {
             return;
         }
-        // Narration after settling is **kept, not drawn**. If a real tool runs after the answer,
-        // that proves "work continues", and `open_after_answer` shows it all together.
-        // If the turn ends with nothing running, it was a closing remark and the next
-        // `on_turn_start` drops it. Without this, a progress message holding only "● Replied in Slack."
-        // appears under the answer and nobody deletes it
+        // Narration right after the answer is **dropped**. It is the agent summing up what it just
+        // replied, for its terminal: it used to be kept and drawn above the next tool, which put the
+        // reply's own words a second time under the reply. Narration after a real tool has opened a
+        // new progress message is drawn as usual (`settled` is gone by then)
         if self.settled.get(key) == Some(&true) {
-            self.held
-                .entry(key.clone())
-                .or_default()
-                .push(text.to_string());
             return;
         }
         if !self.open_after_answer(key, false) {
@@ -649,7 +626,19 @@ impl StickyBoard {
     }
 
     pub fn is_denied(name: &str) -> bool {
-        matches!(name, "TodoWrite" | "ToolSearch" | "advisor") || name.starts_with("mcp__agentgw__")
+        matches!(
+            name,
+            "TodoWrite"
+                | "ToolSearch"
+                | "advisor"
+                // Booking the agent's own next look is not work in the thread. An agent that checks
+                // back every minute calls one right after each reply, and it opened a progress
+                // message under every answer
+                | "ScheduleWakeup"
+                | "CronCreate"
+                | "CronDelete"
+                | "CronList"
+        ) || name.starts_with("mcp__agentgw__")
     }
 
     /// The most prominent argument of the tool input, on one line.
@@ -1879,14 +1868,22 @@ mod tests {
         b.set_posted(&k, "999.1");
         assert!(matches!(b.settle(&k, "reply"), StickyAction::Keep));
 
-        b.push_narration(&k, "ついでに調べました");
+        // The narration right after the answer is the agent summing up its reply: never drawn,
+        // or the reply's words appear a second time under the reply
+        b.push_narration(&k, "Slack に返信しました。要点は…");
         b.tool_at(&k, "t2", "Read", "/x", ToolStatus::Done);
+        b.push_narration(&k, "ついでに調べました");
         let dirty = b.take_dirty(99_000);
         assert_eq!(dirty.len(), 1);
         assert_eq!(dirty[0].1, None, "返事の下に**新しく**出す(編集ではない)");
         assert!(
+            !text_of(&dirty[0].2).contains("要点"),
+            "返事のまとめを付箋に載せない: {}",
+            text_of(&dirty[0].2)
+        );
+        assert!(
             text_of(&dirty[0].2).contains("● ついでに調べました"),
-            "{}",
+            "ツールのあとの地の文は出す: {}",
             text_of(&dirty[0].2)
         );
         assert!(text_of(&dirty[0].2).contains("Read"), "{}", text_of(&dirty[0].2));
@@ -1960,6 +1957,32 @@ mod tests {
     ///
     /// **Nothing that arrives after the turn ended reaches the thread**, text or tool.
     /// Continued work *within* the turn is untouched (the test above covers it).
+    /// An agent that checks back every minute books its next look right after each reply. That
+    /// booking opened a progress message under every answer, carrying the agent's summary of the
+    /// reply -- the same words twice in a row.
+    #[test]
+    fn booking_the_next_look_after_a_reply_opens_nothing() {
+        let k = ThreadKey::parse("k");
+        let mut b = StickyBoard::default();
+        b.on_turn_start(&k);
+        b.tool_at(&k, "t1", "Bash", "ls", ToolStatus::Done);
+        b.set_posted(&k, "999.1");
+        let _ = b.take_dirty(10_000);
+        assert!(matches!(b.settle(&k, "reply"), StickyAction::Keep));
+        b.push_narration(&k, "返事を出しました。次の確認は1分後です。");
+        for name in ["ScheduleWakeup", "CronCreate", "CronDelete", "CronList"] {
+            b.tool_at(&k, name, name, "", ToolStatus::Pending);
+            b.tool_at(&k, name, name, "", ToolStatus::Done);
+        }
+        assert!(b.take_dirty(99_000).is_empty(), "予約だけでは付箋を開かない");
+        assert!(b.take_final(&k).is_none());
+
+        // In a turn of its own (woken by the booking), the booking is not a row either
+        b.on_turn_start(&k);
+        b.tool_at(&k, "w1", "ScheduleWakeup", "", ToolStatus::Done);
+        assert!(b.take_dirty(100_000).is_empty(), "予約の行は出さない");
+    }
+
     #[test]
     fn nothing_after_the_turn_ended_reaches_the_thread() {
         let k = ThreadKey::parse("k");
