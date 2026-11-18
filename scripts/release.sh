@@ -77,6 +77,9 @@ awk '
 if perl -CSD -ne 'exit 1 if /[\p{Hiragana}\p{Katakana}\p{Han}]/' "$notes_file"; then :; else
   notes_stop "The notes for $ver have Japanese in them. Release notes are written in English."
 fi
+# Issue-tracker keys (ABC-123) are internal and must not reach the public notes
+issue_ids="$(grep -oE '\b[A-Z][A-Z0-9]+-[0-9]+\b' "$notes_file" | grep -Ev '^(UTF|SHA|ISO|RFC|CVE|GHSA)-' | sort -u | tr '\n' ' ' || true)"
+[ -z "$issue_ids" ] || notes_stop "The notes for $ver have issue numbers in them: $issue_ids— write for users, without internal IDs."
 echo "==> Release notes for $tag"
 sed 's/^/  /' "$notes_file"
 if [ "$check_only" = 1 ]; then

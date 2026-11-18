@@ -417,7 +417,7 @@ Every GitHub release carries its notes from [CHANGELOG.md](CHANGELOG.md), and `s
 
 1. Rename `## [Unreleased]` to `## [x.y.z] - YYYY-MM-DD` (the version in `Cargo.toml`) and start a new empty `## [Unreleased]` above it.
 2. Group the changes under the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) headings, in this order, leaving out the empty ones: `### Added`, `### Changed`, `### Deprecated`, `### Removed`, `### Fixed`, `### Security`.
-3. Write one `- ` line per change a user can notice, in English: what is different now, not how it was done. Add the issue ID at the end when there is one, e.g. `(WORK-57)`. Internal refactoring and test-only changes are left out.
+3. Write one `- ` line per change a user can notice, in plain English, from the user's point of view: what they can now do, or what no longer goes wrong. Keep it short. Do not include issue or ticket numbers, internal jargon, internal function, tool or file names, machine names, or people's names — the notes are public. Internal refactoring and test-only changes are left out.
 4. Work from `git log v<previous>..HEAD` — the commit subjects and bodies are the source.
 5. Run `./scripts/release.sh --check` to see the notes as they will be published. Then `cargo dist`, `git push`, `./scripts/release.sh`.
 

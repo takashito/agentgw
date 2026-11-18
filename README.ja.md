@@ -409,7 +409,7 @@ GitHub のリリースには毎回 [CHANGELOG.md](CHANGELOG.md) からリリー�
 
 1. `## [Unreleased]` を `## [x.y.z] - YYYY-MM-DD`(`Cargo.toml` の版)に改め、その上に空の `## [Unreleased]` を置く
 2. 変更を [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) の見出しに分ける。順番は `### Added`、`### Changed`、`### Deprecated`、`### Removed`、`### Fixed`、`### Security`(空の見出しは書かない)
-3. 利用者に見える変更を1つにつき `- ` の1行で、**英語で**書く。どうやったかではなく、何が変わったか。Issue 番号があれば末尾に `(WORK-57)` のように添える。内部の整理やテストだけの変更は書かない
+3. 利用者に見える変更を1つにつき `- ` の1行で、**平易な英語で**、利用者の視点で短く書く。何ができるようになったか、何が起きなくなったか。Issue やチケットの番号、社内の用語、内部の関数・ツール・ファイルの名前、マシン名、人の名前は書かない(公開される文面のため)。内部の整理やテストだけの変更は書かない
 4. 元にするのは `git log v<前の版>..HEAD` のコミットの件名と本文
 5. `./scripts/release.sh --check` で公開される文面を確かめてから、`cargo dist`、`git push`、`./scripts/release.sh`
 
