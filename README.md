@@ -420,6 +420,8 @@ Every GitHub release carries its notes from [CHANGELOG.md](CHANGELOG.md), and `s
 4. Work from `git log v<previous>..HEAD` — the commit subjects and bodies are the source.
 5. Run `./scripts/release.sh --check` to see the notes as they will be published. Then `cargo dist`, `git push`, `./scripts/release.sh`.
 
+`scripts/release.sh` also stops when the release would take back a commit that is already on `main` or in the build running now (`agentgw --build`) — for example a fix deployed from another branch and not merged yet. Merge that commit and build again. When dropping it is intended, pass `--force`; the commits being dropped are still listed. `scripts/deploy.sh` runs the same checks (`scripts/preflight.sh`).
+
 To fix the notes of a release that is already out, edit its section and run `gh release edit v<x.y.z> --notes-file <file>` — never move the tag.
 
 Issues and pull requests are welcome — [open an issue](https://github.com/takashito/agentgw/issues) for bugs and questions.

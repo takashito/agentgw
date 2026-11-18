@@ -412,6 +412,8 @@ GitHub のリリースには毎回 [CHANGELOG.md](CHANGELOG.md) からリリー�
 4. 元にするのは `git log v<前の版>..HEAD` のコミットの件名と本文
 5. `./scripts/release.sh --check` で公開される文面を確かめてから、`cargo dist`、`git push`、`./scripts/release.sh`
 
+リリースが、`main` にある、またはいま動いているビルド(`agentgw --build`)に入っているコミットを消すことになる場合も、`scripts/release.sh` は止まります(例: 別のブランチから配備して、まだマージしていない修正)。そのコミットをマージしてビルドし直してください。わざと消すときだけ `--force` を付けます(消えるコミットはそのときも一覧に出ます)。`scripts/deploy.sh` も同じ確認(`scripts/preflight.sh`)をします。
+
 公開済みのリリースのノートを直すときは、その節を直して `gh release edit v<x.y.z> --notes-file <ファイル>`。タグは動かしません。
 
 Issue や Pull Request は歓迎します。バグ報告や質問は [Issue](https://github.com/takashito/agentgw/issues) からどうぞ。
