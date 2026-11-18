@@ -612,7 +612,15 @@ impl StickyBoard {
         if s.posting {
             return None;
         }
+        // Prose alone is never a final picture: the answer that follows takes it down. Drawn here
+        // first, a message not yet out would land after the take-down and stay
+        if self.prose_only(key) {
+            return None;
+        }
+        let s = self.stickies.get_mut(key)?;
         s.dirty = false;
+        // Like `take_dirty`: a first post is out from here, so a take-down waits for its ts
+        s.posting = s.posted_ts.is_none();
         Some((
             s.posted_ts.clone(),
             Self::capped(Self::blocks_of(&s.items, s.perm_timed_out)),
@@ -2166,6 +2174,15 @@ mod tests {
             assert_eq!(c.settle(&k, kind), StickyAction::Keep, "{kind}");
             assert_eq!(c.set_posted(&k, "999.2"), StickyAction::Delete("999.2".into()), "{kind}");
         }
+
+        // Prose not yet out when the answer comes (inside the 1-second throttle): the final
+        // render the bridge draws before settling must not post it, or it lands after the take-down
+        let mut d = StickyBoard::default();
+        d.on_turn_start(&k);
+        d.push_narration(&k, "(返信します)");
+        assert!(d.take_final(&k).is_none(), "prose alone is not a final picture");
+        assert_eq!(d.settle(&k, "reply"), StickyAction::Keep);
+        assert!(d.take_dirty(99_000).is_empty() && d.sticky_ts(&k).is_none());
 
         // A reply keeps the tool rows as a record — that is the A/B decision, not this fix
         let mut b = StickyBoard::default();
