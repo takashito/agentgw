@@ -51,6 +51,9 @@ struct ThreadActivity {
     replied_in_turn: bool,
     last_activity_ms: u64,
     session_ended: bool,
+    /// The agent's window went away in the middle of its work (it crashed, or its tmux server did).
+    /// Cleared when the next turn starts.
+    lost: bool,
 }
 
 /// One row per thread this Bridge has seen work in since it started (memory only).
@@ -77,6 +80,7 @@ impl ActivityBook {
         row.turn_ended_ms = None;
         row.turn_failed = None;
         row.session_ended = false;
+        row.lost = false;
     }
 
     /// The turn is over. A tool still marked running was cut off (no PostToolUse comes for it).
@@ -101,6 +105,36 @@ impl ActivityBook {
         if let Some(row) = self.threads.get_mut(key) {
             row.session_ended = true;
         }
+    }
+
+    /// The agent's window went away while it was at work: nothing will end its turn now.
+    pub fn agent_lost(&mut self, key: &ThreadKey, now: u64) {
+        self.turn_end(key, now);
+        if let Some(row) = self.threads.get_mut(key) {
+            row.lost = true;
+        }
+    }
+
+    /// Whether the book says this thread's agent is at work: in a turn, a tool running, or waiting
+    /// on a person. Only then can a missing window mean it died mid-work.
+    pub fn busy(&self, key: &ThreadKey) -> bool {
+        self.settled(key) == Some(false)
+    }
+
+    /// [`Self::snapshot`], but **checking that a busy agent's window is still there** first.
+    /// The book only hears hooks, and a dead agent sends none: without this a crashed agent stays
+    /// `running_tool` forever. `alive` is asked only when the book says the agent is at work.
+    pub fn snapshot_checked(
+        &mut self,
+        key: &ThreadKey,
+        has_agent: bool,
+        alive: impl FnOnce() -> bool,
+        now: u64,
+    ) -> serde_json::Value {
+        if has_agent && self.busy(key) && !alive() {
+            self.agent_lost(key, now);
+        }
+        self.snapshot(key, has_agent, now)
     }
 
     /// A permission prompt or a question is up (`true`), or answered (`false`).
@@ -202,6 +236,13 @@ impl ActivityBook {
         };
         let (state, summary) = if !has_agent || row.session_ended {
             ("no_agent", "This thread's agent has ended.".to_string())
+        } else if row.lost {
+            (
+                "agent_gone",
+                "This thread's agent stopped unexpectedly in the middle of its work (its window is gone). \
+                 It will not answer by itself; a new message to the thread starts it again from the conversation."
+                    .to_string(),
+            )
         } else if row.waiting_for_person {
             ("waiting_for_person", "Waiting for a person to answer a permission prompt or a question in the thread.".to_string())
         } else if let Some(r) = row.running.iter().min_by_key(|r| r.started_ms) {
@@ -667,6 +708,32 @@ mod tests {
         b.session_end(&key(), 2_000);
         assert_eq!(b.snapshot(&key(), true, 3_000)["state"], "no_agent");
         assert_eq!(b.snapshot(&key(), false, 3_000)["state"], "no_agent");
+    }
+
+    /// A crashed agent sends no more hooks: the book alone would say `running_tool` forever.
+    #[test]
+    fn a_busy_agent_whose_window_is_gone_is_reported_gone() {
+        let mut b = ActivityBook::default();
+        b.turn_start(&key(), 0);
+        b.tool_start(&key(), "t1", "Bash", "sleep 5", 1_000);
+        assert_eq!(b.snapshot_checked(&key(), true, || true, 2_000)["state"], "running_tool");
+        let s = b.snapshot_checked(&key(), true, || false, 3_000);
+        assert_eq!(s["state"], "agent_gone");
+        assert_eq!(s["running"].as_array().unwrap().len(), 0);
+        assert!(!b.busy(&key()), "no longer counted as at work");
+        // The next turn (the agent started again) clears it
+        b.turn_start(&key(), 4_000);
+        assert_eq!(b.snapshot(&key(), true, 5_000)["state"], "thinking");
+    }
+
+    /// An idle agent's window is not looked at: a torn-down cold agent is normal, not a crash.
+    #[test]
+    fn an_idle_agent_is_not_checked() {
+        let mut b = ActivityBook::default();
+        b.turn_start(&key(), 0);
+        b.turn_end(&key(), 1_000);
+        let s = b.snapshot_checked(&key(), true, || panic!("must not look at an idle agent's window"), 2_000);
+        assert_eq!(s["state"], "turn_ended");
     }
 
     #[test]

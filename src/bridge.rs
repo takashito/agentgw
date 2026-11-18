@@ -228,6 +228,10 @@ pub struct Bridge {
     sticky: slack::StickyBoard,
     /// Tool permissions waiting for a person's click. reqId → the waiting agent and the prompt to delete.
     perm_pending: HashMap<String, PermPending>,
+    /// Sessions whose agent was at work but had no window at the last cleanup round. Missing again
+    /// at the next round = it died (`notice_lost_agents`); one round of grace keeps a single failed
+    /// window listing from reading as a crash.
+    lost_suspects: std::collections::HashSet<String>,
     /// When the quiet threads' screens may be looked at again (epoch ms).
     dialog_watch_at_ms: u64,
     /// Dialogs on an agent's screen offered to the thread as buttons. reqId -> which window.
@@ -474,6 +478,7 @@ impl Bridge {
             lifecycle: bridge::Lifecycle::new(),
             sticky: slack::StickyBoard::default(),
             perm_pending: HashMap::new(),
+            lost_suspects: Default::default(),
             dialog_watch_at_ms: 0,
             dialog_pending: HashMap::new(),
             spawn_watching: Default::default(),
@@ -1123,6 +1128,9 @@ impl Bridge {
             .then(|| machine::GatewayAsk::new(up_tx.clone()));
         // What each thread's agent is doing: the main loop writes it, the link handler reads it
         let activity = crate::bridge::activity::ActivityRef::default();
+        // Built here, not in `Deps` below: the link task needs it too, to see whether a busy agent's
+        // window is still there when `thread_activity` asks (it holds no state, so sharing is free)
+        let agent: crate::agent::AgentRef = Arc::new(Claude::real());
         // Via Relay the bot token **comes in the handshake**, so the Api can only be built after it.
         // This is the only ordering difference from a direct connection.
         let (bot_token, link_home, gateway_name, relay_rx) = match &mode {
@@ -1291,6 +1299,7 @@ impl Bridge {
                     updated: updated_tx.clone(),
                     asker: gateway_ask.clone(),
                     activity: activity.clone(),
+                    agent: Some(agent.clone()),
                 };
                 let mut down_rx = down_rx;
                 tokio::spawn(async move {
@@ -1401,6 +1410,7 @@ impl Bridge {
                     updated: updated_tx.clone(),
                     asker: gateway_ask.clone(),
                     activity: activity.clone(),
+                    agent: Some(agent.clone()),
                 };
                 tokio::spawn(async move {
                     while let Some(item) = rx.recv().await {
@@ -1450,7 +1460,7 @@ impl Bridge {
         let mut b = Bridge::new(
             Deps {
                 slack: api.clone(),
-                agent: Arc::new(Claude::real()),
+                agent: agent.clone(),
                 clock: Arc::new(crate::clock::SystemClock),
                 dir,
             },
@@ -1793,6 +1803,8 @@ struct RelaySinks {
     asker: Option<machine::GatewayAsk>,
     /// What each thread's agent is doing (`thread_activity`), read when the gateway asks.
     activity: crate::bridge::activity::ActivityRef,
+    /// To check a busy agent's window is still there before answering `thread_activity`.
+    agent: Option<crate::agent::AgentRef>,
 }
 
 /// Tell the gateway where this machine works for each of its channels. The folders are **this machine's
@@ -1932,6 +1944,7 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
         updated,
         asker,
         activity,
+        agent,
     } = sinks;
     match item {
         machine::FromRelay::Event { name, event } => {
@@ -2111,12 +2124,23 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
         // `thread_activity`: the gateway asks what one of this machine's threads is doing
         machine::FromRelay::ReadActivity { req_id, channel, thread_ts } => {
             let key = crate::chat::ThreadKey::new(&channel, &thread_ts);
-            let has_agent = bridge::Threads::load(dir)
+            let sid = bridge::Threads::load(dir)
                 .get(&thread_ts)
-                .is_some_and(|e| e.agent_id.is_some() && e.channel_id.as_deref().is_none_or(|c| c == channel));
+                .filter(|e| e.channel_id.as_deref().is_none_or(|c| c == channel))
+                .and_then(|e| e.agent_id.clone());
+            let has_agent = sid.is_some();
+            // **A busy agent's window is checked, not assumed**: a crashed agent sends no more hooks,
+            // so the book alone kept answering "running" long after it was gone
+            let alive = || match (&agent, &sid) {
+                (Some(agent), Some(sid)) => {
+                    let name = crate::agent::SessionId::from(sid.clone()).window_name();
+                    agent.pid_of(None, &name).is_some()
+                }
+                _ => true,
+            };
             let now = crate::clock::now_ms();
             let activity = match activity.lock() {
-                Ok(book) => book.snapshot(&key, has_agent, now),
+                Ok(mut book) => book.snapshot_checked(&key, has_agent, alive, now),
                 Err(_) => serde_json::json!({"state": "unknown", "summary": "could not read this machine's record"}),
             };
             let _ = up.send(crate::bridge::gateway::link::LinkFrame::ActivityRead { req_id, activity });
@@ -2506,7 +2530,7 @@ mod tests {
         let (reload, mut reload_rx) = mpsc::channel(4);
         let (relink, _relink_rx) = mpsc::channel(4);
         let (up, mut up_rx) = mpsc::unbounded_channel();
-        let sinks = RelaySinks { msg_tx, click_tx, dir: dir.clone(), reload, relink, up, machine: "desk".into(), gateway_url: String::new(), left: mpsc::channel(4).0, arriving: mpsc::channel(4).0, updated: mpsc::channel(4).0, asker: None, activity: Default::default() };
+        let sinks = RelaySinks { msg_tx, click_tx, dir: dir.clone(), reload, relink, up, machine: "desk".into(), gateway_url: String::new(), left: mpsc::channel(4).0, arriving: mpsc::channel(4).0, updated: mpsc::channel(4).0, asker: None, activity: Default::default(), agent: None };
         let ask = |path: &str| machine::FromRelay::SetProject {
             channel: "C1".into(),
             thread_ts: "1.1".into(),
@@ -2560,6 +2584,7 @@ mod tests {
             updated: mpsc::channel(4).0,
             asker: None,
             activity: Default::default(),
+            agent: None,
         };
         pump_relay(
             machine::FromRelay::Linked {
@@ -2681,6 +2706,61 @@ mod tests {
         assert_eq!(s["state"], "thinking");
         assert_eq!((s["last_tool"]["tool"].as_str(), s["last_tool"]["outcome"].as_str()), (Some("Bash"), Some("ok")));
         assert_eq!(s["last_tool"]["result"], "test result: ok. 3 passed");
+    }
+
+    /// An agent whose window goes away in the middle of its work (it crashed, or the tmux server
+    /// did) sends no more hooks. The cleanup round notices — on the **second** round missing, so one
+    /// bad window listing is not a crash — tells the thread once, and `thread_activity` stops
+    /// saying it is running.
+    #[tokio::test]
+    async fn an_agent_whose_window_vanishes_at_work_is_reported_once() {
+        let (d, slack, agent, _clock) = flow_deps("lost-agent");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let _sid = running_thread(&mut b, &agent).await;
+        let key = ThreadKey::new("C1", ROOT);
+        b.on_progress(Some(&key), &serde_json::json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_use_id": "t1", "tool_input": {"command": "sleep 5"}}));
+        assert!(b.activity.lock().unwrap().busy(&key), "the turn is under way");
+        let told = |slack: &FakeChat| slack.calls().iter().filter(|c| c.contains("stopped unexpectedly")).count();
+
+        // Still there: nothing happens
+        b.notice_lost_agents(&b.live_windows());
+        b.notice_lost_agents(&b.live_windows());
+        settle().await;
+        assert_eq!(told(&slack), 0);
+
+        for r in crate::agent::Agent::windows(&*agent) {
+            crate::agent::Agent::terminate(&*agent, &crate::agent::Window::of(&r.id)).unwrap();
+        }
+        b.notice_lost_agents(&b.live_windows());
+        settle().await;
+        assert_eq!(told(&slack), 0, "one round missing is only a suspicion");
+        b.notice_lost_agents(&b.live_windows());
+        settle().await;
+        assert_eq!(told(&slack), 1, "{:?}", slack.calls());
+        let s = b.activity.lock().unwrap().snapshot(&key, true, b.deps.clock.now_ms());
+        assert_eq!(s["state"], "agent_gone");
+        b.notice_lost_agents(&b.live_windows());
+        b.notice_lost_agents(&b.live_windows());
+        settle().await;
+        assert_eq!(told(&slack), 1, "said once");
+    }
+
+    /// An agent that finished its turn and was torn down by the cleanup is not "lost".
+    #[tokio::test]
+    async fn an_idle_agent_without_a_window_is_not_reported() {
+        let (d, slack, agent, _clock) = flow_deps("lost-idle-agent");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let _sid = running_thread(&mut b, &agent).await;
+        let key = ThreadKey::new("C1", ROOT);
+        b.note_activity(|a, now| a.turn_end(&key, now));
+        for r in crate::agent::Agent::windows(&*agent) {
+            crate::agent::Agent::terminate(&*agent, &crate::agent::Window::of(&r.id)).unwrap();
+        }
+        for _ in 0..3 {
+            b.notice_lost_agents(&b.live_windows());
+        }
+        settle().await;
+        assert!(!slack.calls().iter().any(|c| c.contains("stopped unexpectedly")), "{:?}", slack.calls());
     }
 
     /// The periodic checks look at **agents that have a window**, not at every record. Each one asks
@@ -2825,7 +2905,7 @@ mod tests {
     async fn agent_messages_from_the_gateway_reach_the_inbox() {
         let dir = crate::state_dir::StateDir::at(std::env::temp_dir().join(format!("agentgw-pump-agent-{}", std::process::id())));
         let (msg_tx, mut msg_rx) = mpsc::channel(4);
-        let sinks = RelaySinks { msg_tx, click_tx: mpsc::channel(4).0, dir, reload: mpsc::channel(4).0, relink: mpsc::channel(4).0, up: mpsc::unbounded_channel().0, machine: "desk".into(), gateway_url: String::new(), left: mpsc::channel(4).0, arriving: mpsc::channel(4).0, updated: mpsc::channel(4).0, asker: None, activity: Default::default() };
+        let sinks = RelaySinks { msg_tx, click_tx: mpsc::channel(4).0, dir, reload: mpsc::channel(4).0, relink: mpsc::channel(4).0, up: mpsc::unbounded_channel().0, machine: "desk".into(), gateway_url: String::new(), left: mpsc::channel(4).0, arriving: mpsc::channel(4).0, updated: mpsc::channel(4).0, asker: None, activity: Default::default(), agent: None };
         let d = match agent_msg(ROOT, ROOT, "check", crate::chat::DeliveryKind::Ask) {
             m => crate::bridge::asks::AgentDelivery {
                 channel: m.channel,
@@ -2856,7 +2936,7 @@ mod tests {
             .save(&dir)
             .unwrap();
         let (left, mut left_rx) = mpsc::channel(4);
-        let sinks = RelaySinks { msg_tx: mpsc::channel(4).0, click_tx: mpsc::channel(4).0, dir: dir.clone(), reload: mpsc::channel(4).0, relink: mpsc::channel(4).0, up: mpsc::unbounded_channel().0, machine: "desk".into(), gateway_url: String::new(), left, arriving: mpsc::channel(4).0, updated: mpsc::channel(4).0, asker: None, activity: Default::default() };
+        let sinks = RelaySinks { msg_tx: mpsc::channel(4).0, click_tx: mpsc::channel(4).0, dir: dir.clone(), reload: mpsc::channel(4).0, relink: mpsc::channel(4).0, up: mpsc::unbounded_channel().0, machine: "desk".into(), gateway_url: String::new(), left, arriving: mpsc::channel(4).0, updated: mpsc::channel(4).0, asker: None, activity: Default::default(), agent: None };
 
         pump_relay(machine::FromRelay::ChannelGone { channel: "C_GONE".into() }, &sinks).await;
 
@@ -2879,7 +2959,7 @@ mod tests {
         a.routes.entry("C1".into()).or_default().repo_path = Some(proj.to_string_lossy().to_string());
         a.save(&dir).unwrap();
         let (up, mut up_rx) = mpsc::unbounded_channel();
-        let sinks = RelaySinks { msg_tx: mpsc::channel(4).0, click_tx: mpsc::channel(4).0, dir, reload: mpsc::channel(4).0, relink: mpsc::channel(4).0, up, machine: "desk".into(), gateway_url: String::new(), left: mpsc::channel(4).0, arriving: mpsc::channel(4).0, updated: mpsc::channel(4).0, asker: None, activity: Default::default() };
+        let sinks = RelaySinks { msg_tx: mpsc::channel(4).0, click_tx: mpsc::channel(4).0, dir, reload: mpsc::channel(4).0, relink: mpsc::channel(4).0, up, machine: "desk".into(), gateway_url: String::new(), left: mpsc::channel(4).0, arriving: mpsc::channel(4).0, updated: mpsc::channel(4).0, asker: None, activity: Default::default(), agent: None };
         pump_relay(machine::FromRelay::ReadProject { req_id: "r9".into(), channel: "C1".into() }, &sinks).await;
         match up_rx.try_recv() {
             Ok(crate::bridge::gateway::link::LinkFrame::ProjectRead { req_id, text }) => {
@@ -5858,7 +5938,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let dir = crate::state_dir::StateDir::at(base.join("state"));
         let (up, mut up_rx) = mpsc::unbounded_channel();
-        let sinks = RelaySinks { msg_tx: mpsc::channel(4).0, click_tx: mpsc::channel(4).0, dir: dir.clone(), reload: mpsc::channel(4).0, relink: mpsc::channel(4).0, up, machine: "desk".into(), gateway_url: String::new(), left: mpsc::channel(4).0, arriving: mpsc::channel(4).0, updated: mpsc::channel(4).0, asker: None, activity: Default::default() };
+        let sinks = RelaySinks { msg_tx: mpsc::channel(4).0, click_tx: mpsc::channel(4).0, dir: dir.clone(), reload: mpsc::channel(4).0, relink: mpsc::channel(4).0, up, machine: "desk".into(), gateway_url: String::new(), left: mpsc::channel(4).0, arriving: mpsc::channel(4).0, updated: mpsc::channel(4).0, asker: None, activity: Default::default(), agent: None };
         let target = base.join("a/b").to_string_lossy().to_string();
         let ask = |create| machine::FromRelay::SetProject {
             channel: "C1".into(),
