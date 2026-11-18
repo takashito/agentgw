@@ -8,15 +8,29 @@ in [README.md](README.md#release-notes).
 
 ## [Unreleased]
 
+## [0.72.0] - 2026-11-18
+
 ### Added
 - `end_session` tool: a Claude ends its own session when the person says the work is finished, either marking the thread done (✅) or not. (WORK-68)
 - `end_ask` takes `outcome`: `done` (the default) marks the asked thread done with ✅, `canceled` closes it without the mark. (WORK-68)
+- After a machine reboot, a request that was still unanswered resumes its conversation once (`--resume`) with the messages it had not answered, including a request that was already acknowledged. When it cannot be resumed, the thread and the asking agent are told to send it again. (WORK-74)
+- An agent stopped at a screen nobody answers (a start-up dialog or a permission prompt) is closed after 30 minutes; the prompt says so, the asker is told, and the thread can be resumed later. (WORK-82)
 
 ### Changed
+- `scripts/release.sh` runs the same checks as `scripts/deploy.sh` and stops when the release would drop a commit that is on `main` or in the build running now. `--force` releases anyway and lists what is dropped. (WORK-67)
+- A Slack login whose pasted code does not finish signing in waits 90 seconds, says when it timed out, and shows the last lines of the sign-in screen (code masked). (WORK-71)
 - Only `done` marks a thread done with ✅; `exit` and `bye` now just end the agent. (WORK-68)
 - While the agent is running, a bare `done` goes to it first: if it had asked you to do something, it reads `done` as "I did it" and carries on; otherwise it marks the thread done and ends. (WORK-68)
 - The line posted when a thread ends now says what happened, e.g. "#channel marked this thread done." instead of "Thanks for your work! Ending the Claude Code session." (WORK-68)
 - An ended thread's agent session is set to closed in Slack; the next message there opens it again. (WORK-68)
+
+### Fixed
+- The idle cleanup no longer takes down an agent that is still at work (in a turn, owing an answer to the agent that asked it, or not yet seen finishing a turn since a restart). Over the concurrency cap with every agent busy, nothing is taken down. (WORK-76)
+- A folder whose external imports were approved under its real path is no longer asked again when the agent starts from a linked path. (WORK-82)
+- A permission prompt whose hint goes past "Esc to cancel" (e.g. "Esc to cancel · Tab to amend") is recognized, so it gets Slack buttons instead of sitting on screen. (WORK-82)
+- When an agent is stuck at a screen dialog, the agents that asked it are told a person is needed even if their exchange was already closed. (WORK-82)
+- A reply that names an already acknowledged request now settles it, so a later reboot does not wake the thread for a request it had answered. (WORK-74)
+- A progress message holding only the agent's own prose (e.g. "● .") is removed at turn end instead of staying in the thread. (WORK-64)
 
 ## [0.71.1] - 2026-11-18
 
