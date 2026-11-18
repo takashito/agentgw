@@ -1498,11 +1498,12 @@ impl Bridge {
         // Fold the permission prompts the previous process left waiting — their buttons answer nobody
         b.fold_stale_perm_prompts(&LogCtx::default()).await;
         b.adopt_dialog_prompts(&LogCtx::default());
-        // Pick up threads the previous process was waiting to answer (only those with live agents)
+        // Pick up threads the previous process was waiting to answer. Those whose agent's window was
+        // lost (a machine reboot) are woken once with what they were given, or told the work was cut off
         b.restore_pending(&LogCtx::default());
         // Re-deliver requests that never got handed over (start an agent to hand them to if there is none)
         b.resume_pending_from_disk().await;
-        // Tell home once about the start. pending is always 0 — the Rust version has no auto-resume of unfinished threads
+        // Tell home once about the start
         b.announce_online().await;
         // tokio's signal is in features = ["full"] (no new dependency).
         // slack-morphism grabs TERM_SIGNALS first via signal-hook, but the registry
@@ -4335,6 +4336,118 @@ mod tests {
         assert!(b.threads.get("3.3").is_some(), "no agent yet = not stale");
         assert!(b.threads.get(ROOT).is_some(), "a live window outranks the disk");
         assert!(b.threads.get("2.2").is_none(), "nothing to resume, nothing to remember");
+    }
+
+    /// The machine under an asked thread rebooted mid-request: the window is gone, the ledger and
+    /// `history` (whether the conversation can be resumed) are what the next Bridge finds on disk.
+    /// `bridge` is the one that was running, `None` for a fresh asked thread.
+    async fn rebooted(
+        name: &str,
+        before: Option<(Bridge, Arc<FakeChat>, Arc<FakeAgent>, Arc<FakeClock>)>,
+        history: bool,
+    ) -> (
+        Bridge,
+        Arc<FakeChat>,
+        Arc<FakeAgent>,
+        Arc<FakeClock>,
+        mpsc::UnboundedReceiver<crate::bridge::gateway::link::LinkFrame>,
+        String,
+    ) {
+        let (mut b, slack, agent, clock) = match before {
+            Some(prev) => prev,
+            None => {
+                let (d, slack, agent, clock) = flow_deps(name);
+                let (mut b, _fx) = Bridge::for_test(d);
+                b.ask_gateway = Some(mpsc::unbounded_channel().0);
+                b.on_inbound(&agent_msg(ROOT, ROOT, "check it", crate::chat::DeliveryKind::Ask)).await;
+                (b, slack, agent, clock)
+            }
+        };
+        let sid = b.threads.get(ROOT).and_then(|e| e.agent_id.clone()).expect("an agent");
+        let _ = b.ledger.flush(&mut b.threads);
+        let path = b.deps.dir.path().to_path_buf();
+        drop(b);
+        // The reboot: every window goes
+        agent.spawned.lock().unwrap().clear();
+        for n in 0..8 {
+            let _ = crate::agent::Agent::terminate(&*agent, &crate::agent::Window::of(&format!("@{n}")));
+        }
+        if history {
+            agent.histories.lock().unwrap().push(sid.clone());
+        }
+        let deps = Deps {
+            slack: slack.clone(),
+            agent: agent.clone(),
+            clock: clock.clone(),
+            dir: crate::state_dir::StateDir::at(path),
+        };
+        let (mut b, _fx) = Bridge::for_test(deps);
+        let (tx, rx) = mpsc::unbounded_channel();
+        b.ask_gateway = Some(tx);
+        (b, slack, agent, clock, rx, sid)
+    }
+
+    /// **A request cut off by a machine reboot is picked up again.** The window is gone (a plain restart
+    /// keeps it), so the previous version dropped the request silently and the asker waited forever.
+    #[tokio::test]
+    async fn a_request_cut_off_by_a_reboot_is_resumed_from_the_conversation() {
+        let (mut b, slack, agent, _clock, mut up, sid) = rebooted("reboot-resume", None, true).await;
+
+        b.restore_pending(&LogCtx::default());
+        settle().await;
+
+        let spawned = agent.spawned.lock().unwrap().clone();
+        assert_eq!(spawned.len(), 1, "one agent woken");
+        assert_eq!(spawned[0].resume_from.as_ref().map(|s| s.as_str().to_string()), Some(sid.clone()));
+        let prompt = spawned[0].prompt.clone().unwrap_or_default();
+        assert!(prompt.contains("machine restarted"), "{prompt}");
+        assert!(prompt.contains("check it"), "the request itself goes again: {prompt}");
+        let key = ThreadKey::new("C_ADMIN", ROOT);
+        assert!(!b.ledger.pending(&key).is_empty(), "still owed — the answer settles it");
+        assert!(replies_up(&mut up).is_empty(), "the asker is not told it failed");
+        assert!(
+            slack.calls().iter().any(|c| c.contains("Picking up where it left off")),
+            "{:?}",
+            slack.calls()
+        );
+    }
+
+    /// No conversation to wake: the asker and the thread hear the work was cut off instead of waiting.
+    #[tokio::test]
+    async fn a_cut_off_request_that_cannot_resume_says_send_it_again() {
+        let (mut b, slack, agent, _clock, mut up, _sid) = rebooted("reboot-nohistory", None, false).await;
+
+        b.restore_pending(&LogCtx::default());
+        settle().await;
+
+        assert!(agent.spawned.lock().unwrap().is_empty(), "nothing to resume");
+        let told = replies_up(&mut up);
+        assert!(
+            told.iter().any(|(o, t)| o == "failed" && t.contains("send the request again")),
+            "{told:?}"
+        );
+        assert!(b.ledger.pending(&ThreadKey::new("C_ADMIN", ROOT)).is_empty());
+        assert!(
+            slack.calls().iter().any(|c| c.contains("Send it again")),
+            "{:?}",
+            slack.calls()
+        );
+    }
+
+    /// **Once only.** A second reboot before the answer tells instead of waking the same request again.
+    #[tokio::test]
+    async fn a_cut_off_request_is_resumed_only_once() {
+        let (mut b, slack, agent, clock, _up, _sid) = rebooted("reboot-twice", None, true).await;
+        b.restore_pending(&LogCtx::default());
+        assert_eq!(agent.spawned.lock().unwrap().len(), 1);
+
+        let (mut b, _slack, agent, _clock, mut up, _sid) =
+            rebooted("reboot-twice", Some((b, slack, agent, clock)), true).await;
+        b.restore_pending(&LogCtx::default());
+        settle().await;
+
+        assert!(agent.spawned.lock().unwrap().is_empty(), "woken a second time");
+        assert!(replies_up(&mut up).iter().any(|(o, _)| o == "failed"));
     }
 
     /// **Deleting the thread's root deletes the conversation, so the agent goes with it.** Slack takes
