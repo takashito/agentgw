@@ -272,6 +272,9 @@ pub(super) struct Stall {
 impl Bridge {
     /// Adds a reason and tells Slack, if that changed what the thread is doing.
     pub(super) fn presence_add(&self, key: &ThreadKey, why: Reason) {
+        if why == Reason::Perm {
+            self.note_activity(|b, now| b.waiting_for_person(key, true, now));
+        }
         let change = self.presence.lock().ok().and_then(|mut b| b.add(key, why));
         self.presence_send(key, change);
     }
@@ -279,6 +282,9 @@ impl Bridge {
     /// Takes a reason away and tells Slack, if that changed what the thread is doing.
     /// **A holder only ever removes its own**, so a command ending under a running turn is silent.
     pub(super) fn presence_remove(&self, key: &ThreadKey, why: &Reason) {
+        if *why == Reason::Perm {
+            self.note_activity(|b, now| b.waiting_for_person(key, false, now));
+        }
         let change = self
             .presence
             .lock()
@@ -361,6 +367,9 @@ impl Bridge {
                 // Left in, it stays ready:true, gets taken by the next new thread, and the delivery is lost
                 self.drop_pool_worker(&ev.session_id, "ended", &ctx);
                 self.milestone(key.as_ref(), "session_end", &ctx);
+                if let Some(k) = key.as_ref() {
+                    self.note_activity(|b, now| b.session_end(k, now));
+                }
             }
             // A tool call worked = it holds MCP (an inherited agent never gets another chance to
             // show initialize — mcp.rs's call_tool sends the only evidence). No milestone
@@ -387,6 +396,7 @@ impl Bridge {
                 // If blocked, the turn **continues** (re-prompt), so it's not over yet
                 if let Some(key) = key.as_ref().filter(|_| out.get("decision").is_none()) {
                     self.sticky.on_turn_end(key);
+                    self.note_activity(|b, now| b.turn_end(key, now));
                     // Whatever the thread was waiting for, the turn is over and it is not
                     // waiting for it any more -- including a question answered on the machine,
                     // which sends nothing back through the thread
@@ -411,6 +421,9 @@ impl Bridge {
     /// Keep the order: log → thread gate → **limit gate** → **re-delivery** → wording.
     fn on_turn_failure(&mut self, ev: &HookEvent, key: Option<&ThreadKey>, ctx: &LogCtx) {
         let sent = ev.payload["error_type"].as_str().unwrap_or("");
+        if let Some(k) = key {
+            self.note_activity(|b, now| b.turn_failed(k, sent, now));
+        }
         // An empty type means asking the agent's own record. On a real machine (2026-09-18) an expired sign-in
         // arrived empty, was read as retry, and told people to "send it again" — re-sending doesn't help
         let recorded = if sent.is_empty() && !ev.session_id.is_empty() {
@@ -1342,6 +1355,7 @@ impl Bridge {
         let ids = self.ledger.mark_received(key);
         self.received(key, ids, ctx);
         self.sticky.on_turn_start(key);
+        self.note_activity(|b, now| b.turn_start(key, now));
     }
 
     fn key_of_session(&self, session_id: &str) -> Option<ThreadKey> {
@@ -2044,7 +2058,7 @@ impl Bridge {
     }
 
     /// PreToolUse / PostToolUse → a tool line in the progress message. Which tools **don't** get a line is an invariant of the board.
-    fn on_progress(&mut self, key: Option<&ThreadKey>, p: &serde_json::Value) {
+    pub(super) fn on_progress(&mut self, key: Option<&ThreadKey>, p: &serde_json::Value) {
         let Some(key) = key else { return };
         let name = p["tool_name"].as_str().unwrap_or_default();
         // A progress with no tool name is an activity ping "before the tool is known".
@@ -2052,12 +2066,6 @@ impl Bridge {
         // A line would have an empty name and can't be folded, so it **splits a run of consecutive Read/search lines**
         // (the position gate).
         if name.is_empty() {
-            return;
-        }
-        // **The question gets its own post, with the rows as buttons.** A line on the board
-        // saying the agent called a tool adds nothing, and it is the one tool whose whole point
-        // is already visible in the thread
-        if name == QUESTION_TOOL {
             return;
         }
         // A failed call comes as `PostToolUseFailure`, which carries `error` / `is_error` at the
@@ -2088,6 +2096,13 @@ impl Bridge {
             "" => format!("{name}:{summary}"),
             id => id.to_string(),
         };
+        self.note_tool_activity(key, &id, name, &summary, status, p, &result_text);
+        // **The question gets its own post, with the rows as buttons.** A line on the board
+        // saying the agent called a tool adds nothing, and it is the one tool whose whole point
+        // is already visible in the thread
+        if name == QUESTION_TOOL {
+            return;
+        }
         // Where the subagent came from. The top-level agent_id/agent_type are only on
         // **tools run inside a subagent** (not in the main session).
         // The spawner's id is in tool_response: camelCase for foreground,
@@ -2113,6 +2128,51 @@ impl Bridge {
         };
         self.sticky
             .upsert_tool(key, &id, name, &summary, status, &agent, &p["tool_input"]);
+    }
+
+    /// Writes to the record `thread_activity` reads. The clock is read here so callers can't disagree.
+    pub(super) fn note_activity(&self, f: impl FnOnce(&mut crate::bridge::activity::ActivityBook, u64)) {
+        let now = self.deps.clock.now_ms();
+        if let Ok(mut book) = self.activity.lock() {
+            f(&mut book, now);
+        }
+    }
+
+    /// A tool's start or end, for `thread_activity`. Only a command's output (and a failure's
+    /// message) goes along: a file's contents or a search's hits say nothing about progress and are
+    /// the likeliest place for a secret.
+    #[allow(clippy::too_many_arguments)]
+    fn note_tool_activity(
+        &self,
+        key: &ThreadKey,
+        id: &str,
+        name: &str,
+        summary: &str,
+        status: slack::ToolStatus,
+        p: &serde_json::Value,
+        result_text: &str,
+    ) {
+        use crate::bridge::activity::{detail, result_tail};
+        let shown = detail(summary);
+        let outcome = match status {
+            slack::ToolStatus::Pending => {
+                self.note_activity(|b, now| b.tool_start(key, id, name, &shown, now));
+                return;
+            }
+            slack::ToolStatus::Done => "ok",
+            slack::ToolStatus::Error => "error",
+            slack::ToolStatus::Deny => "denied",
+        };
+        let result = if outcome != "ok" {
+            result_tail(result_text)
+        } else if name == "Bash" {
+            let r = &p["tool_response"];
+            let out = r["stdout"].as_str().filter(|s| !s.trim().is_empty()).or_else(|| r["stderr"].as_str());
+            out.and_then(result_tail).or_else(|| result_tail(result_text))
+        } else {
+            None
+        };
+        self.note_activity(|b, now| b.tool_done(key, id, name, &shown, outcome, result, now));
     }
 
     /// `agentId: <id>` written plainly in the result text (last resort. `/agentId:\s*(\w+)/`).
@@ -2253,6 +2313,9 @@ impl Bridge {
         if d.kind == "title" {
             self.rename_thread(&key, d.title.unwrap_or_default(), &ctx).await;
             return;
+        }
+        if matches!(d.kind, "reply" | "edit") {
+            self.note_activity(|b, now| b.report(&key, now));
         }
         // An answer came = the turn is over. The reason goes; anything else still holding the
         // thread (a command running beside it) keeps it busy on its own.
@@ -2627,7 +2690,7 @@ impl crate::mcp::ToolExecutor for ToolExec {
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
         let (slack, dir, dispo, ask) = (self.slack.clone(), self.state_dir.clone(), self.dispo.clone(), self.ask.clone());
         Box::pin(async move {
-            if matches!(tool.as_str(), "ask_channel" | "end_ask" | "list_channels" | "set_channel_info" | "create_channel" | "join_channel" | "invite_to_channel") {
+            if matches!(tool.as_str(), "ask_channel" | "end_ask" | "thread_activity" | "list_channels" | "set_channel_info" | "create_channel" | "join_channel" | "invite_to_channel") {
                 return execute_ask_tool(slack.as_ref(), &dir, &session_id, &tool, &args, ask.as_ref(), &dispo).await;
             }
             execute_tool(slack.as_ref(), &dir, &session_id, &tool, &args, &dispo).await
@@ -2713,6 +2776,15 @@ pub async fn execute_ask_tool(
             return Err("channel_id and thread_ts are required".into());
         };
         let out = ask.ask(|req_id| LinkFrame::EndAsk { req_id, from_channel, from_thread, to_channel, to_thread }).await?;
+        return Ok(out.to_string());
+    }
+    if tool == "thread_activity" {
+        let (Some(to_channel), Some(to_thread)) = (opt("channel_id"), opt("thread_ts")) else {
+            return Err("channel_id and thread_ts are required".into());
+        };
+        let out = ask
+            .ask(|req_id| LinkFrame::ThreadActivity { req_id, from_channel, from_thread, to_channel, to_thread })
+            .await?;
         return Ok(out.to_string());
     }
     let (Some(to_channel), Some(text)) = (opt("channel_id"), opt("text")) else {

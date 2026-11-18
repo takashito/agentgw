@@ -278,6 +278,20 @@ pub mod link {
             to_channel: String,
             to_thread: String,
         },
+        /// machine → gateway: what the agent in a thread `from_thread` asked is doing right now
+        /// (`thread_activity`). Read only. Answered with [`LinkFrame::AskAnswer`].
+        ThreadActivity {
+            req_id: String,
+            from_channel: String,
+            from_thread: String,
+            to_channel: String,
+            to_thread: String,
+        },
+        /// gateway → machine: what this thread's agent is doing. Answered with [`LinkFrame::ActivityRead`].
+        /// A machine too old to know it drops it, and the gateway gives up after a few seconds.
+        ReadActivity { req_id: String, channel: String, thread_ts: String },
+        /// machine → gateway: the answer (see `bridge::activity::ActivityBook::snapshot`).
+        ActivityRead { req_id: String, activity: serde_json::Value },
         /// machine → gateway: the channels an agent may ask (`list_channels`). Answered with [`LinkFrame::AskAnswer`].
         ListChannels {
             req_id: String,
@@ -2491,6 +2505,14 @@ use tokio::sync::mpsc::Sender;
 /// **The disk (access.json) is the source of truth for owner / home / the assignment table.** The Bridge itself
 /// holds the same file, so after writing here we send one `reload` to make it reread — never keep two copies
 /// in memory that can drift apart.
+/// How long `thread_activity` waits for the machine that has the thread. The answer is read from
+/// memory there, so only a machine too old to know the frame takes this long.
+const ACTIVITY_WAIT: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(200)
+} else {
+    std::time::Duration::from_secs(5)
+};
+
 pub struct Fleet {
     pub links: LinkServer,
     /// The key machines present.
@@ -3885,6 +3907,20 @@ impl Fleet {
                     }
                 });
             }
+            link::LinkFrame::ThreadActivity { req_id, from_channel, from_thread, to_channel, to_thread } => {
+                let (fleet, machine) = (self.clone(), bridge_id.to_string());
+                tokio::spawn(async move {
+                    let result = fleet.thread_activity(&from_channel, &from_thread, &to_channel, &to_thread).await;
+                    if !fleet.send_frame(&machine, &link::LinkFrame::AskAnswer { req_id, result }).await {
+                        rlog("info", &format!("{machine}: could not return a thread_activity answer (link dropped)"));
+                    }
+                });
+            }
+            link::LinkFrame::ActivityRead { req_id, activity } => {
+                if let Some(tx) = self.reads.lock().unwrap_or_else(|e| e.into_inner()).remove(&req_id) {
+                    let _ = tx.send(activity.to_string());
+                }
+            }
             link::LinkFrame::UpdateFailed { version, why } => {
                 rlog("error", &format!("{bridge_id}: could not update to {version}: {why}"));
                 let id = bridge_id.to_string();
@@ -4878,6 +4914,80 @@ impl Fleet {
             // The exchange is over either way; its agent is left to whoever looks at that machine
             Err(why) => serde_json::json!({"status": "ended", "note": format!("the exchange is ended, but its agent could not be stopped now: {why}")}),
         })
+    }
+
+    /// `thread_activity`: what the agent in `to_thread` (a thread `from_thread` asked) is doing now.
+    /// **Read only** — nothing is posted and the agent there is not disturbed. The same threads as
+    /// `end_ask` can be read: only ones this thread asked, ended exchanges included (what it last
+    /// did is still worth knowing). The machine that has the thread answers from its own record.
+    pub(crate) async fn thread_activity(
+        &self,
+        from_channel: &str,
+        from_thread: &str,
+        to_channel: &str,
+        to_thread: &str,
+    ) -> Result<serde_json::Value, String> {
+        let row = self
+            .asks
+            .lock()
+            .await
+            .get(to_thread)
+            .filter(|(ch, _)| ch == to_channel)
+            .map(|(_, r)| r.clone());
+        let exchange_ended = crate::bridge::asks::check_read(row.as_ref(), from_channel, from_thread)?;
+        let (routes, connected) = (self.access().bridges(), self.links.connected());
+        let thread_routes = self.thread_routes.lock().await.clone();
+        let decision = Delivery::decide(
+            Some(to_channel),
+            Some(to_thread),
+            &thread_routes,
+            &routes,
+            &self.self_id,
+            |b| connected.iter().any(|c| c == b),
+        );
+        let machine = match decision {
+            Delivery::Local => self.self_id.clone(),
+            Delivery::Forward(b) => b,
+            Delivery::Offline(b) => {
+                return Ok(serde_json::json!({
+                    "state": "machine_offline",
+                    "summary": format!("The machine for that thread ({b}) is not connected to the gateway now; its agent may still be working, but nothing can be read."),
+                    "machine": b,
+                    "exchange_ended": exchange_ended,
+                }));
+            }
+            Delivery::UnknownChannel => return Err("no channel given".into()),
+        };
+        let mut out = match self.read_activity_on(&machine, to_channel, to_thread).await {
+            Some(v) => v,
+            None => serde_json::json!({
+                "state": "no_answer",
+                "summary": format!("{machine} did not answer within 5 seconds (it may run an agentgw too old to report activity)."),
+            }),
+        };
+        out["machine"] = machine.into();
+        out["exchange_ended"] = exchange_ended.into();
+        Ok(out)
+    }
+
+    /// Ask `machine` (this one included) what a thread's agent is doing; `None` without an answer in time.
+    async fn read_activity_on(&self, machine: &str, channel: &str, thread_ts: &str) -> Option<serde_json::Value> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let req_id = format!("activity-{}-{}", now_ms(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.reads.lock().unwrap_or_else(|e| e.into_inner()).insert(req_id.clone(), tx);
+        let frame = link::LinkFrame::ReadActivity {
+            req_id: req_id.clone(),
+            channel: channel.to_string(),
+            thread_ts: thread_ts.to_string(),
+        };
+        let got = if self.send_frame(machine, &frame).await {
+            tokio::time::timeout(ACTIVITY_WAIT, rx).await.ok().and_then(Result::ok)
+        } else {
+            None
+        };
+        self.reads.lock().unwrap_or_else(|e| e.into_inner()).remove(&req_id);
+        got.and_then(|s| serde_json::from_str(&s).ok())
     }
 
     /// A long text in Slack-sized pieces, the same way replies are split.
@@ -10100,6 +10210,57 @@ mod ask_tests {
         assert_eq!(r.fleet.end_ask("C1", "1.1", "C2", &thread).await.unwrap()["status"], "already_ended");
         assert_eq!(calls(&r.api).len(), again, "nothing posted twice");
         assert!(r.msgs.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn the_asker_reads_what_the_asked_thread_is_doing() {
+        let (r, thread) = approved("activity").await;
+        let (tx, mut wire) = tokio::sync::mpsc::unbounded_channel::<String>();
+        r.fleet.links.register("pve", Conn::new(tx));
+        r.fleet.thread_routes.lock().await.insert(thread.clone(), "pve".into());
+        let before = calls(&r.api).len();
+        let fleet = r.fleet.clone();
+        let t = thread.clone();
+        let read = tokio::spawn(async move { fleet.thread_activity("C1", "1.1", "C2", &t).await });
+        let (req, channel, ts) = loop {
+            let raw = wire.recv().await.unwrap();
+            if let Some(link::LinkFrame::ReadActivity { req_id, channel, thread_ts }) = link::decode(&raw) {
+                break (req_id, channel, thread_ts);
+            }
+        };
+        assert_eq!((channel.as_str(), ts.as_str()), ("C2", thread.as_str()));
+        let activity = serde_json::json!({"state": "running_tool", "summary": "Running Bash for 42s: cargo test"});
+        r.fleet.on_machine_frame("pve", link::LinkFrame::ActivityRead { req_id: req, activity }).await;
+        let out = read.await.unwrap().unwrap();
+        assert_eq!(out["state"], "running_tool");
+        assert_eq!((out["machine"].as_str(), out["exchange_ended"].as_bool()), (Some("pve"), Some(false)));
+        assert_eq!(calls(&r.api).len(), before, "reading posts nothing");
+    }
+
+    #[tokio::test]
+    async fn activity_has_a_state_even_when_the_machine_cannot_say() {
+        let (r, thread) = approved("activitygone").await;
+        r.fleet.thread_routes.lock().await.insert(thread.clone(), "pve".into());
+        let out = r.fleet.thread_activity("C1", "1.1", "C2", &thread).await.unwrap();
+        assert_eq!((out["state"].as_str(), out["machine"].as_str()), (Some("machine_offline"), Some("pve")));
+        // Connected but silent (too old to know the frame): a state after the wait, not an error
+        let (tx, _wire) = tokio::sync::mpsc::unbounded_channel::<String>();
+        r.fleet.links.register("pve", Conn::new(tx));
+        let out = r.fleet.thread_activity("C1", "1.1", "C2", &thread).await.unwrap();
+        assert_eq!(out["state"], "no_answer");
+    }
+
+    #[tokio::test]
+    async fn only_the_asking_thread_may_read_activity() {
+        let (r, thread) = approved("activityother").await;
+        assert!(r.fleet.thread_activity("C9", "9.9", "C2", &thread).await.unwrap_err().contains("only read threads you asked"));
+        assert!(r.fleet.thread_activity("C1", "1.1", "C3", &thread).await.is_err(), "the wrong channel");
+        assert!(r.fleet.thread_activity("C1", "1.1", "C2", "7.7").await.is_err(), "a thread nobody asked");
+        // An ended exchange can still be read
+        r.fleet.end_ask("C1", "1.1", "C2", &thread).await.unwrap();
+        r.fleet.thread_routes.lock().await.insert(thread.clone(), "pve".into());
+        let out = r.fleet.thread_activity("C1", "1.1", "C2", &thread).await.unwrap();
+        assert_eq!(out["exchange_ended"], true);
     }
 
     #[tokio::test]

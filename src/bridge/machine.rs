@@ -183,6 +183,8 @@ pub enum FromRelay {
     AgentMessage(crate::bridge::asks::AgentDelivery),
     /// Read the project notes of this channel's folder for the gateway.
     ReadProject { req_id: String, channel: String },
+    /// Say what one of this machine's threads is doing, for the gateway (`thread_activity`).
+    ReadActivity { req_id: String, channel: String, thread_ts: String },
     /// A refusal that talking won't fix. **No retry.**
     Fatal(Fatal),
 }
@@ -379,10 +381,13 @@ impl FromRelay {
             // An unreadable delivery is not a frame for us (an older or newer gateway's shape)
             F::AgentMessage { msg } => FromRelay::AgentMessage(serde_json::from_value(msg).ok()?),
             F::ReadProject { req_id, channel } => FromRelay::ReadProject { req_id, channel },
+            F::ReadActivity { req_id, channel, thread_ts } => FromRelay::ReadActivity { req_id, channel, thread_ts },
             // Answers and asks only ever go the other way
             F::ProjectSet { .. }
             | F::AskChannel { .. }
             | F::EndAsk { .. }
+            | F::ThreadActivity { .. }
+            | F::ActivityRead { .. }
             | F::ListChannels { .. }
             | F::SetChannelInfo { .. }
             | F::CreateChannel { .. }

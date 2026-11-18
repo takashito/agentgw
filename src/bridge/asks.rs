@@ -85,6 +85,16 @@ pub fn check_end(row: Option<&AskedFrom>, from_channel: &str, from_thread: &str)
     Ok(row.state == AskState::Ended)
 }
 
+/// Whether `from_channel`/`from_thread` may read what the agent in the asked thread whose record is
+/// `row` is doing (`thread_activity`): the same threads it could end — only ones it asked. An exchange
+/// that ended can still be read. `Ok(true)` = that exchange has ended.
+pub fn check_read(row: Option<&AskedFrom>, from_channel: &str, from_thread: &str) -> Result<bool, String> {
+    let Some(row) = row.filter(|r| r.channel == from_channel && r.thread_ts == from_thread) else {
+        return Err("that thread was not asked from this thread; you can only read threads you asked with ask_channel".into());
+    };
+    Ok(row.state == AskState::Ended)
+}
+
 /// Whether a new ask may go to `to_channel`. A new ask always opens a new thread, so it can never
 /// land in the thread that asks (a follow-up into it is refused by [`check_follow_up`]: no record).
 pub fn check_new(to_channel: &str) -> Result<(), String> {
