@@ -325,6 +325,8 @@ The Claudes in different channels ask each other for work with the `ask_channel`
 
 While a request is running, the asking Claude can check on it with `thread_activity` instead of interrupting it. The answer always carries a one-word `state` — `running_tool`, `thinking`, `waiting_for_person`, `turn_ended`, `turn_failed`, `idle`, `no_agent`, `machine_offline` or `no_answer` — with a one-line summary, the tools running and for how many seconds, the last tool with its outcome, and when the asked Claude last posted to its thread. Reading changes nothing in the asked thread.
 
+Any thread of the channel that asked can do this, not only the thread that sent the request. This lets a request that has gone quiet be picked up from a fresh thread. A follow-up (`ask_channel` with the asked `thread_ts`) sent from another thread of the same channel takes the exchange over: replies, notices that a person is needed, and `end_ask` move to that thread, and the thread that asked first gets a one-line note. Threads in other channels cannot read or follow up a request, and a closed request stays closed.
+
 - **Scope:** only threads asked from the calling thread with `ask_channel` (ended ones included). Any other thread is refused.
 - **Masking:** command lines are cut to 200 characters and output to its last 300. Only a command's output or a failure's message is passed on, never a file's contents or search hits. Values that look like secrets are replaced with `***`: tokens with a known prefix (`xoxb-`, `ghp_`, `sk-`, `AKIA` and others), values of variables and fields whose name contains `TOKEN`, `SECRET`, `PASSWORD`, `API_KEY` and the like, the word after `--token`, `--password`, `Bearer` and similar, passwords in URLs, and long random-looking strings.
 

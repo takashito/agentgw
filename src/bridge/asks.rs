@@ -59,15 +59,18 @@ impl From<AgentDelivery> for crate::chat::InboundMsg {
 }
 
 /// Whether a follow-up from `from_channel`/`from_thread` may go into the asked thread whose record is
-/// `row`. The refusals are for the asking agent (a tool error), not shown to people.
+/// `row`. Any thread of the **channel that asked** may send one, not only the thread that asked: a
+/// request left hanging there can be picked up from another thread of the same channel (which then
+/// takes the exchange over — see [`takes_over`]). Other channels may not. The refusals are for the
+/// asking agent (a tool error), not shown to people.
 pub fn check_follow_up(
     row: Option<&AskedFrom>,
     from_channel: &str,
-    from_thread: &str,
+    _from_thread: &str,
     target_online: bool,
 ) -> Result<(), String> {
-    let Some(row) = row.filter(|r| r.channel == from_channel && r.thread_ts == from_thread) else {
-        return Err("no ask from this thread goes to that thread".into());
+    let Some(row) = row.filter(|r| r.channel == from_channel) else {
+        return Err("that thread was not asked from this channel; you can only follow up threads this channel asked".into());
     };
     match row.state {
         AskState::Ended => Err("this exchange has ended; ask again in a new thread".into()),
@@ -86,13 +89,21 @@ pub fn check_end(row: Option<&AskedFrom>, from_channel: &str, from_thread: &str)
 }
 
 /// Whether `from_channel`/`from_thread` may read what the agent in the asked thread whose record is
-/// `row` is doing (`thread_activity`): the same threads it could end — only ones it asked. An exchange
-/// that ended can still be read. `Ok(true)` = that exchange has ended.
-pub fn check_read(row: Option<&AskedFrom>, from_channel: &str, from_thread: &str) -> Result<bool, String> {
-    let Some(row) = row.filter(|r| r.channel == from_channel && r.thread_ts == from_thread) else {
-        return Err("that thread was not asked from this thread; you can only read threads you asked with ask_channel".into());
+/// `row` is doing (`thread_activity`): any thread of the channel that asked it — the same threads that
+/// may follow it up. An exchange that ended can still be read. `Ok(true)` = that exchange has ended.
+pub fn check_read(row: Option<&AskedFrom>, from_channel: &str, _from_thread: &str) -> Result<bool, String> {
+    let Some(row) = row.filter(|r| r.channel == from_channel) else {
+        return Err("that thread was not asked from this channel; you can only read threads this channel asked with ask_channel".into());
     };
     Ok(row.state == AskState::Ended)
+}
+
+/// A follow-up from `from_thread` takes the exchange over when another thread of the same channel
+/// asked it: replies, "a person is needed" notices and `end_ask` move to the thread that sent it.
+/// Left with the thread that asked first, the answer would go back to a thread that may have stopped
+/// or been closed — the very request the follow-up was sent to pick up.
+pub fn takes_over(row: &AskedFrom, from_channel: &str, from_thread: &str) -> bool {
+    row.channel == from_channel && row.thread_ts != from_thread
 }
 
 /// Whether a new ask may go to `to_channel`. A new ask always opens a new thread, so it can never
@@ -610,14 +621,34 @@ mod decision_tests {
     }
 
     #[test]
-    fn follow_ups_need_an_approved_link_from_the_same_thread() {
+    fn follow_ups_need_an_approved_link_from_the_same_channel() {
         let ok = row("C1", "1.1", AskState::Approved);
         assert!(check_follow_up(Some(&ok), "C1", "1.1", true).is_ok());
         assert!(check_follow_up(None, "C1", "1.1", true).is_err());
-        assert!(check_follow_up(Some(&ok), "C1", "9.9", true).is_err());
+        assert!(check_follow_up(Some(&ok), "C1", "9.9", true).is_ok(), "another thread of the channel that asked");
+        assert!(check_follow_up(Some(&ok), "C9", "1.1", true).unwrap_err().contains("this channel"), "another channel");
         let ended = row("C1", "1.1", AskState::Ended);
         assert!(check_follow_up(Some(&ended), "C1", "1.1", true).unwrap_err().contains("new thread"));
+        assert!(check_follow_up(Some(&ended), "C1", "9.9", true).unwrap_err().contains("new thread"), "closed stays closed");
         assert!(check_follow_up(Some(&ok), "C1", "1.1", false).unwrap_err().contains("offline"));
+    }
+
+    #[test]
+    fn reads_are_open_to_the_channel_that_asked() {
+        let ok = row("C1", "1.1", AskState::Approved);
+        assert_eq!(check_read(Some(&ok), "C1", "1.1"), Ok(false));
+        assert_eq!(check_read(Some(&ok), "C1", "9.9"), Ok(false), "another thread of the channel");
+        assert!(check_read(Some(&ok), "C9", "1.1").is_err(), "another channel");
+        assert!(check_read(None, "C1", "1.1").is_err(), "a thread nobody asked");
+        assert_eq!(check_read(Some(&row("C1", "1.1", AskState::Ended)), "C1", "9.9"), Ok(true), "an ended exchange is still readable");
+    }
+
+    #[test]
+    fn a_follow_up_from_another_thread_takes_the_exchange_over() {
+        let ok = row("C1", "1.1", AskState::Approved);
+        assert!(!takes_over(&ok, "C1", "1.1"));
+        assert!(takes_over(&ok, "C1", "9.9"));
+        assert!(!takes_over(&ok, "C9", "9.9"));
     }
 
     #[test]

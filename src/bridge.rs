@@ -3017,6 +3017,26 @@ mod tests {
         assert_eq!(b.ledger.from_agent_ids(&key), vec![ROOT.to_string()]);
     }
 
+    /// Another thread of the asking channel took the exchange over: the record here follows it, so a
+    /// reply posted straight into the new asking thread is still known as the answer.
+    #[tokio::test]
+    async fn a_follow_up_from_another_thread_of_the_asking_channel_moves_asked_from() {
+        let (d, _slack, _agent, _clock) = flow_deps("ask-takeover");
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.on_inbound(&agent_msg(ROOT, ROOT, "check", crate::chat::DeliveryKind::Ask)).await;
+        let mut m = agent_msg(ROOT, "1782000000.000300", "where are you?", crate::chat::DeliveryKind::Ask);
+        m.from_agent.as_mut().unwrap().thread_ts = Some("1781000000.000900".into());
+        b.on_inbound(&m).await;
+        let a = b.threads.get(ROOT).and_then(|e| e.asked_from.clone()).expect("asked_from");
+        assert_eq!((a.channel.as_str(), a.thread_ts.as_str()), ("C_LAN", "1781000000.000900"));
+        // Another channel never moves it
+        let mut other = agent_msg(ROOT, "1782000000.000400", "x", crate::chat::DeliveryKind::Ask);
+        other.from_agent.as_mut().unwrap().channel = Some("C_OTHER".into());
+        b.on_inbound(&other).await;
+        let a = b.threads.get(ROOT).and_then(|e| e.asked_from.clone()).unwrap();
+        assert_eq!((a.channel.as_str(), a.thread_ts.as_str()), ("C_LAN", "1781000000.000900"));
+    }
+
     #[tokio::test]
     async fn a_reply_going_back_is_not_marked_as_a_request() {
         let (d, _slack, _agent, _clock) = flow_deps("ask-back");
