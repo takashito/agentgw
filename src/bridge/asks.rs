@@ -835,7 +835,7 @@ mod owner_link_tests {
         // The Lead's thread: CoS's request **as Slack gives it back** — line breaks gone, links in
         // `<…>` with `&amp;` (the heading's link to where it was asked, the gateway's mark naming the
         // Owner's post, then the CoS's words with a link of their own)
-        let request = ":robot_face: Follow-up from the Claude in <#C0COS> ([where it was asked](<https://ws.slack.com/archives/C0COS/p1700000009000900?thread_ts=1700000001.000100&amp;cid=C0COS>)) \
+        let request = ":robot_face: follow-up from <#C0COS> ([link](<https://ws.slack.com/archives/C0COS/p1700000009000900?thread_ts=1700000001.000100&amp;cid=C0COS>)) \
                        :bust_in_silhouette: Owner's post, checked by agentgw: <https://ws.slack.com/archives/C0COS/p1700000008000800?thread_ts=1700000001.000100&amp;cid=C0COS>  \
                        deploy it; see also https://ws.slack.com/archives/C0OTHER/p1700000007000700";
         let thread = vec![
@@ -854,7 +854,7 @@ mod owner_link_tests {
         assert_eq!(ids(got), vec![own("C0COS", "1700000008.000800", "1700000001.000100", false)]);
 
         // No message_ids: the newest request the gateway posted here stands in, and only that one
-        let older = ":robot_face: A request from the Claude in <#C0COS> :bust_in_silhouette: Owner's post, checked by agentgw: \
+        let older = ":robot_face: request from <#C0COS> :bust_in_silhouette: Owner's post, checked by agentgw: \
                      <https://ws.slack.com/archives/C0COS/p1700000002000200>  an older job";
         let mut with_old = thread.clone();
         with_old.push(at("1700000009.000100", "U_BOT", older));
@@ -870,7 +870,7 @@ mod owner_link_tests {
         assert_eq!(ids(got), vec![own("C0COS", "1700000008.000800", "1700000001.000100", false)]);
         // A newer request without the mark ends it: the older request's Owner post does not ride along
         let mut newer = thread.clone();
-        newer.push(at("1700000014.000100", "U_BOT", ":robot_face: Follow-up from the Claude in <#C0COS>  check the logs"));
+        newer.push(at("1700000014.000100", "U_BOT", ":robot_face: follow-up from <#C0COS>  check the logs"));
         assert!(owner_candidates("", "C0LEAD", "1700000010.000100", &[], true, &newer, "U_OWNER").is_empty());
 
         // The Owner's own post in the asking thread, answered: taken as it is (its link is asked of Slack)
