@@ -395,7 +395,9 @@ impl Bridge {
                 let out = self.stop_decision(key.as_ref(), &ev, &ctx);
                 // If blocked, the turn **continues** (re-prompt), so it's not over yet
                 if let Some(key) = key.as_ref().filter(|_| out.get("decision").is_none()) {
-                    self.sticky.on_turn_end(key);
+                    if let slack::StickyAction::Delete(ts) = self.sticky.on_turn_end(key) {
+                        self.delete_sticky(key, ts);
+                    }
                     self.note_activity(|b, now| b.turn_end(key, now));
                     // Whatever the thread was waiting for, the turn is over and it is not
                     // waiting for it any more -- including a question answered on the machine,
@@ -2348,13 +2350,24 @@ impl Bridge {
             self.flush_sticky(&key, posted, body).await;
         }
         if let slack::StickyAction::Delete(ts) = self.sticky.settle(&key, d.kind) {
-            let (api, channel) = (self.deps.slack.clone(), d.channel_id.clone());
-            tokio::spawn(async move {
-                if let Err(e) = api.delete_message(&channel, &ts).await {
-                    ctx.debug("bridge", &format!("sticky delete failed: {e}"));
-                }
-            });
+            self.delete_sticky(&key, ts);
         }
+    }
+
+    /// Takes a progress message down, off the loop (a failure only costs a stray message).
+    fn delete_sticky(&self, key: &ThreadKey, ts: String) {
+        let (channel, _) = key.split();
+        let api = self.deps.slack.clone();
+        let ctx = LogCtx {
+            session_id: None,
+            thread_key: Some(key.clone()),
+        };
+        tokio::spawn(async move {
+            match api.delete_message(&channel, &ts).await {
+                Ok(()) => ctx.debug("bridge", &format!("sticky deleted ts={ts}")),
+                Err(e) => ctx.debug("bridge", &format!("sticky delete failed: {e}")),
+            }
+        });
     }
 
     /// Rename the thread's session, **unless a person already named it by hand**.
@@ -2448,7 +2461,10 @@ impl Bridge {
             self.sticky.post_failed(&done.key);
             return;
         };
-        self.sticky.set_posted(&done.key, &ts);
+        if let slack::StickyAction::Delete(ts) = self.sticky.set_posted(&done.key, &ts) {
+            self.delete_sticky(&done.key, ts);
+            return;
+        }
         // The turn may have ended while the post was out, and the board held the last render back
         // rather than open a second message. Draw it now, as an update
         if let Some((posted, blocks)) = self.sticky.take_final(&done.key) {

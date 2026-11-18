@@ -312,6 +312,8 @@ struct Sticky {
     /// follows is the agent summing up its reply for its terminal, and is never drawn.
     after_answer: bool,
     held: Vec<String>,
+    /// The round ended holding only prose while the first post was out: delete it on arrival.
+    discard: bool,
 }
 
 /// thread_key → the progress message in flight. One per thread (no pagination).
@@ -391,8 +393,18 @@ impl StickyBoard {
     /// The turn ended. The round **closes here**: text and tool calls keep trickling in for a while afterwards
     /// (the harness asks the agent to keep talking once the answer went out as a tool call alone),
     /// and none of it is addressed to the thread. Only `on_turn_start` opens it again.
-    pub fn on_turn_end(&mut self, key: &ThreadKey) {
+    ///
+    /// **A round that ends holding only the agent's prose is taken down.** A turn that no message
+    /// opened (the agent woke itself with a booked look) owes the thread nothing, so it is never
+    /// settled — and what it wrote for its terminal (often a lone ".") stayed in the thread as a
+    /// progress message reading "● ." that nobody ever removed. Prose is not a record of work;
+    /// tool rows, an interruption and an expired permission are, and keep the message.
+    pub fn on_turn_end(&mut self, key: &ThreadKey) -> StickyAction {
         self.closed.insert(key.clone());
+        if self.prose_only(key) {
+            return self.take_down(key);
+        }
+        StickyAction::Keep
     }
 
     /// A PostToolUse with the same tool_use_id replaces the PreToolUse ◌ row with •/×/🚫.
@@ -537,10 +549,17 @@ impl StickyBoard {
     }
 
     /// Remember the ts that was posted (updates from then on).
-    pub fn set_posted(&mut self, key: &ThreadKey, ts: &str) {
+    /// Returns `Delete` when the round ended holding only prose while this post was out
+    /// (see `on_turn_end`): the message that just landed is taken down again.
+    pub fn set_posted(&mut self, key: &ThreadKey, ts: &str) -> StickyAction {
+        if self.stickies.get(key).is_some_and(|s| s.discard) {
+            self.stickies.remove(key);
+            return StickyAction::Delete(ts.to_string());
+        }
         let s = self.stickies.entry(key.clone()).or_default();
         s.posted_ts = Some(ts.to_string());
         s.posting = false;
+        StickyAction::Keep
     }
 
     /// The first post did not land. Let the next flush try again.
@@ -626,12 +645,37 @@ impl StickyBoard {
         // Only answered rounds allow a new progress message for follow-up progress
         let answered_with_text = !matches!(kind, "no_reply" | "react");
         self.settled.insert(key.clone(), answered_with_text);
-        match self.stickies.remove(key) {
-            Some(Sticky {
-                posted_ts: Some(ts),
-                ..
-            }) if matches!(kind, "no_reply" | "react") => StickyAction::Delete(ts),
-            _ => StickyAction::Keep,
+        // Silence takes the message down whatever it holds; an answer keeps the tool rows as a
+        // record, but never a message holding the agent's prose alone
+        if !answered_with_text || self.prose_only(key) {
+            return self.take_down(key);
+        }
+        self.stickies.remove(key);
+        StickyAction::Keep
+    }
+
+    /// Nothing in the message but the agent's prose (no tool row, interruption or expired permission).
+    fn prose_only(&self, key: &ThreadKey) -> bool {
+        self.stickies.get(key).is_some_and(|s| {
+            !s.perm_timed_out
+                && !s.items.is_empty()
+                && s.items.iter().all(|i| matches!(i, RenderItem::Narration { .. }))
+        })
+    }
+
+    /// Stop tracking the message and take it down. A first post still out is marked instead and
+    /// deleted when its ts comes back (`set_posted`) — removed now, the late ts would put it back.
+    fn take_down(&mut self, key: &ThreadKey) -> StickyAction {
+        if let Some(s) = self.stickies.get_mut(key)
+            && s.posting
+        {
+            s.discard = true;
+            s.dirty = false;
+            return StickyAction::Keep;
+        }
+        match self.stickies.remove(key).and_then(|s| s.posted_ts) {
+            Some(ts) => StickyAction::Delete(ts),
+            None => StickyAction::Keep,
         }
     }
 
@@ -2055,6 +2099,81 @@ mod tests {
         let text = text_of(&c.take_dirty(99_000)[0].2);
         let (said, read_b) = (text.find("● もう一つ調べます"), text.rfind("/b"));
         assert!(said.is_some() && said < read_b, "{text}");
+    }
+
+    /// The live case: an agent woke itself with a booked look (no message opened the turn, so
+    /// nothing is owed and nothing settles it), booked the next one and wrote "." for its terminal.
+    /// That "." became a progress message reading "● ." and stayed in the thread for good.
+    #[test]
+    fn a_round_that_ends_holding_only_prose_is_taken_down() {
+        let k = ThreadKey::parse("k");
+        let mut b = StickyBoard::default();
+        b.on_turn_start(&k);
+        b.tool_at(&k, "w", "ScheduleWakeup", "", ToolStatus::Done);
+        b.push_narration(&k, ".");
+        assert_eq!(b.take_dirty(10_000).len(), 1);
+        assert_eq!(b.set_posted(&k, "999.1"), StickyAction::Keep);
+        assert_eq!(b.on_turn_end(&k), StickyAction::Delete("999.1".into()));
+        assert!(b.sticky_ts(&k).is_none());
+
+        // The turn ends while the first post is still out: it is taken down when it lands
+        b.on_turn_start(&k);
+        b.push_narration(&k, ".");
+        assert_eq!(b.take_dirty(20_000).len(), 1);
+        assert_eq!(b.on_turn_end(&k), StickyAction::Keep);
+        assert_eq!(b.set_posted(&k, "999.2"), StickyAction::Delete("999.2".into()));
+        assert!(b.take_final(&k).is_none() && b.take_dirty(30_000).is_empty());
+
+        // Never posted (inside the 1-second throttle): nothing goes out afterwards either
+        b.on_turn_start(&k);
+        b.push_narration(&k, ".");
+        assert_eq!(b.on_turn_end(&k), StickyAction::Keep);
+        assert!(b.take_final(&k).is_none() && b.take_dirty(40_000).is_empty());
+
+        // Real work is a record and stays, prose and all
+        b.on_turn_start(&k);
+        b.push_narration(&k, "Issue を更新します");
+        b.tool_at(&k, "t1", "mcp__claude_ai_Linear__save_issue", "WORK-1", ToolStatus::Done);
+        let _ = b.take_dirty(50_000);
+        let _ = b.set_posted(&k, "999.3");
+        assert_eq!(b.on_turn_end(&k), StickyAction::Keep);
+        assert_eq!(b.sticky_ts(&k).as_deref(), Some("999.3"));
+    }
+
+    /// The second live case, "● (返信なし。)": the agent's prose and an answer in the same round.
+    /// Whatever ends the round — reply or silence — a message holding only prose does not stay.
+    #[test]
+    fn an_answered_round_never_leaves_prose_alone_behind() {
+        let k = ThreadKey::parse("k");
+        for kind in ["reply", "edit", "ask", "no_reply", "react"] {
+            let mut b = StickyBoard::default();
+            b.on_turn_start(&k);
+            b.push_narration(&k, "(返信なし。)");
+            let _ = b.take_dirty(10_000);
+            let _ = b.set_posted(&k, "999.1");
+            assert_eq!(b.settle(&k, kind), StickyAction::Delete("999.1".into()), "{kind}");
+            // Prose written after the answer opens nothing, and the turn end has nothing left
+            b.push_narration(&k, "(返信なし。)");
+            assert!(b.take_dirty(20_000).is_empty(), "{kind}");
+            assert_eq!(b.on_turn_end(&k), StickyAction::Keep, "{kind}");
+            assert!(b.take_final(&k).is_none(), "{kind}");
+
+            // Settled while the first post is still out: deleted once it lands
+            let mut c = StickyBoard::default();
+            c.on_turn_start(&k);
+            c.push_narration(&k, ".");
+            let _ = c.take_dirty(10_000);
+            assert_eq!(c.settle(&k, kind), StickyAction::Keep, "{kind}");
+            assert_eq!(c.set_posted(&k, "999.2"), StickyAction::Delete("999.2".into()), "{kind}");
+        }
+
+        // A reply keeps the tool rows as a record — that is the A/B decision, not this fix
+        let mut b = StickyBoard::default();
+        b.on_turn_start(&k);
+        b.tool_at(&k, "t1", "Bash", "ls", ToolStatus::Done);
+        let _ = b.take_dirty(10_000);
+        let _ = b.set_posted(&k, "999.3");
+        assert_eq!(b.settle(&k, "reply"), StickyAction::Keep);
     }
 
     #[test]
