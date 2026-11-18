@@ -296,7 +296,8 @@ Mention the bot followed by the command (the bot is named `agentgw` unless the S
 | Command | What it does |
 |---|---|
 | `stop` | Stop the current turn (a 🛑 reaction works too) |
-| `exit` · `bye` · `done` | End this thread's agent; your next message resumes it |
+| `exit` · `bye` | End this thread's agent; your next message resumes it |
+| `done` | The same, and mark the thread done (✅ on its first message) |
 | `compact` | Compact the context, with a progress bar |
 | `model [fable\|opus\|sonnet\|haiku]` | Show or switch the model |
 | `effort [low\|medium\|high\|xhigh\|max\|…]` | Show or set the effort level |
@@ -320,7 +321,7 @@ Mention the bot followed by the command (the bot is named `agentgw` unless the S
 
 When the bot is added to a channel that has no machine yet, it asks the Owner in that channel which machine should handle it, with one button per connected machine and a **Later** button. The chosen machine works in its home folder; `route <machine>:<path>` picks another folder. When only the gateway is connected, the gateway takes the channel without asking. A channel that an agent creates with `create_channel`, or brings the bot into with `join_channel`, goes to that agent's machine without asking. A channel that already has a machine keeps it.
 
-The Claudes in different channels ask each other for work with the `ask_channel` tool. A request starts in the other channel at once, its reply comes back to the thread that asked, and the asking Claude closes the thread it asked with `end_ask` once it is done. The whole exchange stays in Slack.
+The Claudes in different channels ask each other for work with the `ask_channel` tool. A request starts in the other channel at once, its reply comes back to the thread that asked, and the asking Claude closes the thread it asked with `end_ask` once it is done — as completed (✅) or as no longer wanted. A Claude can also end its own session with `end_session` when the person says the work is finished. The whole exchange stays in Slack.
 
 While a request is running, the asking Claude can check on it with `thread_activity` instead of interrupting it. The answer always carries a one-word `state` — `running_tool`, `thinking`, `waiting_for_person`, `turn_ended`, `turn_failed`, `idle`, `no_agent`, `machine_offline` or `no_answer` — with a one-line summary, the tools running and for how many seconds, the last tool with its outcome, and when the asked Claude last posted to its thread. Reading changes nothing in the asked thread.
 

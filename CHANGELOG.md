@@ -8,6 +8,15 @@ in [README.md](README.md#release-notes).
 
 ## [Unreleased]
 
+### Added
+- `end_session` tool: a Claude ends its own session when the person says the work is finished, either marking the thread done (✅) or not. (WORK-68)
+- `end_ask` takes `outcome`: `done` (the default) marks the asked thread done with ✅, `canceled` closes it without the mark. (WORK-68)
+
+### Changed
+- Only `done` marks a thread done with ✅; `exit` and `bye` now just end the agent. (WORK-68)
+- The line posted when a thread ends now says what happened, e.g. "#channel marked this thread done." instead of "Thanks for your work! Ending the Claude Code session." (WORK-68)
+- An ended thread's agent session is set to closed in Slack; the next message there opens it again. (WORK-68)
+
 ## [0.71.1] - 2026-11-18
 
 ### Security

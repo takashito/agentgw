@@ -147,6 +147,8 @@ impl<'a> Message<'a> {
 pub enum Cmd {
     Stop,
     Exit,
+    /// `done`: ends the agent like `exit` and marks the thread finished (✅ on its first post).
+    Done,
     Resume,
     Help,
     Status,
@@ -189,7 +191,7 @@ impl Cmd {
     /// Name, synonyms and variants sit on one row, so neither `parse` nor `label` needs another table.
     /// The five that take arguments (`model` / `effort` / `mode` / `pwd` / access verbs) can't be recognised
     /// without reading the argument, so they are parsed separately below.
-    const WORDS: [(&str, &[&str], Cmd); 13] = [
+    const WORDS: [(&str, &[&str], Cmd); 14] = [
         // stop: word, `:shortcode:`, raw emoji — Slack's `text` may send any of them
         (
             "stop",
@@ -209,7 +211,9 @@ impl Cmd {
             ],
             Cmd::Stop,
         ),
-        ("exit", &["exit", "bye", "done"], Cmd::Exit),
+        // `done` alone marks the thread finished; `exit` / `bye` only end the agent
+        ("exit", &["exit", "bye"], Cmd::Exit),
+        ("done", &["done"], Cmd::Done),
         ("resume", &["resume"], Cmd::Resume),
         ("status", &["status", "ステータス"], Cmd::Status),
         ("context", &["context", "ctx"], Cmd::Context),
@@ -279,6 +283,7 @@ impl Cmd {
         let name = match self {
             Cmd::Stop => "stop",
             Cmd::Exit => "exit",
+            Cmd::Done => "done",
             Cmd::Resume => "resume",
             Cmd::Help => "help",
             Cmd::Status => "status",
@@ -690,15 +695,17 @@ impl Bridge {
                 self.user_stop(msg, key, root_ts, &ctx);
             }
             // exit. Ends **only the agent** — the thread stays
-            Cmd::Exit => {
+            ending @ (Cmd::Exit | Cmd::Done) => {
+                let done = ending == Cmd::Done;
                 ctx.info(
                     "bridge",
                     &format!(
-                        "slack-events: exit command msg={} channel={} dm={dm}",
+                        "slack-events: {} command msg={} channel={} dm={dm}",
+                        if done { "done" } else { "exit" },
                         msg.ts, msg.channel
                     ),
                 );
-                self.user_exit(msg, key, root_ts, &ctx).await;
+                self.user_exit(msg, key, root_ts, done, &ctx).await;
             }
             // resume. Hand the line over to the local terminal
             Cmd::Resume => {

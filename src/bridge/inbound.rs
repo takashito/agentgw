@@ -495,10 +495,16 @@ impl Bridge {
         };
 
         // The asking agent is done with this thread (`end_ask`): end its agent the way `exit` does.
-        // The gateway checked who may and has already ended the exchange, so nothing is told back
+        // The gateway checked who may and has already ended the exchange, so nothing is told back.
+        // It has also posted who closed the thread; the text says whether it was finished
+        // (`canceled` = given up, no ✅; anything else, an older gateway's empty text included, = done)
         if from_agent.as_ref().is_some_and(|o| o.kind == crate::chat::DeliveryKind::End) {
-            ctx(None).info("bridge", &format!("slack-events: ended by the asking agent msg={} channel={}", msg.ts, msg.channel));
-            self.end_agent(msg, &key, &root_ts, &ctx(None), false).await;
+            let done = msg.text.trim() != crate::chat::END_CANCELED;
+            ctx(None).info(
+                "bridge",
+                &format!("slack-events: ended by the asking agent ({}) msg={} channel={}", if done { "done" } else { "canceled" }, msg.ts, msg.channel),
+            );
+            self.end_agent(&msg.channel, &key, &root_ts, &ctx(None), false, None, done).await;
             return;
         }
 
@@ -1197,7 +1203,7 @@ impl Bridge {
         &mut self,
         key: &ThreadKey,
         session_id: String,
-        farewell: Option<(String, String)>,
+        farewell: Option<worker::Farewell>,
         thinking: Option<crate::bridge::turn::PresenceHold>,
         ctx: &LogCtx,
     ) {

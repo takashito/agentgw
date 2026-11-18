@@ -648,6 +648,7 @@ impl Api {
             // agent needs user clarification or a tool approval" (the method's reference). Shown
             // as an attention mark in the sidebar, where `processing` spins like every other
             Presence::Waiting => SlackAgentSessionStatus::Suspended,
+            Presence::Closed => SlackAgentSessionStatus::Closed,
         };
         let req = SlackApiAgentsSessionsSetStatusRequest::new(status)
             .with_channel_id(channel.into())
