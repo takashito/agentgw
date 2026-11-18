@@ -4550,6 +4550,15 @@ mod tests {
         assert!(b.threads.get(ROOT).is_some_and(|e| e.ask_owed.is_empty()), "no longer owed once told");
     }
 
+    /// Acknowledged, then answered by a reply that names the request: nothing is owed any more.
+    #[tokio::test]
+    async fn a_reply_naming_an_acknowledged_request_pays_it() {
+        let (mut b, _slack, _agent, _clock) = acknowledged_asked_thread("owed-paid").await;
+        let sid = b.threads.get(ROOT).and_then(|e| e.agent_id.clone()).unwrap();
+        b.on_disposition(dispo("reply", &[ROOT], Some("done"), &sid)).await;
+        assert!(b.threads.get(ROOT).is_some_and(|e| e.ask_owed.is_empty()), "still owed after the answer");
+    }
+
     /// Woken from the ledger, then acknowledged (the request moves to what is owed), then lost again:
     /// still only once.
     #[tokio::test]

@@ -576,7 +576,12 @@ impl Bridge {
             "reply" | "edit" | "no_reply" => {
                 // An answer to the request itself, or — while one is owed — the answer to what came
                 // back from below (or a reply that names no message). A reply to a person alone is not it
-                let owed_now = !owed.is_empty() && (d.message_ids.is_empty() || !returns.is_empty());
+                // A reply naming the owed request itself pays it too — the usual shape after an
+                // acknowledgement (the ledger no longer holds it, so `asks` is empty). Left owed, a later
+                // machine reboot would wake the thread for a request it had already answered
+                let names_owed = d.message_ids.iter().any(|id| owed.contains(id));
+                let owed_now = !owed.is_empty()
+                    && (d.message_ids.is_empty() || !returns.is_empty() || names_owed);
                 // In a thread another agent asked for, a posted reply to a person goes back too: the
                 // Owner often steers the work here directly after the first answer, and the asker
                 // would otherwise never hear how it ended. So does a reply to what came back from an ask
