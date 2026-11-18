@@ -1457,6 +1457,11 @@ impl Bridge {
                 );
                 return false;
             }
+            // The answer it owes is spent too: acknowledged after this wake, the request moves from the
+            // ledger to `ask_owed`, and a second loss must not wake it again from there
+            if let Some(e) = self.threads.entries.get_mut(&root_ts) {
+                e.owed_resumed = owed.iter().chain(&ids).cloned().collect();
+            }
             let envelopes: Vec<&str> = undisposed.iter().map(|(_, env)| env.as_str()).collect();
             (ids, resume_prompt(&envelopes))
         } else if !owed.is_empty() {

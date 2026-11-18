@@ -4550,6 +4550,24 @@ mod tests {
         assert!(b.threads.get(ROOT).is_some_and(|e| e.ask_owed.is_empty()), "no longer owed once told");
     }
 
+    /// Woken from the ledger, then acknowledged (the request moves to what is owed), then lost again:
+    /// still only once.
+    #[tokio::test]
+    async fn a_resumed_request_acknowledged_afterwards_is_not_woken_again() {
+        let (mut b, slack, agent, clock, _up, sid) = rebooted("reboot-ack-after", None, true).await;
+        b.restore_pending(&LogCtx::default());
+        assert_eq!(agent.spawned.lock().unwrap().len(), 1);
+        b.on_disposition(dispo("react", &[ROOT], None, &sid)).await;
+        assert!(b.ledger.pending(&ThreadKey::new("C_ADMIN", ROOT)).is_empty());
+
+        let (mut b, _slack, agent, _clock, mut up, _sid) =
+            rebooted("reboot-ack-after", Some((b, slack, agent, clock)), true).await;
+        b.restore_pending(&LogCtx::default());
+        settle().await;
+        assert!(agent.spawned.lock().unwrap().is_empty(), "woken a second time");
+        assert!(replies_up(&mut up).iter().any(|(o, _)| o == "failed"));
+    }
+
     /// Acknowledged, and the conversation is gone: the start-up sweep keeps the row long enough for the
     /// asker to be told, and the thread forgets the dead conversation.
     #[tokio::test]
