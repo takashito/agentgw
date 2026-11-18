@@ -8,6 +8,12 @@ in [README.md](README.md#release-notes).
 
 ## [Unreleased]
 
+## [0.71.1] - 2026-11-18
+
+### Security
+- `thread_activity` now masks a password written right after `-p` (`mysql -pS3cret`, `sshpass -pS3cret`, `sshpass -p S3cret`), shown as `-p***`. (WORK-63)
+- `thread_activity` now masks a JWT as a whole, not only its signature: the middle part is readable JSON that can name a person. (WORK-63)
+
 ## [0.71.0] - 2026-11-18
 
 ### Added
@@ -22,5 +28,6 @@ in [README.md](README.md#release-notes).
 - Slack tokens and the link key no longer reach the agents' environment through tmux. A program started by an agent could connect to Slack as the app and take a share of the events, so some messages were never answered. (WORK-44)
 - A reply's summary and timer bookings (`ScheduleWakeup`, Cron tools) no longer show up again in a progress message under the answer. (WORK-32, WORK-37)
 
-[Unreleased]: https://github.com/takashito/agentgw/compare/v0.71.0...HEAD
+[Unreleased]: https://github.com/takashito/agentgw/compare/v0.71.1...HEAD
+[0.71.1]: https://github.com/takashito/agentgw/compare/v0.71.0...v0.71.1
 [0.71.0]: https://github.com/takashito/agentgw/compare/v0.70.0...v0.71.0
