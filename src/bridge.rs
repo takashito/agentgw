@@ -2140,7 +2140,7 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
             };
             let now = crate::clock::now_ms();
             let activity = match activity.lock() {
-                Ok(mut book) => book.snapshot_checked(&key, has_agent, alive, now),
+                Ok(book) => book.snapshot_checked(&key, has_agent, alive, now),
                 Err(_) => serde_json::json!({"state": "unknown", "summary": "could not read this machine's record"}),
             };
             let _ = up.send(crate::bridge::gateway::link::LinkFrame::ActivityRead { req_id, activity });

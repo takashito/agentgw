@@ -124,15 +124,24 @@ impl ActivityBook {
     /// [`Self::snapshot`], but **checking that a busy agent's window is still there** first.
     /// The book only hears hooks, and a dead agent sends none: without this a crashed agent stays
     /// `running_tool` forever. `alive` is asked only when the book says the agent is at work.
+    ///
+    /// **Reads only.** The book is left as it is, so the cleanup round still sees the agent at work
+    /// and tells the thread (`notice_lost_agents`): marking it lost here made a look at the thread
+    /// swallow the notice.
     pub fn snapshot_checked(
-        &mut self,
+        &self,
         key: &ThreadKey,
         has_agent: bool,
         alive: impl FnOnce() -> bool,
         now: u64,
     ) -> serde_json::Value {
         if has_agent && self.busy(key) && !alive() {
-            self.agent_lost(key, now);
+            let mut seen = ActivityBook::default();
+            if let Some(row) = self.threads.get(key) {
+                seen.threads.insert(key.clone(), row.clone());
+            }
+            seen.agent_lost(key, now);
+            return seen.snapshot(key, has_agent, now);
         }
         self.snapshot(key, has_agent, now)
     }
@@ -720,7 +729,9 @@ mod tests {
         let s = b.snapshot_checked(&key(), true, || false, 3_000);
         assert_eq!(s["state"], "agent_gone");
         assert_eq!(s["running"].as_array().unwrap().len(), 0);
-        assert!(!b.busy(&key()), "no longer counted as at work");
+        assert!(b.busy(&key()), "a look does not change the book: the cleanup round still tells the thread");
+        b.agent_lost(&key(), 3_500);
+        assert!(!b.busy(&key()), "once told, no longer counted as at work");
         // The next turn (the agent started again) clears it
         b.turn_start(&key(), 4_000);
         assert_eq!(b.snapshot(&key(), true, 5_000)["state"], "thinking");
