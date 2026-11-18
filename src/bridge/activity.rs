@@ -275,7 +275,25 @@ const SECRET_NAMES: [&str; 10] = [
 /// Flags whose next word is a secret.
 const SECRET_FLAGS: [&str; 7] = ["--token", "--password", "--passwd", "--api-key", "--secret", "--auth", "--key"];
 
+/// Commands that take a password glued to `-p` (`mysql -pS3cret`). Only these: elsewhere `-p…` is an
+/// ordinary flag (`cp -pr`, `mkdir -p`, `cargo test -p name`).
+const GLUED_PASSWORD_COMMANDS: [&str; 9] = [
+    "mysql", "mysqldump", "mysqladmin", "mysqlimport", "mysqlshow", "mysqlcheck", "mariadb", "mariadb-dump",
+    "sshpass",
+];
+
 const MASK: &str = "***";
+
+/// The word ends one command in a shell line, so the next word starts another.
+fn ends_command(w: &str) -> bool {
+    matches!(w, "|" | "||" | "&&" | ";" | "&") || w.ends_with(';')
+}
+
+fn is_glued_password_command(w: &str) -> bool {
+    let name = w.trim_matches(|c: char| c == '"' || c == '\'' || c == '(');
+    let name = name.rsplit('/').next().unwrap_or(name);
+    GLUED_PASSWORD_COMMANDS.contains(&name)
+}
 
 fn is_secret_name(name: &str) -> bool {
     let n = name
@@ -310,6 +328,10 @@ struct RedactState {
     mask_next: bool,
     /// Inside a quoted secret that spans words: masked up to this closing quote.
     until_quote: Option<char>,
+    /// The current command is one that takes `-p<password>` (`mysql`, `sshpass`).
+    password_command: bool,
+    /// The current command is `sshpass`, whose `-p` may also take the password as the next word.
+    sshpass: bool,
 }
 
 impl RedactState {
@@ -327,6 +349,36 @@ impl RedactState {
                 }
                 None => out.push_str(MASK),
             }
+            return;
+        }
+        if self.password_command
+            && let Some(pw) = w.strip_prefix("-p")
+            && !pw.is_empty()
+        {
+            // mysql -pS3cret / sshpass -pS3cret
+            let (open, close) = quote_ends(pw);
+            out.push_str("-p");
+            out.push_str(open);
+            out.push_str(MASK);
+            out.push_str(close);
+            if let Some(q) = open.chars().next().filter(|_| close.is_empty()) {
+                self.until_quote = Some(q);
+            }
+            if ends_command(&w) {
+                self.password_command = false;
+                self.sshpass = false;
+            }
+            return;
+        } else if ends_command(&w) {
+            self.password_command = false;
+            self.sshpass = false;
+        } else if is_glued_password_command(&w) {
+            self.password_command = true;
+            self.sshpass = w.ends_with("sshpass");
+        } else if self.sshpass && w == "-p" {
+            // sshpass -p S3cret
+            self.mask_next = true;
+            out.push_str(&w);
             return;
         }
         let bare = w.trim_matches(|c: char| c == '"' || c == '\'');
@@ -393,8 +445,32 @@ fn redact_word(w: &str) -> String {
             w.replace_range(rest_start + colon + 1..rest_start + at, MASK);
         }
     }
+    let w = mask_jwts(&w);
     let w = mask_prefixed(&w);
     mask_blobs(&w)
+}
+
+/// A JWT (`eyJ….eyJ….sig`) is masked whole: its middle part is readable JSON that can name a person.
+fn mask_jwts(w: &str) -> String {
+    let is_jwt_char = |c: char| is_token_char(c) || c == '.';
+    let mut out = String::new();
+    let mut i = 0;
+    while i < w.len() {
+        let at_start = i == 0 || !w[..i].chars().next_back().is_some_and(is_jwt_char);
+        if at_start && w[i..].starts_with("eyJ") {
+            let len = w[i..].find(|c: char| !is_jwt_char(c)).unwrap_or(w.len() - i);
+            let parts: Vec<&str> = w[i..i + len].split('.').collect();
+            if parts.len() >= 3 && parts[0].len() >= 10 && !parts[1].is_empty() {
+                out.push_str(MASK);
+                i += len;
+                continue;
+            }
+        }
+        let c = w[i..].chars().next().unwrap_or_default();
+        out.push(c);
+        i += c.len_utf8();
+    }
+    out
 }
 
 fn is_token_char(c: char) -> bool {
@@ -487,6 +563,28 @@ mod tests {
         let sha = "2a002c9f0e1d2c3b4a5968778695a4b3c2d1e0f9";
         assert_eq!(redact(&format!("git show {sha}")), format!("git show {sha}"), "commit ids stay");
         assert_eq!(redact("cargo test --lib bridge::activity"), "cargo test --lib bridge::activity");
+    }
+
+    #[test]
+    fn passwords_glued_to_dash_p_are_masked() {
+        assert_eq!(redact("mysql -uroot -pS3cret db"), "mysql -uroot -p*** db");
+        assert_eq!(redact("/usr/bin/mysqldump -p'S3 cret' db"), "/usr/bin/mysqldump -p'*** ***' db");
+        assert_eq!(redact("sshpass -pS3cret ssh user@host"), "sshpass -p*** ssh user@host");
+        assert_eq!(redact("sshpass -p S3cret ssh user@host"), "sshpass -p *** ssh user@host");
+        assert_eq!(redact("cd x && mysql -pS3cret; cp -pr a b"), "cd x && mysql -p***; cp -pr a b");
+        assert_eq!(redact("mysql -p db"), "mysql -p db", "a bare -p asks for the password");
+        assert_eq!(redact("cp -pr a b && mkdir -p c"), "cp -pr a b && mkdir -p c");
+        assert_eq!(redact("cargo test -p agentgw"), "cargo test -p agentgw");
+    }
+
+    #[test]
+    fn jwts_are_masked_whole() {
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbGljZSIsImVtYWlsIjoiYUBiLmMifQ.SflKxwRJSMeKKF2QT4fwpM";
+        assert_eq!(redact(&format!("curl -d token={jwt}")), "curl -d token=***");
+        assert_eq!(redact(&format!("echo {jwt} | jq")), "echo *** | jq");
+        assert_eq!(redact(&format!("\"id_token\":\"{jwt}\",")), "\"id_token\":\"***\",");
+        assert_eq!(redact("eyJhbGciOiJub25lIn0.eyJzdWIiOiJhIn0."), "***", "unsigned JWT");
+        assert_eq!(redact("eyJust.a.word"), "eyJust.a.word", "too short to be a JWT header");
     }
 
     #[test]
