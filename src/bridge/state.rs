@@ -130,6 +130,10 @@ pub struct PendingDialog {
     /// the screen, which is answered row by row instead.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub questions: Vec<crate::agent::Question>,
+    /// When it was posted (epoch ms). Records written before this was kept have none; the
+    /// post's own ts says it then.
+    #[serde(rename = "postedMs", default, skip_serializing_if = "Option::is_none")]
+    pub posted_ms: Option<u64>,
 }
 
 /// One thread in threads.json = **what the Bridge remembers about that thread**

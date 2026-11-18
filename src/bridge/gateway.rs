@@ -354,6 +354,10 @@ pub mod link {
             channel: String,
             thread_ts: String,
             ts: String,
+            /// Tell the askers even when their exchange was closed: an agent stuck at a screen
+            /// that only a person can answer. Left out by older machines, read as false.
+            #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+            closed_too: bool,
         },
         /// machine → gateway: a person typed `exit` in this thread (asked or asking — the gateway works out which).
         AskEnded { channel: String, thread_ts: String },
@@ -3823,7 +3827,9 @@ impl Fleet {
                 posted_in_asker,
             } => self.on_agent_reply(&channel, &thread_ts, &ts, text, needs_human, &outcome, posted_in_asker).await,
             link::LinkFrame::AskEnded { channel, thread_ts } => self.on_ask_ended(&channel, &thread_ts).await,
-            link::LinkFrame::NeedsHuman { channel, thread_ts, ts } => self.on_needs_human(&channel, &thread_ts, &ts).await,
+            link::LinkFrame::NeedsHuman { channel, thread_ts, ts, closed_too } => {
+                self.on_needs_human(&channel, &thread_ts, &ts, closed_too).await
+            }
             link::LinkFrame::ProjectRead { req_id, text } => {
                 if let Some(tx) = self.reads.lock().unwrap_or_else(|e| e.into_inner()).remove(&req_id) {
                     let _ = tx.send(text);
@@ -5485,8 +5491,11 @@ impl Fleet {
 
     /// A person is needed in an asked thread: a link to the thread that asked, and to the top of the
     /// chain (where the Owner gave the first instruction, and the only one that mentions them).
-    async fn on_needs_human(&self, channel: &str, thread: &str, ts: &str) {
-        let targets = crate::bridge::asks::notify_targets(&*self.asks.lock().await, channel, thread);
+    async fn on_needs_human(&self, channel: &str, thread: &str, ts: &str, closed_too: bool) {
+        let targets = match closed_too {
+            true => crate::bridge::asks::notify_targets_closed_too(&*self.asks.lock().await, channel, thread),
+            false => crate::bridge::asks::notify_targets(&*self.asks.lock().await, channel, thread),
+        };
         if targets.is_empty() {
             return;
         }
@@ -9958,7 +9967,7 @@ mod ask_tests {
         let (r, thread) = approved("humanended").await;
         r.fleet.on_machine_frame("parent", link::LinkFrame::AskEnded { channel: "C2".into(), thread_ts: thread.clone() }).await;
         let before = calls(&r.api).len();
-        r.fleet.on_machine_frame("parent", link::LinkFrame::NeedsHuman { channel: "C2".into(), thread_ts: thread, ts: "2.9".into() }).await;
+        r.fleet.on_machine_frame("parent", link::LinkFrame::NeedsHuman { channel: "C2".into(), thread_ts: thread, ts: "2.9".into(), closed_too: false }).await;
         assert!(calls(&r.api)[before..].iter().all(|c| !c.contains("person is needed")), "{:?}", &calls(&r.api)[before..]);
     }
 
@@ -9992,7 +10001,7 @@ mod ask_tests {
             asks.insert("2.1".into(), ("C2".into(), row("C1", "1.1"))); // Lead → project
         }
         r.fleet
-            .on_machine_frame("parent", link::LinkFrame::NeedsHuman { channel: "C2".into(), thread_ts: "2.1".into(), ts: "2.9".into() })
+            .on_machine_frame("parent", link::LinkFrame::NeedsHuman { channel: "C2".into(), thread_ts: "2.1".into(), ts: "2.9".into(), closed_too: false })
             .await;
         let said = calls(&r.api);
         let to = |ch: &str, th: &str| said.iter().filter(|c| c.contains(&format!(" {ch} {th} ")) && c.contains("https://slack/C2/2.9")).cloned().collect::<Vec<_>>();
@@ -10177,7 +10186,7 @@ mod ask_tests {
     #[tokio::test]
     async fn notices_link_with_a_word_not_a_bare_url() {
         let (r, thread) = approved("nobareurl").await;
-        r.fleet.on_machine_frame("parent", link::LinkFrame::NeedsHuman { channel: "C2".into(), thread_ts: thread.clone(), ts: "2.9".into() }).await;
+        r.fleet.on_machine_frame("parent", link::LinkFrame::NeedsHuman { channel: "C2".into(), thread_ts: thread.clone(), ts: "2.9".into(), closed_too: false }).await;
         r.fleet.on_machine_frame("parent", reply_frame(&thread, "reply", "done")).await;
         r.fleet.on_machine_frame("parent", reply_frame(&thread, "stopped", "")).await;
         let bare: Vec<String> = calls(&r.api)

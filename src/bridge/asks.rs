@@ -121,10 +121,31 @@ pub fn notify_targets(
     channel: &str,
     thread_ts: &str,
 ) -> Vec<NotifyTarget> {
+    notify_targets_in(rows, channel, thread_ts, false)
+}
+
+/// [`notify_targets`] that also follows exchanges that were closed: for an agent stuck where
+/// nobody in its own thread is looking. A thread woken after its asker closed it (a late reply
+/// to one of its own asks) can stop at a screen nobody answers -- with the closed links skipped,
+/// the prompt reached no one and the agent sat there for 73 hours.
+pub fn notify_targets_closed_too(
+    rows: &std::collections::HashMap<String, (String, AskedFrom)>,
+    channel: &str,
+    thread_ts: &str,
+) -> Vec<NotifyTarget> {
+    notify_targets_in(rows, channel, thread_ts, true)
+}
+
+fn notify_targets_in(
+    rows: &std::collections::HashMap<String, (String, AskedFrom)>,
+    channel: &str,
+    thread_ts: &str,
+    closed_too: bool,
+) -> Vec<NotifyTarget> {
     // A ts is only unique within a channel: a record kept for another channel is not this thread's
     let live = |ch: &str, ts: &str| {
         rows.get(ts)
-            .filter(|(c, r)| c == ch && r.state != AskState::Ended && !r.origin_closed)
+            .filter(|(c, r)| c == ch && (closed_too || (r.state != AskState::Ended && !r.origin_closed)))
             .map(|(_, r)| r)
     };
     // An exchange that ended (Reject, `exit` on either side) has nobody waiting on it any more
@@ -545,7 +566,7 @@ mod frame_tests {
 
     #[test]
     fn a_machine_never_takes_a_frame_meant_for_the_gateway() {
-        let f = LinkFrame::NeedsHuman { channel: "C".into(), thread_ts: "1".into(), ts: "2".into() };
+        let f = LinkFrame::NeedsHuman { channel: "C".into(), thread_ts: "1".into(), ts: "2".into(), closed_too: false };
         assert!(crate::bridge::machine::FromRelay::of(f).is_none());
     }
 
@@ -652,6 +673,22 @@ mod decision_tests {
         closed.origin_closed = true;
         rows.insert("1.1".to_string(), ("C1".to_string(), closed));
         assert!(notify_targets(&rows, "C1", "1.1").is_empty());
+    }
+
+    #[test]
+    fn a_stuck_agent_reaches_the_asker_of_a_closed_exchange() {
+        // The real case: the Lead (C0/0.1) closed the thread it asked (C1/1.1), and a late reply
+        // woke that thread's agent into a screen nobody answered
+        let mut rows = HashMap::new();
+        let mut closed = row("C0", "0.1", AskState::Ended);
+        closed.origin_closed = true;
+        rows.insert("1.1".to_string(), ("C1".to_string(), closed));
+        assert!(notify_targets(&rows, "C1", "1.1").is_empty());
+        assert_eq!(
+            notify_targets_closed_too(&rows, "C1", "1.1"),
+            vec![NotifyTarget { channel: "C0".into(), thread_ts: "0.1".into(), mention_owner: true }]
+        );
+        assert!(notify_targets_closed_too(&HashMap::new(), "C1", "1.1").is_empty());
     }
 
     #[test]

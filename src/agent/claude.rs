@@ -344,6 +344,28 @@ impl Claude {
             updated = next;
             written.push(format!("trust for {}", key.display()));
         }
+        // The folder reached through a link (`~/dev` -> `/mnt/dev`) is a second project to Claude
+        // Code, with none of the answers given under its real path: an agent started there stopped at
+        // "Allow external CLAUDE.md file imports?" for a folder whose imports were approved long ago.
+        // **Only an approval that already exists is carried over** -- none is made up here
+        if let (Some(key), Ok(real), Ok(real_home)) = (
+            Self::trust_key(std::path::Path::new(cwd), std::path::Path::new(&home)),
+            std::fs::canonicalize(cwd),
+            std::fs::canonicalize(&home),
+        ) && let Some(real_key) = Self::trust_key(&real, &real_home)
+            && let Some(next) = Self::with_imports_of(
+                &updated,
+                &Self::trust_key_text(&key),
+                &Self::trust_key_text(&real_key),
+            )
+        {
+            updated = next;
+            written.push(format!(
+                "external imports approval of {} for {}",
+                real_key.display(),
+                key.display()
+            ));
+        }
         if let Some(next) = Self::with_auto_mode_dismissed(&updated) {
             updated = next;
             written.push("auto mode environment setup dismissed".to_string());
@@ -390,6 +412,25 @@ impl Claude {
         let projects = root.entry("projects").or_insert_with(|| serde_json::json!({}));
         let project = projects.as_object_mut()?.entry(key).or_insert_with(|| serde_json::json!({}));
         project.as_object_mut()?.insert("hasTrustDialogAccepted".into(), serde_json::Value::Bool(true));
+        Some(updated)
+    }
+
+    /// `config` with `projects[key]` carrying the external-imports approval `projects[real]` has,
+    /// or `None` when there is nothing to carry: the same folder, no approval under the real path,
+    /// or one already in place.
+    pub fn with_imports_of(config: &serde_json::Value, key: &str, real: &str) -> Option<serde_json::Value> {
+        const APPROVED: &str = "hasClaudeMdExternalIncludesApproved";
+        const SHOWN: &str = "hasClaudeMdExternalIncludesWarningShown";
+        let yes = serde_json::Value::Bool(true);
+        if key == real || config["projects"][real][APPROVED] != yes || config["projects"][key][APPROVED] == yes {
+            return None;
+        }
+        let mut updated = config.clone();
+        let projects = updated.as_object_mut()?.entry("projects").or_insert_with(|| serde_json::json!({}));
+        let project = projects.as_object_mut()?.entry(key).or_insert_with(|| serde_json::json!({}));
+        let project = project.as_object_mut()?;
+        project.insert(APPROVED.into(), yes.clone());
+        project.insert(SHOWN.into(), yes);
         Some(updated)
     }
 
@@ -2923,6 +2964,26 @@ mod tests {
         assert_eq!(Claude::with_trust(&updated, "/srv/app"), None, "already trusted: no write");
         let fresh = Claude::with_trust(&serde_json::json!({}), "/x").unwrap();
         assert_eq!(fresh["projects"]["/x"]["hasTrustDialogAccepted"], true);
+    }
+
+    /// A folder reached through a link stopped at the imports question although its real path had
+    /// approved them. The approval is carried over; none is invented.
+    #[test]
+    fn an_imports_approval_follows_the_folder_through_a_link() {
+        let config = serde_json::json!({"projects": {
+            "/mnt/dev/ops/it": {"hasClaudeMdExternalIncludesApproved": true, "hasTrustDialogAccepted": true},
+            "/home/u/dev/ops/it": {"hasTrustDialogAccepted": true}
+        }});
+        let updated = Claude::with_imports_of(&config, "/home/u/dev/ops/it", "/mnt/dev/ops/it").expect("needs writing");
+        let link = &updated["projects"]["/home/u/dev/ops/it"];
+        assert_eq!(link["hasClaudeMdExternalIncludesApproved"], true);
+        assert_eq!(link["hasClaudeMdExternalIncludesWarningShown"], true);
+        assert_eq!(link["hasTrustDialogAccepted"], true, "other fields kept");
+        assert_eq!(Claude::with_imports_of(&updated, "/home/u/dev/ops/it", "/mnt/dev/ops/it"), None, "already there");
+        let refused = serde_json::json!({"projects": {"/mnt/dev/ops": {"hasClaudeMdExternalIncludesApproved": false}}});
+        assert_eq!(Claude::with_imports_of(&refused, "/home/u/dev/ops", "/mnt/dev/ops"), None, "a refusal is not an approval");
+        assert_eq!(Claude::with_imports_of(&serde_json::json!({}), "/a", "/b"), None, "nothing approved anywhere");
+        assert_eq!(Claude::with_imports_of(&config, "/mnt/dev/ops/it", "/mnt/dev/ops/it"), None, "not a link");
     }
 
     /// The modal came back on a real machine although `dismissedAt` was set: the current Claude Code

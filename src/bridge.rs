@@ -401,6 +401,8 @@ pub(crate) struct DialogPending {
     pub dialog: crate::agent::Dialog,
     /// The question tool's questions, when the prompt is its form; empty for a screen dialog.
     pub questions: Vec<crate::agent::Question>,
+    /// When the prompt went up (epoch ms): a screen dialog nobody answers is given up on.
+    pub posted_ms: u64,
 }
 
 /// A window that would not take a delivery.
@@ -3382,6 +3384,61 @@ mod tests {
     }
 
     /// Starts a thread at ROOT and lets its agent take the first turn. Returns the session id.
+    /// A screen dialog nobody answers is not waited on for ever: after half an hour the agent is
+    /// closed (the thread stays), the prompt says so, and the askers hear it **even when their
+    /// exchange was closed** -- a session woken by a late reply sat at an import question for 73
+    /// hours, its prompt reaching nobody.
+    #[tokio::test]
+    async fn a_dialog_nobody_answers_closes_the_agent_and_tells_the_asker() {
+        let (d, slack, agent, clock) = flow_deps("dialog-give-up");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let (tx, mut up) = mpsc::unbounded_channel();
+        b.ask_gateway = Some(tx);
+        b.on_inbound(&agent_msg(ROOT, ROOT, "check it", crate::chat::DeliveryKind::Ask)).await;
+        let sid = b.threads.get(ROOT).and_then(|e| e.agent_id.clone()).expect("an agent");
+        on_hook_user_prompt_for_test(&mut b, &sid).await;
+        settle().await;
+        *agent.dialog.lock().unwrap() = Some(crate::agent::Dialog {
+            title: "Allow external CLAUDE.md file imports?".into(),
+            footer: "Enter to confirm \u{b7} Esc to cancel".into(),
+            options: vec!["No, disable external imports".into(), "Yes, allow external imports".into()],
+            details: vec![String::new(), String::new()],
+            asked: false,
+            selected: 0,
+        });
+        b.stall.clear();
+        clock.advance(30_000);
+        b.dialog_tick().await;
+        let raised: Vec<bool> = std::iter::from_fn(|| up.try_recv().ok())
+            .filter_map(|f| match f {
+                crate::bridge::gateway::link::LinkFrame::NeedsHuman { closed_too, .. } => Some(closed_too),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(raised, vec![true], "a screen dialog reaches the askers, closed or not");
+
+        // Still inside the half hour: left alone
+        clock.advance(20 * 60_000);
+        b.dialog_tick().await;
+        assert!(!b.dialog_pending.is_empty(), "given up too early");
+        assert_eq!(crate::agent::Agent::windows(&*agent).len(), 1, "the agent is still there");
+
+        clock.advance(11 * 60_000);
+        b.dialog_tick().await;
+        assert!(b.dialog_pending.is_empty(), "the prompt is still held");
+        assert!(crate::agent::Agent::windows(&*agent).is_empty(), "the agent was left at the dialog");
+        assert!(
+            slack.calls().iter().any(|c| c.starts_with("update_md C") && c.contains("agent was closed")),
+            "the prompt still looks live: {:?}",
+            slack.calls()
+        );
+        let frames: Vec<String> = std::iter::from_fn(|| up.try_recv().ok()).map(|f| format!("{f:?}")).collect();
+        assert!(frames.iter().any(|f| f.contains("AgentReply") && f.contains("failed")), "the asker was not told: {frames:?}");
+        assert!(frames.iter().any(|f| f.contains("NeedsHuman") && f.contains("closed_too: true")), "{frames:?}");
+        let e = b.threads.get(ROOT).expect("the thread stays, to resume");
+        assert!(e.dialog_prompt.is_none());
+    }
+
     async fn running_thread(b: &mut Bridge, agent: &FakeAgent) -> String {
         b.on_inbound(&channel_msg(ROOT, "U_OWNER", "<@U_BOT> fix the tests"))
             .await;

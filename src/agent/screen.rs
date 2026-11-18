@@ -280,7 +280,10 @@ impl<'a> Pane<'a> {
             .iter()
             .find(|l| {
                 let t = l.trim().to_ascii_lowercase();
-                t.ends_with(CANCEL_HINT)
+                // **Not always last on its line.** A tool's permission screen goes on after it
+                // (`Esc to cancel · Tab to amend`): read as no modal, it sat unanswered on a real
+                // machine after its Slack prompt timed out, and nobody was told
+                t.ends_with(CANCEL_HINT) || t.contains(&format!("{CANCEL_HINT} \u{b7} "))
             })
             .copied()
     }
@@ -1603,6 +1606,33 @@ Enter to select \u{b7} \u{2191}/\u{2193} to navigate \u{b7} ctrl+g to edit in VS
             .expect("a modal is up");
         assert_eq!(moved.options, ["No, exit", "Yes, I trust this folder"]);
         assert_eq!(moved.selected, 1);
+    }
+
+    /// A tool's permission screen left on the agent after its Slack prompt timed out (a real
+    /// Windows machine, 2026-11-18). Its hint goes on past "Esc to cancel", and it was not read as
+    /// a modal at all, so it never reached anyone.
+    #[test]
+    fn a_permission_screen_whose_hint_goes_on_is_a_dialog() {
+        let pane = concat!(
+            "\u{25cf} Finding keymap.ahk on the dock dev share\n",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\n",
+            " PowerShell command\n",
+            " Find keymap.ahk on the dock dev share\n",
+            " \u{2502} Get-ChildItem \\\\DOCK\\dev -Recurse -Include *.ahk\n",
+            " \u{2502} PowerShell can load code while reading `#requires`, so Claude Code did not let it read\n",
+            "\n",
+            " Do you want to proceed?\n",
+            " \u{276f} 1. Yes\n",
+            "   2. No\n",
+            "\n",
+            " Esc to cancel \u{b7} Tab to amend\n",
+        );
+        let d = Pane::new(pane).dialog().expect("a modal is up");
+        assert_eq!(d.options, ["Yes", "No"]);
+        assert_eq!(d.selected, 0);
+        assert_eq!(d.title, "PowerShell command");
+        // The working footer is not a modal's
+        assert_eq!(Pane::new(" \u{276f} \u{a0}\n esc to interrupt \u{b7} ctrl+t to hide").dialog(), None);
     }
 
     /// Why the reading refuses an empty row: under a modal the input box keeps its own

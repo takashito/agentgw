@@ -25,6 +25,15 @@ const QUESTION_TOOL: &str = "AskUserQuestion";
 /// agent sends hooks, and each of those re-arms the clock this reads.
 const DIALOG_WATCH_EVERY_MS: u64 = 10_000;
 const DIALOG_WATCH_QUIET_MS: u64 = 10_000;
+/// How long a screen dialog may wait for a person before the agent is closed
+/// ([`Bridge::give_up_dialog`]). Long enough to come back from a meeting, short of "hours".
+const DIALOG_GIVE_UP_MS: u64 = 30 * 60_000;
+
+/// A Slack ts (`"1794749149.290569"`) as epoch milliseconds.
+fn slack_ts_ms(ts: &str) -> Option<u64> {
+    let secs: f64 = ts.parse().ok()?;
+    (secs > 0.0).then(|| (secs * 1000.0) as u64)
+}
 
 /// Is the screen still showing the dialog a prompt was posted for?
 ///
@@ -619,7 +628,10 @@ impl Bridge {
 
     /// A person is needed in this thread (`ts` is the message to point at). If another channel's
     /// agent asked for this thread, the gateway tells the threads up the chain.
-    pub(super) fn needs_human(&self, channel: &str, root: &str, ts: &str) {
+    ///
+    /// `closed_too`: tell them even if their exchange was closed — for a screen only a person can
+    /// answer, which otherwise holds the agent with nobody looking (see `notify_targets_closed_too`).
+    pub(super) fn needs_human(&self, channel: &str, root: &str, ts: &str, closed_too: bool) {
         if self.threads.get(root).is_none_or(|e| e.asked_from.is_none()) {
             return;
         }
@@ -628,6 +640,7 @@ impl Bridge {
             channel: channel.to_string(),
             thread_ts: root.to_string(),
             ts: ts.to_string(),
+            closed_too,
         });
     }
 
@@ -1222,6 +1235,9 @@ impl Bridge {
             if let Some((req_id, asked)) = waiting {
                 let same = on_screen.as_ref().is_some_and(|d| still_asking(&asked, d));
                 if same {
+                    if self.dialog_abandoned(&req_id, now) {
+                        self.give_up_dialog(&req_id, &key, &session, &ctx).await;
+                    }
                     continue; // the same question, still waiting for a person
                 }
                 self.retire_dialog_prompt(&req_id, &ctx).await;
@@ -1303,6 +1319,73 @@ impl Bridge {
         {
             ctx.debug("bridge", &format!("questions prompt update failed: {e}"));
         }
+    }
+
+    /// Has this screen dialog waited past [`DIALOG_GIVE_UP_MS`] with nobody answering? Timed from
+    /// when it was posted -- across a restart, from the post's own Slack ts.
+    /// **A question form never is**: the agent asked a person on purpose and keeps waiting.
+    fn dialog_abandoned(&self, req_id: &str, now_ms: u64) -> bool {
+        let Some(p) = self.dialog_pending.get(req_id) else {
+            return false;
+        };
+        p.questions.is_empty() && now_ms.saturating_sub(p.posted_ms) >= DIALOG_GIVE_UP_MS
+    }
+
+    /// Nobody answered a screen dialog in time: **close the agent**, keep the thread. Pressing a
+    /// row for them would be answering for a person -- allowing a command, or starting without
+    /// the rules an import holds -- so nothing is pressed. The thread keeps its record, so the
+    /// next message there resumes the same conversation.
+    ///
+    /// Before this a dialog waited for ever: a session woken by a late reply sat at an import
+    /// question for 73 hours, outliving twenty restarts and every cleanup, which leave a
+    /// waiting agent alone.
+    async fn give_up_dialog(&mut self, req_id: &str, key: &ThreadKey, session: &str, ctx: &LogCtx) {
+        let Some(p) = self.dialog_pending.remove(req_id) else {
+            return;
+        };
+        let (channel, root) = (p.channel.clone(), p.thread_ts.clone());
+        ctx.info(
+            "bridge",
+            &format!(
+                "dialog reqId={req_id} window={} unanswered for {} min (\"{}\") — closing the agent",
+                p.window,
+                DIALOG_GIVE_UP_MS / 60_000,
+                p.dialog.title
+            ),
+        );
+        if let Some(e) = self.threads.entries.get_mut(&root)
+            && e.dialog_prompt.as_ref().is_some_and(|d| d.req_id == req_id)
+        {
+            e.dialog_prompt = None;
+            if let Err(e) = self.threads.save() {
+                ctx.error("bridge", &format!("threads.json save failed: {e}"));
+            }
+        }
+        let mins = DIALOG_GIVE_UP_MS / 60_000;
+        let text = slack::unanswered_dialog(
+            &p.dialog,
+            &crate::t!(
+                "Nobody answered this for {mins} minutes, so the agent was closed without answering it. The thread stays: a new message here starts it again from the same conversation.",
+                "{mins}分だれも答えなかったので、答えずにエージェントを閉じました。スレッドは残っているので、ここに書けば同じ会話から再開します。"
+            ),
+        );
+        if let Err(e) = self.deps.slack.update_markdown(&channel, &p.prompt_ts, &text).await {
+            ctx.debug("bridge", &format!("dialog prompt update failed: {e}"));
+        }
+        // Whoever asked for this work hears that it stopped, and why -- not silence
+        self.tell_asker(
+            key,
+            "failed",
+            format!(
+                "The agent stopped at a screen only a person can answer (\"{}\"); nobody answered for {mins} minutes, so it was closed. Ask again to resume it.",
+                p.dialog.title
+            ),
+        );
+        self.needs_human(&channel, &root, &p.prompt_ts, true);
+        self.stall.remove(key);
+        self.presence_remove(key, &Reason::Perm);
+        self.presence_remove(key, &Reason::Turn);
+        self.terminate(key, Some(session), None).await;
     }
 
     /// Takes down a prompt whose dialog the screen has moved on from: says so in the post, and
@@ -1550,7 +1633,7 @@ impl Bridge {
                  awaiting click"
             ),
         );
-        self.needs_human(&channel, &thread_ts, &prompt_ts);
+        self.needs_human(&channel, &thread_ts, &prompt_ts, false);
         // From here the agent is silent waiting for a person. Stop the watch
         self.suspend_stall_for_perm(&ThreadKey::new(&channel, &thread_ts));
         self.remember_perm_prompt(&thread_ts, &prompt_ts);
@@ -1713,7 +1796,8 @@ impl Bridge {
                 d.options.len()
             ),
         );
-        self.needs_human(channel, thread_ts, &prompt_ts);
+        // A screen dialog holds the agent before or between turns, where nobody may be looking
+        self.needs_human(channel, thread_ts, &prompt_ts, questions.is_empty());
 
         // **Written down, not only remembered.** A restart empties the map, and a button whose
         // id nobody recognises is ignored in silence -- while the dialog it belongs to is still
@@ -1725,6 +1809,7 @@ impl Bridge {
                 window: window.to_string(),
                 dialog: d.clone(),
                 questions: questions.clone(),
+                posted_ms: Some(self.deps.clock.now_ms()),
             });
             if let Err(e) = self.threads.save() {
                 ctx.error("bridge", &format!("threads.json save failed: {e}"));
@@ -1739,6 +1824,7 @@ impl Bridge {
                 prompt_ts,
                 dialog: d,
                 questions,
+                posted_ms: self.deps.clock.now_ms(),
             },
         );
         true
@@ -1961,6 +2047,11 @@ impl Bridge {
                     channel: channel.clone(),
                     thread_ts: thread_ts.clone(),
                     window: p.window,
+                    // Taken back after a restart: the post's own ts says when it went up
+                    posted_ms: p
+                        .posted_ms
+                        .or_else(|| slack_ts_ms(&p.prompt_ts))
+                        .unwrap_or_else(|| self.deps.clock.now_ms()),
                     prompt_ts: p.prompt_ts,
                     dialog: p.dialog,
                     questions: p.questions,
