@@ -3115,10 +3115,18 @@ mod tests {
         assert!(replies_up(&mut up).iter().any(|(o, _)| o == "exited"));
     }
 
-    /// `exit` / `done` leave ✅ on the thread's root next to the farewell.
+    /// Only `done` leaves ✅ on the thread's root; `exit` / `bye` just end the agent. Each says
+    /// which it was, and the session shows closed.
     #[tokio::test]
-    async fn exit_and_done_mark_the_thread_with_a_check() {
-        for (n, word) in ["exit", "done"].iter().enumerate() {
+    async fn only_done_marks_the_thread_with_a_check() {
+        for (n, (word, check, line)) in [
+            ("exit", false, "Ended the Claude Code session."),
+            ("bye", false, "Ended the Claude Code session."),
+            ("done", true, "Marked this thread done and ended the Claude Code session."),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let (d, slack, _agent, _clock) = flow_deps(&format!("exit-check-{word}"));
             let (mut b, _fx) = Bridge::for_test(d);
             let root = format!("1782000000.00070{n}");
@@ -3129,11 +3137,80 @@ mod tests {
             b.on_inbound(&bye).await;
             settle().await;
             let calls = slack.calls();
-            assert!(calls.iter().any(|c| c.starts_with(&format!("post C_ADMIN {root}"))), "farewell still posted: {calls:?}");
-            assert!(
-                calls.contains(&format!("react C_ADMIN {root} white_check_mark")),
-                "{word}: ✅ on the root: {calls:?}"
-            );
+            assert!(calls.contains(&format!("post C_ADMIN {root} {line}")), "{word}: {calls:?}");
+            assert!(!calls.iter().any(|c| c.contains("Thanks for your work")), "{calls:?}");
+            assert_eq!(calls.contains(&format!("react C_ADMIN {root} white_check_mark")), check, "{word}: {calls:?}");
+            assert!(calls.contains(&format!("status C_ADMIN {root} closed")), "{word}: {calls:?}");
+        }
+    }
+
+    /// A bare `done` while the agent runs is the agent's to read — it may mean "I did what you
+    /// asked". It is delivered with a note, and nothing ends: no farewell, no ✅, no closed session.
+    #[tokio::test]
+    async fn done_to_a_running_agent_is_delivered_for_it_to_decide() {
+        let (d, slack, agent, _clock) = flow_deps("done-running");
+        let ((mut b, _fx), mut deliv) = Bridge::for_test_with_deliveries(d);
+        let _sid = running_thread(&mut b, &agent).await;
+        b.on_inbound(&in_thread("1782000000.000200", "done")).await;
+        settle_deliveries(&mut b, &mut deliv).await;
+        settle().await;
+        let last = agent.delivered.lock().unwrap().last().unwrap().1.clone();
+        assert!(last.contains(crate::agent::DONE_NOTE) && last.contains("\ndone\n"), "{last}");
+        let calls = slack.calls();
+        assert!(!calls.iter().any(|c| c.contains("white_check_mark") || c.ends_with(" closed") || c.contains("Claude Code session")), "{calls:?}");
+        assert!(b.agent_running(ROOT), "the agent goes on");
+        // Any other message carries no such note
+        b.on_inbound(&in_thread("1782000000.000300", "done already?")).await;
+        settle_deliveries(&mut b, &mut deliv).await;
+        let last = agent.delivered.lock().unwrap().last().unwrap().1.clone();
+        assert!(!last.contains(crate::agent::DONE_NOTE), "{last}");
+    }
+
+    /// The asker closing a thread: finished (`done`, an older gateway's empty text too) gets ✅,
+    /// given up (`canceled`) does not. The gateway said who closed it, so nothing more is posted.
+    #[tokio::test]
+    async fn the_asker_ending_a_thread_marks_it_done_only_when_finished() {
+        for (text, check) in [("", true), (crate::chat::END_CANCELED, false)] {
+            let (d, slack, _agent, _clock) = flow_deps(&format!("ask-end-{}", if check { "done" } else { "cancel" }));
+            let (mut b, _fx) = Bridge::for_test(d);
+            b.on_inbound(&agent_msg(ROOT, ROOT, "check it", crate::chat::DeliveryKind::Ask)).await;
+            b.on_inbound(&agent_msg(ROOT, "1782000000.000700", text, crate::chat::DeliveryKind::End)).await;
+            b.run_drains().await;
+            settle().await;
+            let calls = slack.calls();
+            assert_eq!(calls.contains(&format!("react C_ADMIN {ROOT} white_check_mark")), check, "{text:?}: {calls:?}");
+            assert!(!calls.iter().any(|c| c.contains("session.") || c.contains("Thanks for your work")), "{calls:?}");
+            assert!(calls.contains(&format!("status C_ADMIN {ROOT} closed")), "it really ended: {calls:?}");
+        }
+    }
+
+    /// `end_session`: the agent ends itself. The asker hears it ended, the thread says so, and
+    /// `done` marks it; `ended` does not.
+    #[tokio::test]
+    async fn the_agent_ends_its_own_session() {
+        for (kind, check, line) in [
+            ("end_done", true, "Claude marked this thread done and ended its session."),
+            ("end", false, "Claude ended its session without marking this thread done."),
+        ] {
+            let (d, slack, _agent, _clock) = flow_deps(&format!("self-{kind}"));
+            let (mut b, _fx) = Bridge::for_test(d);
+            let (tx, mut up) = mpsc::unbounded_channel();
+            b.ask_gateway = Some(tx);
+            b.on_inbound(&agent_msg(ROOT, ROOT, "check it", crate::chat::DeliveryKind::Ask)).await;
+            let sid = b.threads.get(ROOT).and_then(|e| e.agent_id.clone()).expect("an agent");
+            // The tool gives no thread: it is found from the session
+            let mut d = dispo(kind, &[], None, &sid);
+            d.channel_id = String::new();
+            d.thread_ts = None;
+            b.on_disposition(d).await;
+            assert!(replies_up(&mut up).iter().any(|(o, _)| o == "exited"), "{kind}");
+            b.run_drains().await;
+            settle().await;
+            let calls = slack.calls();
+            assert!(calls.contains(&format!("post C_ADMIN {ROOT} {line}")), "{kind}: {calls:?}");
+            assert_eq!(calls.contains(&format!("react C_ADMIN {ROOT} white_check_mark")), check, "{kind}: {calls:?}");
+            assert!(calls.contains(&format!("status C_ADMIN {ROOT} closed")), "{kind}: {calls:?}");
+            assert!(b.threads.get(ROOT).is_some(), "the thread stays, as after exit");
         }
     }
 
@@ -3144,7 +3221,7 @@ mod tests {
         let refusing = Arc::new(FakeChat::failing());
         d.slack = refusing.clone();
         let (mut b, _fx) = Bridge::for_test(d);
-        let mut bye = channel_msg("1782000000.000810", "U_OWNER", "exit");
+        let mut bye = channel_msg("1782000000.000810", "U_OWNER", "done");
         bye.channel = "C_ADMIN".into();
         bye.thread_ts = Some("1782000000.000710".into());
         b.threads.upsert("1782000000.000710", crate::bridge::state::ThreadEntry::default());

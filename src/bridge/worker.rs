@@ -486,16 +486,28 @@ pub struct DrainJob {
     pub key: ThreadKey,
     pub session_id: String,
     pub deadline_ms: u64,
-    /// Where to post the farewell (channel, thread_ts). Only exit announces it —
-    /// for resume the report text already says the session is ending.
-    pub farewell: Option<(String, String)>,
+    /// How the ending is announced. Only an intended ending (exit, done, end_ask, end_session) has
+    /// one — for resume the report text already says the session is ending.
+    pub farewell: Option<Farewell>,
     /// The reason held for the whole drain (only `resume` hands one over). Dropped when the job
     /// leaves `drains` — this reservation is what we wait on, so the hold lives here too.
     pub thinking: Option<crate::bridge::turn::PresenceHold>,
 }
 
-/// The reaction an ended session leaves on its thread's root message.
+/// The reaction a thread marked done gets on its root message.
 pub(super) const DONE_EMOJI: &str = "white_check_mark";
+
+/// How an intended ending shows in its thread.
+#[derive(Clone, Debug)]
+pub struct Farewell {
+    pub channel: String,
+    pub thread_ts: String,
+    /// The line posted in the thread. None when it was said already (`end_ask`: the gateway
+    /// posts who closed the thread before the ending reaches this machine).
+    pub line: Option<String>,
+    /// The thread is finished, not just stopped: ✅ goes on its root message.
+    pub done: bool,
+}
 
 // ── starting, pooling and reaping agents ──
 
@@ -506,7 +518,7 @@ impl Bridge {
         &mut self,
         key: &ThreadKey,
         sid: Option<&str>,
-        farewell: Option<(String, String)>,
+        farewell: Option<Farewell>,
     ) {
         let ctx = LogCtx {
             session_id: sid.map(str::to_string),
@@ -584,25 +596,29 @@ impl Bridge {
                 sid.unwrap_or("none")
             ),
         );
-        if let Some((channel, thread_ts)) = farewell {
-            self.post(
-                &channel,
-                &thread_ts,
-                crate::t!("Thanks for your work! Ending the Claude Code session.", "お疲れさまでした。Claude Code のセッションを終了します。"),
-                key,
-            );
+        if let Some(Farewell { channel, thread_ts, line, done }) = farewell {
+            if let Some(line) = line {
+                self.post(&channel, &thread_ts, line, key);
+            }
+            // The agent will not answer here any more: Slack shows the session as closed
+            self.presence_close(key);
             // Mark the thread itself as finished, so it reads as done in the channel without
             // opening it. Best-effort: a missing scope or a ✅ already there must not hold up the
             // ending, so it runs on its own and a failure is only logged
-            let (api, ch, ts, log) = (self.deps.slack.clone(), channel.clone(), thread_ts.clone(), ctx.clone());
-            tokio::spawn(async move {
-                if let Err(e) = api.add_reaction(&ch, &ts, DONE_EMOJI).await {
-                    log.debug("bridge", &format!("exit: '{DONE_EMOJI}' on the thread failed: {e}"));
-                }
-            });
+            if done {
+                let (api, ch, ts, log) = (self.deps.slack.clone(), channel.clone(), thread_ts.clone(), ctx.clone());
+                tokio::spawn(async move {
+                    if let Err(e) = api.add_reaction(&ch, &ts, DONE_EMOJI).await {
+                        log.debug("bridge", &format!("exit: '{DONE_EMOJI}' on the thread failed: {e}"));
+                    }
+                });
+            }
             ctx.info(
                 "bridge",
-                &format!("slack-events: user exit → session ended for {channel}:{thread_ts}"),
+                &format!(
+                    "slack-events: session ended{} for {channel}:{thread_ts}",
+                    if done { " and thread marked done" } else { "" }
+                ),
             );
         }
     }

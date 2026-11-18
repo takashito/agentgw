@@ -1385,7 +1385,8 @@ mod tests {
         let h = help(false, &crate::agent::fake::FakeAgent::default());
         for word in [
             "stop",
-            "exit / bye / done",
+            "exit / bye",
+            "done",
             "compact",
             "model [fable|opus|sonnet|haiku]",
             "effort [low|medium|high|xhigh|max|ultracode|auto]",

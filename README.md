@@ -296,7 +296,8 @@ Mention the bot followed by the command (the bot is named `agentgw` unless the S
 | Command | What it does |
 |---|---|
 | `stop` | Stop the current turn (a 🛑 reaction works too) |
-| `exit` · `bye` · `done` | End this thread's agent; your next message resumes it |
+| `exit` · `bye` | End this thread's agent; your next message resumes it |
+| `done` | Mark the thread done (✅ on its first message) and end its agent. While the agent is running, `done` goes to it first: if it had asked you to do something, it takes `done` as "I did it" and carries on |
 | `compact` | Compact the context, with a progress bar |
 | `model [fable\|opus\|sonnet\|haiku]` | Show or switch the model |
 | `effort [low\|medium\|high\|xhigh\|max\|…]` | Show or set the effort level |
@@ -320,7 +321,7 @@ Mention the bot followed by the command (the bot is named `agentgw` unless the S
 
 When the bot is added to a channel that has no machine yet, it asks the Owner in that channel which machine should handle it, with one button per connected machine and a **Later** button. The chosen machine works in its home folder; `route <machine>:<path>` picks another folder. When only the gateway is connected, the gateway takes the channel without asking. A channel that an agent creates with `create_channel`, or brings the bot into with `join_channel`, goes to that agent's machine without asking. A channel that already has a machine keeps it.
 
-The Claudes in different channels ask each other for work with the `ask_channel` tool. A request starts in the other channel at once, its reply comes back to the thread that asked, and the asking Claude closes the thread it asked with `end_ask` once it is done. The whole exchange stays in Slack.
+The Claudes in different channels ask each other for work with the `ask_channel` tool. A request starts in the other channel at once, its reply comes back to the thread that asked, and the asking Claude closes the thread it asked with `end_ask` once it is done — as completed (✅) or as no longer wanted. A Claude can also end its own session with `end_session` when the person says the work is finished. The whole exchange stays in Slack.
 
 While a request is running, the asking Claude can check on it with `thread_activity` instead of interrupting it. The answer always carries a one-word `state` — `running_tool`, `thinking`, `waiting_for_person`, `turn_ended`, `turn_failed`, `idle`, `no_agent`, `machine_offline` or `no_answer` — with a one-line summary, the tools running and for how many seconds, the last tool with its outcome, and when the asked Claude last posted to its thread. Reading changes nothing in the asked thread.
 
@@ -419,6 +420,8 @@ Every GitHub release carries its notes from [CHANGELOG.md](CHANGELOG.md), and `s
 3. Write one `- ` line per change a user can notice, in English: what is different now, not how it was done. Add the issue ID at the end when there is one, e.g. `(WORK-57)`. Internal refactoring and test-only changes are left out.
 4. Work from `git log v<previous>..HEAD` — the commit subjects and bodies are the source.
 5. Run `./scripts/release.sh --check` to see the notes as they will be published. Then `cargo dist`, `git push`, `./scripts/release.sh`.
+
+`scripts/release.sh` also stops when the release would take back a commit that is already on `main` or in the build running now (`agentgw --build`) — for example a fix deployed from another branch and not merged yet. Merge that commit and build again. When dropping it is intended, pass `--force`; the commits being dropped are still listed. `scripts/deploy.sh` runs the same checks (`scripts/preflight.sh`).
 
 To fix the notes of a release that is already out, edit its section and run `gh release edit v<x.y.z> --notes-file <file>` — never move the tag.
 

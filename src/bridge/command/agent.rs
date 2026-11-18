@@ -26,7 +26,21 @@ const LOGIN_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 
 const URL_POLL_MAX: u32 = 20;
 
-const CODE_POLL_MAX: u32 = 30;
+/// Seconds to wait for the verdict on a pasted code. 30 was too short to tell a slow exchange from a
+/// stuck one: two sign-ins on a Windows machine ran out with neither a success nor an error on screen.
+const CODE_POLL_MAX: u32 = 90;
+
+/// The sign-in screen's last lines for the failure reply, with the pasted code (and its `#state`)
+/// masked: the code is single-use, but it has no business sitting in a channel.
+fn login_screen_report(screen: &str, code: &str) -> String {
+    let mut text = screen.to_string();
+    for secret in [code, code.split('#').next().unwrap_or("")] {
+        if secret.len() >= 8 {
+            text = text.replace(secret, "***");
+        }
+    }
+    text.replace("```", "'''")
+}
 
 /// The one line returned to a thread with no session (shared by all commands).
 fn no_session() -> String {
@@ -106,22 +120,71 @@ impl Bridge {
     /// `exit` / `bye` / `done`. What ends is
     /// **the agent, not the thread** — the threads.json entry stays, so the next message
     /// continues the same session with `--resume`. A running turn is waited for, not cut (unlike stop):
-    /// so the farewell lands **below** the agent's last reply.
-    pub(super) async fn user_exit(&mut self, msg: &InboundMsg, key: &ThreadKey, root_ts: &str, ctx: &LogCtx) {
-        self.end_agent(msg, key, root_ts, ctx, true).await;
+    /// so the farewell lands **below** the agent's last reply. Only `done` marks the thread finished.
+    pub(super) async fn user_exit(&mut self, msg: &InboundMsg, key: &ThreadKey, root_ts: &str, done: bool, ctx: &LogCtx) {
+        let line = match done {
+            true => crate::t!(
+                "Marked this thread done and ended the Claude Code session.",
+                "このスレッドを完了にして、Claude Code のセッションを終了しました。"
+            ),
+            false => crate::t!("Ended the Claude Code session.", "Claude Code のセッションを終了しました。"),
+        };
+        self.end_agent(&msg.channel, key, root_ts, ctx, true, Some(line.to_string()), done).await;
+    }
+
+    /// Whether this thread has an agent process alive right now.
+    pub(in crate::bridge) fn agent_running(&self, root_ts: &str) -> bool {
+        let Some(sid) = self.threads.get(root_ts).and_then(|e| e.agent_id.clone()) else {
+            return false;
+        };
+        let name = SessionId::from(sid.as_str()).window_name();
+        let window_id = self.workers.warm(&sid).and_then(|h| h.window_id.clone());
+        self.deps.agent.pid_of(window_id.as_deref(), &name).is_some()
+    }
+
+    /// The agent ends its own session (`end_session`), after the turn it is in. Like `exit`, the
+    /// thread stays and the next message resumes it; `done` marks the thread finished.
+    pub(in crate::bridge) async fn agent_exit(&mut self, channel: &str, key: &ThreadKey, root_ts: &str, done: bool, ctx: &LogCtx) {
+        let line = match done {
+            true => crate::t!(
+                "Claude marked this thread done and ended its session.",
+                "Claude がこのスレッドを完了にして、セッションを終了しました。"
+            ),
+            false => crate::t!(
+                "Claude ended its session without marking this thread done.",
+                "Claude がセッションを終了しました(完了にはしていません)。"
+            ),
+        };
+        self.end_agent(channel, key, root_ts, ctx, true, Some(line.to_string()), done).await;
     }
 
     /// What `exit` does, also used when the agent that asked this thread ends it (`end_ask`). Then
     /// `tell` is false: the gateway has ended the exchange already, and the asker is the one who
-    /// ended it, so nothing goes back.
-    pub(in crate::bridge) async fn end_agent(&mut self, msg: &InboundMsg, key: &ThreadKey, root_ts: &str, ctx: &LogCtx, tell: bool) {
-        let farewell = Some((msg.channel.clone(), root_ts.to_string()));
+    /// ended it, so nothing goes back. `line` is what the thread is told (None: said already);
+    /// `done` puts ✅ on the thread's first post.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::bridge) async fn end_agent(
+        &mut self,
+        channel: &str,
+        key: &ThreadKey,
+        root_ts: &str,
+        ctx: &LogCtx,
+        tell: bool,
+        line: Option<String>,
+        done: bool,
+    ) {
+        let farewell = Some(crate::bridge::worker::Farewell {
+            channel: channel.to_string(),
+            thread_ts: root_ts.to_string(),
+            line,
+            done,
+        });
         // An exchange between agents through this thread ends here, whichever end it is
         if tell {
             self.tell_asker(key, "exited", String::new());
             if let Some(up) = &self.ask_gateway {
                 let _ = up.send(crate::bridge::gateway::link::LinkFrame::AskEnded {
-                    channel: msg.channel.clone(),
+                    channel: channel.to_string(),
                     thread_ts: root_ts.to_string(),
                 });
             }
@@ -1020,19 +1083,35 @@ impl Bridge {
                     Some(user),
                 )
             } else {
+                let screen = login_screen_report(&agent.login_screen(), &code);
                 ctx.error(
                     "bridge",
                     &format!(
-                        "login: sign-in {outcome} for {user} (channel {channel}) — no Owner bound"
+                        "login: sign-in {outcome} for {user} (channel {channel}) — no Owner bound; \
+                         screen: {}",
+                        screen.replace('\n', " | ")
                     ),
                 );
-                (
+                let head = if outcome == "timeout" {
+                    crate::t!(
+                        "Sign-in did not finish within {CODE_POLL_MAX} seconds. Send `login` to try again.",
+                        "{CODE_POLL_MAX}秒たってもサインインが終わりませんでした。`login` と送ってやり直してください。"
+                    )
+                } else {
                     crate::t!(
                         "Sign-in failed — the code may be wrong or expired. Send `login` to try again.",
                         "サインインできませんでした。コードが違うか、期限が切れた可能性があります。`login` と送ってやり直してください。"
-                    ),
-                    None,
-                )
+                    )
+                };
+                let text = if screen.is_empty() {
+                    head.to_string()
+                } else {
+                    format!(
+                        "{head}\n{}\n```\n{screen}\n```",
+                        crate::t!("The sign-in screen said:", "サインインの画面の表示:")
+                    )
+                };
+                (text, None)
             };
             let _ = cmd_tx
                 .send(CmdFx::LoginFinished {
@@ -1599,7 +1678,8 @@ pub(super) fn help_sections(agent: &dyn Agent) -> Vec<(String, Vec<(String, Stri
             crate::t!("In the threads", "スレッドで"),
             vec![
                 ("stop".to_string(), crate::t!("stop the current turn (a 🛑 reaction works too)", "実行中のターンを止める(🛑 のリアクションでも可)")),
-                ("exit / bye / done".to_string(), crate::t!("end this thread's agent; your next message resumes it", "このスレッドのエージェントを終える。次に書けば再開する")),
+                ("exit / bye".to_string(), crate::t!("end this thread's agent; your next message resumes it", "このスレッドのエージェントを終える。次に書けば再開する")),
+                ("done".to_string(), crate::t!("the same, and mark the thread done (✅)", "同じく終えて、スレッドを完了にする(✅)")),
                 ("compact".to_string(), crate::t!("compact the context, with a progress bar", "コンテキストを圧縮する(進捗バー付き)")),
                 (choice("model", agent.models()), crate::t!("show or switch the model", "モデルを見る・切り替える")),
                 (choice("effort", agent.effort_levels()), crate::t!("show or set the effort level", "effort を見る・決める")),
@@ -1625,6 +1705,18 @@ mod tests {
     // The drawing test calls one reader (`renders_context_report`). The parser's own net
     // lives in `mod tests` of `agent/claude.rs`.
     use crate::agent::screen::Pane;
+
+    #[test]
+    fn the_login_failure_report_masks_the_pasted_code() {
+        let code = "PwjqVahVDDuJLYaVCRaZ#XqSukjgt3MWXEdKHh";
+        let screen = "Paste code here if prompted > PwjqVahVDDuJLYaVCRaZ#XqSukjgt3MWXEdKHh\nSigning in…";
+        let report = login_screen_report(screen, code);
+        assert!(!report.contains("PwjqVahVDDuJLYaVCRaZ"), "{report}");
+        assert!(report.contains("Signing in…"), "{report}");
+        // Only the code part showing (no #state) is masked too
+        let half = login_screen_report("> PwjqVahVDDuJLYaVCRaZ", code);
+        assert_eq!(half, "> ***");
+    }
 
     fn sample_now() -> WallClock {
         WallClock::new(2026, 7, 29, 13, 0).expect("valid wall clock")

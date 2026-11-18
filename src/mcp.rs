@@ -168,14 +168,27 @@ impl Mcp {
             }),
             serde_json::json!({
                 "name": "end_ask",
-                "description": "Close a thread you asked with ask_channel, once you are done with it (the request is finished, or no longer wanted). Its agent ends the way `exit` ends it — after any turn it is in, not in the middle — and a line there says you closed it. Only threads asked from this thread can be closed. No more follow-ups go to it afterwards; ask in a new thread if you need more.",
+                "description": "Close a thread you asked with ask_channel, once you are done with it (the request is finished, or no longer wanted). Its agent ends the way `exit` ends it — after any turn it is in, not in the middle — and a line there says you closed it and whether it was completed. Only threads asked from this thread can be closed. No more follow-ups go to it afterwards; ask in a new thread if you need more.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "channel_id": { "type": "string", "description": "The channel you asked (C...)." },
                         "thread_ts": { "type": "string", "description": "The thread_ts of the thread you asked (from ask_channel's result or the reply's from_thread)." },
+                        "outcome": { "type": "string", "enum": ["done", "canceled"], "description": "done (the default): the request was completed — the thread is marked done with ✅. canceled: it is no longer wanted — closed without the mark." },
                     },
                     "required": ["channel_id", "thread_ts"],
+                },
+            }),
+            serde_json::json!({
+                "name": "end_session",
+                "description": "End your own session in this thread, as the last call of your turn (reply first). outcome done marks the thread done (✅ on its first post); ended only ends it. Call it only when the person told you the work in this thread is finished — in any words (\"done\", \"that's all, thanks\") — never on your own judgment, and never when their words answer something you asked of them (\"done\" meaning \"I did what you asked\", or \"ok\" / \"good\" to a question): then carry on. The thread stays: a later message there starts you again with this conversation.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "outcome": { "type": "string", "enum": ["done", "ended"], "description": "done: the work here is finished (✅). ended: stop without marking it done." },
+                        "message_ids": { "type": "array", "items": { "type": "string" }, "description": "The inbound message_id(s) this answers (e.g. the person's \"done\"), as with reply." },
+                    },
+                    "required": ["outcome"],
                 },
             }),
             serde_json::json!({
@@ -359,7 +372,9 @@ pub fn server_instructions() -> String {
      For a task tracked in an issue, the ask is a short summary with the issue's link (details live \
      in the issue); a question or a check needs no issue. Close the thread you asked with end_ask \
      once you are done with it. To see how a thread you asked is getting on (what it is running and \
-     for how long), call thread_activity instead of asking it."
+     for how long), call thread_activity instead of asking it. \
+     When the person tells you the work in your thread is finished, reply, then end your session with \
+     end_session (outcome done) — but not when their words only answer something you asked of them."
         .into()
 }
 
@@ -578,6 +593,7 @@ mod tests {
                 "set_thread_title",
                 "ask_channel",
                 "end_ask",
+                "end_session",
                 "thread_activity",
                 "list_channels",
                 "set_channel_info",
@@ -657,6 +673,7 @@ mod tests {
         assert_eq!(req("set_thread_title"), ["channel_id", "thread_ts", "title"]);
         assert_eq!(req("ask_channel"), ["channel_id", "text"]);
         assert_eq!(req("end_ask"), ["channel_id", "thread_ts"]);
+        assert_eq!(req("end_session"), ["outcome"]);
         assert_eq!(req("thread_activity"), ["channel_id", "thread_ts"]);
         assert!(req("list_channels").is_empty());
         assert_eq!(req("set_channel_info"), ["channel_id"]);
@@ -679,6 +696,7 @@ mod tests {
         assert!(i.contains("ask_channel") && i.contains("end your turn instead of waiting"), "{i}");
         assert!(i.contains("end_ask") && i.contains("needs no issue"), "{i}");
         assert!(i.contains("thread_activity"), "{i}");
+        assert!(i.contains("end_session"), "{i}");
         assert!(i.starts_with("Slack bridge — reply to the Slack thread"), "the existing words stay first");
     }
 }

@@ -126,9 +126,14 @@ pub enum DeliveryKind {
     Ask,
     Reply,
     Notice,
-    /// The asking agent is done with this thread: end its agent the way `exit` does. Carries no text.
+    /// The asking agent is done with this thread: end its agent the way `exit` does. Its text is
+    /// empty when the request was finished (✅), [`END_CANCELED`] when it was given up.
     End,
 }
+
+/// The text of an [`DeliveryKind::End`] delivery whose request was given up, not finished.
+/// Carried as text so an older machine still reads the frame (it ends the agent either way).
+pub const END_CANCELED: &str = "canceled";
 
 /// One edit. `revision` is Slack's `edited.ts` (marks the same edit being redelivered).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -323,6 +328,10 @@ pub enum Presence {
     Idle,
     Working,
     Waiting,
+    /// The agent ended (`exit`, `done`, `end_ask`, `end_session`): "the agent has closed the session
+    /// and will no longer respond on it" (Slack's reference). A later message in the thread starts
+    /// a new agent, whose first turn sets the session busy again.
+    Closed,
 }
 
 impl Presence {
@@ -332,6 +341,7 @@ impl Presence {
             Presence::Idle => "idle",
             Presence::Working => "busy",
             Presence::Waiting => "waiting",
+            Presence::Closed => "closed",
         }
     }
 }
