@@ -800,6 +800,10 @@ pub trait Agent: Send + Sync + 'static {
     fn login_url(&self) -> Option<String>;
     fn login_submit_code(&self, code: &str) -> Result<(), String>;
     fn login_outcome(&self) -> LoginOutcome;
+    /// The last lines the sign-in screen shows, to say why a sign-in did not finish.
+    fn login_screen(&self) -> String {
+        String::new()
+    }
     async fn logout(&self) -> Result<(), ProbeErr>;
 }
 

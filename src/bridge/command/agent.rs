@@ -26,7 +26,21 @@ const LOGIN_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 
 const URL_POLL_MAX: u32 = 20;
 
-const CODE_POLL_MAX: u32 = 30;
+/// Seconds to wait for the verdict on a pasted code. 30 was too short to tell a slow exchange from a
+/// stuck one: two sign-ins on a Windows machine ran out with neither a success nor an error on screen.
+const CODE_POLL_MAX: u32 = 90;
+
+/// The sign-in screen's last lines for the failure reply, with the pasted code (and its `#state`)
+/// masked: the code is single-use, but it has no business sitting in a channel.
+fn login_screen_report(screen: &str, code: &str) -> String {
+    let mut text = screen.to_string();
+    for secret in [code, code.split('#').next().unwrap_or("")] {
+        if secret.len() >= 8 {
+            text = text.replace(secret, "***");
+        }
+    }
+    text.replace("```", "'''")
+}
 
 /// The one line returned to a thread with no session (shared by all commands).
 fn no_session() -> String {
@@ -1069,19 +1083,35 @@ impl Bridge {
                     Some(user),
                 )
             } else {
+                let screen = login_screen_report(&agent.login_screen(), &code);
                 ctx.error(
                     "bridge",
                     &format!(
-                        "login: sign-in {outcome} for {user} (channel {channel}) — no Owner bound"
+                        "login: sign-in {outcome} for {user} (channel {channel}) — no Owner bound; \
+                         screen: {}",
+                        screen.replace('\n', " | ")
                     ),
                 );
-                (
+                let head = if outcome == "timeout" {
+                    crate::t!(
+                        "Sign-in did not finish within {CODE_POLL_MAX} seconds. Send `login` to try again.",
+                        "{CODE_POLL_MAX}秒たってもサインインが終わりませんでした。`login` と送ってやり直してください。"
+                    )
+                } else {
                     crate::t!(
                         "Sign-in failed — the code may be wrong or expired. Send `login` to try again.",
                         "サインインできませんでした。コードが違うか、期限が切れた可能性があります。`login` と送ってやり直してください。"
-                    ),
-                    None,
-                )
+                    )
+                };
+                let text = if screen.is_empty() {
+                    head.to_string()
+                } else {
+                    format!(
+                        "{head}\n{}\n```\n{screen}\n```",
+                        crate::t!("The sign-in screen said:", "サインインの画面の表示:")
+                    )
+                };
+                (text, None)
             };
             let _ = cmd_tx
                 .send(CmdFx::LoginFinished {
@@ -1675,6 +1705,18 @@ mod tests {
     // The drawing test calls one reader (`renders_context_report`). The parser's own net
     // lives in `mod tests` of `agent/claude.rs`.
     use crate::agent::screen::Pane;
+
+    #[test]
+    fn the_login_failure_report_masks_the_pasted_code() {
+        let code = "PwjqVahVDDuJLYaVCRaZ#XqSukjgt3MWXEdKHh";
+        let screen = "Paste code here if prompted > PwjqVahVDDuJLYaVCRaZ#XqSukjgt3MWXEdKHh\nSigning in…";
+        let report = login_screen_report(screen, code);
+        assert!(!report.contains("PwjqVahVDDuJLYaVCRaZ"), "{report}");
+        assert!(report.contains("Signing in…"), "{report}");
+        // Only the code part showing (no #state) is masked too
+        let half = login_screen_report("> PwjqVahVDDuJLYaVCRaZ", code);
+        assert_eq!(half, "> ***");
+    }
 
     fn sample_now() -> WallClock {
         WallClock::new(2026, 7, 29, 13, 0).expect("valid wall clock")
