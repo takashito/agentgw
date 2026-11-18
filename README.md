@@ -322,6 +322,11 @@ When the bot is added to a channel that has no machine yet, it asks the Owner in
 
 The Claudes in different channels ask each other for work with the `ask_channel` tool. A request starts in the other channel at once, its reply comes back to the thread that asked, and the asking Claude closes the thread it asked with `end_ask` once it is done. The whole exchange stays in Slack.
 
+While a request is running, the asking Claude can check on it with `thread_activity` instead of interrupting it. The answer always carries a one-word `state` — `running_tool`, `thinking`, `waiting_for_person`, `turn_ended`, `turn_failed`, `idle`, `no_agent`, `machine_offline` or `no_answer` — with a one-line summary, the tools running and for how many seconds, the last tool with its outcome, and when the asked Claude last posted to its thread. Reading changes nothing in the asked thread.
+
+- **Scope:** only threads asked from the calling thread with `ask_channel` (ended ones included). Any other thread is refused.
+- **Masking:** command lines are cut to 200 characters and output to its last 300. Only a command's output or a failure's message is passed on, never a file's contents or search hits. Values that look like secrets are replaced with `***`: tokens with a known prefix (`xoxb-`, `ghp_`, `sk-`, `AKIA` and others), values of variables and fields whose name contains `TOKEN`, `SECRET`, `PASSWORD`, `API_KEY` and the like, the word after `--token`, `--password`, `Bearer` and similar, passwords in URLs, and long random-looking strings.
+
 ## CLI
 
 ```bash

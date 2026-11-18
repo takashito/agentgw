@@ -179,6 +179,18 @@ impl Mcp {
                 },
             }),
             serde_json::json!({
+                "name": "thread_activity",
+                "description": "Read what the Claude in a thread you asked with ask_channel is doing right now, without disturbing it: its state in one word (running_tool, thinking, waiting_for_person, turn_ended, turn_failed, idle, no_agent, machine_offline, no_answer) with a one-line summary, the tools running and for how many seconds, the last tool with its outcome and the end of its output, and when it last posted to its thread. Use it when someone wants to know how that work is going; its reply still arrives as a message, so do not call this over and over to wait for it. Only threads asked from this thread can be read. Command lines and output are cut short, and values that look like secrets (tokens, passwords, keys) are masked as ***.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "channel_id": { "type": "string", "description": "The channel you asked (C...)." },
+                        "thread_ts": { "type": "string", "description": "The thread_ts of the thread you asked (from ask_channel's result or the reply's from_thread)." },
+                    },
+                    "required": ["channel_id", "thread_ts"],
+                },
+            }),
+            serde_json::json!({
                 "name": "list_channels",
                 "description": "List the Slack channels you can ask, with the machine, folder, topic and purpose of each. Pass channel_id for one channel's project notes (its CLAUDE.md or README).",
                 "inputSchema": {
@@ -346,7 +358,8 @@ pub fn server_instructions() -> String {
      list_channels); its reply comes back as a message, so end your turn instead of waiting. \
      For a task tracked in an issue, the ask is a short summary with the issue's link (details live \
      in the issue); a question or a check needs no issue. Close the thread you asked with end_ask \
-     once you are done with it."
+     once you are done with it. To see how a thread you asked is getting on (what it is running and \
+     for how long), call thread_activity instead of asking it."
         .into()
 }
 
@@ -565,6 +578,7 @@ mod tests {
                 "set_thread_title",
                 "ask_channel",
                 "end_ask",
+                "thread_activity",
                 "list_channels",
                 "set_channel_info",
                 "create_channel",
@@ -643,6 +657,7 @@ mod tests {
         assert_eq!(req("set_thread_title"), ["channel_id", "thread_ts", "title"]);
         assert_eq!(req("ask_channel"), ["channel_id", "text"]);
         assert_eq!(req("end_ask"), ["channel_id", "thread_ts"]);
+        assert_eq!(req("thread_activity"), ["channel_id", "thread_ts"]);
         assert!(req("list_channels").is_empty());
         assert_eq!(req("set_channel_info"), ["channel_id"]);
         assert_eq!(req("create_channel"), ["name"]);
@@ -663,6 +678,7 @@ mod tests {
         let i = server_instructions();
         assert!(i.contains("ask_channel") && i.contains("end your turn instead of waiting"), "{i}");
         assert!(i.contains("end_ask") && i.contains("needs no issue"), "{i}");
+        assert!(i.contains("thread_activity"), "{i}");
         assert!(i.starts_with("Slack bridge — reply to the Slack thread"), "the existing words stay first");
     }
 }

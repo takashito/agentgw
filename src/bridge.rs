@@ -16,6 +16,7 @@ pub mod turn;
 pub mod state;
 pub mod worker;
 pub mod asks;
+pub mod activity;
 
 use crate::agent::claude::HookIntake;
 use crate::agent::claude::Claude;
@@ -289,6 +290,9 @@ pub struct Bridge {
     fleet: bool,
     /// This machine's name as the gateway knows it (`pwd <name>`); the hostname if unset.
     machine_name: String,
+    /// What each thread's agent is doing, for `thread_activity`. Written only here; the link
+    /// handler reads it to answer the gateway.
+    activity: crate::bridge::activity::ActivityRef,
 }
 
 /// The outside world. Only `Bridge::run()` wires the real ones; tests fill it with fakes
@@ -328,6 +332,8 @@ struct Config {
     link: Option<LinkStatus>,
     /// Set on the gateway: the machines connected right now, read when `status` is asked.
     machines_now: Option<Arc<dyn Fn() -> Vec<String> + Send + Sync>>,
+    /// Shared with the link handler, which answers the gateway's `thread_activity` reads from it.
+    activity: crate::bridge::activity::ActivityRef,
 }
 
 /// What a delivery task reports back. **The one way news of a finished delivery enters the loop.**
@@ -488,6 +494,7 @@ impl Bridge {
             presence_tx,
             fleet: config.fleet,
             machine_name: config.machine_name,
+            activity: config.activity,
         }
     }
 
@@ -523,6 +530,7 @@ impl Bridge {
             ask_gateway: None,
             link: None,
             machines_now: None,
+            activity: Default::default(),
         };
         ((Bridge::new(deps, config), cmd_rx), deliv_rx)
     }
@@ -1107,6 +1115,8 @@ impl Bridge {
         // is one (it accepts machines) or is linked to one
         let gateway_ask = (wiring.children.is_some() || up_is_linked)
             .then(|| machine::GatewayAsk::new(up_tx.clone()));
+        // What each thread's agent is doing: the main loop writes it, the link handler reads it
+        let activity = crate::bridge::activity::ActivityRef::default();
         // Via Relay the bot token **comes in the handshake**, so the Api can only be built after it.
         // This is the only ordering difference from a direct connection.
         let (bot_token, link_home, gateway_name, relay_rx) = match &mode {
@@ -1274,6 +1284,7 @@ impl Bridge {
                     arriving: arriving_tx.clone(),
                     updated: updated_tx.clone(),
                     asker: gateway_ask.clone(),
+                    activity: activity.clone(),
                 };
                 let mut down_rx = down_rx;
                 tokio::spawn(async move {
@@ -1383,6 +1394,7 @@ impl Bridge {
                     arriving: arriving_tx.clone(),
                     updated: updated_tx.clone(),
                     asker: gateway_ask.clone(),
+                    activity: activity.clone(),
                 };
                 tokio::spawn(async move {
                     while let Some(item) = rx.recv().await {
@@ -1460,6 +1472,7 @@ impl Bridge {
                     let fleet = fleet.clone();
                     Arc::new(move || fleet.links.connected()) as Arc<dyn Fn() -> Vec<String> + Send + Sync>
                 }),
+                activity: activity.clone(),
             },
         );
         // **Only a machine reports.** The gateway's own access already holds its folders, and among them
@@ -1771,6 +1784,8 @@ struct RelaySinks {
     updated: mpsc::Sender<String>,
     /// Tool calls waiting for the gateway's answer.
     asker: Option<machine::GatewayAsk>,
+    /// What each thread's agent is doing (`thread_activity`), read when the gateway asks.
+    activity: crate::bridge::activity::ActivityRef,
 }
 
 /// Tell the gateway where this machine works for each of its channels. The folders are **this machine's
@@ -1909,6 +1924,7 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
         arriving,
         updated,
         asker,
+        activity,
     } = sinks;
     match item {
         machine::FromRelay::Event { name, event } => {
@@ -2084,6 +2100,19 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
             let (folder, _) = bridge::Access::load(dir).repo_path(&channel, &Host::home());
             let text = crate::bridge::asks::read_project(std::path::Path::new(&folder));
             let _ = up.send(crate::bridge::gateway::link::LinkFrame::ProjectRead { req_id, text });
+        }
+        // `thread_activity`: the gateway asks what one of this machine's threads is doing
+        machine::FromRelay::ReadActivity { req_id, channel, thread_ts } => {
+            let key = crate::chat::ThreadKey::new(&channel, &thread_ts);
+            let has_agent = bridge::Threads::load(dir)
+                .get(&thread_ts)
+                .is_some_and(|e| e.agent_id.is_some() && e.channel_id.as_deref().is_none_or(|c| c == channel));
+            let now = crate::clock::now_ms();
+            let activity = match activity.lock() {
+                Ok(book) => book.snapshot(&key, has_agent, now),
+                Err(_) => serde_json::json!({"state": "unknown", "summary": "could not read this machine's record"}),
+            };
+            let _ = up.send(crate::bridge::gateway::link::LinkFrame::ActivityRead { req_id, activity });
         }
         // Getting here means the link has been given up. **Don't touch the agents** — running ones
         // keep running. New Slack messages just stop coming until a person fixes the config and restarts
@@ -2470,7 +2499,7 @@ mod tests {
         let (reload, mut reload_rx) = mpsc::channel(4);
         let (relink, _relink_rx) = mpsc::channel(4);
         let (up, mut up_rx) = mpsc::unbounded_channel();
-        let sinks = RelaySinks { msg_tx, click_tx, dir: dir.clone(), reload, relink, up, machine: "desk".into(), gateway_url: String::new(), left: mpsc::channel(4).0, arriving: mpsc::channel(4).0, updated: mpsc::channel(4).0, asker: None };
+        let sinks = RelaySinks { msg_tx, click_tx, dir: dir.clone(), reload, relink, up, machine: "desk".into(), gateway_url: String::new(), left: mpsc::channel(4).0, arriving: mpsc::channel(4).0, updated: mpsc::channel(4).0, asker: None, activity: Default::default() };
         let ask = |path: &str| machine::FromRelay::SetProject {
             channel: "C1".into(),
             thread_ts: "1.1".into(),
@@ -2523,6 +2552,7 @@ mod tests {
             arriving: mpsc::channel(4).0,
             updated: mpsc::channel(4).0,
             asker: None,
+            activity: Default::default(),
         };
         pump_relay(
             machine::FromRelay::Linked {
@@ -2621,6 +2651,29 @@ mod tests {
             dir: crate::state_dir::StateDir::at(path),
         };
         (deps, slack, agent, clock)
+    }
+
+    /// Tool hooks feed what `thread_activity` reads: the running tool, then the last one with the end
+    /// of its output, secrets masked.
+    #[tokio::test]
+    async fn tool_hooks_feed_the_activity_record() {
+        let (d, _slack, _agent, _clock) = flow_deps("activity-hooks");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let key = ThreadKey::new("C1", "1.1");
+        let input = serde_json::json!({"command": "SLACK_BOT_TOKEN=xoxb-123456789 cargo test"});
+        b.on_progress(Some(&key), &serde_json::json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_use_id": "t1", "tool_input": input}));
+        let s = b.activity.lock().unwrap().snapshot(&key, true, b.deps.clock.now_ms());
+        assert_eq!(s["state"], "running_tool");
+        assert_eq!(s["running"][0]["detail"], "SLACK_BOT_TOKEN=*** cargo test");
+        b.on_progress(
+            Some(&key),
+            &serde_json::json!({"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_use_id": "t1", "tool_input": input,
+                "tool_response": {"stdout": "test result: ok. 3 passed", "stderr": ""}}),
+        );
+        let s = b.activity.lock().unwrap().snapshot(&key, true, b.deps.clock.now_ms());
+        assert_eq!(s["state"], "thinking");
+        assert_eq!((s["last_tool"]["tool"].as_str(), s["last_tool"]["outcome"].as_str()), (Some("Bash"), Some("ok")));
+        assert_eq!(s["last_tool"]["result"], "test result: ok. 3 passed");
     }
 
     /// The periodic checks look at **agents that have a window**, not at every record. Each one asks
@@ -2765,7 +2818,7 @@ mod tests {
     async fn agent_messages_from_the_gateway_reach_the_inbox() {
         let dir = crate::state_dir::StateDir::at(std::env::temp_dir().join(format!("agentgw-pump-agent-{}", std::process::id())));
         let (msg_tx, mut msg_rx) = mpsc::channel(4);
-        let sinks = RelaySinks { msg_tx, click_tx: mpsc::channel(4).0, dir, reload: mpsc::channel(4).0, relink: mpsc::channel(4).0, up: mpsc::unbounded_channel().0, machine: "desk".into(), gateway_url: String::new(), left: mpsc::channel(4).0, arriving: mpsc::channel(4).0, updated: mpsc::channel(4).0, asker: None };
+        let sinks = RelaySinks { msg_tx, click_tx: mpsc::channel(4).0, dir, reload: mpsc::channel(4).0, relink: mpsc::channel(4).0, up: mpsc::unbounded_channel().0, machine: "desk".into(), gateway_url: String::new(), left: mpsc::channel(4).0, arriving: mpsc::channel(4).0, updated: mpsc::channel(4).0, asker: None, activity: Default::default() };
         let d = match agent_msg(ROOT, ROOT, "check", crate::chat::DeliveryKind::Ask) {
             m => crate::bridge::asks::AgentDelivery {
                 channel: m.channel,
@@ -2796,7 +2849,7 @@ mod tests {
             .save(&dir)
             .unwrap();
         let (left, mut left_rx) = mpsc::channel(4);
-        let sinks = RelaySinks { msg_tx: mpsc::channel(4).0, click_tx: mpsc::channel(4).0, dir: dir.clone(), reload: mpsc::channel(4).0, relink: mpsc::channel(4).0, up: mpsc::unbounded_channel().0, machine: "desk".into(), gateway_url: String::new(), left, arriving: mpsc::channel(4).0, updated: mpsc::channel(4).0, asker: None };
+        let sinks = RelaySinks { msg_tx: mpsc::channel(4).0, click_tx: mpsc::channel(4).0, dir: dir.clone(), reload: mpsc::channel(4).0, relink: mpsc::channel(4).0, up: mpsc::unbounded_channel().0, machine: "desk".into(), gateway_url: String::new(), left, arriving: mpsc::channel(4).0, updated: mpsc::channel(4).0, asker: None, activity: Default::default() };
 
         pump_relay(machine::FromRelay::ChannelGone { channel: "C_GONE".into() }, &sinks).await;
 
@@ -2819,7 +2872,7 @@ mod tests {
         a.routes.entry("C1".into()).or_default().repo_path = Some(proj.to_string_lossy().to_string());
         a.save(&dir).unwrap();
         let (up, mut up_rx) = mpsc::unbounded_channel();
-        let sinks = RelaySinks { msg_tx: mpsc::channel(4).0, click_tx: mpsc::channel(4).0, dir, reload: mpsc::channel(4).0, relink: mpsc::channel(4).0, up, machine: "desk".into(), gateway_url: String::new(), left: mpsc::channel(4).0, arriving: mpsc::channel(4).0, updated: mpsc::channel(4).0, asker: None };
+        let sinks = RelaySinks { msg_tx: mpsc::channel(4).0, click_tx: mpsc::channel(4).0, dir, reload: mpsc::channel(4).0, relink: mpsc::channel(4).0, up, machine: "desk".into(), gateway_url: String::new(), left: mpsc::channel(4).0, arriving: mpsc::channel(4).0, updated: mpsc::channel(4).0, asker: None, activity: Default::default() };
         pump_relay(machine::FromRelay::ReadProject { req_id: "r9".into(), channel: "C1".into() }, &sinks).await;
         match up_rx.try_recv() {
             Ok(crate::bridge::gateway::link::LinkFrame::ProjectRead { req_id, text }) => {
@@ -5376,7 +5429,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let dir = crate::state_dir::StateDir::at(base.join("state"));
         let (up, mut up_rx) = mpsc::unbounded_channel();
-        let sinks = RelaySinks { msg_tx: mpsc::channel(4).0, click_tx: mpsc::channel(4).0, dir: dir.clone(), reload: mpsc::channel(4).0, relink: mpsc::channel(4).0, up, machine: "desk".into(), gateway_url: String::new(), left: mpsc::channel(4).0, arriving: mpsc::channel(4).0, updated: mpsc::channel(4).0, asker: None };
+        let sinks = RelaySinks { msg_tx: mpsc::channel(4).0, click_tx: mpsc::channel(4).0, dir: dir.clone(), reload: mpsc::channel(4).0, relink: mpsc::channel(4).0, up, machine: "desk".into(), gateway_url: String::new(), left: mpsc::channel(4).0, arriving: mpsc::channel(4).0, updated: mpsc::channel(4).0, asker: None, activity: Default::default() };
         let target = base.join("a/b").to_string_lossy().to_string();
         let ask = |create| machine::FromRelay::SetProject {
             channel: "C1".into(),
