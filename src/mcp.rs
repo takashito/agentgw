@@ -153,14 +153,14 @@ impl Mcp {
             }),
             serde_json::json!({
                 "name": "ask_channel",
-                "description": "Ask the Claude in another Slack channel to do something, in a new thread there (or a follow-up in a thread you asked before, with thread_ts). It starts at once. Its reply arrives later as a message in your thread; do not poll or wait. Use list_channels to find the right channel. When the exchange is done, close that thread with end_ask.",
+                "description": "Ask the Claude in another Slack channel to do something, in a new thread there (or a follow-up in a thread you asked before, with thread_ts). A follow-up may come from any thread of this channel, not only the one that asked: a thread that sends one takes the exchange over, and replies come to it from then on. It starts at once. Its reply arrives later as a message in your thread; do not poll or wait. Use list_channels to find the right channel. When the exchange is done, close that thread with end_ask.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "channel_id": { "type": "string", "description": "The channel to ask (C...), as list_channels or a <#C...> link gives it." },
                         "text": { "type": "string", "description": "The request, standard Markdown. The other Claude does not see your conversation. For a task tracked in an issue (e.g. Linear), write a short summary and the issue's link and ID; the details and background belong in the issue, which the other Claude reads. For a question or a check with no issue, write the question itself, with what the other Claude needs to answer it." },
                         "title": { "type": "string", "description": "A few words naming the request, shown on top of it in Slack so people can tell what each thread is about." },
-                        "thread_ts": { "type": "string", "description": "Only for a follow-up: the thread_ts of the thread you asked before (from the earlier result or the reply's from_thread)." },
+                        "thread_ts": { "type": "string", "description": "Only for a follow-up: the thread_ts of a thread this channel asked before (from the earlier result, the reply's from_thread, or the 📤 line in the thread that asked)." },
                         "message_ids": { "type": "array", "items": { "type": "string" }, "description": "The inbound message_id(s) this call answers, as with reply — marks them answered once the ask is posted." },
                     },
                     "required": ["channel_id", "text"],
@@ -168,7 +168,7 @@ impl Mcp {
             }),
             serde_json::json!({
                 "name": "end_ask",
-                "description": "Close a thread you asked with ask_channel, once you are done with it (the request is finished, or no longer wanted). Its agent ends the way `exit` ends it — after any turn it is in, not in the middle — and a line there says you closed it and whether it was completed. Only threads asked from this thread can be closed. No more follow-ups go to it afterwards; ask in a new thread if you need more.",
+                "description": "Close a thread you asked with ask_channel, once you are done with it (the request is finished, or no longer wanted). Its agent ends the way `exit` ends it — after any turn it is in, not in the middle — and a line there says you closed it and whether it was completed. Only the thread an exchange belongs to (the one that asked, or the one that took it over with a follow-up) can close it. No more follow-ups go to it afterwards; ask in a new thread if you need more.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -193,7 +193,7 @@ impl Mcp {
             }),
             serde_json::json!({
                 "name": "thread_activity",
-                "description": "Read what the Claude in a thread you asked with ask_channel is doing right now, without disturbing it: its state in one word (running_tool, thinking, waiting_for_person, turn_ended, turn_failed, idle, no_agent, machine_offline, no_answer) with a one-line summary, the tools running and for how many seconds, the last tool with its outcome and the end of its output, and when it last posted to its thread. Use it when someone wants to know how that work is going; its reply still arrives as a message, so do not call this over and over to wait for it. Only threads asked from this thread can be read. Command lines and output are cut short, and values that look like secrets (tokens, passwords, keys) are masked as ***.",
+                "description": "Read what the Claude in a thread you asked with ask_channel is doing right now, without disturbing it: its state in one word (running_tool, thinking, waiting_for_person, turn_ended, turn_failed, idle, no_agent, machine_offline, no_answer) with a one-line summary, the tools running and for how many seconds, the last tool with its outcome and the end of its output, and when it last posted to its thread. Use it when someone wants to know how that work is going; its reply still arrives as a message, so do not call this over and over to wait for it. Any thread of this channel can read the threads this channel asked. Command lines and output are cut short, and values that look like secrets (tokens, passwords, keys) are masked as ***.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

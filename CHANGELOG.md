@@ -8,6 +8,9 @@ in [README.md](README.md#release-notes).
 
 ## [Unreleased]
 
+### Added
+- Any thread of a channel can check on, and follow up, a request that channel sent to another channel, not only the thread that sent it. The thread that follows up takes the request over and gets its replies.
+
 ## [0.72.0] - 2026-11-18
 
 ### Added
