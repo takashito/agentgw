@@ -3061,6 +3061,46 @@ mod tests {
         assert!(replies_up(&mut up).iter().any(|(o, _)| o == "exited"));
     }
 
+    /// `exit` / `done` leave ✅ on the thread's root next to the farewell.
+    #[tokio::test]
+    async fn exit_and_done_mark_the_thread_with_a_check() {
+        for (n, word) in ["exit", "done"].iter().enumerate() {
+            let (d, slack, _agent, _clock) = flow_deps(&format!("exit-check-{word}"));
+            let (mut b, _fx) = Bridge::for_test(d);
+            let root = format!("1782000000.00070{n}");
+            let mut bye = channel_msg(&format!("1782000000.00080{n}"), "U_OWNER", word);
+            bye.channel = "C_ADMIN".into();
+            bye.thread_ts = Some(root.clone());
+            b.threads.upsert(&root, crate::bridge::state::ThreadEntry::default());
+            b.on_inbound(&bye).await;
+            settle().await;
+            let calls = slack.calls();
+            assert!(calls.iter().any(|c| c.starts_with(&format!("post C_ADMIN {root}"))), "farewell still posted: {calls:?}");
+            assert!(
+                calls.contains(&format!("react C_ADMIN {root} white_check_mark")),
+                "{word}: ✅ on the root: {calls:?}"
+            );
+        }
+    }
+
+    /// A ✅ Slack refuses does not stop the ending: the farewell goes out all the same.
+    #[tokio::test]
+    async fn a_refused_check_does_not_stop_the_exit() {
+        let (mut d, _slack, _agent, _clock) = flow_deps("exit-check-refused");
+        let refusing = Arc::new(FakeChat::failing());
+        d.slack = refusing.clone();
+        let (mut b, _fx) = Bridge::for_test(d);
+        let mut bye = channel_msg("1782000000.000810", "U_OWNER", "exit");
+        bye.channel = "C_ADMIN".into();
+        bye.thread_ts = Some("1782000000.000710".into());
+        b.threads.upsert("1782000000.000710", crate::bridge::state::ThreadEntry::default());
+        b.on_inbound(&bye).await;
+        settle().await;
+        let calls = refusing.calls();
+        assert!(calls.iter().any(|c| c.starts_with("react C_ADMIN 1782000000.000710 white_check_mark")), "{calls:?}");
+        assert!(calls.iter().any(|c| c.starts_with("post C_ADMIN 1782000000.000710")), "farewell posted: {calls:?}");
+    }
+
     #[tokio::test]
     async fn a_request_settled_without_a_reply_tells_the_asker() {
         let (mut b, mut up, _sid) = asked_thread("ask-settled").await;

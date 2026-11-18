@@ -494,6 +494,9 @@ pub struct DrainJob {
     pub thinking: Option<crate::bridge::turn::PresenceHold>,
 }
 
+/// The reaction an ended session leaves on its thread's root message.
+pub(super) const DONE_EMOJI: &str = "white_check_mark";
+
 // ── starting, pooling and reaping agents ──
 
 impl Bridge {
@@ -588,6 +591,15 @@ impl Bridge {
                 crate::t!("Thanks for your work! Ending the Claude Code session.", "お疲れさまでした。Claude Code のセッションを終了します。"),
                 key,
             );
+            // Mark the thread itself as finished, so it reads as done in the channel without
+            // opening it. Best-effort: a missing scope or a ✅ already there must not hold up the
+            // ending, so it runs on its own and a failure is only logged
+            let (api, ch, ts, log) = (self.deps.slack.clone(), channel.clone(), thread_ts.clone(), ctx.clone());
+            tokio::spawn(async move {
+                if let Err(e) = api.add_reaction(&ch, &ts, DONE_EMOJI).await {
+                    log.debug("bridge", &format!("exit: '{DONE_EMOJI}' on the thread failed: {e}"));
+                }
+            });
             ctx.info(
                 "bridge",
                 &format!("slack-events: user exit → session ended for {channel}:{thread_ts}"),
