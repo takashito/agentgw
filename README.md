@@ -297,7 +297,7 @@ Mention the bot followed by the command (the bot is named `agentgw` unless the S
 |---|---|
 | `stop` | Stop the current turn (a 🛑 reaction works too) |
 | `exit` · `bye` | End this thread's agent; your next message resumes it |
-| `done` | The same, and mark the thread done (✅ on its first message) |
+| `done` | Mark the thread done (✅ on its first message) and end its agent. While the agent is running, `done` goes to it first: if it had asked you to do something, it takes `done` as "I did it" and carries on |
 | `compact` | Compact the context, with a progress bar |
 | `model [fable\|opus\|sonnet\|haiku]` | Show or switch the model |
 | `effort [low\|medium\|high\|xhigh\|max\|…]` | Show or set the effort level |

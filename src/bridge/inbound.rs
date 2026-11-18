@@ -78,6 +78,10 @@ pub fn envelope_guarded(
             },
             quotes: o.quotes.clone(),
         }),
+        // Only a person's bare `done` that got this far: the agent is running and decides (see
+        // `handle_command`)
+        note: (msg.from_agent.is_none() && crate::bridge::command::Message::new(&msg.text, None).is("done"))
+            .then_some(crate::agent::DONE_NOTE),
     }
     .render()
 }

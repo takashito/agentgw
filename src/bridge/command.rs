@@ -681,6 +681,18 @@ impl Bridge {
         }
         let dm = msg.channel_kind == crate::chat::ChannelKind::Dm;
 
+        // A bare `done` to a running agent is **its** to read: it may answer something the agent
+        // asked the person to do ("I did it"), which only the agent knows. It goes there as a
+        // message with a note, and the agent either carries on or ends with `end_session`.
+        // With no agent running there is nothing to answer, so it ends the thread here
+        if cmd == Cmd::Done && self.agent_running(root_ts) {
+            ctx.info(
+                "bridge",
+                &format!("slack-events: done to a running agent — delivered for it to decide msg={}", msg.ts),
+            );
+            return false;
+        }
+
         match cmd {
             // stop. ESC goes through tmux, so it
             // works even when MCP is dead — which is usually exactly when you want to stop

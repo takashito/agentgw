@@ -311,6 +311,8 @@ pub struct Envelope {
     /// Set when this came from an agent in another channel: where it came from, and the line that
     /// tells the agent what that means (its reply goes back, or this is the answer to its ask).
     pub from_agent: Option<EnvelopeAgent>,
+    /// A line for the agent above a person's message (a bare `done`: [`DONE_NOTE`]).
+    pub note: Option<&'static str>,
 }
 
 /// The agent-to-agent part of an envelope.
@@ -407,6 +409,13 @@ impl EnvelopeAgent {
     }
 }
 
+/// The line above a person's bare `done` while the agent is running. The word is ambiguous: it
+/// ends the thread, or it answers something the agent asked them to do — and only the agent knows
+/// which. Read by the agent, so English only.
+pub const DONE_NOTE: &str = "The person wrote only \"done\". If you had asked them to do something, \
+    this means they did it: carry on with your work. Otherwise they are finishing this thread: reply \
+    briefly if anything is left to say, then call end_session with outcome done.";
+
 /// The line on a request from another channel's agent. Read by the agent, so English only.
 pub const ASKED_NOTE: &str = "This message is a request from the Claude in another channel \
     (from_channel/from_thread). Your reply to it goes back to that Claude. If a person must decide \
@@ -466,7 +475,7 @@ impl Envelope {
             Some(who) => format!(" loop_guard=\"true\" loop_notify=\"{who}\""),
         };
         let (agent, note, quotes) = match &e.from_agent {
-            None => (String::new(), String::new(), String::new()),
+            None => (String::new(), e.note.map(|n| format!("{n}\n")).unwrap_or_default(), String::new()),
             Some(a) => (
                 format!(
                     " from_channel=\"{}\" from_thread=\"{}\"{}",
@@ -1157,6 +1166,7 @@ mod tests {
             loop_guard: None,
             thread_title: None,
             from_agent: None,
+            note: None,
         };
         assert_eq!(
             e.render(),
@@ -1184,6 +1194,7 @@ mod tests {
                 loop_guard: None,
                 thread_title: Some(t.into()),
                 from_agent: None,
+                note: None,
             }
             .render()
         };
@@ -1212,6 +1223,7 @@ mod tests {
                 note: ASKED_NOTE,
                 quotes,
             }),
+            note: None,
         }
         .render()
     }
@@ -1237,6 +1249,7 @@ mod tests {
                 note: ANSWER_NOTE,
                 quotes: Default::default(),
             }),
+            note: None,
         };
         let out = e.render();
         assert!(out.contains(" needs_human=\"true\""), "{out}");
@@ -1274,6 +1287,7 @@ mod tests {
             loop_guard: None,
             thread_title: None,
             from_agent: None,
+            note: None,
         };
         assert!(e.render().contains("\n<channel>\n"));
     }
@@ -1323,6 +1337,7 @@ mod tests {
             loop_guard: None,
             thread_title: None,
             from_agent: None,
+            note: None,
         }
         .render()
     }
@@ -1343,6 +1358,7 @@ mod tests {
                 loop_guard: guard.map(str::to_string),
                 thread_title: None,
                 from_agent: None,
+                note: None,
             }
             .render()
         };

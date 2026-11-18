@@ -3143,6 +3143,28 @@ mod tests {
         }
     }
 
+    /// A bare `done` while the agent runs is the agent's to read — it may mean "I did what you
+    /// asked". It is delivered with a note, and nothing ends: no farewell, no ✅, no closed session.
+    #[tokio::test]
+    async fn done_to_a_running_agent_is_delivered_for_it_to_decide() {
+        let (d, slack, agent, _clock) = flow_deps("done-running");
+        let ((mut b, _fx), mut deliv) = Bridge::for_test_with_deliveries(d);
+        let _sid = running_thread(&mut b, &agent).await;
+        b.on_inbound(&in_thread("1782000000.000200", "done")).await;
+        settle_deliveries(&mut b, &mut deliv).await;
+        settle().await;
+        let last = agent.delivered.lock().unwrap().last().unwrap().1.clone();
+        assert!(last.contains(crate::agent::DONE_NOTE) && last.contains("\ndone\n"), "{last}");
+        let calls = slack.calls();
+        assert!(!calls.iter().any(|c| c.contains("white_check_mark") || c.ends_with(" closed") || c.contains("Claude Code session")), "{calls:?}");
+        assert!(b.agent_running(ROOT), "the agent goes on");
+        // Any other message carries no such note
+        b.on_inbound(&in_thread("1782000000.000300", "done already?")).await;
+        settle_deliveries(&mut b, &mut deliv).await;
+        let last = agent.delivered.lock().unwrap().last().unwrap().1.clone();
+        assert!(!last.contains(crate::agent::DONE_NOTE), "{last}");
+    }
+
     /// The asker closing a thread: finished (`done`, an older gateway's empty text too) gets ✅,
     /// given up (`canceled`) does not. The gateway said who closed it, so nothing more is posted.
     #[tokio::test]

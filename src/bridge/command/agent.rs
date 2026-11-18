@@ -118,6 +118,16 @@ impl Bridge {
         self.end_agent(&msg.channel, key, root_ts, ctx, true, Some(line.to_string()), done).await;
     }
 
+    /// Whether this thread has an agent process alive right now.
+    pub(in crate::bridge) fn agent_running(&self, root_ts: &str) -> bool {
+        let Some(sid) = self.threads.get(root_ts).and_then(|e| e.agent_id.clone()) else {
+            return false;
+        };
+        let name = SessionId::from(sid.as_str()).window_name();
+        let window_id = self.workers.warm(&sid).and_then(|h| h.window_id.clone());
+        self.deps.agent.pid_of(window_id.as_deref(), &name).is_some()
+    }
+
     /// The agent ends its own session (`end_session`), after the turn it is in. Like `exit`, the
     /// thread stays and the next message resumes it; `done` marks the thread finished.
     pub(in crate::bridge) async fn agent_exit(&mut self, channel: &str, key: &ThreadKey, root_ts: &str, done: bool, ctx: &LogCtx) {
