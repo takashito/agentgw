@@ -293,6 +293,9 @@ pub struct Bridge {
     /// What each thread's agent is doing, for `thread_activity`. Written only here; the link
     /// handler reads it to answer the gateway.
     activity: crate::bridge::activity::ActivityRef,
+    /// How many agents were live when the cleanup last said it is over the cap with all of them at
+    /// work (0 = not over). Said again only when the count changes.
+    over_cap_logged: usize,
 }
 
 /// The outside world. Only `Bridge::run()` wires the real ones; tests fill it with fakes
@@ -497,6 +500,7 @@ impl Bridge {
             fleet: config.fleet,
             machine_name: config.machine_name,
             activity: config.activity,
+            over_cap_logged: 0,
         }
     }
 
@@ -1500,11 +1504,12 @@ impl Bridge {
         // Fold the permission prompts the previous process left waiting — their buttons answer nobody
         b.fold_stale_perm_prompts(&LogCtx::default()).await;
         b.adopt_dialog_prompts(&LogCtx::default());
-        // Pick up threads the previous process was waiting to answer (only those with live agents)
+        // Pick up threads the previous process was waiting to answer. Those whose agent's window was
+        // lost (a machine reboot) are woken once with what they were given, or told the work was cut off
         b.restore_pending(&LogCtx::default());
         // Re-deliver requests that never got handed over (start an agent to hand them to if there is none)
         b.resume_pending_from_disk().await;
-        // Tell home once about the start. pending is always 0 — the Rust version has no auto-resume of unfinished threads
+        // Tell home once about the start
         b.announce_online().await;
         // tokio's signal is in features = ["full"] (no new dependency).
         // slack-morphism grabs TERM_SIGNALS first via signal-hook, but the registry
@@ -3116,10 +3121,18 @@ mod tests {
         assert!(replies_up(&mut up).iter().any(|(o, _)| o == "exited"));
     }
 
-    /// `exit` / `done` leave ✅ on the thread's root next to the farewell.
+    /// Only `done` leaves ✅ on the thread's root; `exit` / `bye` just end the agent. Each says
+    /// which it was, and the session shows closed.
     #[tokio::test]
-    async fn exit_and_done_mark_the_thread_with_a_check() {
-        for (n, word) in ["exit", "done"].iter().enumerate() {
+    async fn only_done_marks_the_thread_with_a_check() {
+        for (n, (word, check, line)) in [
+            ("exit", false, "Ended the Claude Code session."),
+            ("bye", false, "Ended the Claude Code session."),
+            ("done", true, "Marked this thread done and ended the Claude Code session."),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let (d, slack, _agent, _clock) = flow_deps(&format!("exit-check-{word}"));
             let (mut b, _fx) = Bridge::for_test(d);
             let root = format!("1782000000.00070{n}");
@@ -3130,11 +3143,80 @@ mod tests {
             b.on_inbound(&bye).await;
             settle().await;
             let calls = slack.calls();
-            assert!(calls.iter().any(|c| c.starts_with(&format!("post C_ADMIN {root}"))), "farewell still posted: {calls:?}");
-            assert!(
-                calls.contains(&format!("react C_ADMIN {root} white_check_mark")),
-                "{word}: ✅ on the root: {calls:?}"
-            );
+            assert!(calls.contains(&format!("post C_ADMIN {root} {line}")), "{word}: {calls:?}");
+            assert!(!calls.iter().any(|c| c.contains("Thanks for your work")), "{calls:?}");
+            assert_eq!(calls.contains(&format!("react C_ADMIN {root} white_check_mark")), check, "{word}: {calls:?}");
+            assert!(calls.contains(&format!("status C_ADMIN {root} closed")), "{word}: {calls:?}");
+        }
+    }
+
+    /// A bare `done` while the agent runs is the agent's to read — it may mean "I did what you
+    /// asked". It is delivered with a note, and nothing ends: no farewell, no ✅, no closed session.
+    #[tokio::test]
+    async fn done_to_a_running_agent_is_delivered_for_it_to_decide() {
+        let (d, slack, agent, _clock) = flow_deps("done-running");
+        let ((mut b, _fx), mut deliv) = Bridge::for_test_with_deliveries(d);
+        let _sid = running_thread(&mut b, &agent).await;
+        b.on_inbound(&in_thread("1782000000.000200", "done")).await;
+        settle_deliveries(&mut b, &mut deliv).await;
+        settle().await;
+        let last = agent.delivered.lock().unwrap().last().unwrap().1.clone();
+        assert!(last.contains(crate::agent::DONE_NOTE) && last.contains("\ndone\n"), "{last}");
+        let calls = slack.calls();
+        assert!(!calls.iter().any(|c| c.contains("white_check_mark") || c.ends_with(" closed") || c.contains("Claude Code session")), "{calls:?}");
+        assert!(b.agent_running(ROOT), "the agent goes on");
+        // Any other message carries no such note
+        b.on_inbound(&in_thread("1782000000.000300", "done already?")).await;
+        settle_deliveries(&mut b, &mut deliv).await;
+        let last = agent.delivered.lock().unwrap().last().unwrap().1.clone();
+        assert!(!last.contains(crate::agent::DONE_NOTE), "{last}");
+    }
+
+    /// The asker closing a thread: finished (`done`, an older gateway's empty text too) gets ✅,
+    /// given up (`canceled`) does not. The gateway said who closed it, so nothing more is posted.
+    #[tokio::test]
+    async fn the_asker_ending_a_thread_marks_it_done_only_when_finished() {
+        for (text, check) in [("", true), (crate::chat::END_CANCELED, false)] {
+            let (d, slack, _agent, _clock) = flow_deps(&format!("ask-end-{}", if check { "done" } else { "cancel" }));
+            let (mut b, _fx) = Bridge::for_test(d);
+            b.on_inbound(&agent_msg(ROOT, ROOT, "check it", crate::chat::DeliveryKind::Ask)).await;
+            b.on_inbound(&agent_msg(ROOT, "1782000000.000700", text, crate::chat::DeliveryKind::End)).await;
+            b.run_drains().await;
+            settle().await;
+            let calls = slack.calls();
+            assert_eq!(calls.contains(&format!("react C_ADMIN {ROOT} white_check_mark")), check, "{text:?}: {calls:?}");
+            assert!(!calls.iter().any(|c| c.contains("session.") || c.contains("Thanks for your work")), "{calls:?}");
+            assert!(calls.contains(&format!("status C_ADMIN {ROOT} closed")), "it really ended: {calls:?}");
+        }
+    }
+
+    /// `end_session`: the agent ends itself. The asker hears it ended, the thread says so, and
+    /// `done` marks it; `ended` does not.
+    #[tokio::test]
+    async fn the_agent_ends_its_own_session() {
+        for (kind, check, line) in [
+            ("end_done", true, "Claude marked this thread done and ended its session."),
+            ("end", false, "Claude ended its session without marking this thread done."),
+        ] {
+            let (d, slack, _agent, _clock) = flow_deps(&format!("self-{kind}"));
+            let (mut b, _fx) = Bridge::for_test(d);
+            let (tx, mut up) = mpsc::unbounded_channel();
+            b.ask_gateway = Some(tx);
+            b.on_inbound(&agent_msg(ROOT, ROOT, "check it", crate::chat::DeliveryKind::Ask)).await;
+            let sid = b.threads.get(ROOT).and_then(|e| e.agent_id.clone()).expect("an agent");
+            // The tool gives no thread: it is found from the session
+            let mut d = dispo(kind, &[], None, &sid);
+            d.channel_id = String::new();
+            d.thread_ts = None;
+            b.on_disposition(d).await;
+            assert!(replies_up(&mut up).iter().any(|(o, _)| o == "exited"), "{kind}");
+            b.run_drains().await;
+            settle().await;
+            let calls = slack.calls();
+            assert!(calls.contains(&format!("post C_ADMIN {ROOT} {line}")), "{kind}: {calls:?}");
+            assert_eq!(calls.contains(&format!("react C_ADMIN {ROOT} white_check_mark")), check, "{kind}: {calls:?}");
+            assert!(calls.contains(&format!("status C_ADMIN {ROOT} closed")), "{kind}: {calls:?}");
+            assert!(b.threads.get(ROOT).is_some(), "the thread stays, as after exit");
         }
     }
 
@@ -3145,7 +3227,7 @@ mod tests {
         let refusing = Arc::new(FakeChat::failing());
         d.slack = refusing.clone();
         let (mut b, _fx) = Bridge::for_test(d);
-        let mut bye = channel_msg("1782000000.000810", "U_OWNER", "exit");
+        let mut bye = channel_msg("1782000000.000810", "U_OWNER", "done");
         bye.channel = "C_ADMIN".into();
         bye.thread_ts = Some("1782000000.000710".into());
         b.threads.upsert("1782000000.000710", crate::bridge::state::ThreadEntry::default());
@@ -4392,6 +4474,296 @@ mod tests {
         assert!(b.threads.get("3.3").is_some(), "no agent yet = not stale");
         assert!(b.threads.get(ROOT).is_some(), "a live window outranks the disk");
         assert!(b.threads.get("2.2").is_none(), "nothing to resume, nothing to remember");
+    }
+
+    /// The machine under an asked thread rebooted mid-request: the window is gone, the ledger and
+    /// `history` (whether the conversation can be resumed) are what the next Bridge finds on disk.
+    /// `bridge` is the one that was running, `None` for a fresh asked thread.
+    async fn rebooted(
+        name: &str,
+        before: Option<(Bridge, Arc<FakeChat>, Arc<FakeAgent>, Arc<FakeClock>)>,
+        history: bool,
+    ) -> (
+        Bridge,
+        Arc<FakeChat>,
+        Arc<FakeAgent>,
+        Arc<FakeClock>,
+        mpsc::UnboundedReceiver<crate::bridge::gateway::link::LinkFrame>,
+        String,
+    ) {
+        let (mut b, slack, agent, clock) = match before {
+            Some(prev) => prev,
+            None => {
+                let (d, slack, agent, clock) = flow_deps(name);
+                let (mut b, _fx) = Bridge::for_test(d);
+                b.ask_gateway = Some(mpsc::unbounded_channel().0);
+                b.on_inbound(&agent_msg(ROOT, ROOT, "check it", crate::chat::DeliveryKind::Ask)).await;
+                (b, slack, agent, clock)
+            }
+        };
+        let sid = b.threads.get(ROOT).and_then(|e| e.agent_id.clone()).expect("an agent");
+        let _ = b.ledger.flush(&mut b.threads);
+        let path = b.deps.dir.path().to_path_buf();
+        drop(b);
+        // The reboot: every window goes
+        agent.spawned.lock().unwrap().clear();
+        for n in 0..8 {
+            let _ = crate::agent::Agent::terminate(&*agent, &crate::agent::Window::of(&format!("@{n}")));
+        }
+        if history {
+            agent.histories.lock().unwrap().push(sid.clone());
+        }
+        let deps = Deps {
+            slack: slack.clone(),
+            agent: agent.clone(),
+            clock: clock.clone(),
+            dir: crate::state_dir::StateDir::at(path),
+        };
+        let (mut b, _fx) = Bridge::for_test(deps);
+        let (tx, rx) = mpsc::unbounded_channel();
+        b.ask_gateway = Some(tx);
+        (b, slack, agent, clock, rx, sid)
+    }
+
+    /// **A request cut off by a machine reboot is picked up again.** The window is gone (a plain restart
+    /// keeps it), so the previous version dropped the request silently and the asker waited forever.
+    #[tokio::test]
+    async fn a_request_cut_off_by_a_reboot_is_resumed_from_the_conversation() {
+        let (mut b, slack, agent, _clock, mut up, sid) = rebooted("reboot-resume", None, true).await;
+
+        b.restore_pending(&LogCtx::default());
+        settle().await;
+
+        let spawned = agent.spawned.lock().unwrap().clone();
+        assert_eq!(spawned.len(), 1, "one agent woken");
+        assert_eq!(spawned[0].resume_from.as_ref().map(|s| s.as_str().to_string()), Some(sid.clone()));
+        let prompt = spawned[0].prompt.clone().unwrap_or_default();
+        assert!(prompt.contains("machine restarted"), "{prompt}");
+        assert!(prompt.contains("check it"), "the request itself goes again: {prompt}");
+        let key = ThreadKey::new("C_ADMIN", ROOT);
+        assert!(!b.ledger.pending(&key).is_empty(), "still owed — the answer settles it");
+        assert!(replies_up(&mut up).is_empty(), "the asker is not told it failed");
+        assert!(
+            slack.calls().iter().any(|c| c.contains("Picking up where it left off")),
+            "{:?}",
+            slack.calls()
+        );
+    }
+
+    /// No conversation to wake: the asker and the thread hear the work was cut off instead of waiting.
+    #[tokio::test]
+    async fn a_cut_off_request_that_cannot_resume_says_send_it_again() {
+        let (mut b, slack, agent, _clock, mut up, _sid) = rebooted("reboot-nohistory", None, false).await;
+
+        b.restore_pending(&LogCtx::default());
+        settle().await;
+
+        assert!(agent.spawned.lock().unwrap().is_empty(), "nothing to resume");
+        let told = replies_up(&mut up);
+        assert!(
+            told.iter().any(|(o, t)| o == "failed" && t.contains("send the request again")),
+            "{told:?}"
+        );
+        assert!(b.ledger.pending(&ThreadKey::new("C_ADMIN", ROOT)).is_empty());
+        assert!(
+            slack.calls().iter().any(|c| c.contains("Send it again")),
+            "{:?}",
+            slack.calls()
+        );
+    }
+
+    /// An asked thread whose agent acknowledged (⏳) and went on working: nothing is left in the ledger,
+    /// only the answer it owes. Running Bridge, before the reboot.
+    async fn acknowledged_asked_thread(name: &str) -> (Bridge, Arc<FakeChat>, Arc<FakeAgent>, Arc<FakeClock>) {
+        let (d, slack, agent, clock) = flow_deps(name);
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.ask_gateway = Some(mpsc::unbounded_channel().0);
+        b.on_inbound(&agent_msg(ROOT, ROOT, "check it", crate::chat::DeliveryKind::Ask)).await;
+        let sid = b.threads.get(ROOT).and_then(|e| e.agent_id.clone()).expect("an agent");
+        b.on_disposition(dispo("react", &[ROOT], None, &sid)).await;
+        assert!(b.ledger.pending(&ThreadKey::new("C_ADMIN", ROOT)).is_empty());
+        assert!(b.threads.get(ROOT).is_some_and(|e| !e.ask_owed.is_empty()), "the answer is owed");
+        (b, slack, agent, clock)
+    }
+
+    /// **The usual shape of a cut-off asked thread**: acknowledged, working, owing the answer. It is
+    /// woken once with a prompt naming what it owes; a second loss tells the asker instead.
+    #[tokio::test]
+    async fn an_acknowledged_request_cut_off_by_a_reboot_is_resumed_once() {
+        let before = acknowledged_asked_thread("reboot-owed").await;
+        let (mut b, slack, agent, clock, mut up, sid) = rebooted("reboot-owed", Some(before), true).await;
+        b.restore_pending(&LogCtx::default());
+        settle().await;
+
+        let spawned = agent.spawned.lock().unwrap().clone();
+        assert_eq!(spawned.len(), 1, "one agent woken");
+        assert_eq!(spawned[0].resume_from.as_ref().map(|s| s.as_str().to_string()), Some(sid));
+        let prompt = spawned[0].prompt.clone().unwrap_or_default();
+        assert!(prompt.contains("You still owe") && prompt.contains(ROOT), "{prompt}");
+        assert!(replies_up(&mut up).is_empty());
+
+        let (mut b, _slack, agent, _clock, mut up, _sid) =
+            rebooted("reboot-owed", Some((b, slack, agent, clock)), true).await;
+        b.restore_pending(&LogCtx::default());
+        settle().await;
+        assert!(agent.spawned.lock().unwrap().is_empty(), "woken a second time");
+        assert!(replies_up(&mut up).iter().any(|(o, t)| o == "failed" && t.contains("send the request again")));
+        assert!(b.threads.get(ROOT).is_some_and(|e| e.ask_owed.is_empty()), "no longer owed once told");
+    }
+
+    /// Acknowledged, then answered by a reply that names the request: nothing is owed any more.
+    #[tokio::test]
+    async fn a_reply_naming_an_acknowledged_request_pays_it() {
+        let (mut b, _slack, _agent, _clock) = acknowledged_asked_thread("owed-paid").await;
+        let sid = b.threads.get(ROOT).and_then(|e| e.agent_id.clone()).unwrap();
+        b.on_disposition(dispo("reply", &[ROOT], Some("done"), &sid)).await;
+        assert!(b.threads.get(ROOT).is_some_and(|e| e.ask_owed.is_empty()), "still owed after the answer");
+    }
+
+    /// Woken from the ledger, then acknowledged (the request moves to what is owed), then lost again:
+    /// still only once.
+    #[tokio::test]
+    async fn a_resumed_request_acknowledged_afterwards_is_not_woken_again() {
+        let (mut b, slack, agent, clock, _up, sid) = rebooted("reboot-ack-after", None, true).await;
+        b.restore_pending(&LogCtx::default());
+        assert_eq!(agent.spawned.lock().unwrap().len(), 1);
+        b.on_disposition(dispo("react", &[ROOT], None, &sid)).await;
+        assert!(b.ledger.pending(&ThreadKey::new("C_ADMIN", ROOT)).is_empty());
+
+        let (mut b, _slack, agent, _clock, mut up, _sid) =
+            rebooted("reboot-ack-after", Some((b, slack, agent, clock)), true).await;
+        b.restore_pending(&LogCtx::default());
+        settle().await;
+        assert!(agent.spawned.lock().unwrap().is_empty(), "woken a second time");
+        assert!(replies_up(&mut up).iter().any(|(o, _)| o == "failed"));
+    }
+
+    /// Acknowledged, and the conversation is gone: the start-up sweep keeps the row long enough for the
+    /// asker to be told, and the thread forgets the dead conversation.
+    #[tokio::test]
+    async fn an_acknowledged_request_with_no_history_tells_the_asker() {
+        let before = acknowledged_asked_thread("reboot-owed-gone").await;
+        let (mut b, slack, agent, _clock, mut up, _sid) = rebooted("reboot-owed-gone", Some(before), false).await;
+        b.forget_unresumable_threads(&LogCtx::default());
+        b.restore_pending(&LogCtx::default());
+        settle().await;
+
+        assert!(agent.spawned.lock().unwrap().is_empty());
+        assert!(replies_up(&mut up).iter().any(|(o, t)| o == "failed" && t.contains("send the request again")));
+        assert!(slack.calls().iter().any(|c| c.contains("Send it again")), "{:?}", slack.calls());
+        assert!(b.threads.get(ROOT).is_some_and(|e| e.agent_id.is_none()), "the dead conversation is forgotten");
+    }
+
+    /// `n` threads, each with a live agent last written 5 minutes ago (warm: only the concurrency cap
+    /// can take one). Returns their keys, ROOT-independent.
+    fn seated(b: &mut Bridge, agent: &FakeAgent, n: usize) -> Vec<ThreadKey> {
+        *agent.last_activity.lock().unwrap() = Some(b.deps.clock.now_ms() - 5 * 60_000);
+        (0..n)
+            .map(|i| {
+                let sid = format!("18e90000-0000-4000-8000-{i:012}");
+                let ts = format!("1782000000.{:06}", 100 + i);
+                b.threads.entries.insert(ts.clone(), crate::bridge::state::ThreadEntry {
+                    channel_id: Some("C1".into()),
+                    agent_id: Some(sid.clone()),
+                    ..Default::default()
+                });
+                crate::agent::Agent::spawn(agent, &crate::agent::SpawnReq {
+                    session_id: sid.clone().into(),
+                    cwd: "/tmp".into(),
+                    prompt: None,
+                    resume_from: None,
+                    window: crate::agent::SessionId::from(sid).window_name(),
+                    state: crate::agent::WorkerState::Absent,
+                    hooks_file: String::new(),
+                    mcp_config: String::new(),
+                    moved_from: None,
+                })
+                .unwrap();
+                ThreadKey::new("C1", &ts)
+            })
+            .collect()
+    }
+
+    fn agent_alive(agent: &FakeAgent, n: usize) -> bool {
+        let name = crate::agent::SessionId::from(format!("18e90000-0000-4000-8000-{n:012}")).window_name();
+        crate::agent::Agent::pid_of(agent, None, &name).is_some()
+    }
+
+    /// **Over the cap, only an agent known to be done gives way.** One in a turn, one that acknowledged
+    /// and still owes its asker the answer, and one not seen since this Bridge started all stay; the
+    /// one whose turn ended goes.
+    #[tokio::test]
+    async fn over_the_cap_only_a_finished_agent_is_taken_down() {
+        let (d, _slack, agent, _clock) = flow_deps("evict-busy");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let keys = seated(&mut b, &agent, 11);
+        let now = b.deps.clock.now_ms();
+        {
+            let mut a = b.activity.lock().unwrap();
+            for k in &keys[..8] {
+                a.turn_start(k, now); // at work
+            }
+            a.turn_end(&keys[8], now); // finished, but owes its asker
+            a.turn_end(&keys[9], now); // finished
+            // keys[10]: nothing seen since start
+        }
+        b.threads.entries.get_mut(&keys[8].split().1.unwrap()).unwrap().ask_owed = vec!["9.9".into()];
+
+        // Asked, not done: tearing one down in a test would signal a real pid
+        let (snaps, _) = b.idle_snapshots(&b.live_windows());
+        let free: Vec<ThreadKey> = snaps.iter().filter(|s| s.eligible).map(|s| s.key.clone()).collect();
+        assert_eq!(free, vec![keys[9].clone()], "only the finished agent may give way");
+        assert_eq!(
+            crate::bridge::worker::select_cleanup_keys(snaps, &crate::bridge::worker::CLEANUP),
+            vec![keys[9].clone()]
+        );
+    }
+
+    /// **Every agent at work: run over the cap** rather than take one down, and say so once.
+    #[tokio::test]
+    async fn over_the_cap_with_everyone_at_work_nobody_is_taken_down() {
+        let (d, _slack, agent, _clock) = flow_deps("evict-none");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let keys = seated(&mut b, &agent, 12);
+        let now = b.deps.clock.now_ms();
+        for k in &keys {
+            b.activity.lock().unwrap().turn_start(k, now);
+        }
+
+        let live = b.live_windows();
+        b.evict_idle_worker(&live).await;
+
+        assert!((0..12).all(|n| agent_alive(&agent, n)));
+        assert_eq!(b.over_cap_logged, 12, "the over-cap line was not said");
+    }
+
+    /// An agent not seen since start is unknown: kept while warm, taken once cold past the absolute
+    /// limit — so one inherited and forgotten cannot stay forever.
+    #[tokio::test]
+    async fn an_agent_unseen_since_start_is_taken_only_when_long_cold() {
+        let (d, _slack, agent, _clock) = flow_deps("evict-unknown");
+        let (mut b, _fx) = Bridge::for_test(d);
+        seated(&mut b, &agent, 1);
+        let free = |b: &Bridge| b.idle_snapshots(&b.live_windows()).0[0].eligible;
+        assert!(!free(&b), "warm and unknown may be taken down");
+        *agent.last_activity.lock().unwrap() = Some(b.deps.clock.now_ms() - 61 * 60_000);
+        assert!(free(&b), "cold for an hour and still kept");
+    }
+
+    /// **Once only.** A second reboot before the answer tells instead of waking the same request again.
+    #[tokio::test]
+    async fn a_cut_off_request_is_resumed_only_once() {
+        let (mut b, slack, agent, clock, _up, _sid) = rebooted("reboot-twice", None, true).await;
+        b.restore_pending(&LogCtx::default());
+        assert_eq!(agent.spawned.lock().unwrap().len(), 1);
+
+        let (mut b, _slack, agent, _clock, mut up, _sid) =
+            rebooted("reboot-twice", Some((b, slack, agent, clock)), true).await;
+        b.restore_pending(&LogCtx::default());
+        settle().await;
+
+        assert!(agent.spawned.lock().unwrap().is_empty(), "woken a second time");
+        assert!(replies_up(&mut up).iter().any(|(o, _)| o == "failed"));
     }
 
     /// **Deleting the thread's root deletes the conversation, so the agent goes with it.** Slack takes

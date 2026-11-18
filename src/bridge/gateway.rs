@@ -277,6 +277,10 @@ pub mod link {
             from_thread: String,
             to_channel: String,
             to_thread: String,
+            /// The request was given up rather than finished: no ✅ on the asked thread.
+            /// Absent from an older machine, which only ever finished them.
+            #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+            canceled: bool,
         },
         /// machine → gateway: what the agent in a thread `from_thread` asked is doing right now
         /// (`thread_activity`). Read only. Answered with [`LinkFrame::AskAnswer`].
@@ -3904,10 +3908,10 @@ impl Fleet {
                     }
                 });
             }
-            link::LinkFrame::EndAsk { req_id, from_channel, from_thread, to_channel, to_thread } => {
+            link::LinkFrame::EndAsk { req_id, from_channel, from_thread, to_channel, to_thread, canceled } => {
                 let (fleet, machine) = (self.clone(), bridge_id.to_string());
                 tokio::spawn(async move {
-                    let result = fleet.end_ask(&from_channel, &from_thread, &to_channel, &to_thread).await;
+                    let result = fleet.end_ask(&from_channel, &from_thread, &to_channel, &to_thread, canceled).await;
                     if !fleet.send_frame(&machine, &link::LinkFrame::AskAnswer { req_id, result }).await {
                         rlog("info", &format!("{machine}: could not return an end_ask's answer (link dropped)"));
                     }
@@ -4870,14 +4874,17 @@ impl Fleet {
     }
 
     /// `end_ask`: the agent in `from_thread` is done with `to_thread`, a thread it asked. The exchange
-    /// ends here (follow-ups are refused from now on), a line in the asked thread says who ended it,
-    /// and the agent there ends the way `exit` ends it — after its running turn, not in the middle.
+    /// ends here (follow-ups are refused from now on), a line in the asked thread says who ended it
+    /// and whether the request was finished, and the agent there ends the way `exit` ends it — after
+    /// its running turn, not in the middle. A finished request gets ✅ there (`done`); a given-up one
+    /// (`canceled`) does not.
     pub(crate) async fn end_ask(
         &self,
         from_channel: &str,
         from_thread: &str,
         to_channel: &str,
         to_thread: &str,
+        canceled: bool,
     ) -> Result<serde_json::Value, String> {
         use crate::bridge::asks::{AgentDelivery, DeliveryKind, check_end};
         use crate::bridge::state::AskState;
@@ -4896,17 +4903,20 @@ impl Fleet {
             r.outstanding = false;
         })
         .await;
-        let said = crate::t!(
-            ":white_check_mark: The Claude in <#{from_channel}> that asked this closed it.",
-            ":white_check_mark: 依頼元の <#{from_channel}> の Claude がこの依頼を終了しました。"
-        );
+        let said = match canceled {
+            false => crate::t!("<#{from_channel}> marked this thread done.", "<#{from_channel}> がこのスレッドを完了にしました。"),
+            true => crate::t!(
+                "<#{from_channel}> closed this thread without completing it.",
+                "<#{from_channel}> がこのスレッドを、完了にせずに閉じました。"
+            ),
+        };
         let ts = self.api.post_markdown(to_channel, &said, Some(to_thread)).await?;
         let delivered = self
             .deliver_agent(AgentDelivery {
                 channel: to_channel.to_string(),
                 thread_ts: to_thread.to_string(),
                 ts,
-                text: String::new(),
+                text: if canceled { crate::chat::END_CANCELED.to_string() } else { String::new() },
                 origin_channel: Some(from_channel.to_string()),
                 origin_thread: Some(from_thread.to_string()),
                 kind: DeliveryKind::End,
@@ -4914,9 +4924,10 @@ impl Fleet {
                 quotes: Default::default(),
             })
             .await;
-        rlog("info", &format!("ask {to_channel}:{to_thread}: ended by {from_channel}:{from_thread}"));
+        let outcome = if canceled { "canceled" } else { "done" };
+        rlog("info", &format!("ask {to_channel}:{to_thread}: ended ({outcome}) by {from_channel}:{from_thread}"));
         Ok(match delivered {
-            Ok(()) => serde_json::json!({"status": "ended"}),
+            Ok(()) => serde_json::json!({"status": "ended", "outcome": outcome}),
             // The exchange is over either way; its agent is left to whoever looks at that machine
             Err(why) => serde_json::json!({"status": "ended", "note": format!("the exchange is ended, but its agent could not be stopped now: {why}")}),
         })
@@ -10203,22 +10214,41 @@ mod ask_tests {
     async fn the_asker_ends_the_thread_it_asked() {
         let (mut r, thread) = approved("endask").await;
         let before = calls(&r.api).len();
-        let out = r.fleet.end_ask("C1", "1.1", "C2", &thread).await.unwrap();
+        let out = r.fleet.end_ask("C1", "1.1", "C2", &thread, false).await.unwrap();
         assert_eq!(out["status"], "ended");
         let row = r.fleet.asks.lock().await[&thread].1.clone();
         assert!(row.state == AskState::Ended && !row.outstanding);
         // A line in the asked thread says who ended it, and its agent is told to end
         let said = &calls(&r.api)[before..];
-        assert!(said.iter().any(|c| c.starts_with(&format!("post_md C2 {thread} ")) && c.contains("<#C1>")), "{said:?}");
+        assert!(
+            said.iter().any(|c| c.starts_with(&format!("post_md C2 {thread} ")) && c.contains("<#C1> marked this thread done.")),
+            "{said:?}"
+        );
+        assert!(!said.iter().any(|c| c.contains("Thanks for your work")), "{said:?}");
         let m = r.msgs.try_recv().expect("handed to the asked thread");
         assert_eq!((m.channel.as_str(), m.thread_ts.as_deref()), ("C2", Some(thread.as_str())));
+        assert_eq!(m.text, "", "finished: the machine puts ✅ on it");
         assert_eq!(m.from_agent.unwrap().kind, DeliveryKind::End);
         // Ended: no more follow-ups, and ending again changes nothing
         assert!(r.fleet.ask("C1", "1.1", "C2", Some(&thread), "more", None, &[]).await.is_err());
         let again = calls(&r.api).len();
-        assert_eq!(r.fleet.end_ask("C1", "1.1", "C2", &thread).await.unwrap()["status"], "already_ended");
+        assert_eq!(r.fleet.end_ask("C1", "1.1", "C2", &thread, false).await.unwrap()["status"], "already_ended");
         assert_eq!(calls(&r.api).len(), again, "nothing posted twice");
         assert!(r.msgs.try_recv().is_err());
+    }
+
+    /// A request given up is said so, and the machine is told not to mark it done.
+    #[tokio::test]
+    async fn the_asker_closes_a_thread_without_completing_it() {
+        let (mut r, thread) = approved("endcancel").await;
+        let before = calls(&r.api).len();
+        let out = r.fleet.end_ask("C1", "1.1", "C2", &thread, true).await.unwrap();
+        assert_eq!((out["status"].as_str(), out["outcome"].as_str()), (Some("ended"), Some("canceled")));
+        let said = &calls(&r.api)[before..];
+        assert!(said.iter().any(|c| c.contains("<#C1> closed this thread without completing it.")), "{said:?}");
+        let m = r.msgs.try_recv().expect("handed to the asked thread");
+        assert_eq!(m.text, crate::chat::END_CANCELED);
+        assert_eq!(m.from_agent.unwrap().kind, DeliveryKind::End);
     }
 
     #[tokio::test]
@@ -10266,7 +10296,7 @@ mod ask_tests {
         assert!(r.fleet.thread_activity("C1", "1.1", "C3", &thread).await.is_err(), "the wrong channel");
         assert!(r.fleet.thread_activity("C1", "1.1", "C2", "7.7").await.is_err(), "a thread nobody asked");
         // An ended exchange can still be read
-        r.fleet.end_ask("C1", "1.1", "C2", &thread).await.unwrap();
+        r.fleet.end_ask("C1", "1.1", "C2", &thread, false).await.unwrap();
         r.fleet.thread_routes.lock().await.insert(thread.clone(), "pve".into());
         let out = r.fleet.thread_activity("C1", "1.1", "C2", &thread).await.unwrap();
         assert_eq!(out["exchange_ended"], true);
@@ -10276,9 +10306,9 @@ mod ask_tests {
     async fn only_the_asking_thread_may_end_an_ask() {
         let (mut r, thread) = approved("endother").await;
         let before = calls(&r.api).len();
-        assert!(r.fleet.end_ask("C9", "9.9", "C2", &thread).await.is_err(), "another thread");
-        assert!(r.fleet.end_ask("C1", "1.1", "C3", &thread).await.is_err(), "the wrong channel");
-        assert!(r.fleet.end_ask("C1", "1.1", "C2", "7.7").await.is_err(), "a thread nobody asked");
+        assert!(r.fleet.end_ask("C9", "9.9", "C2", &thread, false).await.is_err(), "another thread");
+        assert!(r.fleet.end_ask("C1", "1.1", "C3", &thread, false).await.is_err(), "the wrong channel");
+        assert!(r.fleet.end_ask("C1", "1.1", "C2", "7.7", false).await.is_err(), "a thread nobody asked");
         assert_eq!(calls(&r.api).len(), before, "nothing posted");
         assert!(r.msgs.try_recv().is_err());
         assert_eq!(r.fleet.asks.lock().await[&thread].1.state, AskState::Approved);

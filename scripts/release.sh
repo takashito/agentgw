@@ -7,6 +7,14 @@
 #
 #   scripts/release.sh --check        # only check the release notes and print them
 #
+#   scripts/release.sh --force        # release even if it drops commits that are running (says which)
+#
+# Before uploading, this runs preflight.sh — the same checks as deploy.sh: the builds are HEAD,
+# HEAD has everything on main, and **HEAD has everything in the build that is running now**.
+# A release replaces the running build on every machine, so a fix deployed from another branch
+# and not yet merged would be taken back out without a word (it happened to 0.71.1). If a commit
+# would be dropped this stops; merge it, or pass --force when dropping it is intended.
+#
 # The release notes are the `## [<version>]` section of CHANGELOG.md (Keep a Changelog). This
 # stops if that section is missing, has no `### Added` / `Changed` / ... heading with `- ` lines
 # under it, or has Japanese in it — every release page has to say what changed, in English.
@@ -22,11 +30,13 @@ set -euo pipefail
 
 replace=0
 check_only=0
+force=0
 for arg in "$@"; do
   case "$arg" in
     --replace) replace=1 ;;
     --check) check_only=1 ;;
-    *) echo "Unknown argument: $arg (only --replace, --check)" >&2; exit 2 ;;
+    --force) force=1 ;;
+    *) echo "Unknown argument: $arg (only --replace, --check, --force)" >&2; exit 2 ;;
   esac
 done
 
@@ -71,6 +81,15 @@ echo "==> Release notes for $tag"
 sed 's/^/  /' "$notes_file"
 if [ "$check_only" = 1 ]; then
   exit 0
+fi
+
+# Nothing goes out that takes back a commit already running or already on main
+echo "==> Checking the builds against main and the running build"
+pre=""; [ "$force" = 0 ] || pre=--force
+# shellcheck disable=SC2086  # $pre is one word or nothing
+if ! (cd "$repo_root" && scripts/preflight.sh $pre); then
+  echo "Stopped. Not releasing." >&2
+  exit 1
 fi
 
 # Stage the builds under names with their <triple>.

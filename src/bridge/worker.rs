@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 /// Rules for tearing down cold agents (four numbers the user decided on 2026-08-02; the
 /// concurrency cap went 10 → 8 on 2026-09-22).
 /// Hard-coded rather than read from env vars — add that when someone needs to tune them.
-const CLEANUP: CleanupPolicy = CleanupPolicy {
+pub(super) const CLEANUP: CleanupPolicy = CleanupPolicy {
     idle_ttl_ms: 30 * 60_000,
     idle_slots: 5,
     idle_max_ms: 60 * 60_000,
@@ -486,16 +486,28 @@ pub struct DrainJob {
     pub key: ThreadKey,
     pub session_id: String,
     pub deadline_ms: u64,
-    /// Where to post the farewell (channel, thread_ts). Only exit announces it —
-    /// for resume the report text already says the session is ending.
-    pub farewell: Option<(String, String)>,
+    /// How the ending is announced. Only an intended ending (exit, done, end_ask, end_session) has
+    /// one — for resume the report text already says the session is ending.
+    pub farewell: Option<Farewell>,
     /// The reason held for the whole drain (only `resume` hands one over). Dropped when the job
     /// leaves `drains` — this reservation is what we wait on, so the hold lives here too.
     pub thinking: Option<crate::bridge::turn::PresenceHold>,
 }
 
-/// The reaction an ended session leaves on its thread's root message.
+/// The reaction a thread marked done gets on its root message.
 pub(super) const DONE_EMOJI: &str = "white_check_mark";
+
+/// How an intended ending shows in its thread.
+#[derive(Clone, Debug)]
+pub struct Farewell {
+    pub channel: String,
+    pub thread_ts: String,
+    /// The line posted in the thread. None when it was said already (`end_ask`: the gateway
+    /// posts who closed the thread before the ending reaches this machine).
+    pub line: Option<String>,
+    /// The thread is finished, not just stopped: ✅ goes on its root message.
+    pub done: bool,
+}
 
 // ── starting, pooling and reaping agents ──
 
@@ -506,7 +518,7 @@ impl Bridge {
         &mut self,
         key: &ThreadKey,
         sid: Option<&str>,
-        farewell: Option<(String, String)>,
+        farewell: Option<Farewell>,
     ) {
         let ctx = LogCtx {
             session_id: sid.map(str::to_string),
@@ -584,25 +596,29 @@ impl Bridge {
                 sid.unwrap_or("none")
             ),
         );
-        if let Some((channel, thread_ts)) = farewell {
-            self.post(
-                &channel,
-                &thread_ts,
-                crate::t!("Thanks for your work! Ending the Claude Code session.", "お疲れさまでした。Claude Code のセッションを終了します。"),
-                key,
-            );
+        if let Some(Farewell { channel, thread_ts, line, done }) = farewell {
+            if let Some(line) = line {
+                self.post(&channel, &thread_ts, line, key);
+            }
+            // The agent will not answer here any more: Slack shows the session as closed
+            self.presence_close(key);
             // Mark the thread itself as finished, so it reads as done in the channel without
             // opening it. Best-effort: a missing scope or a ✅ already there must not hold up the
             // ending, so it runs on its own and a failure is only logged
-            let (api, ch, ts, log) = (self.deps.slack.clone(), channel.clone(), thread_ts.clone(), ctx.clone());
-            tokio::spawn(async move {
-                if let Err(e) = api.add_reaction(&ch, &ts, DONE_EMOJI).await {
-                    log.debug("bridge", &format!("exit: '{DONE_EMOJI}' on the thread failed: {e}"));
-                }
-            });
+            if done {
+                let (api, ch, ts, log) = (self.deps.slack.clone(), channel.clone(), thread_ts.clone(), ctx.clone());
+                tokio::spawn(async move {
+                    if let Err(e) = api.add_reaction(&ch, &ts, DONE_EMOJI).await {
+                        log.debug("bridge", &format!("exit: '{DONE_EMOJI}' on the thread failed: {e}"));
+                    }
+                });
+            }
             ctx.info(
                 "bridge",
-                &format!("slack-events: user exit → session ended for {channel}:{thread_ts}"),
+                &format!(
+                    "slack-events: session ended{} for {channel}:{thread_ts}",
+                    if done { " and thread marked done" } else { "" }
+                ),
             );
         }
     }
@@ -1150,7 +1166,8 @@ impl Bridge {
             let Some(sid) = e.agent_id.as_deref() else {
                 return true; // no agent yet — the thread is waiting for one
             };
-            agent.session_history_exists(None, sid) || live.contains_key(sid)
+            // Still owing another agent an answer: `restore_pending` tells that agent first
+            agent.session_history_exists(None, sid) || live.contains_key(sid) || !e.ask_owed.is_empty()
         });
         let dropped = before - self.threads.entries.len();
         if dropped == 0 {
@@ -1169,8 +1186,12 @@ impl Bridge {
         }
     }
 
-    /// Tears down one cold thread agent.
-    async fn evict_idle_worker(&mut self, live: &HashMap<String, String>) {
+    /// Every live thread agent, with whether the cleanup may take it down. Kept apart from the
+    /// teardown so what counts as free can be checked without killing anything.
+    pub(super) fn idle_snapshots(
+        &self,
+        live: &HashMap<String, String>,
+    ) -> (Vec<worker::IdleSnapshot>, HashMap<ThreadKey, String>) {
         let now = self.deps.clock.now_ms();
         let mut snaps: Vec<worker::IdleSnapshot> = Vec::new();
         let mut sid_of: HashMap<ThreadKey, String> = HashMap::new();
@@ -1195,20 +1216,59 @@ impl Bridge {
             let last = self
                 .deps.agent
                 .last_activity_ms(h.and_then(|h| h.transcript_path.as_deref()), sid);
+            let idle_ms = last.map_or(0, |t| now.saturating_sub(t));
+            // **Free is more than "nothing unanswered".** The ledger empties the moment the agent first
+            // replies or reacts, and the work goes on after that: a build, a wait on a background job.
+            // Taken down then, the work was lost with nobody told. So a seat is only free when the
+            // agent is known to be done:
+            // - not in a turn (a tool running, or thinking) — the same record `thread_activity` reads
+            // - not owing the agent that asked it an answer (acknowledged, still working)
+            // - a turn seen ending since this Bridge started. That record lives in memory, so an
+            //   agent inherited across a restart is unknown until it ends a turn; it is only taken
+            //   once it has been cold past the absolute limit, so a forgotten one cannot stay forever
+            let done = match self.activity.lock().map(|a| a.settled(&key)) {
+                Ok(Some(done)) => done,
+                Ok(None) => idle_ms > CLEANUP.idle_max_ms,
+                Err(_) => false,
+            };
             let eligible = last.is_some()
+                && done
+                && e.ask_owed.is_empty()
                 && !self.workers.is_starting(sid)
                 && !self.workers.is_draining(&key)
                 && self.ledger.pending(&key).is_empty()
                 && !waiting.contains(&key);
             snaps.push(worker::IdleSnapshot {
                 key: key.clone(),
-                idle_ms: last.map_or(0, |t| now.saturating_sub(t)),
+                idle_ms,
                 eligible,
             });
             sid_of.insert(key, sid.to_string());
         }
+        (snaps, sid_of)
+    }
+
+    /// Tears down one cold thread agent.
+    pub(super) async fn evict_idle_worker(&mut self, live: &HashMap<String, String>) {
+        let (snaps, sid_of) = self.idle_snapshots(live);
         let live = snaps.len();
+        let busy = snaps.iter().filter(|s| !s.eligible).count();
         let mut evict = worker::select_cleanup_keys(snaps, &CLEANUP);
+        // **Over the cap with every agent at work: run over it.** New requests still get an agent
+        // (none waits, none is dropped); the machine just carries more for a while. Said once per
+        // change in the count, not every pass
+        let over = live > CLEANUP.max_concurrent && evict.is_empty();
+        if over && self.over_cap_logged != live {
+            LogCtx::default().info(
+                "bridge",
+                &format!(
+                    "cleanup: {live} agents live, over the cap of {}, but {busy} are at work — \
+                     none taken down",
+                    CLEANUP.max_concurrent
+                ),
+            );
+        }
+        self.over_cap_logged = if over { live } else { 0 };
         if evict.is_empty() {
             return;
         }

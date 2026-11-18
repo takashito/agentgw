@@ -242,6 +242,10 @@ pub struct ThreadEntry {
     /// acknowledged: it still owes that agent an answer, and its next real reply is it.
     #[serde(rename = "askOwed", default, skip_serializing_if = "Vec::is_empty")]
     pub ask_owed: Vec<String>,
+    /// Owed requests already woken once after the agent's window was lost (a machine reboot).
+    /// A second loss before the answer tells the asker instead of waking them again.
+    #[serde(rename = "owedResumed", default, skip_serializing_if = "Vec::is_empty")]
+    pub owed_resumed: Vec<String>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }

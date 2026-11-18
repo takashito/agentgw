@@ -115,6 +115,17 @@ impl ActivityBook {
         row.replied_in_turn = true;
     }
 
+    /// Whether this thread's agent is known to be done for now: a turn was seen ending since this
+    /// Bridge started, and nothing is running or waiting on a person. `None` = nothing seen since
+    /// start (an agent inherited across a restart), so its state is unknown.
+    pub fn settled(&self, key: &ThreadKey) -> Option<bool> {
+        let r = self.threads.get(key)?;
+        if r.in_turn || !r.running.is_empty() || r.waiting_for_person {
+            return Some(false);
+        }
+        r.turn_ended_ms.is_some().then_some(true)
+    }
+
     /// PreToolUse.
     pub fn tool_start(&mut self, key: &ThreadKey, id: &str, name: &str, detail: &str, now: u64) {
         let row = self.row(key, now);

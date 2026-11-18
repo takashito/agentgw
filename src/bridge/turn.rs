@@ -226,6 +226,14 @@ impl PresenceBook {
         self.changed(key)
     }
 
+    /// The agent ended: nothing holds the thread and Slack shows it closed. A later reason (the
+    /// next agent's turn) differs from `Closed`, so it goes out as usual.
+    pub(super) fn close(&mut self, key: &ThreadKey) -> crate::chat::Presence {
+        self.reasons.remove(key);
+        self.last_sent.insert(key.clone(), crate::chat::Presence::Closed);
+        crate::chat::Presence::Closed
+    }
+
     /// What the reasons add up to.
     fn presence_of(&self, key: &ThreadKey) -> crate::chat::Presence {
         use crate::chat::Presence;
@@ -279,6 +287,24 @@ pub(super) struct Stall {
 }
 
 impl Bridge {
+    /// `end_session`: the agent asked to end itself. What it answered is settled first, so the
+    /// ending waits only for a reply still on its way, then goes the way `exit` / `done` go.
+    async fn on_end_session(&mut self, d: Disposition) {
+        let found = self.threads.find_by_session(&d.session_id).map(|(ts, e)| (ts.clone(), e.channel_id.clone()));
+        let ctx = LogCtx { session_id: Some(d.session_id.clone()), thread_key: None };
+        let Some((root, Some(channel))) = found else {
+            ctx.info("bridge", "end_session: no thread for this session — nothing ended");
+            return;
+        };
+        let key = ThreadKey::new(&channel, &root);
+        let ctx = LogCtx { session_id: Some(d.session_id.clone()), thread_key: Some(key.clone()) };
+        if !d.message_ids.is_empty() {
+            self.ledger.disposed(&key, &d.message_ids);
+        }
+        self.stall.remove(&key);
+        self.agent_exit(&channel, &key, &root, d.kind == "end_done", &ctx).await;
+    }
+
     /// Adds a reason and tells Slack, if that changed what the thread is doing.
     pub(super) fn presence_add(&self, key: &ThreadKey, why: Reason) {
         if why == Reason::Perm {
@@ -299,6 +325,12 @@ impl Bridge {
             .lock()
             .ok()
             .and_then(|mut b| b.remove(key, why));
+        self.presence_send(key, change);
+    }
+
+    /// The agent ended on purpose: drop every reason and show the session closed.
+    pub(super) fn presence_close(&self, key: &ThreadKey) {
+        let change = self.presence.lock().ok().map(|mut b| b.close(key));
         self.presence_send(key, change);
     }
 
@@ -404,7 +436,9 @@ impl Bridge {
                 let out = self.stop_decision(key.as_ref(), &ev, &ctx);
                 // If blocked, the turn **continues** (re-prompt), so it's not over yet
                 if let Some(key) = key.as_ref().filter(|_| out.get("decision").is_none()) {
-                    self.sticky.on_turn_end(key);
+                    if let slack::StickyAction::Delete(ts) = self.sticky.on_turn_end(key) {
+                        self.delete_sticky(key, ts);
+                    }
                     self.note_activity(|b, now| b.turn_end(key, now));
                     // Whatever the thread was waiting for, the turn is over and it is not
                     // waiting for it any more -- including a question answered on the machine,
@@ -551,7 +585,12 @@ impl Bridge {
             "reply" | "edit" | "no_reply" => {
                 // An answer to the request itself, or — while one is owed — the answer to what came
                 // back from below (or a reply that names no message). A reply to a person alone is not it
-                let owed_now = !owed.is_empty() && (d.message_ids.is_empty() || !returns.is_empty());
+                // A reply naming the owed request itself pays it too — the usual shape after an
+                // acknowledgement (the ledger no longer holds it, so `asks` is empty). Left owed, a later
+                // machine reboot would wake the thread for a request it had already answered
+                let names_owed = d.message_ids.iter().any(|id| owed.contains(id));
+                let owed_now = !owed.is_empty()
+                    && (d.message_ids.is_empty() || !returns.is_empty() || names_owed);
                 // In a thread another agent asked for, a posted reply to a person goes back too: the
                 // Owner often steers the work here directly after the first answer, and the asker
                 // would otherwise never hear how it ended. So does a reply to what came back from an ask
@@ -586,6 +625,9 @@ impl Bridge {
 
     pub(in crate::bridge) fn set_owed(&mut self, root: &str, owed: Vec<String>) {
         let Some(e) = self.threads.entries.get_mut(root) else { return };
+        if owed.is_empty() {
+            e.owed_resumed.clear();
+        }
         e.ask_owed = owed;
         if let Err(err) = self.threads.save() {
             LogCtx::default().error("bridge", &format!("threads.json save failed: {err}"));
@@ -2358,6 +2400,11 @@ impl Bridge {
 
     /// A tool "answered" — drop it from the ledger and settle the progress message.
     pub(super) async fn on_disposition(&mut self, mut d: Disposition) {
+        // `end_session`: the agent ends itself. Its own thread only — taken from the session
+        if matches!(d.kind, "end" | "end_done") {
+            self.on_end_session(d).await;
+            return;
+        }
         // reply / no_reply / edit may not carry thread_ts — look the root back up from the session
         let root = d.thread_ts.clone().or_else(|| {
             self.threads
@@ -2439,13 +2486,24 @@ impl Bridge {
             self.flush_sticky(&key, posted, body).await;
         }
         if let slack::StickyAction::Delete(ts) = self.sticky.settle(&key, d.kind) {
-            let (api, channel) = (self.deps.slack.clone(), d.channel_id.clone());
-            tokio::spawn(async move {
-                if let Err(e) = api.delete_message(&channel, &ts).await {
-                    ctx.debug("bridge", &format!("sticky delete failed: {e}"));
-                }
-            });
+            self.delete_sticky(&key, ts);
         }
+    }
+
+    /// Takes a progress message down, off the loop (a failure only costs a stray message).
+    fn delete_sticky(&self, key: &ThreadKey, ts: String) {
+        let (channel, _) = key.split();
+        let api = self.deps.slack.clone();
+        let ctx = LogCtx {
+            session_id: None,
+            thread_key: Some(key.clone()),
+        };
+        tokio::spawn(async move {
+            match api.delete_message(&channel, &ts).await {
+                Ok(()) => ctx.debug("bridge", &format!("sticky deleted ts={ts}")),
+                Err(e) => ctx.debug("bridge", &format!("sticky delete failed: {e}")),
+            }
+        });
     }
 
     /// Rename the thread's session, **unless a person already named it by hand**.
@@ -2539,7 +2597,10 @@ impl Bridge {
             self.sticky.post_failed(&done.key);
             return;
         };
-        self.sticky.set_posted(&done.key, &ts);
+        if let slack::StickyAction::Delete(ts) = self.sticky.set_posted(&done.key, &ts) {
+            self.delete_sticky(&done.key, ts);
+            return;
+        }
         // The turn may have ended while the post was out, and the board held the last render back
         // rather than open a second message. Draw it now, as an update
         if let Some((posted, blocks)) = self.sticky.take_final(&done.key) {
@@ -2866,7 +2927,14 @@ pub async fn execute_ask_tool(
         let (Some(to_channel), Some(to_thread)) = (opt("channel_id"), opt("thread_ts")) else {
             return Err("channel_id and thread_ts are required".into());
         };
-        let out = ask.ask(|req_id| LinkFrame::EndAsk { req_id, from_channel, from_thread, to_channel, to_thread }).await?;
+        let canceled = match opt("outcome").as_deref() {
+            None | Some("done") => false,
+            Some("canceled") => true,
+            Some(other) => return Err(format!("outcome must be done or canceled, not {other}")),
+        };
+        let out = ask
+            .ask(|req_id| LinkFrame::EndAsk { req_id, from_channel, from_thread, to_channel, to_thread, canceled })
+            .await?;
         return Ok(out.to_string());
     }
     if tool == "thread_activity" {
@@ -3248,6 +3316,31 @@ pub async fn execute_tool(
             };
             notify(dispo, d, &c).await;
             Ok("recorded — nothing posted".to_string())
+        }
+        "end_session" => {
+            // The ending happens on the main side, after this turn's reply has landed. The thread
+            // is looked up there from the session, so an agent can only end its own
+            let done = match opt("outcome").as_deref() {
+                Some("done") => true,
+                Some("ended") => false,
+                other => return Err(format!("outcome must be done or ended, not {}", other.unwrap_or("missing"))),
+            };
+            let c = dctx(None);
+            c.info("bridge", &format!("disposition=end_session outcome={} covers=[{}]", if done { "done" } else { "ended" }, ids.join(",")));
+            let d = Disposition {
+                kind: if done { "end_done" } else { "end" },
+                channel_id: String::new(),
+                thread_ts: None,
+                message_ids: ids.clone(),
+                session_id: session_id.to_string(),
+                title: None,
+                body: None,
+            };
+            notify(dispo, d, &c).await;
+            Ok(format!(
+                "this session ends once your turn is over{}. Do not write anything more",
+                if done { " and the thread is marked done" } else { "" }
+            ))
         }
         "set_thread_title" => {
             // The rename happens on the main side (it holds Threads, so it knows whether a person

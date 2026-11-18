@@ -77,6 +77,13 @@ fn submit_retries(text: &str) -> u32 {
     (DELIVER_SUBMIT_RETRIES + (text.len() / 1024) as u32).min(DELIVER_SUBMIT_RETRIES_MAX)
 }
 
+/// The last `n` non-blank lines of a pane, trailing spaces trimmed (psmux pads the scrollback
+/// with blank lines, measured on a Windows machine).
+fn last_lines(pane: &str, n: usize) -> String {
+    let lines: Vec<&str> = pane.lines().map(str::trim_end).filter(|l| !l.is_empty()).collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
 /// How many cursor moves an answer to a dialog may take, and the pause after each press.
 ///
 /// One press per read: the cursor is the only proof the key landed. The cap is a few more than
@@ -1381,6 +1388,15 @@ impl Claude {
         Pane::new(&pane).login_outcome()
     }
 
+    /// The last non-blank lines of the sign-in screen (scrollback included), for the failure report.
+    pub fn login_screen(&self) -> String {
+        let pane = self
+            .tmux
+            .capture_history(&self.login_window(), 200)
+            .unwrap_or_default();
+        last_lines(&pane, 6)
+    }
+
     /// Signs out. Runs the real command once. `Failed` is a non-zero exit (its content describes the
     /// exit status), `Errored` is a failure to launch at all — the caller shows different text for each.
     pub async fn logout(&self) -> Result<(), ProbeErr> {
@@ -1743,6 +1759,10 @@ impl crate::agent::Agent for Claude {
 
     fn login_outcome(&self) -> LoginOutcome {
         Claude::login_outcome(self)
+    }
+
+    fn login_screen(&self) -> String {
+        Claude::login_screen(self)
     }
 
     async fn logout(&self) -> Result<(), ProbeErr> {
@@ -2279,6 +2299,13 @@ mod tests {
     use crate::agent::Agent;
     use crate::agent::SessionId;
     use crate::agent::screen::tests::{LOGIN_PANE, TRUST_PANE};
+
+    #[test]
+    fn last_lines_skips_the_blank_padding_psmux_adds() {
+        let pane = "PS C:\\> claude auth login\nPaste code here if prompted > x\nSigning in…   \n\n\n\n";
+        assert_eq!(last_lines(pane, 2), "Paste code here if prompted > x\nSigning in…");
+        assert_eq!(last_lines("", 6), "");
+    }
 
     fn claude_with(
         run: impl Fn(&[&str]) -> Result<String, String> + Send + Sync + 'static,

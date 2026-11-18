@@ -48,6 +48,30 @@ pub fn envelope(msg: &InboundMsg, root_ts: &str, title: Option<&str>, now_ms: u6
     envelope_guarded(msg, root_ts, title, None, now_ms)
 }
 
+/// What a conversation woken after its machine restarted is given: why it is being woken, then the
+/// messages it had not answered, as they were first delivered. English: read by the agent.
+pub fn resume_prompt(envelopes: &[&str]) -> String {
+    format!(
+        "This machine restarted while you were working, and your session was cut off. The message(s) \
+         below were still waiting for your answer. Check what you already did (the conversation above, \
+         the files, git) and continue from where you stopped — do not redo finished steps — then answer \
+         as usual with reply.\n\n{}",
+        envelopes.join("\n\n")
+    )
+}
+
+/// The same, for a request that was acknowledged and still being worked on: nothing is re-sent, the
+/// request is already in the conversation. English: read by the agent.
+pub fn resume_owed_prompt(ids: &[String]) -> String {
+    format!(
+        "This machine restarted while you were working, and your session was cut off. You still owe the \
+         agent that asked you an answer to message_id {}, which is in the conversation above. Check what \
+         you already did (the conversation, the files, git) and continue from where you stopped — do \
+         not redo finished steps — then answer as usual with reply.",
+        ids.join(", ")
+    )
+}
+
 /// Only deliveries that tripped the loop guard carry `loop_guard` (empty = nobody to call).
 pub fn envelope_guarded(
     msg: &InboundMsg,
@@ -78,6 +102,10 @@ pub fn envelope_guarded(
             },
             quotes: o.quotes.clone(),
         }),
+        // Only a person's bare `done` that got this far: the agent is running and decides (see
+        // `handle_command`)
+        note: (msg.from_agent.is_none() && crate::bridge::command::Message::new(&msg.text, None).is("done"))
+            .then_some(crate::agent::DONE_NOTE),
     }
     .render()
 }
@@ -495,10 +523,16 @@ impl Bridge {
         };
 
         // The asking agent is done with this thread (`end_ask`): end its agent the way `exit` does.
-        // The gateway checked who may and has already ended the exchange, so nothing is told back
+        // The gateway checked who may and has already ended the exchange, so nothing is told back.
+        // It has also posted who closed the thread; the text says whether it was finished
+        // (`canceled` = given up, no ✅; anything else, an older gateway's empty text included, = done)
         if from_agent.as_ref().is_some_and(|o| o.kind == crate::chat::DeliveryKind::End) {
-            ctx(None).info("bridge", &format!("slack-events: ended by the asking agent msg={} channel={}", msg.ts, msg.channel));
-            self.end_agent(msg, &key, &root_ts, &ctx(None), false).await;
+            let done = msg.text.trim() != crate::chat::END_CANCELED;
+            ctx(None).info(
+                "bridge",
+                &format!("slack-events: ended by the asking agent ({}) msg={} channel={}", if done { "done" } else { "canceled" }, msg.ts, msg.channel),
+            );
+            self.end_agent(&msg.channel, &key, &root_ts, &ctx(None), false, None, done).await;
             return;
         }
 
@@ -1197,7 +1231,7 @@ impl Bridge {
         &mut self,
         key: &ThreadKey,
         session_id: String,
-        farewell: Option<(String, String)>,
+        farewell: Option<worker::Farewell>,
         thinking: Option<crate::bridge::turn::PresenceHold>,
         ctx: &LogCtx,
     ) {
@@ -1313,18 +1347,72 @@ impl Bridge {
             let name = SessionId::from(sid.to_string()).window_name();
             self.deps.agent.pid_of(None, &name).is_some()
         });
-        self.ledger.retain_keys(&alive);
-        if all.is_empty() {
+        // **The agent's window is gone** — the machine rebooted or the tmux server died, which a plain
+        // restart never does. Dropping these silently left the request owed forever: the person or the
+        // asking agent kept waiting for an answer nobody would write. Wake the conversation once with
+        // what it was given; when that cannot be done, say the work was cut off.
+        //
+        // **An asked thread usually holds nothing in the ledger while it works**: its agent acknowledges
+        // first (a reply or a reaction settles the message) and keeps going. What stays is the answer it
+        // owes the asking agent (`ask_owed`), so those threads count too.
+        let window_alive = |sid: &str| {
+            let name = SessionId::from(sid.to_string()).window_name();
+            self.deps.agent.pid_of(None, &name).is_some()
+        };
+        let owed: Vec<ThreadKey> = self
+            .threads
+            .entries
+            .iter()
+            .filter(|(_, e)| !e.ask_owed.is_empty())
+            .filter_map(|(ts, e)| match (e.channel_id.as_deref(), e.agent_id.as_deref()) {
+                (Some(ch), Some(sid)) if !window_alive(sid) => Some(ThreadKey::new(ch, ts)),
+                _ => None,
+            })
+            .filter(|k| !all.contains(k))
+            .collect();
+        let lost: Vec<ThreadKey> = all
+            .iter()
+            .filter(|k| !alive.contains(k))
+            .cloned()
+            .chain(owed)
+            .collect();
+        let mut resumed = Vec::new();
+        for key in &lost {
+            let tctx = LogCtx {
+                session_id: None,
+                thread_key: Some(key.clone()),
+            };
+            if self.resume_cut_off(key, &tctx) {
+                resumed.push(key.clone());
+            } else {
+                self.tell_cut_off(key, &tctx);
+            }
+        }
+        let keep: Vec<ThreadKey> = alive.iter().chain(&resumed).cloned().collect();
+        self.ledger.retain_keys(&keep);
+        if all.is_empty() && lost.is_empty() {
             return;
+        }
+        // Written now, not on the next tick: the spent resume must survive a second restart that comes
+        // straight after, or the same request would be woken twice
+        if let Some(Err(e)) = self.ledger.flush(&mut self.threads) {
+            ctx.error("bridge", &format!("threads.json save failed: {e}"));
         }
         ctx.info(
             "bridge",
             &format!(
-                "restored {}/{} thread(s) with undisposed messages from the previous bridge process",
+                "restored {}/{} thread(s) with undisposed messages from the previous bridge process; \
+                 {} lost their agent's window, {} of them resumed",
                 alive.len(),
-                all.len()
+                all.len(),
+                lost.len(),
+                resumed.len()
             ),
         );
+        for key in resumed {
+            self.touch_thread(&key, false);
+            self.presence_add(&key, Reason::Turn);
+        }
         for key in alive {
             self.touch_thread(&key, false);
             // **The turn crossed the restart.** Its reason died with the process that set it, so
@@ -1332,6 +1420,148 @@ impl Bridge {
             // lands — which is how a thread sat showing "Claude is working…" for fifteen minutes.
             self.presence_add(&key, Reason::Turn);
         }
+    }
+
+    /// Wake a conversation whose agent vanished while it owed an answer, with the messages it was
+    /// working on (once at startup). True = an agent was started and the thread keeps waiting on it.
+    ///
+    /// Only once per message: the turn-failure re-send budget is spent here, so a request that keeps
+    /// killing its agent across restarts is not woken again and again.
+    fn resume_cut_off(&mut self, key: &ThreadKey, ctx: &LogCtx) -> bool {
+        let (channel, root) = key.split();
+        let Some(root_ts) = root else { return false };
+        let Some(sid) = self.threads.get(&root_ts).and_then(|e| e.agent_id.clone()) else {
+            ctx.info("bridge", &format!("cut off: {key} has no conversation to resume"));
+            return false;
+        };
+        if !self.deps.agent.session_history_exists(None, &sid) {
+            ctx.info("bridge", &format!("cut off: session={sid} has no history to resume"));
+            return false;
+        }
+        let (cwd, home_fallback) = self.thread_cwd(&root_ts, &channel);
+        if !home_fallback && !self.deps.agent.workdir_exists(&cwd) {
+            ctx.info("bridge", &format!("cut off: project folder {cwd} is missing"));
+            return false;
+        }
+        let undisposed = self.ledger.undisposed(key);
+        let owed = self.threads.get(&root_ts).map(|e| e.ask_owed.clone()).unwrap_or_default();
+        let (ids, prompt) = if !undisposed.is_empty() {
+            let ids: Vec<String> = undisposed.iter().map(|(id, _)| id.clone()).collect();
+            if !self
+                .ledger
+                .spend_retry(key, &ids, crate::bridge::turn::TURN_FAILURE_RETRY_CAP)
+            {
+                ctx.info(
+                    "bridge",
+                    &format!("cut off: {key} message_id=[{}] was already resumed once", ids.join(",")),
+                );
+                return false;
+            }
+            // The answer it owes is spent too: acknowledged after this wake, the request moves from the
+            // ledger to `ask_owed`, and a second loss must not wake it again from there
+            if let Some(e) = self.threads.entries.get_mut(&root_ts) {
+                e.owed_resumed = owed.iter().chain(&ids).cloned().collect();
+            }
+            let envelopes: Vec<&str> = undisposed.iter().map(|(_, env)| env.as_str()).collect();
+            (ids, resume_prompt(&envelopes))
+        } else if !owed.is_empty() {
+            // Acknowledged, still being worked on: the request is in the conversation already
+            let Some(e) = self.threads.entries.get_mut(&root_ts) else { return false };
+            if owed.iter().all(|id| e.owed_resumed.contains(id)) {
+                ctx.info(
+                    "bridge",
+                    &format!("cut off: {key} owed=[{}] was already resumed once", owed.join(",")),
+                );
+                return false;
+            }
+            e.owed_resumed = owed.clone();
+            if let Err(err) = self.threads.save() {
+                ctx.error("bridge", &format!("threads.json save failed: {err}"));
+            }
+            (owed.clone(), resume_owed_prompt(&owed))
+        } else {
+            ctx.info("bridge", &format!("cut off: {key} has nothing left to re-send"));
+            return false;
+        };
+        let Some((hooks_file, mcp)) = self.write_agent_files(&sid, ctx) else {
+            return false;
+        };
+        let req = SpawnReq {
+            session_id: sid.clone().into(),
+            cwd,
+            prompt: Some(prompt),
+            resume_from: Some(sid.clone().into()),
+            window: SessionId::from(sid.clone()).window_name(),
+            state: WorkerState::Absent,
+            hooks_file,
+            mcp_config: mcp,
+            moved_from: None,
+        };
+        self.spawn_worker(&req, key, ctx, &sid);
+        // A failed start already told the thread and settled it (`agent_never_started`)
+        if !self.workers.is_starting(&sid) {
+            return false;
+        }
+        ctx.info(
+            "bridge",
+            &format!(
+                "cut off: resuming session={sid} with message_id=[{}] after its window was lost",
+                ids.join(",")
+            ),
+        );
+        let machine = &self.machine_name;
+        self.post(
+            &channel,
+            &root_ts,
+            crate::t!(
+                "*{machine}* restarted while working on this. Picking up where it left off.",
+                "*{machine}* が作業の途中で再起動しました。続きから再開します。"
+            ),
+            key,
+        );
+        true
+    }
+
+    /// The work in `key` was cut off and could not be resumed: say so in the thread, and to the agent
+    /// that asked for it, so nobody waits for an answer that will never come.
+    fn tell_cut_off(&mut self, key: &ThreadKey, ctx: &LogCtx) {
+        // Only replies coming back from agents this thread asked = nobody is waiting on this thread
+        let returns = self.ledger.agent_return_ids(key);
+        let root_ts = key.split().1.unwrap_or_default();
+        let waited_on = self.ledger.pending(key).iter().any(|id| !returns.contains(id))
+            || self.threads.get(&root_ts).is_some_and(|e| !e.ask_owed.is_empty());
+        // A conversation with no history can never be resumed: the next message starts afresh
+        if let Some(e) = self.threads.entries.get_mut(&root_ts)
+            && let Some(sid) = e.agent_id.clone()
+            && !self.deps.agent.session_history_exists(None, &sid)
+        {
+            e.agent_id = None;
+            if let Err(err) = self.threads.save() {
+                ctx.error("bridge", &format!("threads.json save failed: {err}"));
+            }
+        }
+        self.tell_asker(
+            key,
+            "failed",
+            "the machine restarted while working on it and the work could not be resumed; \
+             send the request again"
+                .into(),
+        );
+        let (channel, root) = key.split();
+        let Some(root_ts) = root else { return };
+        if !waited_on {
+            return;
+        }
+        ctx.info("bridge", &format!("cut off: telling {key} to send it again"));
+        let machine = &self.machine_name;
+        self.post_error_frame(
+            channel,
+            root_ts,
+            crate::t!(
+                "*{machine}* restarted while working on this, and the work could not be resumed. Send it again to continue.",
+                "*{machine}* が作業の途中で再起動し、続きから再開できませんでした。続けるにはもう一度送ってください。"
+            ),
+        );
     }
 
     /// **Await** adding the ack. Fire-and-forget lets the flip on receipt (👀 remove → 🤖 add)
