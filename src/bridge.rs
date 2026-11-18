@@ -4511,6 +4511,61 @@ mod tests {
         );
     }
 
+    /// An asked thread whose agent acknowledged (⏳) and went on working: nothing is left in the ledger,
+    /// only the answer it owes. Running Bridge, before the reboot.
+    async fn acknowledged_asked_thread(name: &str) -> (Bridge, Arc<FakeChat>, Arc<FakeAgent>, Arc<FakeClock>) {
+        let (d, slack, agent, clock) = flow_deps(name);
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.ask_gateway = Some(mpsc::unbounded_channel().0);
+        b.on_inbound(&agent_msg(ROOT, ROOT, "check it", crate::chat::DeliveryKind::Ask)).await;
+        let sid = b.threads.get(ROOT).and_then(|e| e.agent_id.clone()).expect("an agent");
+        b.on_disposition(dispo("react", &[ROOT], None, &sid)).await;
+        assert!(b.ledger.pending(&ThreadKey::new("C_ADMIN", ROOT)).is_empty());
+        assert!(b.threads.get(ROOT).is_some_and(|e| !e.ask_owed.is_empty()), "the answer is owed");
+        (b, slack, agent, clock)
+    }
+
+    /// **The usual shape of a cut-off asked thread**: acknowledged, working, owing the answer. It is
+    /// woken once with a prompt naming what it owes; a second loss tells the asker instead.
+    #[tokio::test]
+    async fn an_acknowledged_request_cut_off_by_a_reboot_is_resumed_once() {
+        let before = acknowledged_asked_thread("reboot-owed").await;
+        let (mut b, slack, agent, clock, mut up, sid) = rebooted("reboot-owed", Some(before), true).await;
+        b.restore_pending(&LogCtx::default());
+        settle().await;
+
+        let spawned = agent.spawned.lock().unwrap().clone();
+        assert_eq!(spawned.len(), 1, "one agent woken");
+        assert_eq!(spawned[0].resume_from.as_ref().map(|s| s.as_str().to_string()), Some(sid));
+        let prompt = spawned[0].prompt.clone().unwrap_or_default();
+        assert!(prompt.contains("You still owe") && prompt.contains(ROOT), "{prompt}");
+        assert!(replies_up(&mut up).is_empty());
+
+        let (mut b, _slack, agent, _clock, mut up, _sid) =
+            rebooted("reboot-owed", Some((b, slack, agent, clock)), true).await;
+        b.restore_pending(&LogCtx::default());
+        settle().await;
+        assert!(agent.spawned.lock().unwrap().is_empty(), "woken a second time");
+        assert!(replies_up(&mut up).iter().any(|(o, t)| o == "failed" && t.contains("send the request again")));
+        assert!(b.threads.get(ROOT).is_some_and(|e| e.ask_owed.is_empty()), "no longer owed once told");
+    }
+
+    /// Acknowledged, and the conversation is gone: the start-up sweep keeps the row long enough for the
+    /// asker to be told, and the thread forgets the dead conversation.
+    #[tokio::test]
+    async fn an_acknowledged_request_with_no_history_tells_the_asker() {
+        let before = acknowledged_asked_thread("reboot-owed-gone").await;
+        let (mut b, slack, agent, _clock, mut up, _sid) = rebooted("reboot-owed-gone", Some(before), false).await;
+        b.forget_unresumable_threads(&LogCtx::default());
+        b.restore_pending(&LogCtx::default());
+        settle().await;
+
+        assert!(agent.spawned.lock().unwrap().is_empty());
+        assert!(replies_up(&mut up).iter().any(|(o, t)| o == "failed" && t.contains("send the request again")));
+        assert!(slack.calls().iter().any(|c| c.contains("Send it again")), "{:?}", slack.calls());
+        assert!(b.threads.get(ROOT).is_some_and(|e| e.agent_id.is_none()), "the dead conversation is forgotten");
+    }
+
     /// **Once only.** A second reboot before the answer tells instead of waking the same request again.
     #[tokio::test]
     async fn a_cut_off_request_is_resumed_only_once() {

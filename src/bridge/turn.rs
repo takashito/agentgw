@@ -611,6 +611,9 @@ impl Bridge {
 
     pub(in crate::bridge) fn set_owed(&mut self, root: &str, owed: Vec<String>) {
         let Some(e) = self.threads.entries.get_mut(root) else { return };
+        if owed.is_empty() {
+            e.owed_resumed.clear();
+        }
         e.ask_owed = owed;
         if let Err(err) = self.threads.save() {
             LogCtx::default().error("bridge", &format!("threads.json save failed: {err}"));

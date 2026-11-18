@@ -1166,7 +1166,8 @@ impl Bridge {
             let Some(sid) = e.agent_id.as_deref() else {
                 return true; // no agent yet — the thread is waiting for one
             };
-            agent.session_history_exists(None, sid) || live.contains_key(sid)
+            // Still owing another agent an answer: `restore_pending` tells that agent first
+            agent.session_history_exists(None, sid) || live.contains_key(sid) || !e.ask_owed.is_empty()
         });
         let dropped = before - self.threads.entries.len();
         if dropped == 0 {
