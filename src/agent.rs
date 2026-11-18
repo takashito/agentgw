@@ -867,6 +867,8 @@ pub mod fake {
         pub dirty_worktrees: Mutex<Vec<String>>,
         /// Folders `remove_worktree` was asked to take down and did.
         pub removed_worktrees: Mutex<Vec<String>>,
+        /// What `last_activity_ms` answers for every session (when its record was last written).
+        pub last_activity: Mutex<Option<u64>>,
         windows: Mutex<Vec<WindowRow>>,
         next: AtomicU64,
     }
@@ -1043,7 +1045,7 @@ pub mod fake {
             Some(Ok(()))
         }
         fn last_activity_ms(&self, _r: Option<&str>, _s: &str) -> Option<u64> {
-            None
+            *self.last_activity.lock().unwrap()
         }
         fn current_model(
             &self,

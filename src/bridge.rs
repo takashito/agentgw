@@ -293,6 +293,9 @@ pub struct Bridge {
     /// What each thread's agent is doing, for `thread_activity`. Written only here; the link
     /// handler reads it to answer the gateway.
     activity: crate::bridge::activity::ActivityRef,
+    /// How many agents were live when the cleanup last said it is over the cap with all of them at
+    /// work (0 = not over). Said again only when the count changes.
+    over_cap_logged: usize,
 }
 
 /// The outside world. Only `Bridge::run()` wires the real ones; tests fill it with fakes
@@ -495,6 +498,7 @@ impl Bridge {
             fleet: config.fleet,
             machine_name: config.machine_name,
             activity: config.activity,
+            over_cap_logged: 0,
         }
     }
 
@@ -4591,6 +4595,102 @@ mod tests {
         assert!(replies_up(&mut up).iter().any(|(o, t)| o == "failed" && t.contains("send the request again")));
         assert!(slack.calls().iter().any(|c| c.contains("Send it again")), "{:?}", slack.calls());
         assert!(b.threads.get(ROOT).is_some_and(|e| e.agent_id.is_none()), "the dead conversation is forgotten");
+    }
+
+    /// `n` threads, each with a live agent last written 5 minutes ago (warm: only the concurrency cap
+    /// can take one). Returns their keys, ROOT-independent.
+    fn seated(b: &mut Bridge, agent: &FakeAgent, n: usize) -> Vec<ThreadKey> {
+        *agent.last_activity.lock().unwrap() = Some(b.deps.clock.now_ms() - 5 * 60_000);
+        (0..n)
+            .map(|i| {
+                let sid = format!("18e90000-0000-4000-8000-{i:012}");
+                let ts = format!("1782000000.{:06}", 100 + i);
+                b.threads.entries.insert(ts.clone(), crate::bridge::state::ThreadEntry {
+                    channel_id: Some("C1".into()),
+                    agent_id: Some(sid.clone()),
+                    ..Default::default()
+                });
+                crate::agent::Agent::spawn(agent, &crate::agent::SpawnReq {
+                    session_id: sid.clone().into(),
+                    cwd: "/tmp".into(),
+                    prompt: None,
+                    resume_from: None,
+                    window: crate::agent::SessionId::from(sid).window_name(),
+                    state: crate::agent::WorkerState::Absent,
+                    hooks_file: String::new(),
+                    mcp_config: String::new(),
+                    moved_from: None,
+                })
+                .unwrap();
+                ThreadKey::new("C1", &ts)
+            })
+            .collect()
+    }
+
+    fn agent_alive(agent: &FakeAgent, n: usize) -> bool {
+        let name = crate::agent::SessionId::from(format!("18e90000-0000-4000-8000-{n:012}")).window_name();
+        crate::agent::Agent::pid_of(agent, None, &name).is_some()
+    }
+
+    /// **Over the cap, only an agent known to be done gives way.** One in a turn, one that acknowledged
+    /// and still owes its asker the answer, and one not seen since this Bridge started all stay; the
+    /// one whose turn ended goes.
+    #[tokio::test]
+    async fn over_the_cap_only_a_finished_agent_is_taken_down() {
+        let (d, _slack, agent, _clock) = flow_deps("evict-busy");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let keys = seated(&mut b, &agent, 11);
+        let now = b.deps.clock.now_ms();
+        {
+            let mut a = b.activity.lock().unwrap();
+            for k in &keys[..8] {
+                a.turn_start(k, now); // at work
+            }
+            a.turn_end(&keys[8], now); // finished, but owes its asker
+            a.turn_end(&keys[9], now); // finished
+            // keys[10]: nothing seen since start
+        }
+        b.threads.entries.get_mut(&keys[8].split().1.unwrap()).unwrap().ask_owed = vec!["9.9".into()];
+
+        // Asked, not done: tearing one down in a test would signal a real pid
+        let (snaps, _) = b.idle_snapshots(&b.live_windows());
+        let free: Vec<ThreadKey> = snaps.iter().filter(|s| s.eligible).map(|s| s.key.clone()).collect();
+        assert_eq!(free, vec![keys[9].clone()], "only the finished agent may give way");
+        assert_eq!(
+            crate::bridge::worker::select_cleanup_keys(snaps, &crate::bridge::worker::CLEANUP),
+            vec![keys[9].clone()]
+        );
+    }
+
+    /// **Every agent at work: run over the cap** rather than take one down, and say so once.
+    #[tokio::test]
+    async fn over_the_cap_with_everyone_at_work_nobody_is_taken_down() {
+        let (d, _slack, agent, _clock) = flow_deps("evict-none");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let keys = seated(&mut b, &agent, 12);
+        let now = b.deps.clock.now_ms();
+        for k in &keys {
+            b.activity.lock().unwrap().turn_start(k, now);
+        }
+
+        let live = b.live_windows();
+        b.evict_idle_worker(&live).await;
+
+        assert!((0..12).all(|n| agent_alive(&agent, n)));
+        assert_eq!(b.over_cap_logged, 12, "the over-cap line was not said");
+    }
+
+    /// An agent not seen since start is unknown: kept while warm, taken once cold past the absolute
+    /// limit — so one inherited and forgotten cannot stay forever.
+    #[tokio::test]
+    async fn an_agent_unseen_since_start_is_taken_only_when_long_cold() {
+        let (d, _slack, agent, _clock) = flow_deps("evict-unknown");
+        let (mut b, _fx) = Bridge::for_test(d);
+        seated(&mut b, &agent, 1);
+        let free = |b: &Bridge| b.idle_snapshots(&b.live_windows()).0[0].eligible;
+        assert!(!free(&b), "warm and unknown may be taken down");
+        *agent.last_activity.lock().unwrap() = Some(b.deps.clock.now_ms() - 61 * 60_000);
+        assert!(free(&b), "cold for an hour and still kept");
     }
 
     /// **Once only.** A second reboot before the answer tells instead of waking the same request again.
