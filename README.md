@@ -410,6 +410,18 @@ cargo dist              # release binaries: macOS (arm64), Linux (x86_64, musl),
 
 `cargo dist` needs [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild), zig, and `rustup target add` for each target. For a development instance next to a real one, use a separate `AGENTGW_STATE_DIR` **and a separate Slack app**.
 
+### Release notes
+
+Every GitHub release carries its notes from [CHANGELOG.md](CHANGELOG.md), and `scripts/release.sh` stops if the version has none. Before releasing:
+
+1. Rename `## [Unreleased]` to `## [x.y.z] - YYYY-MM-DD` (the version in `Cargo.toml`) and start a new empty `## [Unreleased]` above it.
+2. Group the changes under the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) headings, in this order, leaving out the empty ones: `### Added`, `### Changed`, `### Deprecated`, `### Removed`, `### Fixed`, `### Security`.
+3. Write one `- ` line per change a user can notice, in English: what is different now, not how it was done. Add the issue ID at the end when there is one, e.g. `(WORK-57)`. Internal refactoring and test-only changes are left out.
+4. Work from `git log v<previous>..HEAD` — the commit subjects and bodies are the source.
+5. Run `./scripts/release.sh --check` to see the notes as they will be published. Then `cargo dist`, `git push`, `./scripts/release.sh`.
+
+To fix the notes of a release that is already out, edit its section and run `gh release edit v<x.y.z> --notes-file <file>` — never move the tag.
+
 Issues and pull requests are welcome — [open an issue](https://github.com/takashito/agentgw/issues) for bugs and questions.
 
 ## License

@@ -402,6 +402,18 @@ cargo dist              # 配布用バイナリ: macOS(arm64)、Linux(x86_64、m
 
 `cargo dist` には [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild)、zig、ターゲットごとの `rustup target add` が必要です。本番環境と並行して開発用インスタンスを動かす場合は、`AGENTGW_STATE_DIR` に加えて **Slack アプリも別に**用意してください。
 
+### リリースノート
+
+GitHub のリリースには毎回 [CHANGELOG.md](CHANGELOG.md) からリリースノートが付きます。その版の節が無ければ `scripts/release.sh` は止まります。リリースの前に:
+
+1. `## [Unreleased]` を `## [x.y.z] - YYYY-MM-DD`(`Cargo.toml` の版)に改め、その上に空の `## [Unreleased]` を置く
+2. 変更を [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) の見出しに分ける。順番は `### Added`、`### Changed`、`### Deprecated`、`### Removed`、`### Fixed`、`### Security`(空の見出しは書かない)
+3. 利用者に見える変更を1つにつき `- ` の1行で、**英語で**書く。どうやったかではなく、何が変わったか。Issue 番号があれば末尾に `(WORK-57)` のように添える。内部の整理やテストだけの変更は書かない
+4. 元にするのは `git log v<前の版>..HEAD` のコミットの件名と本文
+5. `./scripts/release.sh --check` で公開される文面を確かめてから、`cargo dist`、`git push`、`./scripts/release.sh`
+
+公開済みのリリースのノートを直すときは、その節を直して `gh release edit v<x.y.z> --notes-file <ファイル>`。タグは動かしません。
+
 Issue や Pull Request は歓迎します。バグ報告や質問は [Issue](https://github.com/takashito/agentgw/issues) からどうぞ。
 
 ## ライセンス
