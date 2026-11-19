@@ -62,6 +62,9 @@ fn tmux_bin() -> String {
 #[cfg(windows)]
 const WINDOWS_SERVER: &str = "agentgw";
 
+/// The spare window the session starts with on Windows (see [`Tmux::spawn`]).
+pub const ANCHOR_WINDOW: &str = "_anchor";
+
 /// agentgw's psmux settings on Windows, used instead of the user's `~/.psmux.conf`: **Windows
 /// PowerShell 5.1 as the shell**. The user's own psmux may well use `pwsh`, and on a machine with
 /// only the Store build of PowerShell 7 that cannot start outside a desktop ("Access is denied" in
@@ -283,7 +286,20 @@ impl Tmux {
             .unwrap_or_default();
         #[cfg(not(windows))]
         let window_env: Vec<String> = Vec::new();
-        let id = if (self.run)(&["has-session", "-t", TMUX_SESSION]).is_err() {
+        let missing = (self.run)(&["has-session", "-t", TMUX_SESSION]).is_err();
+        let id = if cfg!(windows) && missing {
+            // Windows: the session starts with a spare window that runs nothing, so the psmux server
+            // **does not end when the last agent does** (it ends with its last window). An agent dying
+            // used to take the server down with it, and every other agent on the machine too.
+            // Not an agent window (`_anchor` has no session id), so nothing counts or reaps it
+            let args = vec!["new-session", "-d", "-s", TMUX_SESSION, "-x", x, "-y", y, "-n", ANCHOR_WINDOW, "-c", cwd];
+            (self.run)(&args)?;
+            self.pin_session_size(&[("window-size", "manual")]);
+            let mut args = vec!["new-window", "-d", "-t", TMUX_SESSION];
+            args.extend(window_env.iter().map(String::as_str));
+            args.extend(["-n", window, "-c", cwd, "-P", "-F", "#{window_id}", line]);
+            (self.run)(&args)?
+        } else if missing {
             let mut args = vec!["new-session", "-d", "-s", TMUX_SESSION, "-x", x, "-y", y];
             args.extend(window_env.iter().map(String::as_str));
             args.extend(["-n", window, "-c", cwd, "-P", "-F", "#{window_id}", line]);

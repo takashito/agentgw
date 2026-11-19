@@ -4793,6 +4793,9 @@ impl Fleet {
                 .map(|(_, r)| r.clone());
             let online = self.thread_online(to_channel, thread).await;
             check_follow_up(row.as_ref(), from_channel, from_thread, online)?;
+            if let Some(prev) = row.as_ref().filter(|r| crate::bridge::asks::takes_over(r, from_channel, from_thread)) {
+                self.take_over_ask(to_channel, thread, prev, from_thread).await;
+            }
             let (line, line_link) = self.post_asked_line(from_channel, from_thread, to_channel, &title, true).await?;
             let shown = format!("{}{named}\n\n{text}", ask_heading(given, from_channel, &line_link, true));
             let ts = crate::bridge::turn::post_chunked(self.api.as_ref(), self.dir.path(), to_channel, &shown, Some(thread), true).await?;
@@ -5155,6 +5158,29 @@ impl Fleet {
     }
 
     /// Change an ask in place (nothing happens for a thread nobody asked).
+    /// Another thread of the channel that asked sent a follow-up into `channel`/`thread`: the exchange
+    /// moves to it (`new_thread`). Replies, "a person is needed" notices and `end_ask` go there from
+    /// now on, and the thread that asked before is told so in one line. A closed asking thread no
+    /// longer drops the replies — they go to the thread that took over.
+    async fn take_over_ask(&self, channel: &str, thread: &str, prev: &crate::bridge::state::AskedFrom, new_thread: &str) {
+        let to = new_thread.to_string();
+        self.edit_ask(channel, thread, |r| {
+            r.thread_ts = to;
+            r.origin_closed = false;
+        })
+        .await;
+        rlog("info", &format!("ask: {channel}:{thread} taken over by {}:{new_thread} (was {})", prev.channel, prev.thread_ts));
+        let link = self.api.get_permalink(&prev.channel, new_thread).await.unwrap_or_default();
+        let name = self.channel_label(channel).await;
+        let said = crate::t!(
+            ":twisted_rightwards_arrows: [Another thread]({link}) took over the request to {name}; its replies go there now.",
+            ":twisted_rightwards_arrows: {name} への依頼は[別のスレッド]({link})が引き継ぎました。返事は以後そちらに届きます。"
+        );
+        if let Err(e) = self.api.post_markdown(&prev.channel, &said, Some(&prev.thread_ts)).await {
+            rlog("error", &format!("ask: could not tell {}:{} it was taken over: {e}", prev.channel, prev.thread_ts));
+        }
+    }
+
     async fn edit_ask(&self, channel: &str, thread: &str, f: impl FnOnce(&mut crate::bridge::state::AskedFrom)) {
         self.write_ask(channel, thread, |slot| {
             if let Some(row) = slot {
@@ -9831,7 +9857,7 @@ mod ask_tests {
         let thread = out["thread_ts"].as_str().unwrap();
         r.fleet.ask("C1", "1.1", "C2", Some(thread), "second", None, &[]).await.unwrap();
         assert_eq!(r.msgs.try_recv().unwrap().text, "second");
-        assert!(r.fleet.ask("C9", "9.9", "C2", Some(thread), "x", None, &[]).await.is_err(), "another thread may not follow up");
+        assert!(r.fleet.ask("C9", "9.9", "C2", Some(thread), "x", None, &[]).await.is_err(), "another channel may not follow up");
     }
 
     #[tokio::test]
@@ -9876,6 +9902,47 @@ mod ask_tests {
         assert_eq!((o.kind, o.channel.as_deref(), o.thread_ts.as_deref()), (DeliveryKind::Reply, Some("C2"), Some(thread.as_str())));
         assert!(calls(&r.api).iter().any(|c| c.contains(" C1 1.1 ") && c.contains("https://slack/C2/2.9")), "a line in the asking thread");
         assert!(!r.fleet.asks.lock().await[&thread].1.outstanding);
+    }
+
+    /// A request left hanging in C1/1.1 is picked up from C1/9.9: the follow-up goes in, the exchange
+    /// moves to 9.9 (replies, `end_ask`), and 1.1 is told in one line.
+    #[tokio::test]
+    async fn a_follow_up_from_another_thread_of_the_channel_takes_the_exchange_over() {
+        let (mut r, thread) = approved("takeover").await;
+        let before = calls(&r.api).len();
+        let out = r.fleet.ask("C1", "9.9", "C2", Some(&thread), "where are you?", None, &[]).await.unwrap();
+        assert_eq!(out["status"], "delivered");
+        let m = r.msgs.try_recv().expect("the follow-up reaches the asked thread");
+        assert_eq!((m.channel.as_str(), m.thread_ts.as_deref()), ("C2", Some(thread.as_str())));
+        let o = m.from_agent.unwrap();
+        assert_eq!((o.channel.as_deref(), o.thread_ts.as_deref()), (Some("C1"), Some("9.9")), "the asked agent answers the new thread");
+        let row = r.fleet.asks.lock().await[&thread].1.clone();
+        assert_eq!((row.channel.as_str(), row.thread_ts.as_str()), ("C1", "9.9"));
+        let said = &calls(&r.api)[before..];
+        assert!(said.iter().any(|c| c.starts_with("post_md C1 1.1 ") && c.contains("took over")), "{said:?}");
+        // The answer goes to the thread that took over
+        r.fleet.on_machine_frame("parent", reply_frame(&thread, "reply", "here")).await;
+        let m = r.msgs.try_recv().expect("delivered to the new asker");
+        assert_eq!((m.channel.as_str(), m.thread_ts.as_deref(), m.text.as_str()), ("C1", Some("9.9"), "here"));
+        // Only the thread it belongs to now may close it
+        assert!(r.fleet.end_ask("C1", "1.1", "C2", &thread, false).await.is_err(), "the old thread");
+        assert!(r.fleet.end_ask("C1", "9.9", "C2", &thread, false).await.is_ok());
+        assert!(r.fleet.ask("C1", "9.9", "C2", Some(&thread), "more", None, &[]).await.unwrap_err().contains("new thread"), "closed stays closed");
+    }
+
+    /// The thread that asked was closed (`exit`), which drops replies: picking the request up from
+    /// another thread brings them back there.
+    #[tokio::test]
+    async fn taking_over_from_a_closed_thread_gets_the_replies_again() {
+        let (mut r, thread) = approved("takeoverclosed").await;
+        r.fleet.on_machine_frame("parent", link::LinkFrame::AskEnded { channel: "C1".into(), thread_ts: "1.1".into() }).await;
+        assert!(r.fleet.asks.lock().await[&thread].1.origin_closed);
+        r.fleet.ask("C1", "9.9", "C2", Some(&thread), "go on", None, &[]).await.unwrap();
+        let _ = r.msgs.try_recv();
+        assert!(!r.fleet.asks.lock().await[&thread].1.origin_closed);
+        r.fleet.on_machine_frame("parent", reply_frame(&thread, "reply", "done")).await;
+        let m = r.msgs.try_recv().expect("delivered to the thread that took over");
+        assert_eq!((m.thread_ts.as_deref(), m.text.as_str()), (Some("9.9"), "done"));
     }
 
     #[tokio::test]
@@ -10325,9 +10392,13 @@ mod ask_tests {
     }
 
     #[tokio::test]
-    async fn only_the_asking_thread_may_read_activity() {
+    async fn only_the_asking_channel_may_read_activity() {
         let (r, thread) = approved("activityother").await;
-        assert!(r.fleet.thread_activity("C9", "9.9", "C2", &thread).await.unwrap_err().contains("only read threads you asked"));
+        assert!(r.fleet.thread_activity("C9", "9.9", "C2", &thread).await.unwrap_err().contains("threads this channel asked"));
+        // Another thread of the channel that asked may read it (machine offline here: a state, not an error)
+        r.fleet.thread_routes.lock().await.insert(thread.clone(), "pve".into());
+        assert_eq!(r.fleet.thread_activity("C1", "9.9", "C2", &thread).await.unwrap()["state"], "machine_offline");
+        r.fleet.thread_routes.lock().await.remove(&thread);
         assert!(r.fleet.thread_activity("C1", "1.1", "C3", &thread).await.is_err(), "the wrong channel");
         assert!(r.fleet.thread_activity("C1", "1.1", "C2", "7.7").await.is_err(), "a thread nobody asked");
         // An ended exchange can still be read

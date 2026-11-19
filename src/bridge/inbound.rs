@@ -343,11 +343,19 @@ impl Bridge {
     /// oversized file doesn't take the user's text or other attachments down with it.
     /// Write down which thread asked this one, so a person needed here can be announced there.
     /// **A record already there is kept**: on the gateway the same row also carries the gateway's own
-    /// bookkeeping of the exchange, which this must not overwrite.
+    /// bookkeeping of the exchange, which this must not overwrite. Only its thread moves, when another
+    /// thread of the same channel took the exchange over (the gateway has moved its own row already).
     fn note_asked_from(&mut self, root_ts: &str, channel: &str, from: Option<&crate::chat::AgentOrigin>) {
         let Some(o) = from else { return };
         let (Some(c), Some(t)) = (o.channel.clone(), o.thread_ts.clone()) else { return };
-        if self.threads.get(root_ts).is_some_and(|e| e.asked_from.is_some()) {
+        if let Some(prev) = self.threads.get(root_ts).and_then(|e| e.asked_from.clone()) {
+            if prev.channel == c && prev.thread_ts != t {
+                let moved = crate::bridge::state::AskedFrom { thread_ts: t, origin_closed: false, ..prev };
+                self.threads.set_asked(root_ts, channel, Some(moved));
+                if let Err(e) = self.threads.save() {
+                    LogCtx::default().error("bridge", &format!("threads.json save failed: {e}"));
+                }
+            }
             return;
         }
         let row = crate::bridge::state::AskedFrom {

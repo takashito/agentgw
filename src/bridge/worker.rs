@@ -1051,8 +1051,81 @@ impl Bridge {
         }
         // One list for both halves — each used to fetch its own
         let live = self.live_windows();
+        self.notice_lost_agents(&live);
         self.reap_stray_windows().await;
         self.evict_idle_worker(&live).await;
+    }
+
+    /// Notices an agent that **died at work** — its window gone while it was in a turn, or while
+    /// it still owed the agent that asked an answer — and says so: in the thread, and to that agent.
+    ///
+    /// Nothing else would. A dead agent sends no hook, so its turn never ends: `thread_activity`
+    /// kept saying "running", and the person and the asking agent waited for an answer nobody would
+    /// write (on a real machine, the whole tmux server went down with an agent's background
+    /// command, taking every agent with it). **Not woken again by itself**: what killed it may well
+    /// kill it again. The next message to the thread starts it with `--resume`, as after any teardown.
+    ///
+    /// **Two rounds in a row** before it counts: one failed window listing is not a crash.
+    /// Agents the cleanup tore down are never in a turn, so they never show up here.
+    pub(super) fn notice_lost_agents(&mut self, live: &HashMap<String, String>) {
+        let busy: Vec<(ThreadKey, String)> = self
+            .threads
+            .entries
+            .iter()
+            .filter_map(|(ts, e)| {
+                let (Some(channel), Some(sid)) = (e.channel_id.as_deref(), e.agent_id.as_deref()) else {
+                    return None;
+                };
+                if live.contains_key(sid) || self.workers.is_starting(sid) {
+                    return None;
+                }
+                let key = ThreadKey::new(channel, ts);
+                let at_work = self.activity.lock().is_ok_and(|a| a.busy(&key)) || !e.ask_owed.is_empty();
+                at_work.then(|| (key, sid.to_string()))
+            })
+            .collect();
+        let mut suspects = std::collections::HashSet::new();
+        for (key, sid) in busy {
+            if !self.lost_suspects.contains(&sid) {
+                suspects.insert(sid);
+                continue;
+            }
+            self.agent_lost(&key, &sid);
+        }
+        self.lost_suspects = suspects;
+    }
+
+    fn agent_lost(&mut self, key: &ThreadKey, sid: &str) {
+        let ctx = LogCtx {
+            session_id: Some(sid.to_string()),
+            thread_key: Some(key.clone()),
+        };
+        ctx.error(
+            "bridge",
+            "agent lost: its window is gone while it was at work (it crashed, or the tmux server went down) — telling the thread",
+        );
+        self.note_activity(|b, now| b.agent_lost(key, now));
+        self.tell_asker_agent_lost(
+            key,
+            "the agent there stopped unexpectedly in the middle of the work (its window disappeared); \
+             send a message in that thread to start it again from the conversation"
+                .into(),
+        );
+        // Settled: the silence watch, "working…" and the unanswered messages all go — nothing will
+        // answer them now, and the notice below is the thread's answer
+        self.settle_told(key);
+        self.presence_clear(key);
+        let (channel, root) = key.split();
+        let Some(root_ts) = root else { return };
+        let machine = &self.machine_name;
+        self.post_error_frame(
+            channel,
+            root_ts,
+            crate::t!(
+                "The agent on *{machine}* stopped unexpectedly in the middle of this work. Send a message to start it again; it picks up from the conversation.",
+                "*{machine}* のエージェントが作業の途中で止まりました。続けるにはメッセージを送ってください。会話の続きから再開します。"
+            ),
+        );
     }
 
     /// Closes windows that belong to nobody (empty and orphaned windows).

@@ -335,7 +335,6 @@ impl Bridge {
     }
 
     /// Drops every reason a thread holds (the turn was abandoned, or the thread is gone).
-    #[allow(dead_code)]
     pub(super) fn presence_clear(&self, key: &ThreadKey) {
         let change = self.presence.lock().ok().and_then(|mut b| b.clear(key));
         self.presence_send(key, change);
@@ -659,6 +658,26 @@ impl Bridge {
             return;
         }
         self.send_agent_reply(key, &root, "delayed", text, String::new(), false, false);
+    }
+
+    /// This thread's agent died at work. Tell the agent that asked for the thread — **even when its
+    /// request was already answered**: an asker still following the work (the exchange is open)
+    /// would otherwise wait for a progress report or a final answer that will never come.
+    pub(super) fn tell_asker_agent_lost(&mut self, key: &ThreadKey, text: String) {
+        let Some(root) = key.split().1 else { return };
+        let owed = self.threads.get(&root).is_some_and(|e| !e.ask_owed.is_empty());
+        if owed || !self.ledger.from_agent_ids(key).is_empty() {
+            self.tell_asker(key, "failed", text);
+            return;
+        }
+        let following = self
+            .threads
+            .get(&root)
+            .and_then(|e| e.asked_from.as_ref())
+            .is_some_and(|a| a.state == crate::bridge::state::AskState::Approved && !a.origin_closed);
+        if following {
+            self.send_agent_reply(key, &root, "failed", text, String::new(), false, false);
+        }
     }
 
     /// A person deleted one request from another channel's agent (not the thread's root): that request

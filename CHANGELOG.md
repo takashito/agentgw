@@ -8,6 +8,9 @@ in [README.md](README.md#release-notes).
 
 ## [Unreleased]
 
+### Added
+- Any thread of a channel can check on, and follow up, a request that channel sent to another channel, not only the thread that sent it. The thread that follows up takes the request over and gets its replies.
+
 ### Changed
 - Agents started by agentgw no longer show the grey prompt suggestion in their input box.
 - When a request from Claude in another channel never reaches the agent there, the asking Claude is now told it was not delivered, when, and why, instead of being told the other agent failed.
