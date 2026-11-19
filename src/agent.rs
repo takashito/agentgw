@@ -162,11 +162,23 @@ impl WindowRow {
 
     /// Whether this is a husk where claude is gone and only the shell is left.
     /// Login shells carry a leading `-`, like `-zsh`.
+    ///
+    /// **Never on Windows.** psmux names the newest process in the pane, not the pane's foreground
+    /// one, so a live claude running its Bash tool reads as `bash` (and its PowerShell tool as `pwsh`).
+    /// Reading that as a husk killed working agents whenever a Bash command spanned the 60s sweep
+    /// (measured 2026-11-19: 18 times, every one `command=bash`). Nothing is lost by not asking:
+    /// a Windows agent runs as the pane's one `pwsh -Command` line, so when claude exits the window
+    /// closes with it and no husk is left.
     pub fn is_empty_shell(&self) -> bool {
-        matches!(
-            self.command.trim().trim_start_matches('-'),
-            "zsh" | "bash" | "sh" | "fish" | "dash" | "ksh"
-        )
+        Self::shell_left_behind(&self.command, cfg!(windows))
+    }
+
+    fn shell_left_behind(command: &str, windows: bool) -> bool {
+        !windows
+            && matches!(
+                command.trim().trim_start_matches('-'),
+                "zsh" | "bash" | "sh" | "fish" | "dash" | "ksh"
+            )
     }
 }
 
@@ -1414,6 +1426,20 @@ mod tests {
         // Multiple notes are joined with newlines
         let two = envelope_with(Vec::new(), vec!["[a]".into(), "[b]".into()]);
         assert!(two.contains("file_errors=\"[a]\n[b]\">"), "{two}");
+    }
+
+    /// psmux names the newest process in the pane: a live claude running its Bash tool reads as
+    /// `bash`. On Windows no name means "claude is gone" — tmux keeps reading shells as husks.
+    #[test]
+    fn a_shell_name_is_a_husk_only_off_windows() {
+        for shell in ["bash", "-bash", "zsh", "sh"] {
+            assert!(WindowRow::shell_left_behind(shell, false), "{shell} on tmux");
+            assert!(!WindowRow::shell_left_behind(shell, true), "{shell} on psmux");
+        }
+        for live in ["claude", "pwsh", "powershell", "node"] {
+            assert!(!WindowRow::shell_left_behind(live, false), "{live}");
+            assert!(!WindowRow::shell_left_behind(live, true), "{live}");
+        }
     }
 
     #[tokio::test]
