@@ -65,16 +65,6 @@ const WINDOWS_SERVER: &str = "agentgw";
 /// The spare window the session starts with on Windows (see [`Tmux::spawn`]).
 pub const ANCHOR_WINDOW: &str = "_anchor";
 
-/// Environment every agent window gets on Windows, on top of `PATH`.
-///
-/// **No background commands.** On Windows, Claude Code exits when a Bash command it started with
-/// `run_in_background` finishes (measured 2026-11-19: four times out of four, each at the moment the
-/// command ended). The agent's turn and its thread went with it, and when it was the last window, the
-/// psmux server too. Claude Code's own switch turns background commands off; long commands then run
-/// in the foreground, which is what that machine's notes already told the agent to do.
-#[cfg(windows)]
-const WINDOWS_AGENT_ENV: &[(&str, &str)] = &[("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1")];
-
 /// agentgw's psmux settings on Windows, used instead of the user's `~/.psmux.conf`: **Windows
 /// PowerShell 5.1 as the shell**. The user's own psmux may well use `pwsh`, and on a machine with
 /// only the Store build of PowerShell 7 that cannot start outside a desktop ("Access is denied" in
@@ -293,10 +283,7 @@ impl Tmux {
         #[cfg(windows)]
         let window_env: Vec<String> = agents_path()
             .map(|p| vec!["-e".to_string(), format!("PATH={}", p.to_string_lossy())])
-            .unwrap_or_default()
-            .into_iter()
-            .chain(WINDOWS_AGENT_ENV.iter().flat_map(|(k, v)| ["-e".to_string(), format!("{k}={v}")]))
-            .collect();
+            .unwrap_or_default();
         #[cfg(not(windows))]
         let window_env: Vec<String> = Vec::new();
         let missing = (self.run)(&["has-session", "-t", TMUX_SESSION]).is_err();
