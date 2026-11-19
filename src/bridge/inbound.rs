@@ -43,6 +43,18 @@ const DELIVERY_RETRY_WAIT_MS: u64 = 30_000;
 /// fine.
 const RECEIPT_GRACE_MS: u64 = 180_000;
 
+/// How long a window may keep refusing a message before the agent that asked for this thread (another
+/// channel's) is told it has not got through. A passing refusal clears within a retry or two
+/// ([`DELIVERY_RETRY_WAIT_MS`] apart), so this is four of them: only trouble that stays is reported.
+const ASKER_UNDELIVERED_MS: u64 = 120_000;
+
+/// A time of day for a notice to another agent, in UTC (`05:53 UTC`).
+fn utc_clock(ms: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms as i64)
+        .map(|t| t.format("%H:%M UTC").to_string())
+        .unwrap_or_default()
+}
+
 /// `title` is the thread's current name (`None` = it has none yet, sent as an empty `thread_title`).
 pub fn envelope(msg: &InboundMsg, root_ts: &str, title: Option<&str>, now_ms: u64) -> String {
     envelope_guarded(msg, root_ts, title, None, now_ms)
@@ -1875,24 +1887,25 @@ impl Bridge {
                 );
                 // **Told once per spell of trouble.** The message stays queued and the tick keeps trying,
                 // so without this the thread fills with the same warning every couple of seconds
-                let told = self
-                    .delivery_trouble
-                    .get(&done.window)
-                    .is_some_and(|t| t.told);
-                self.delivery_trouble.insert(
-                    done.window.clone(),
-                    crate::bridge::DeliveryTrouble {
-                        retry_after_ms: self.deps.clock.now_ms() + DELIVERY_RETRY_WAIT_MS,
-                        told: true,
-                    },
-                );
+                let now = self.deps.clock.now_ms();
+                let before = self.delivery_trouble.get(&done.window).cloned();
+                let told = before.as_ref().is_some_and(|t| t.told);
+                let mut trouble = before.unwrap_or(crate::bridge::DeliveryTrouble {
+                    retry_after_ms: 0,
+                    told: false,
+                    since_ms: now,
+                    dialog: false,
+                    asker_told: false,
+                });
+                trouble.retry_after_ms = now + DELIVERY_RETRY_WAIT_MS;
+                trouble.told = true;
                 if !told {
                     // A modal is the one refusal a person can lift from here: offer its rows as
                     // buttons instead of a warning nobody can act on without the machine
-                    if !self
+                    trouble.dialog = self
                         .offer_dialog(&done.window, &channel, &root_ts, &ctx)
-                        .await
-                    {
+                        .await;
+                    if !trouble.dialog {
                         self.post_error_frame(
                             channel,
                             root_ts,
@@ -1900,6 +1913,22 @@ impl Bridge {
                         );
                     }
                 }
+                // **The agent that asked hears it too, once, when it stays.** It is not a failure: the
+                // message is still queued and its answer comes as usual once it goes in. A dialog has
+                // already told that thread a person is needed
+                if !trouble.asker_told && !trouble.dialog && now.saturating_sub(trouble.since_ms) >= ASKER_UNDELIVERED_MS {
+                    trouble.asker_told = true;
+                    let since = utc_clock(trouble.since_ms);
+                    self.warn_asker(
+                        &done.key,
+                        format!(
+                            "it has been refused since {since} ({e}); it stays queued and is tried again every \
+                             {} seconds",
+                            DELIVERY_RETRY_WAIT_MS / 1000
+                        ),
+                    );
+                }
+                self.delivery_trouble.insert(done.window.clone(), trouble);
             }
         }
     }
@@ -1951,13 +1980,30 @@ impl Bridge {
                 "bridge",
                 &format!("message_id={ts} was typed in but never reached the agent"),
             );
+            // **Still in the box, a resend only adds to it** — the next body lands behind this one and
+            // is not sent either. Stop clears the box (it sends Escape); after that a resend goes in
+            let stuck = self.deps.agent.input_left(&Window::of(&window));
+            // The agent that asked hears what happened, not "its turn failed": nothing was done with it
+            let typed = utc_clock(now.saturating_sub(RECEIPT_GRACE_MS));
+            self.tell_asker(
+                &key,
+                "undelivered",
+                if stuck {
+                    format!(
+                        "it was typed into that agent's input box at {typed} and is still sitting there unsent; \
+                         a resend would only pile up behind it until a person presses stop in that thread"
+                    )
+                } else {
+                    format!(
+                        "it was typed in at {typed}, but nothing shows the agent took it in; send it again in \
+                         the same thread if it still matters"
+                    )
+                },
+            );
             self.settle_told(&key);
             let (channel, Some(thread_ts)) = key.split() else {
                 continue;
             };
-            // **Still in the box, a resend only adds to it** — the next body lands behind this one and
-            // is not sent either. Stop clears the box (it sends Escape); after that a resend goes in
-            let stuck = self.deps.agent.input_left(&Window::of(&window));
             self.post_error_frame(
                 channel,
                 thread_ts,

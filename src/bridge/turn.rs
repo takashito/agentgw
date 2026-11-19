@@ -650,6 +650,17 @@ impl Bridge {
         }
     }
 
+    /// Tell the agent that asked for this thread that its request has **not got through yet** — without
+    /// ending anything: the request stays owed and the answer comes as usual once it goes in.
+    pub(super) fn warn_asker(&mut self, key: &ThreadKey, text: String) {
+        let Some(root) = key.split().1 else { return };
+        let owed = self.threads.get(&root).is_some_and(|e| !e.ask_owed.is_empty());
+        if self.ledger.from_agent_ids(key).is_empty() && !owed {
+            return;
+        }
+        self.send_agent_reply(key, &root, "delayed", text, String::new(), false, false);
+    }
+
     /// A person deleted one request from another channel's agent (not the thread's root): that request
     /// is cancelled, and the agent that asked hears so. The thread itself goes on.
     pub(super) fn cancel_ask(&mut self, key: &ThreadKey, deleted: &str) {

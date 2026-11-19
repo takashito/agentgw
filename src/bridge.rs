@@ -409,11 +409,18 @@ pub(crate) struct DialogPending {
 }
 
 /// A window that would not take a delivery.
+#[derive(Clone)]
 pub(crate) struct DeliveryTrouble {
     /// Nothing is tried again before this.
     pub retry_after_ms: u64,
     /// The thread has been told once; saying it again on every retry is noise, not news.
     pub told: bool,
+    /// When this spell of trouble began — the first refusal.
+    pub since_ms: u64,
+    /// The first notice offered a dialog's buttons: the asking thread already heard "a person is needed".
+    pub dialog: bool,
+    /// The thread that asked for this one (another channel's agent) has been told it is not through yet.
+    pub asker_told: bool,
 }
 
 /// One delivery in flight, keyed by window. **Set in one place, cleared in one place.**
@@ -5176,6 +5183,82 @@ mod tests {
         let calls = slack.calls();
         assert!(calls.iter().any(|c| c.contains("still sitting in the agent's input box")), "{calls:?}");
         assert!(!calls.iter().any(|c| c.contains("Send it again if")), "{calls:?}");
+    }
+
+    /// An asked thread with deliveries running off the loop, its first request answered. Returns the
+    /// frames going up to the gateway, the delivery reports, and the fakes.
+    async fn asked_thread_with_deliveries(
+        name: &str,
+    ) -> (Bridge, mpsc::UnboundedReceiver<crate::bridge::gateway::link::LinkFrame>, mpsc::Receiver<DeliveryDone>, Arc<FakeAgent>, Arc<FakeClock>) {
+        let (d, _slack, agent, clock) = flow_deps(name);
+        let ((mut b, _fx), mut deliv) = Bridge::for_test_with_deliveries(d);
+        let (tx, mut up) = mpsc::unbounded_channel();
+        b.ask_gateway = Some(tx);
+        b.on_inbound(&agent_msg(ROOT, ROOT, "check it", crate::chat::DeliveryKind::Ask)).await;
+        let sid = b.threads.get(ROOT).and_then(|e| e.agent_id.clone()).expect("an agent");
+        on_hook_user_prompt_for_test(&mut b, &sid).await;
+        settle_deliveries(&mut b, &mut deliv).await;
+        b.on_disposition(dispo("reply", &[ROOT], Some("first done"), &sid)).await;
+        assert_eq!(replies_up(&mut up).iter().map(|(o, _)| o.as_str()).collect::<Vec<_>>(), vec!["reply"]);
+        (b, up, deliv, agent, clock)
+    }
+
+    /// **A follow-up that keeps being refused reaches the asker once, and only once it stays.** A
+    /// refusal that clears within a retry or two says nothing to the asking thread; one still there
+    /// after two minutes does, as "not through yet" — the request stays owed, so the answer that comes
+    /// once it goes in is passed on as usual, and nothing more is said when it does.
+    #[tokio::test]
+    async fn a_follow_up_refused_for_a_while_tells_the_asker_once() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (mut b, mut up, mut deliv, agent, clock) = asked_thread_with_deliveries("ask-refused").await;
+        agent.fail_deliver.store(true, SeqCst);
+        b.on_inbound(&agent_msg(ROOT, "1782000000.000950", "one more thing", crate::chat::DeliveryKind::Ask)).await;
+        settle_deliveries(&mut b, &mut deliv).await;
+        let mut said = Vec::new();
+        for _ in 0..3 {
+            clock.advance(30_000);
+            b.retry_pending(&LogCtx::default());
+            settle_deliveries(&mut b, &mut deliv).await;
+            said.extend(replies_up(&mut up));
+        }
+        assert!(said.is_empty(), "a passing refusal reached the asker: {said:?}");
+        for _ in 0..4 {
+            clock.advance(30_000);
+            b.retry_pending(&LogCtx::default());
+            settle_deliveries(&mut b, &mut deliv).await;
+            said.extend(replies_up(&mut up));
+        }
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert_eq!(said[0].0, "delayed");
+        assert!(said[0].1.contains("stays queued"), "{said:?}");
+        assert!(!b.ledger.from_agent_ids(&ThreadKey::new("C_ADMIN", ROOT)).is_empty(), "the request is still owed");
+
+        // It goes in at last: no further word to the asker
+        agent.fail_deliver.store(false, SeqCst);
+        clock.advance(30_000);
+        b.retry_pending(&LogCtx::default());
+        settle_deliveries(&mut b, &mut deliv).await;
+        assert!(agent.delivered.lock().unwrap().iter().any(|(_, t)| t.contains("one more thing")));
+        assert!(replies_up(&mut up).is_empty());
+    }
+
+    /// A follow-up typed in that never turns up reaches the asker as **not delivered** (with when and
+    /// why), not as "its turn failed" — and nothing is said to it before the grace is over.
+    #[tokio::test]
+    async fn a_follow_up_that_never_reaches_the_agent_tells_the_asker_it_was_not_delivered() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (mut b, mut up, mut deliv, agent, clock) = asked_thread_with_deliveries("ask-unreceived").await;
+        b.on_inbound(&agent_msg(ROOT, "1782000000.000950", "one more thing", crate::chat::DeliveryKind::Ask)).await;
+        settle_deliveries(&mut b, &mut deliv).await;
+        b.warn_unreceived(&LogCtx::default());
+        assert!(replies_up(&mut up).is_empty(), "told within the grace");
+
+        agent.input_left.store(true, SeqCst);
+        clock.advance(200_000);
+        b.warn_unreceived(&LogCtx::default());
+        let said = replies_up(&mut up);
+        assert_eq!(said.iter().map(|(o, _)| o.as_str()).collect::<Vec<_>>(), vec!["undelivered"], "{said:?}");
+        assert!(said[0].1.contains("still sitting there unsent") && said[0].1.contains("UTC"), "{said:?}");
     }
 
     #[tokio::test]

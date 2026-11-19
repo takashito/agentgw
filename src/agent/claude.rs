@@ -2163,6 +2163,10 @@ impl HookIntake {
             // writes .claude/settings.local.json there). The agent in that folder can run anything
             // with Bash already, so refusing the folder's servers would not protect anything.
             "enableAllProjectMcpServers": true,
+            // No grey "next prompt" suggestion in the input box. Delivery reads the input box to tell
+            // whether a body went in, and a suggestion there looks like text left unsent (a person
+            // misread it that way too). Settings passed with --settings outrank the user's own.
+            "promptSuggestionEnabled": false,
             // Tells auto mode's classifier what the gateway's verified block is, so the Owner's own
             // post, carried through asks between channels, counts as the Owner's words. `$defaults`
             // keeps the built-in entries: a list without it replaces them all (measured on 2.1.322).
@@ -2815,6 +2819,7 @@ mod tests {
         assert_eq!(v["disableRemoteControl"], true);
         // A folder's .mcp.json would otherwise stop the worker on an approval dialog
         assert_eq!(v["enableAllProjectMcpServers"], true);
+        assert_eq!(v["promptSuggestionEnabled"], false);
         // The Owner's verified posts count for auto mode, and the built-in entries stay
         let env = v["autoMode"]["environment"].as_array().unwrap();
         assert_eq!(env[0], "$defaults", "without it the built-in entries are replaced");

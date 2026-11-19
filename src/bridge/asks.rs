@@ -198,6 +198,13 @@ pub fn dead_end_line(outcome: &str, detail: &str) -> String {
             .into(),
         "closed" => "The other thread was closed before it answered.".into(),
         "offline" => OFFLINE_LINE.into(),
+        "delayed" => format!(
+            "Your message has not reached the other agent yet: {detail}. Nothing is lost and its answer comes \
+             as usual once it goes in; do not send it again (it would arrive twice)."
+        ),
+        "undelivered" => format!(
+            "Your message never reached the other agent: {detail}. Nothing was done with it."
+        ),
         other => format!("The other agent ended without a reply ({other})."),
     }
 }

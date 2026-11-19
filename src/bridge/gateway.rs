@@ -5194,13 +5194,20 @@ impl Fleet {
             rlog("info", &format!("ask: an answer from {channel}:{thread}, which nobody asked"));
             return;
         };
-        self.edit_ask(channel, thread, |r| {
-            r.outstanding = false;
-            if outcome == "deleted" {
-                r.state = AskState::Ended;
-            }
-        })
-        .await;
+        // "Not through yet" ends nothing: the request is still owed, and its answer is passed on as usual
+        let interim = outcome == "delayed";
+        if !interim {
+            self.edit_ask(channel, thread, |r| {
+                r.outstanding = false;
+                if outcome == "deleted" {
+                    r.state = AskState::Ended;
+                }
+            })
+            .await;
+        }
+        if row.origin_closed && interim {
+            return; // nobody is waiting there to hear it
+        }
         if row.origin_closed {
             // Said once per request: the next answer finds `outstanding` already down
             if row.outstanding {
@@ -5229,7 +5236,11 @@ impl Fleet {
         } else {
             let line = crate::bridge::asks::dead_end_line(outcome, &text);
             let name = self.channel_label(channel).await;
-            let shown = crate::t!(":information_source: [No reply from {name}]({link}): {line}", ":information_source: [{name} から返事がありません]({link}): {line}");
+            let shown = match outcome {
+                "delayed" => crate::t!(":hourglass: [Not delivered to {name} yet]({link}): {line}", ":hourglass: [{name} にまだ届いていません]({link}): {line}"),
+                "undelivered" => crate::t!(":warning: [Not delivered to {name}]({link}): {line}", ":warning: [{name} に届きませんでした]({link}): {line}"),
+                _ => crate::t!(":information_source: [No reply from {name}]({link}): {line}", ":information_source: [{name} から返事がありません]({link}): {line}"),
+            };
             (shown, line, crate::chat::DeliveryKind::Notice)
         };
         let Ok(posted) = self.api.post_markdown(&row.channel, &shown, Some(&row.thread_ts)).await else {
@@ -9893,6 +9904,30 @@ mod ask_tests {
         let m = r.msgs.try_recv().unwrap();
         assert_eq!(m.from_agent.unwrap().kind, DeliveryKind::Notice);
         assert!(m.text.contains("stopped"), "{}", m.text);
+    }
+
+    /// "Not through yet" reaches the asker as a notice that ends nothing: the request is still
+    /// outstanding, so the answer that follows is passed on as usual.
+    #[tokio::test]
+    async fn a_delayed_request_tells_the_asker_and_stays_outstanding() {
+        let (mut r, thread) = approved("delayed").await;
+        r.fleet.on_machine_frame("parent", reply_frame(&thread, "delayed", "refused since 05:53 UTC")).await;
+        let m = r.msgs.try_recv().unwrap();
+        assert_eq!(m.from_agent.unwrap().kind, DeliveryKind::Notice);
+        assert!(m.text.contains("has not reached the other agent yet") && m.text.contains("05:53 UTC"), "{}", m.text);
+        assert!(calls(&r.api).iter().any(|c| c.contains("Not delivered to")), "{:?}", calls(&r.api));
+        assert!(r.fleet.asks.lock().await[&thread].1.outstanding, "the request is still owed");
+        r.fleet.on_machine_frame("parent", reply_frame(&thread, "reply", "done")).await;
+        assert_eq!(r.msgs.try_recv().unwrap().text, "done");
+    }
+
+    #[tokio::test]
+    async fn an_undelivered_request_tells_the_asker_it_never_arrived() {
+        let (mut r, thread) = approved("undelivered").await;
+        r.fleet.on_machine_frame("parent", reply_frame(&thread, "undelivered", "typed in at 05:53 UTC")).await;
+        let m = r.msgs.try_recv().unwrap();
+        assert!(m.text.contains("never reached the other agent") && !m.text.contains("turn failed"), "{}", m.text);
+        assert!(!r.fleet.asks.lock().await[&thread].1.outstanding);
     }
 
     #[tokio::test]

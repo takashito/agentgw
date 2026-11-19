@@ -8,6 +8,13 @@ in [README.md](README.md#release-notes).
 
 ## [Unreleased]
 
+### Changed
+- Agents started by agentgw no longer show the grey prompt suggestion in their input box.
+- When a request from Claude in another channel never reaches the agent there, the asking Claude is now told it was not delivered, when, and why, instead of being told the other agent failed.
+
+### Fixed
+- When a request from Claude in another channel cannot be handed to the agent there for a couple of minutes, the asking Claude is now told it has not arrived yet, instead of waiting without a word.
+
 ## [0.72.0] - 2026-11-18
 
 ### Added
