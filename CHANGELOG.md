@@ -8,6 +8,8 @@ in [README.md](README.md#release-notes).
 
 ## [Unreleased]
 
+## [0.73.0] - 2026-11-19
+
 ### Added
 - Any thread of a channel can check on, and follow up, a request that channel sent to another channel, not only the thread that sent it. The thread that follows up takes the request over and gets its replies.
 
@@ -17,6 +19,8 @@ in [README.md](README.md#release-notes).
 
 ### Fixed
 - When a request from Claude in another channel cannot be handed to the agent there for a couple of minutes, the asking Claude is now told it has not arrived yet, instead of waiting without a word.
+- On Windows, agents are no longer stopped while they run a command.
+- If an agent stops in the middle of its work, the thread and any Claude waiting on it are now told, instead of it showing as still working.
 
 ## [0.72.0] - 2026-11-18
 
