@@ -8,6 +8,9 @@ in [README.md](README.md#release-notes).
 
 ## [Unreleased]
 
+### Fixed
+- Reading a thread or channel no longer fails when one of its messages contains a heading or another newer kind of formatting. Such threads can be read again, and the Owner's posts linked from them are recognized again.
+
 ## [0.73.0] - 2026-11-19
 
 ### Added

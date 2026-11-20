@@ -411,16 +411,30 @@ impl Api {
 
     /// Channel history (the caller puts it oldest-first).
     pub async fn history(&self, channel: &str, limit: u16) -> Result<Vec<FetchedMsg>, String> {
-        let req = SlackApiConversationsHistoryRequest::new()
-            .with_channel(channel.into())
-            .with_limit(limit);
-        let res = self
-            .client
-            .open_session(&self.token)
-            .conversations_history(&req)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(res.messages.iter().map(Self::fetched).collect())
+        let limit = limit.to_string();
+        let page = self
+            .get_json("conversations.history", &[("channel", channel), ("limit", &limit)])
+            .await?;
+        Ok(messages_of(&page).map(fetched_msg).collect())
+    }
+
+    /// `conversations.replies` as plain JSON. **Not through the library's types**: they know a
+    /// fixed list of block kinds with no catch-all, so one post holding a kind they lack (a
+    /// `rich_text_header`, which Slack makes from a Markdown `##`) failed the whole page — and
+    /// with it every read of that thread, the check of the Owner's links among them.
+    async fn replies_json(
+        &self,
+        channel: &str,
+        ts: &str,
+        limit: u16,
+    ) -> Result<serde_json::Value, String> {
+        let limit = limit.to_string();
+        // inclusive: include the message at the given ts itself
+        self.get_json(
+            "conversations.replies",
+            &[("channel", channel), ("ts", ts), ("limit", &limit), ("inclusive", "true")],
+        )
+        .await
     }
 
     /// Root of the thread the message at this ts belongs to.
@@ -444,13 +458,8 @@ impl Api {
     /// failed with `could not read`). `conversations.replies` takes the reply's ts as is and
     /// returns **that post itself** with its author and `thread_ts` (confirmed by measurement).
     pub async fn message_at(&self, channel: &str, ts: &str) -> Option<MessageAt> {
-        let req = SlackApiConversationsRepliesRequest::new(channel.into(), ts.into())
-            .with_limit(1)
-            .with_inclusive(true);
-        let res = self
-            .client
-            .open_session(&self.token)
-            .conversations_replies(&req)
+        let page = self
+            .replies_json(channel, ts, 1)
             .await
             .map_err(|e| {
                 LogCtx::default().debug(
@@ -459,20 +468,7 @@ impl Api {
                 );
             })
             .ok()?;
-        let m = res.messages.first()?;
-        // Check that what came back really is that ts (the thread root can come back instead)
-        if m.origin.ts.to_string() != ts {
-            return None;
-        }
-        Some(MessageAt {
-            user: m.sender.user.as_ref().map(|u| u.to_string()),
-            is_bot: m.sender.bot_id.is_some(),
-            thread_ts: m
-                .origin
-                .thread_ts
-                .as_ref()
-                .map_or_else(|| ts.to_string(), |t| t.to_string()),
-        })
+        message_at_of(&page, ts)
     }
 
     pub async fn replies(
@@ -481,17 +477,8 @@ impl Api {
         thread_ts: &str,
         limit: u16,
     ) -> Result<Vec<FetchedMsg>, String> {
-        // inclusive: include the message at the given ts itself
-        let req = SlackApiConversationsRepliesRequest::new(channel.into(), thread_ts.into())
-            .with_limit(limit)
-            .with_inclusive(true);
-        let res = self
-            .client
-            .open_session(&self.token)
-            .conversations_replies(&req)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(res.messages.iter().map(Self::fetched).collect())
+        let page = self.replies_json(channel, thread_ts, limit).await?;
+        Ok(messages_of(&page).map(fetched_msg).collect())
     }
 
     /// Whether the thread root is gone. Posting with `thread_ts` to a deleted root makes Slack
@@ -959,19 +946,39 @@ impl Api {
         }
     }
 
-    fn fetched(m: &SlackHistoryMessage) -> FetchedMsg {
-        FetchedMsg {
-            ts: m.origin.ts.to_string(),
-            user: m
-                .sender
-                .user
-                .as_ref()
-                .map(|u| u.to_string())
-                .unwrap_or_else(|| "bot".to_string()),
-            text: m.content.text.clone().unwrap_or_default(),
-            thread_ts: m.origin.thread_ts.as_ref().map(|t| t.to_string()),
-        }
+}
+
+/// The `messages` of a `conversations.history` / `.replies` page (none when it has no such list).
+fn messages_of(page: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
+    page["messages"].as_array().into_iter().flatten()
+}
+
+fn str_of<'a>(m: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    m.get(key).and_then(|v| v.as_str())
+}
+
+/// One message of a page, read field by field — the blocks are never looked at.
+fn fetched_msg(m: &serde_json::Value) -> FetchedMsg {
+    FetchedMsg {
+        ts: str_of(m, "ts").unwrap_or_default().to_string(),
+        user: str_of(m, "user").unwrap_or("bot").to_string(),
+        text: str_of(m, "text").unwrap_or_default().to_string(),
+        thread_ts: str_of(m, "thread_ts").map(str::to_string),
     }
+}
+
+/// The message at `ts` from a `conversations.replies` page asked for that ts. None when the page
+/// holds something else first (the thread root can come back instead).
+fn message_at_of(page: &serde_json::Value, ts: &str) -> Option<MessageAt> {
+    let m = messages_of(page).next()?;
+    if str_of(m, "ts") != Some(ts) {
+        return None;
+    }
+    Some(MessageAt {
+        user: str_of(m, "user").map(str::to_string),
+        is_bot: m.get("bot_id").is_some_and(|b| !b.is_null()),
+        thread_ts: str_of(m, "thread_ts").unwrap_or(ts).to_string(),
+    })
 }
 
 /// The name for a thread's agent session, or `None` when nothing usable is left.
@@ -2438,6 +2445,35 @@ impl SlackId {
 
 #[cfg(test)]
 mod tests {
+
+    /// A page with a block kind the library's types do not know (`rich_text_header`, made from a
+    /// Markdown `##`) still reads: once it failed the whole thread, and with it the Owner's links.
+    #[test]
+    fn a_page_with_unknown_block_kinds_still_reads() {
+        let page = serde_json::json!({
+            "ok": true,
+            "messages": [
+                {"type": "message", "user": "U_OWNER", "text": "ship it", "ts": "1.1", "thread_ts": "1.0",
+                 "blocks": [{"type": "rich_text", "elements": [{"type": "rich_text_header", "elements": []}]}]},
+                {"type": "message", "bot_id": "B1", "text": "## Plan", "ts": "1.2", "thread_ts": "1.0",
+                 "blocks": [{"type": "some_future_block"}]},
+            ]
+        });
+        let msgs: Vec<_> = super::messages_of(&page).map(super::fetched_msg).collect();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!((msgs[0].user.as_str(), msgs[0].text.as_str(), msgs[0].ts.as_str()), ("U_OWNER", "ship it", "1.1"));
+        assert_eq!(msgs[0].thread_ts.as_deref(), Some("1.0"));
+        assert_eq!(msgs[1].user, "bot");
+
+        let at = super::message_at_of(&page, "1.1").unwrap();
+        assert_eq!((at.user.as_deref(), at.is_bot, at.thread_ts.as_str()), (Some("U_OWNER"), false, "1.0"));
+        // Another ts first → not taken as that message
+        assert!(super::message_at_of(&page, "9.9").is_none());
+        // A root with no thread_ts is its own thread
+        let root = serde_json::json!({"messages": [{"bot_id": "B1", "ts": "2.0"}]});
+        let at = super::message_at_of(&root, "2.0").unwrap();
+        assert!(at.is_bot && at.thread_ts == "2.0" && at.user.is_none());
+    }
 
     fn q(title: &str, multi: bool) -> crate::agent::Question {
         crate::agent::Question {
