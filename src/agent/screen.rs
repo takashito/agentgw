@@ -288,16 +288,21 @@ impl<'a> Pane<'a> {
             .rposition(|l| !l.trim().is_empty())
             .map_or(0, |i| i + 1);
         let from = end.saturating_sub(MODAL_FOOTER_TAIL);
-        lines[from..end]
-            .iter()
-            .find(|l| {
-                let t = l.trim().to_ascii_lowercase();
+        (from..end)
+            .find(|&i| {
+                let t = lines[i].trim().to_ascii_lowercase();
                 // **Not always last on its line.** A tool's permission screen goes on after it
                 // (`Esc to cancel · Tab to amend`): read as no modal, it sat unanswered on a real
                 // machine after its Slack prompt timed out, and nobody was told
-                t.ends_with(CANCEL_HINT) || t.contains(&format!("{CANCEL_HINT} \u{b7} "))
+                (t.ends_with(CANCEL_HINT) || t.contains(&format!("{CANCEL_HINT} \u{b7} ")))
+                    // **Our own notice quotes a footer** ("the agent is waiting on a dialog
+                    // (… · Esc to cancel · …)"), and that notice is relayed to other agents. Typed
+                    // into a worker's box it was read as a modal: the envelope's lines went to
+                    // Slack as buttons and the delivery was refused (2026-11-22)
+                    && !t.contains(OWN_NOTICE)
+                    && !inside_input_box(&lines, i)
             })
-            .copied()
+            .map(|i| lines[i])
     }
 
     /// The rows a modal is offering and which one the cursor sits on. `None` when no modal
@@ -904,6 +909,23 @@ fn parse_percent_line(line: &str) -> Option<u32> {
 /// The words every cancel hint ends with.
 const CANCEL_HINT: &str = "esc to cancel";
 
+/// Words of our own "waiting on a dialog" notice (see `Claude::not_accepting_keys`), which
+/// quotes the footer it saw.
+const OWN_NOTICE: &str = "waiting on a dialog";
+
+/// Whether line `i` sits in the input box: between the box's two rules, at or below its `❯`.
+/// A message being typed in (or a long one wrapping) can carry any words, a footer's included.
+fn inside_input_box(lines: &[&str], i: usize) -> bool {
+    let Some(top) = lines[..i].iter().rposition(|l| is_rule(l)) else {
+        return false;
+    };
+    let below = lines[i + 1..].iter().any(|l| is_rule(l));
+    below
+        && lines[top + 1..=i]
+            .iter()
+            .any(|l| l.trim_start().starts_with('\u{276f}'))
+}
+
 /// The words of the usage-limit wait's footer (see [`Pane::waiting_out_usage_limit`]).
 const AUTO_CONTINUE_HINT: &str = "continuing automatically";
 
@@ -1437,6 +1459,38 @@ the full history gets re-read on your next message.
         let pane = format!("{TRUST_PANE}{}", "\n".repeat(30));
         let d = Pane::new(&pane).dialog().expect("the modal is up");
         assert_eq!(d.options, ["Yes, I trust this folder", "No, exit"]);
+    }
+
+    /// 2026-11-22: a relayed message carrying our own "waiting on a dialog (… · Esc to cancel · …)"
+    /// notice was read as a modal while it sat in the input box. The envelope's lines went to
+    /// Slack as buttons and the delivery was refused.
+    #[test]
+    fn a_message_in_the_input_box_is_not_a_dialog() {
+        let pane = "\u{25cf} Done.\n\n\u{2500}\u{2500}\u{2500}\u{2500}\n\
+                    \u{276f} <channel source=\"plugin:agentgw:agentgw\" channel_id=\"C1\">\n  \
+                    This is the result of your ask.\n  \
+                    Your message has not reached the other agent yet (the agent is waiting on a\n  \
+                    dialog (Continuing automatically at 12:40am \u{b7} Esc to cancel \u{b7} /usage-credits\n  \
+                    to continue now)\n\
+                    \u{2500}\u{2500}\u{2500}\u{2500}\n  \
+                    \u{23f5}\u{23f5} auto mode on (shift+tab to cycle)\n";
+        let p = Pane::new(pane);
+        assert_eq!(p.modal_footer(), None);
+        assert_eq!(p.dialog(), None);
+        assert!(!p.waiting_out_usage_limit());
+        // The notice quoted on one line, anywhere near the foot, is not a footer either
+        let quoted = "  the agent is waiting on a dialog (Continuing automatically at 12:40am \u{b7} Esc to cancel \u{b7} x)\n";
+        assert_eq!(Pane::new(quoted).modal_footer(), None);
+    }
+
+    /// The usage-limit wait sits **below** the box's bottom rule, so it is still seen.
+    #[test]
+    fn the_usage_limit_wait_is_seen() {
+        let pane = "\u{2500}\u{2500}\u{2500}\u{2500}\n\u{276f} \n\u{2500}\u{2500}\u{2500}\u{2500}\n  \
+                    \u{26a0} Usage limit reached \u{b7} limit resets 3:40pm\n    \
+                    Continuing automatically at 3:40pm \u{b7} Esc to cancel \u{b7} /usage-credits to continue now\n  \
+                    \u{23f5}\u{23f5} auto mode on (shift+tab to cycle)\n";
+        assert!(Pane::new(pane).waiting_out_usage_limit());
     }
 
     #[test]
