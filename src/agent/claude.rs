@@ -473,10 +473,20 @@ impl Claude {
         // not only fails to arrive, the body becomes input to the modal — in a choice list, digits in the body select,
         // and the following Enter confirms. Counting the retries (the tick's redelivery), it picks before a human answers.
         // If the screen cannot be read, proceed (unreadable is not evidence of a modal; as before).
-        if let Ok(pane) = self.tmux.capture(w)
-            && let Some(why) = Self::not_accepting_keys(&pane)
-        {
-            return Err(why.to_string());
+        let mut pane = self.tmux.capture(w).ok();
+        if let Some(p) = &pane {
+            // **The usage-limit wait is the one modal answered here.** Escape only drops its timer
+            // (the conversation stays), and a message that has arrived is the person asking to go
+            // on. If the limit still holds, the turn fails on it and the turn-failure path tells
+            // the thread — far better than holding the message silently until the stated time.
+            if Pane::new(p).waiting_out_usage_limit() {
+                self.tmux.send_escape(w)?;
+                std::thread::sleep(DELIVER_SUBMIT_POLL);
+                pane = self.tmux.capture(w).ok();
+            }
+        }
+        if let Some(why) = pane.as_deref().and_then(Self::not_accepting_keys) {
+            return Err(why);
         }
         self.tmux.deliver(w, text)?;
         let retries = submit_retries(text);
@@ -487,7 +497,13 @@ impl Claude {
                 return Ok(());
             };
             // A modal that appears mid-send is caught here too. Pressing again would **confirm the dialog**,
-            // so back out without firing a single key
+            // so back out without firing a single key.
+            // **Except the usage-limit wait coming back**: that means the body went in and the turn
+            // died on the limit again. The turn-failure path reports it; calling it undelivered
+            // would leave it queued, and the tick would press Escape and type it again every 30s
+            if Pane::new(&pane).waiting_out_usage_limit() {
+                return Ok(());
+            }
             if let Some(why) = Self::not_accepting_keys(&pane) {
                 return Err(why.to_string());
             }
@@ -2617,6 +2633,49 @@ mod tests {
     /// empty), and reporting failure here left the message queued — where the tick typed the whole
     /// body in again, four copies of one request. Enter is pressed up to the cap, and whether the body
     /// truly went in is settled by the ledger (`user_prompt` / the transcript), not by this screen.
+    /// The real screen of a worker that hit its 5-hour limit (2026-11-22). It held every message
+    /// for over 20 minutes while other threads of the same account were working.
+    const USAGE_LIMIT_WAIT: &str = "● Usage limit reached again · set to continue automatically at 3:40pm\n  \
+        ⎿  You've hit your 5-hour limit · resets 3:40pm (UTC) · out of usage credits\n\n\
+        ────────────────────────────────────────\n❯ \n────────────────────────────────────────\n  \
+        ⚠ Usage limit reached · limit resets 3:40pm\n    \
+        Continuing automatically at 3:40pm · Esc to cancel · /usage-credits to continue now\n  \
+        ⏵⏵ auto mode on (shift+tab to cycle)\n";
+
+    #[test]
+    fn deliver_drops_the_usage_limit_wait_and_goes_through() {
+        // wait → (Escape) → box live → typed → box empty
+        let (calls, c) = deliver_probe(vec![USAGE_LIMIT_WAIT, "❯ \u{a0}", "❯ \u{a0}"]);
+        c.deliver(&Window::of("@42"), "hello").unwrap();
+        let calls = calls.lock().unwrap();
+        let esc = calls.iter().position(|c| c.ends_with(" Escape")).expect("Escape pressed");
+        let typed = calls.iter().position(|c| c.contains("hello")).expect("body typed");
+        assert!(esc < typed, "Escape before typing: {calls:?}");
+        assert_eq!(calls.iter().filter(|c| c.ends_with(" Escape")).count(), 1);
+    }
+
+    /// The limit still holds: the turn dies on it and the wait comes back. The body went in, so
+    /// it is not reported undelivered (the tick would type it again every 30s).
+    #[test]
+    fn the_wait_coming_back_after_typing_counts_as_delivered() {
+        let (calls, c) = deliver_probe(vec![USAGE_LIMIT_WAIT, "❯ \u{a0}", USAGE_LIMIT_WAIT]);
+        c.deliver(&Window::of("@42"), "hello").unwrap();
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.iter().filter(|c| c.ends_with(" Escape")).count(), 1);
+        assert_eq!(enters(&calls), 1, "no Enter into the wait");
+    }
+
+    /// Other modals are still left for a person — only the usage-limit wait is answered.
+    #[test]
+    fn other_modals_get_no_escape() {
+        for (label, modal, _) in REAL_MODALS {
+            let (calls, c) = deliver_probe(vec![modal]);
+            c.deliver(&Window::of("@42"), "hello").unwrap_err();
+            let calls = calls.lock().unwrap();
+            assert!(!calls.iter().any(|c| c.ends_with(" Escape")), "{label}: {calls:?}");
+        }
+    }
+
     #[test]
     fn a_box_that_never_empties_is_not_reported_as_a_failure() {
         let (calls, c) = deliver_probe(vec!["❯ </channel>\n"]); // stays there forever

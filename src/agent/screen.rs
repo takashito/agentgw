@@ -257,6 +257,18 @@ impl<'a> Pane<'a> {
         (!rows.is_empty()).then_some(rows)
     }
 
+    /// Whether the screen is Claude Code's wait after a usage limit
+    /// (`Continuing automatically at 3:40pm · Esc to cancel · /usage-credits to continue now`).
+    ///
+    /// It looks like a modal (it carries the cancel hint) but answering it with Escape only drops
+    /// the timer: the conversation is untouched and the input box is live again. Left alone it
+    /// holds every message until the stated time, even after the limit has lifted — a real thread
+    /// sat on it while other threads of the same account were working (2026-11-22).
+    pub fn waiting_out_usage_limit(&self) -> bool {
+        self.modal_footer()
+            .is_some_and(|f| f.to_ascii_lowercase().contains(AUTO_CONTINUE_HINT))
+    }
+
     /// Sign that a modal **holds the keyboard**. Every Claude Code dialog shows a cancel hint at
     /// its foot (real screens 2026-08-18: the auto mode onboarding's
     /// `Enter to confirm · Esc to cancel` / `/model`'s
@@ -891,6 +903,9 @@ fn parse_percent_line(line: &str) -> Option<u32> {
 /// How far above the cancel hint a modal's own text can be. Past that is scrollback.
 /// The words every cancel hint ends with.
 const CANCEL_HINT: &str = "esc to cancel";
+
+/// The words of the usage-limit wait's footer (see [`Pane::waiting_out_usage_limit`]).
+const AUTO_CONTINUE_HINT: &str = "continuing automatically";
 
 /// How close to the foot of the pane a real hint line sits. The TUI draws it just above the
 /// input box: the tallest real case (the auto mode onboarding) leaves 5 lines below it.
