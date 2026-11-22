@@ -584,7 +584,7 @@ mod frame_tests {
 
     #[test]
     fn a_machine_never_takes_a_frame_meant_for_the_gateway() {
-        let f = LinkFrame::NeedsHuman { channel: "C".into(), thread_ts: "1".into(), ts: "2".into(), closed_too: false };
+        let f = LinkFrame::NeedsHuman { channel: "C".into(), thread_ts: "1".into(), ts: "2".into(), closed_too: false, what: String::new(), todo: String::new() };
         assert!(crate::bridge::machine::FromRelay::of(f).is_none());
     }
 

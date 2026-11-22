@@ -3489,6 +3489,71 @@ mod tests {
         assert_eq!(needs_human_up(&mut up), vec![ROOT.to_string()]);
     }
 
+    /// The notice says what the agent is stopped at and what to do -- a bare link told the Owner
+    /// nothing. And **once per stop**: the permission button expiring into the agent's own screen
+    /// for the same command raised it a second time two minutes later (a real machine, 2026-11-22).
+    #[tokio::test]
+    async fn a_permission_notice_says_what_and_comes_once_per_stop() {
+        let (d, _slack, agent, clock) = flow_deps("ask-perm-once");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let (tx, mut up) = mpsc::unbounded_channel();
+        b.ask_gateway = Some(tx);
+        b.on_inbound(&agent_msg(ROOT, ROOT, "check it", crate::chat::DeliveryKind::Ask)).await;
+        let sid = b.threads.get(ROOT).and_then(|e| e.agent_id.clone()).expect("an agent");
+        on_hook_user_prompt_for_test(&mut b, &sid).await;
+        settle().await;
+        let key = ThreadKey::new("C_ADMIN", ROOT);
+        let notices = |up: &mut mpsc::UnboundedReceiver<crate::bridge::gateway::link::LinkFrame>| -> Vec<(String, String)> {
+            std::iter::from_fn(|| up.try_recv().ok())
+                .filter_map(|f| match f {
+                    crate::bridge::gateway::link::LinkFrame::NeedsHuman { what, todo, .. } => Some((what, todo)),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        b.on_progress(Some(&key), &serde_json::json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_use_id": "toolu_9", "tool_input": {"command": "rm -r build"}}));
+        let (ev, _rx) = bash_perm(&sid);
+        b.on_hook(ev).await;
+        let first = notices(&mut up);
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert!(first[0].0.contains("Bash") && first[0].0.contains("`rm -r build`"), "{first:?}");
+        assert!(first[0].1.contains("Allow or Deny"), "{first:?}");
+
+        // Nobody clicks: the button expires and Claude Code shows its own screen for the same command
+        clock.advance(130_000);
+        b.expire_perm_prompts().await;
+        *agent.dialog.lock().unwrap() = Some(crate::agent::Dialog {
+            title: "rm -r build".into(),
+            footer: "Esc to cancel".into(),
+            options: vec!["Yes".into(), "No".into()],
+            details: vec![String::new(), String::new()],
+            asked: false,
+            selected: 0,
+        });
+        b.stall.clear();
+        clock.advance(30_000);
+        b.dialog_tick().await;
+        assert_eq!(b.dialog_pending.len(), 1, "the screen is offered in the thread");
+        assert!(notices(&mut up).is_empty(), "the same stop was announced twice");
+
+        // The agent moves on and stops at another command: that is news
+        *agent.dialog.lock().unwrap() = None;
+        b.on_progress(Some(&key), &serde_json::json!({"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_use_id": "toolu_9", "tool_input": {"command": "rm -r build"}, "tool_response": {}}));
+        b.on_progress(Some(&key), &serde_json::json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_use_id": "toolu_10", "tool_input": {"command": "cargo clean"}}));
+        let (tx2, _rx2) = tokio::sync::oneshot::channel();
+        b.on_hook(HookEvent {
+            kind: "perm".into(),
+            session_id: sid.clone(),
+            payload: serde_json::json!({"tool_name": "Bash", "tool_input": {"command": "cargo clean"}, "tool_use_id": "toolu_10"}),
+            respond: Some(tx2),
+        })
+        .await;
+        let next = notices(&mut up);
+        assert_eq!(next.len(), 1, "{next:?}");
+        assert!(next[0].0.contains("`cargo clean`"), "{next:?}");
+    }
+
     #[tokio::test]
     async fn a_thread_nobody_asked_raises_nothing() {
         let (d, _slack, agent, _clock) = flow_deps("ask-perm-none");

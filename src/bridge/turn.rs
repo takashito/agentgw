@@ -50,6 +50,74 @@ fn still_asking(posted: &Dialog, screen: &Dialog) -> bool {
     posted.title == screen.title && posted.options == screen.options
 }
 
+/// What a "a person is needed" notice says beyond its link. See [`Bridge::needs_human`].
+pub(super) struct HumanNotice {
+    /// What the agent is stopped at, one line, secrets masked.
+    pub what: String,
+    /// What the person has to do.
+    pub todo: String,
+    /// Sent even if the asker was already told about this stop.
+    pub always: bool,
+}
+
+impl HumanNotice {
+    /// A tool's permission prompt: the command (or the file, or the input) it wants to run.
+    pub fn permission(tool: &str, input: &serde_json::Value) -> Self {
+        let field = ["command", "file_path", "path", "url", "pattern"]
+            .iter()
+            .find_map(|k| input.get(*k).and_then(|v| v.as_str()).map(str::to_string));
+        let shown = notice_snippet(&field.unwrap_or_else(|| input.to_string()));
+        Self {
+            what: crate::t!(
+                "its agent is waiting for permission to use {tool}: `{shown}`",
+                "エージェントが {tool} の許可を待っています: `{shown}`"
+            ),
+            todo: crate::t!(
+                "To let it go on, open it and press Allow or Deny.",
+                "進めるには、開いて Allow か Deny を押してください。"
+            ),
+            always: false,
+        }
+    }
+
+    /// A dialog found holding the agent's screen (Claude Code's own permission screen among them).
+    pub fn screen(d: &Dialog) -> Self {
+        let title = notice_snippet(&d.title);
+        let rows = notice_snippet(&d.options.join(" / "));
+        Self {
+            what: crate::t!(
+                "its agent is stopped at a confirmation on its screen: `{title}`",
+                "エージェントが画面の確認で止まっています: `{title}`"
+            ),
+            todo: crate::t!(
+                "To let it go on, open it and press one of its buttons ({rows}).",
+                "進めるには、開いて、ボタンのどれかを押してください({rows})。"
+            ),
+            always: false,
+        }
+    }
+
+    /// The agent asked a person a question with the question tool.
+    pub fn question(title: &str) -> Self {
+        let title = notice_snippet(title);
+        Self {
+            what: crate::t!("its agent asked a question: {title}", "エージェントが質問しています: {title}"),
+            todo: crate::t!(
+                "To let it go on, open it and answer the form.",
+                "進めるには、開いて、フォームに答えてください。"
+            ),
+            always: false,
+        }
+    }
+}
+
+/// A command or a screen line as it goes into a notice in another channel: secrets masked, on one
+/// line, cut short, and without backticks (they would close the code span around it).
+fn notice_snippet(s: &str) -> String {
+    let one_line = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    crate::bridge::activity::detail(&one_line).replace('`', "'")
+}
+
 /// Reads the question tool's questions out of its hook payload: `questions[]`, each with its
 /// `question`, `header`, `multiSelect` and `options[]` of `label` / `description`. **Every
 /// shape** — one question or several, one choice or many — because the form in the thread can
@@ -705,16 +773,30 @@ impl Bridge {
     ///
     /// `closed_too`: tell them even if their exchange was closed — for a screen only a person can
     /// answer, which otherwise holds the agent with nobody looking (see `notify_targets_closed_too`).
-    pub(super) fn needs_human(&self, channel: &str, root: &str, ts: &str, closed_too: bool) {
+    ///
+    /// The notice carries `what` the agent is stopped at and what the person has to do — a bare
+    /// link told the Owner nothing. **Once per stop**: the same stop seen again (a permission button
+    /// expiring into the agent's own screen for the same command) is not sent twice, unless the
+    /// notice is `always` news (the agent was closed).
+    pub(super) fn needs_human(&self, channel: &str, root: &str, ts: &str, closed_too: bool, n: HumanNotice) {
         if self.threads.get(root).is_none_or(|e| e.asked_from.is_none()) {
             return;
         }
         let Some(up) = &self.ask_gateway else { return };
+        let key = ThreadKey::new(channel, root);
+        let first = self.activity.lock().map(|mut b| b.tell_person_once(&key)).unwrap_or(true);
+        if !first && !n.always {
+            LogCtx { session_id: None, thread_key: Some(key) }
+                .info("bridge", "a person is needed again for the same stop; the asking thread was already told");
+            return;
+        }
         let _ = up.send(crate::bridge::gateway::link::LinkFrame::NeedsHuman {
             channel: channel.to_string(),
             thread_ts: root.to_string(),
             ts: ts.to_string(),
             closed_too,
+            what: n.what,
+            todo: n.todo,
         });
     }
 
@@ -1455,7 +1537,24 @@ impl Bridge {
                 p.dialog.title
             ),
         );
-        self.needs_human(&channel, &root, &p.prompt_ts, true);
+        let title = notice_snippet(&p.dialog.title);
+        self.needs_human(
+            &channel,
+            &root,
+            &p.prompt_ts,
+            true,
+            HumanNotice {
+                what: crate::t!(
+                    "nobody answered `{title}` on its agent's screen for {mins} minutes, so the agent was closed without answering it.",
+                    "エージェントの画面の `{title}` に{mins}分だれも答えなかったので、答えずにエージェントを閉じました。"
+                ),
+                todo: crate::t!(
+                    "Nothing was run. Write in that thread to resume it.",
+                    "何も実行されていません。そのスレッドに書けば再開します。"
+                ),
+                always: true,
+            },
+        );
         self.stall.remove(key);
         self.presence_remove(key, &Reason::Perm);
         self.presence_remove(key, &Reason::Turn);
@@ -1709,7 +1808,7 @@ impl Bridge {
                  awaiting click"
             ),
         );
-        self.needs_human(&channel, &thread_ts, &prompt_ts, false);
+        self.needs_human(&channel, &thread_ts, &prompt_ts, false, HumanNotice::permission(&tool, &input));
         // From here the agent is silent waiting for a person. Stop the watch
         self.suspend_stall_for_perm(&ThreadKey::new(&channel, &thread_ts));
         self.remember_perm_prompt(&thread_ts, &prompt_ts);
@@ -1885,7 +1984,11 @@ impl Bridge {
             ),
         );
         // A screen dialog holds the agent before or between turns, where nobody may be looking
-        self.needs_human(channel, thread_ts, &prompt_ts, questions.is_empty());
+        let notice = match questions.first() {
+            Some(q) => HumanNotice::question(&q.title),
+            None => HumanNotice::screen(&d),
+        };
+        self.needs_human(channel, thread_ts, &prompt_ts, questions.is_empty(), notice);
 
         // **Written down, not only remembered.** A restart empties the map, and a button whose
         // id nobody recognises is ignored in silence -- while the dialog it belongs to is still

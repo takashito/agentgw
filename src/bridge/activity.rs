@@ -54,6 +54,10 @@ struct ThreadActivity {
     /// The agent's window went away in the middle of its work (it crashed, or its tmux server did).
     /// Cleared when the next turn starts.
     lost: bool,
+    /// The thread that asked has been told a person is needed here, and the agent has not moved
+    /// since. A permission whose button expires comes back as the agent's own screen for the same
+    /// command: telling the asker again then is the same news twice.
+    person_told: bool,
 }
 
 /// One row per thread this Bridge has seen work in since it started (memory only).
@@ -81,6 +85,7 @@ impl ActivityBook {
         row.turn_failed = None;
         row.session_ended = false;
         row.lost = false;
+        row.person_told = false;
     }
 
     /// The turn is over. A tool still marked running was cut off (no PostToolUse comes for it).
@@ -90,6 +95,7 @@ impl ActivityBook {
         row.turn_ended_ms = Some(now);
         row.running.clear();
         row.waiting_for_person = false;
+        row.person_told = false;
     }
 
     /// The turn failed (`StopFailure`); `why` is its error type.
@@ -151,6 +157,13 @@ impl ActivityBook {
         self.row(key, now).waiting_for_person = on;
     }
 
+    /// Marks that the asker was told a person is needed here. False when it already was and the
+    /// agent has not started, finished or failed a tool or a turn since — the same stop, not news.
+    pub fn tell_person_once(&mut self, key: &ThreadKey) -> bool {
+        let row = self.threads.entry(key.clone()).or_default();
+        !std::mem::replace(&mut row.person_told, true)
+    }
+
     /// The agent posted to the thread (`reply`, `edit_message`).
     pub fn report(&mut self, key: &ThreadKey, now: u64) {
         let row = self.row(key, now);
@@ -178,6 +191,7 @@ impl ActivityBook {
         // A new tool means the agent got past whatever it was waiting on, even if the answer was
         // given where this Bridge does not hear it (on the agent's own screen)
         row.waiting_for_person = false;
+        row.person_told = false;
         row.running.retain(|r| r.id != id);
         row.running.push(ToolRun {
             id: id.to_string(),
@@ -200,6 +214,7 @@ impl ActivityBook {
     ) {
         let row = self.row(key, now);
         row.running.retain(|r| r.id != id);
+        row.person_told = false;
         row.last = Some(ToolDone {
             name: name.to_string(),
             detail: detail.to_string(),
