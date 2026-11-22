@@ -8,7 +8,10 @@ in [README.md](README.md#release-notes).
 
 ## [Unreleased]
 
+## [0.73.1] - 2026-11-22
+
 ### Fixed
+- When Claude renames a thread without saying which channel it is in, the thread is now renamed instead of the request failing. Claude is also told whether the new name took, so a failed rename no longer looks like a success.
 - Reading a thread or channel no longer fails when one of its messages contains a heading or another newer kind of formatting. Such threads can be read again, and the Owner's posts linked from them are recognized again.
 
 ## [0.73.0] - 2026-11-19
