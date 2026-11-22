@@ -2044,10 +2044,45 @@ pub struct Disposition {
     pub session_id: String,
     /// Only for `kind: "title"` — the name the agent asked for. The rename itself happens on the
     /// main side, which holds Threads and therefore knows whether a person already named this one.
-    pub title: Option<String>,
+    pub title: Option<TitleAsk>,
     /// What was posted (`reply`, an answering `edit`) or why nothing was (`no_reply`'s reason) —
     /// what goes back to an agent in another channel when this answers its request.
     pub body: Option<DispoBody>,
+}
+
+/// A rename the agent asked for, and the way its outcome goes back to the tool call.
+///
+/// The tool waits for the answer, so the agent learns whether the name took (or why not) instead
+/// of a bare "asked" — a refused rename used to end up only in the log.
+#[derive(Clone, Debug)]
+pub struct TitleAsk {
+    pub name: String,
+    pub answer: TitleAnswer,
+}
+
+impl TitleAsk {
+    /// A rename with no one waiting on its outcome.
+    pub fn unanswered(name: &str) -> Self {
+        Self { name: name.to_string(), answer: TitleAnswer::default() }
+    }
+}
+
+/// The one-shot answer to a [`TitleAsk`]. Cloneable because [`Disposition`] is; only the first
+/// `send` arrives.
+#[derive(Clone, Debug, Default)]
+pub struct TitleAnswer(std::sync::Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>>);
+
+impl TitleAnswer {
+    pub fn new() -> (Self, tokio::sync::oneshot::Receiver<String>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (Self(std::sync::Arc::new(std::sync::Mutex::new(Some(tx)))), rx)
+    }
+
+    pub fn send(&self, outcome: String) {
+        if let Some(tx) = self.0.lock().ok().and_then(|mut t| t.take()) {
+            let _ = tx.send(outcome);
+        }
+    }
 }
 
 /// The content of a disposition, for answering an agent in another channel.

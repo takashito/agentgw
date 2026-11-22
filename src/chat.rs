@@ -563,6 +563,11 @@ pub mod fake {
         pub gone: Vec<String>,
         /// The workspace's members, for `user_brief` and `find_users`.
         pub users: Vec<UserBrief>,
+        /// No thread has a session yet: `rename_session` answers `not_authorized` until a status
+        /// is set (that is what makes a session in Slack).
+        pub sessionless: std::sync::atomic::AtomicBool,
+        /// `rename_session` answers `invalid_name`.
+        pub rename_refused: std::sync::atomic::AtomicBool,
     }
 
     impl FakeChat {
@@ -810,10 +815,18 @@ pub mod fake {
             self.record(format!("upload {c} {} {}", th.unwrap_or("-"), p.display()))
         }
         async fn set_presence(&self, c: &str, th: &str, p: Presence) -> Result<(), String> {
+            self.sessionless.store(false, Ordering::SeqCst);
             self.record(format!("status {c} {th} {}", p.word()))
         }
         async fn rename_session(&self, c: &str, th: &str, title: &str) -> Result<(), String> {
-            self.record(format!("rename {c} {th} {title}"))
+            self.record(format!("rename {c} {th} {title}"))?;
+            if self.sessionless.load(Ordering::SeqCst) {
+                return Err("Slack API error: not_authorized".into());
+            }
+            if self.rename_refused.load(Ordering::SeqCst) {
+                return Err("Slack API error: invalid_name\nBody: '{}'".into());
+            }
+            Ok(())
         }
     }
 

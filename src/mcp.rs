@@ -140,15 +140,15 @@ impl Mcp {
             }),
             serde_json::json!({
                 "name": "set_thread_title",
-                "description": "Rename this thread's session so it can be found again by what it is about. Each delivered message carries the thread's current name as `thread_title` (empty = no name yet). Name it once the topic is clear, and again when the topic has clearly moved on from that name — not for every message. Keep it short, a few words, in the language of the conversation. A name a person set by hand wins and this call is then quietly ignored, so do not tell anyone the thread was renamed. Do NOT narrate this tool: never write \"I should use set_thread_title\" / \"I will rename this thread\" or any similar preamble.",
+                "description": "Rename this thread's session so it can be found again by what it is about. Each delivered message carries the thread's current name as `thread_title` (empty = no name yet). Name it once the topic is clear, and again when the topic has clearly moved on from that name — not for every message. Keep it short, a few words, in the language of the conversation. channel_id and thread_ts default to your own thread. The result says whether the name took: \"renamed …\", \"not renamed: a person named this thread by hand\" (theirs stands — do not tell anyone the thread was renamed), or an error with Slack's reason (fix the title and call again). Do NOT narrate this tool: never write \"I should use set_thread_title\" / \"I will rename this thread\" or any similar preamble.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "channel_id": { "type": "string", "description": "Channel or DM ID (C.../D.../G...) of the thread." },
-                        "thread_ts": { "type": "string", "description": "Thread root timestamp — the thread being renamed." },
+                        "channel_id": { "type": "string", "description": "Channel or DM ID (C.../D.../G...) of the thread. Your own thread's channel when left out." },
+                        "thread_ts": { "type": "string", "description": "Thread root timestamp — the thread being renamed. Your own thread when left out." },
                         "title": { "type": "string", "description": "The new name, a few words (at most 200 characters). Slack rejects the whole title if it contains any character outside this set: letters and digits of any script (Japanese, full-width and emoji included), plain spaces, and the ASCII marks - _ . , ! ? ( ) & ' \" = |. Every other mark is refused — Japanese punctuation (、 。 「 」 ・ ： ／ ！ and the full-width space), dashes and arrows (– — → …), and ASCII : / @ # + * ~ % $ < > [ ] { } ; ` ^ \\. Write titles that need none of them: \"スレッド名が付かない件の調査\", not \"スレッド名、調査\"." },
                     },
-                    "required": ["channel_id", "thread_ts", "title"],
+                    "required": ["title"],
                 },
             }),
             serde_json::json!({
@@ -670,7 +670,7 @@ mod tests {
         assert_eq!(req("edit_message"), ["channel_id", "message_ts", "text"]);
         assert_eq!(req("download_attachment"), ["file_id"]);
         assert_eq!(req("fetch_messages"), ["channel"]);
-        assert_eq!(req("set_thread_title"), ["channel_id", "thread_ts", "title"]);
+        assert_eq!(req("set_thread_title"), ["title"]);
         assert_eq!(req("ask_channel"), ["channel_id", "text"]);
         assert_eq!(req("end_ask"), ["channel_id", "thread_ts"]);
         assert_eq!(req("end_session"), ["outcome"]);

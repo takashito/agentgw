@@ -4333,7 +4333,7 @@ mod tests {
             thread_ts: Some(ROOT.to_string()),
             message_ids: Vec::new(),
             session_id: sid.clone(),
-            title: Some(title.to_string()),
+            title: Some(bridge::TitleAsk::unanswered(title)),
             body: None,
         };
         // Nothing named it yet: the agent is told so, with an empty name
@@ -4366,6 +4366,76 @@ mod tests {
         b.on_inbound(&in_thread("1782000000.000400", "third")).await;
         settle_deliveries(&mut b, &mut deliv).await;
         assert!(last().contains(r#" thread_title="mine now""#), "{}", last());
+    }
+
+    #[tokio::test]
+    async fn the_agent_hears_whether_its_rename_took() {
+        // Observed: an agent called set_thread_title with only a title. The thread came from its
+        // session but the channel went to Slack empty (`channel_not_found`), and the tool still
+        // answered "asked the bridge" — the failure was only in the log. And a thread whose parent
+        // is a bot's post has no session in Slack yet, so the rename was `not_authorized`.
+        let (d, slack, agent, _clock) = flow_deps("rename-outcome");
+        let ((mut b, mut fx), _deliv) = Bridge::for_test_with_deliveries(d);
+        let sid = running_thread(&mut b, &agent).await;
+        settle().await; // the opening status goes out off the loop
+        slack.sessionless.store(true, std::sync::atomic::Ordering::SeqCst);
+        let ask = |title: &str| {
+            let (answer, rx) = bridge::TitleAnswer::new();
+            let d = bridge::Disposition {
+                kind: "title",
+                channel_id: String::new(),
+                thread_ts: None,
+                message_ids: Vec::new(),
+                session_id: sid.clone(),
+                title: Some(bridge::TitleAsk { name: title.to_string(), answer }),
+                body: None,
+            };
+            (d, rx)
+        };
+        let outcome = |rx| async { turn::title_outcome(rx, Duration::from_secs(2)).await };
+
+        // Neither channel nor thread given: both come from the session. No session in Slack yet:
+        // setting the status makes one, and the rename goes through on the second try
+        let (d, rx) = ask("the cache rewrite");
+        b.on_disposition(d).await;
+        assert_eq!(outcome(rx).await, Ok("renamed this thread to \"the cache rewrite\"".to_string()));
+        let calls = slack.calls();
+        let renames: Vec<_> = calls.iter().filter(|c| c.starts_with("rename ")).collect();
+        assert_eq!(renames, [&format!("rename C1 {ROOT} the cache rewrite"); 2], "{calls:?}");
+        assert!(calls.contains(&format!("status C1 {ROOT} idle")), "{calls:?}");
+        b.on_cmd_fx(fx.recv().await.expect("the rename reports back")).await;
+
+        // Nothing usable left once the refused characters go: said so, nothing sent
+        let (d, rx) = ask("、。");
+        b.on_disposition(d).await;
+        assert!(outcome(rx).await.unwrap_err().starts_with("not renamed: nothing usable"));
+
+        // A person named it: the agent is told theirs stands (not an error — nothing to fix)
+        b.on_inbound(&renamed_by_hand(ROOT, "mine now")).await;
+        let (d, rx) = ask("something else");
+        b.on_disposition(d).await;
+        assert!(outcome(rx).await.unwrap().starts_with("not renamed: a person named this thread"));
+    }
+
+    #[tokio::test]
+    async fn a_rename_slack_refuses_comes_back_as_an_error() {
+        let (d, slack, agent, _clock) = flow_deps("rename-refused");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let sid = running_thread(&mut b, &agent).await;
+        slack.rename_refused.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (answer, rx) = bridge::TitleAnswer::new();
+        b.on_disposition(bridge::Disposition {
+            kind: "title",
+            channel_id: "C1".into(),
+            thread_ts: Some(ROOT.to_string()),
+            message_ids: Vec::new(),
+            session_id: sid,
+            title: Some(bridge::TitleAsk { name: "x".into(), answer }),
+            body: None,
+        })
+        .await;
+        let err = turn::title_outcome(rx, Duration::from_secs(2)).await.unwrap_err();
+        assert_eq!(err, "not renamed: Slack refused \"x\" (Slack API error: invalid_name)");
     }
 
     #[tokio::test]

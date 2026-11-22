@@ -2442,6 +2442,9 @@ impl Bridge {
                 .map(|(ts, _)| ts.clone())
         });
         let Some(root) = root else {
+            if let Some(t) = &d.title {
+                t.answer.send("not renamed: this session has no thread the bridge knows of; pass channel_id and thread_ts".into());
+            }
             LogCtx {
                 session_id: Some(d.session_id.clone()),
                 thread_key: None,
@@ -2468,6 +2471,13 @@ impl Bridge {
             None => root,
         };
         let posted_in_asker = posted_in_asker.is_some();
+        // An agent may leave channel_id out too (seen with set_thread_title): the thread's own
+        // channel is on record. An empty one sent to Slack is `channel_not_found`
+        if d.channel_id.is_empty()
+            && let Some(ch) = self.threads.get(&root).and_then(|e| e.channel_id.clone())
+        {
+            d.channel_id = ch;
+        }
         let key = ThreadKey::new(&d.channel_id, &root);
         let ctx = LogCtx {
             session_id: Some(d.session_id.clone()),
@@ -2479,7 +2489,8 @@ impl Bridge {
         // **A rename is not an answer.** It clears no ledger entry and ends no turn, so it is
         // handled here and never reaches the code below
         if d.kind == "title" {
-            self.rename_thread(&key, d.title.unwrap_or_default(), &ctx).await;
+            let ask = d.title.unwrap_or_else(|| bridge::TitleAsk::unanswered(""));
+            self.rename_thread(&key, ask, &ctx).await;
             return;
         }
         if matches!(d.kind, "reply" | "edit") {
@@ -2538,29 +2549,52 @@ impl Bridge {
 
     /// Rename the thread's session, **unless a person already named it by hand**.
     ///
-    /// Fire-and-forget like the first naming: a name is a convenience, and the turn does not
-    /// depend on it. The characters Slack rejects are dropped by the same `session_title` the
-    /// opening message goes through.
-    async fn rename_thread(&mut self, key: &ThreadKey, asked: String, ctx: &LogCtx) {
+    /// Off the loop like every Slack call; the outcome goes back to the waiting tool call. The
+    /// characters Slack rejects are dropped by `session_title` first. A thread whose session Slack
+    /// has not made yet (its parent is a bot's post, so no status ever went out for it) answers
+    /// `not_authorized`: setting its status makes the session, and the rename is tried once more.
+    async fn rename_thread(&mut self, key: &ThreadKey, ask: bridge::TitleAsk, ctx: &LogCtx) {
+        let bridge::TitleAsk { name: asked, answer } = ask;
         let (channel, Some(root)) = key.split() else {
+            answer.send("not renamed: no thread to rename".into());
             return;
         };
+        if channel.is_empty() {
+            ctx.info("bridge", "rename skipped — no channel for the thread");
+            answer.send("not renamed: the thread's channel is unknown; pass channel_id".into());
+            return;
+        }
         if self.threads.get(&root).and_then(|e| e.title_locked) == Some(true) {
             ctx.info("bridge", "rename skipped — a person named this thread");
+            answer.send("not renamed: a person named this thread by hand, and their name stands".into());
             return;
         }
         let Some(title) = slack::session_title(&asked) else {
             ctx.info("bridge", &format!("rename skipped — nothing usable in \"{asked}\""));
+            answer.send(format!("not renamed: nothing usable is left of \"{asked}\" once the characters Slack refuses are dropped"));
             return;
         };
         let (api, cmd_tx, ctx) = (self.deps.slack.clone(), self.cmd_tx.clone(), ctx.clone());
         tokio::spawn(async move {
-            match api.rename_session(&channel, &root, &title).await {
+            let mut out = api.rename_session(&channel, &root, &title).await;
+            if out.as_ref().is_err_and(|e| e.contains("not_authorized")) {
+                ctx.info("bridge", "rename refused — the thread has no session yet; making one");
+                match api.set_presence(&channel, &root, crate::chat::Presence::Idle).await {
+                    Ok(()) => out = api.rename_session(&channel, &root, &title).await,
+                    Err(e) => ctx.info("bridge", &format!("making the session failed: {e}")),
+                }
+            }
+            match out {
                 Ok(()) => {
                     ctx.info("bridge", &format!("session renamed \"{title}\""));
+                    answer.send(format!("renamed this thread to \"{title}\""));
                     let _ = cmd_tx.send(CmdFx::ThreadTitled { root_ts: root, title }).await;
                 }
-                Err(e) => ctx.info("bridge", &format!("session rename \"{title}\" failed: {e}")),
+                Err(e) => {
+                    ctx.info("bridge", &format!("session rename \"{title}\" failed: {e}"));
+                    let why = e.lines().next().unwrap_or_default().to_string();
+                    answer.send(format!("not renamed: Slack refused \"{title}\" ({why})"));
+                }
             }
         });
     }
@@ -2850,6 +2884,26 @@ async fn notify(
 ) {
     if let Err(e) = dispo.send(d).await {
         ctx.error("bridge", &format!("disposition channel closed: {e}"));
+    }
+}
+
+/// How long `set_thread_title` waits for Slack's answer before saying it does not know.
+const TITLE_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// What `set_thread_title` tells the agent. A refusal comes back as an error, so the agent sees
+/// that the name did not take and why.
+pub(super) async fn title_outcome(
+    outcome: tokio::sync::oneshot::Receiver<String>,
+    wait: std::time::Duration,
+) -> Result<String, String> {
+    match tokio::time::timeout(wait, outcome).await {
+        Ok(Ok(o)) if o.starts_with("renamed") || o.starts_with("not renamed: a person") => Ok(o),
+        Ok(Ok(o)) => Err(o),
+        Ok(Err(_)) => Err("not renamed: the bridge dropped the request".into()),
+        Err(_) => Ok(format!(
+            "asked the bridge to rename this thread; Slack has not answered within {}s, so whether it took is unknown",
+            wait.as_secs()
+        )),
     }
 }
 
@@ -3374,22 +3428,25 @@ pub async fn execute_tool(
         }
         "set_thread_title" => {
             // The rename happens on the main side (it holds Threads, so it knows whether a person
-            // already named this thread). Nothing is posted to Slack from here
-            let thread = opt("thread_ts");
+            // already named this thread). Nothing is posted to Slack from here. Missing channel and
+            // thread are taken from the caller's own session there. The call waits for the outcome
+            // so the agent hears whether the name took
+            let thread = opt("thread_ts").filter(|t| !t.is_empty());
             let c = dctx(thread.as_deref());
             let title = s("title");
             c.info("bridge", &format!("disposition=title thread={} title=\"{title}\"", thread.as_deref().unwrap_or("-")));
+            let (answer, outcome) = bridge::TitleAnswer::new();
             let d = Disposition {
                 kind: "title",
                 channel_id: s("channel_id"),
                 thread_ts: thread,
                 message_ids: Vec::new(),
                 session_id: session_id.to_string(),
-                title: Some(title),
+                title: Some(bridge::TitleAsk { name: title, answer }),
                 body: None,
             };
             notify(dispo, d, &c).await;
-            Ok("asked the bridge to rename this thread (a name a person set by hand stands)".to_string())
+            title_outcome(outcome, TITLE_WAIT).await
         }
         other => Err(format!("unknown tool: {other}")),
     };
