@@ -8,6 +8,16 @@ in [README.md](README.md#release-notes).
 
 ## [Unreleased]
 
+## [0.73.2] - 2026-11-22
+
+### Changed
+- When an agent in another channel needs a person, the notice now says what it is stopped at and what to do to let it go on, with secrets hidden. It is sent once per stop instead of again when a permission prompt expires.
+
+### Fixed
+- Messages sent to an agent that was waiting out a usage limit are now delivered once the limit lifts, instead of waiting silently until the stated reset time. If the limit still holds, the thread is told.
+- A thread no longer keeps showing as waiting for a person after the prompt has been answered, has expired, or the agent has moved on.
+- A message quoting an agent's "waiting on a dialog" notice is no longer mistaken for a dialog, so it is delivered instead of being posted to Slack as buttons.
+
 ## [0.73.1] - 2026-11-22
 
 ### Fixed
