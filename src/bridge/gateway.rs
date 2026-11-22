@@ -2581,8 +2581,69 @@ pub struct Fleet {
     /// Machines that said they take asks (in their `MachineVersion`). Memory only: every machine says
     /// it again on each connect.
     pub ask_capable: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Catching up machines that come back behind the gateway (see [`CatchUp`]).
+    pub catch_up: CatchUp,
     /// What the gateway knows about the bot being brought into channels (see [`JoinBook`]).
     pub joins: JoinBook,
+}
+
+/// A machine that was away during an `update` comes back on the old version, and nothing brought it
+/// up: the rollout skipped it, and the link protocol still matches, so it is not refused either.
+/// **The gateway brings it up to the gateway's own version**, that machine alone, as soon as no
+/// update is under way (see [`Fleet::catch_up_one`]).
+///
+/// **Once per machine and version, in memory.** A machine whose update fails, or that comes back
+/// still behind, is not asked again until the gateway runs a newer version or restarts — a release
+/// that cannot be fetched for it must not turn into a machine restarting over and over. Machines a
+/// rollout already tried count as tried too: the ones that failed there were told once already.
+#[derive(Default)]
+pub struct CatchUp {
+    /// What each machine said it runs on the link it has now (its `MachineVersion`). Dropped when
+    /// the link goes, so a machine is judged on what it says when it is back, never on an old record.
+    reported: std::sync::Mutex<HashMap<String, String>>,
+    /// The version each machine was already sent to.
+    tried: std::sync::Mutex<HashMap<String, String>>,
+}
+
+impl CatchUp {
+    /// A machine said what it runs.
+    pub fn reported(&self, id: &str, version: &str) {
+        self.reported
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string(), version.to_string());
+    }
+
+    /// A machine's link is gone.
+    pub fn gone(&self, id: &str) {
+        self.reported.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+    }
+
+    /// A rollout to `version` told this machine to update (whatever came of it).
+    pub fn tried(&self, id: &str, version: &str) {
+        self.tried
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string(), version.to_string());
+    }
+
+    /// The next connected machine behind `mine` that was not sent to `mine` yet, with the version
+    /// it runs — **marked as tried**. `None` = nobody to catch up.
+    pub fn next(&self, mine: &str, connected: &[String]) -> Option<(String, String)> {
+        let reported = self.reported.lock().unwrap_or_else(|e| e.into_inner());
+        let mut tried = self.tried.lock().unwrap_or_else(|e| e.into_inner());
+        let (id, from) = reported
+            .iter()
+            .filter(|(id, v)| {
+                connected.contains(id)
+                    && crate::setup::update::older(v, mine)
+                    && tried.get(*id).map(String::as_str) != Some(mine)
+            })
+            .min_by(|a, b| a.0.cmp(b.0))
+            .map(|(id, v)| (id.clone(), v.clone()))?;
+        tried.insert(id.clone(), mine.to_string());
+        Some((id, from))
+    }
 }
 
 /// The bot being brought into channels. **Memory only**: a restart forgets which channels were asked
@@ -2941,6 +3002,7 @@ impl Fleet {
             .as_ref()
             .is_some_and(|r| r.from == bridge_id);
         if self.links.unregister(bridge_id, conn) && !renamed {
+            self.catch_up.gone(bridge_id);
             self.presence
                 .lock()
                 .await
@@ -3792,6 +3854,7 @@ impl Fleet {
             }
             link::LinkFrame::MachineVersion { version, build, triple, asks } => {
                 let id = bridge_id.to_string();
+                self.catch_up.reported(&id, &version);
                 {
                     let mut able = self.ask_capable.lock().unwrap_or_else(|e| e.into_inner());
                     if asks {
@@ -4039,9 +4102,16 @@ impl Fleet {
                 .unwrap_or_default();
             machines.push(RolloutStep::new(&id, &from));
         }
+        r.machines = machines;
+        self.post_rollout(channel, thread_ts, r).await;
+    }
+
+    /// Post a rollout's progress message and write the rollout down — [`Self::drive_updates`] carries
+    /// it from there. `r.machines` is already filled in.
+    async fn post_rollout(&self, channel: &str, thread_ts: &str, mut r: crate::bridge::state::Rollout) {
+        let thread = (!thread_ts.is_empty()).then_some(thread_ts);
         r.channel = channel.to_string();
         r.thread_ts = thread_ts.to_string();
-        r.machines = machines;
         match self
             .api
             .post_message_no_unfurl(channel, &rollout_text(&r, &self.self_id, false), thread)
@@ -4051,7 +4121,34 @@ impl Fleet {
             Err(e) => rlog("error", &format!("update: could not post the progress message: {e}")),
         }
         rlog("info", &format!("update: starting a rollout to v{}", r.goal()));
-        self.edit_access(|a| a.update = Some(r)).await;
+        // Another rollout may have been written down while the message went out
+        self.edit_access(|a| {
+            a.update.get_or_insert(r);
+        })
+        .await;
+    }
+
+    /// Bring one machine that came back behind the gateway up to the gateway's version (see
+    /// [`CatchUp`]). A rollout of that machine alone: the gateway is not in it, so a gateway on a
+    /// local build is never sent to the release, and the machines already there are not restarted.
+    async fn catch_up_one(&self) {
+        let Some(home) = self.home() else {
+            return;
+        };
+        let mine = env!("CARGO_PKG_VERSION");
+        let Some((id, from)) = self.catch_up.next(mine, &self.links.connected()) else {
+            return;
+        };
+        rlog(
+            "info",
+            &format!("update: {id} is back on v{from}, behind this gateway (v{mine}) — updating it alone"),
+        );
+        let r = crate::bridge::state::Rollout {
+            target: mine.to_string(),
+            machines: vec![crate::bridge::state::RolloutStep::new(&id, &from)],
+            ..Default::default()
+        };
+        self.post_rollout(&home, "", r).await;
     }
 
     /// `rename-machine <from> <to>`: give a connected machine a new name.
@@ -4376,6 +4473,7 @@ impl Fleet {
             let access = self.access();
             let Some(mut r) = access.update.clone() else {
                 shown.clear();
+                self.catch_up_one().await;
                 continue;
             };
             let connected = self.links.connected();
@@ -4406,6 +4504,10 @@ impl Fleet {
             let finished = next == RolloutNext::Finished;
             // **Written down before the machine is told** — telling the gateway itself restarts it
             if finished {
+                // A machine the rollout reached was told once; one it skipped as away was not
+                for s in r.machines.iter().filter(|s| s.state != crate::bridge::state::RolloutStep::OFFLINE) {
+                    self.catch_up.tried(&s.id, &r.target);
+                }
                 self.end_update(&r).await;
                 rlog("info", &format!("update: rollout to v{} finished", r.goal()));
             } else if r != before {
@@ -7489,6 +7591,7 @@ mod tests {
             reads: Default::default(),
             departed: Default::default(),
             ask_capable: Default::default(),
+            catch_up: Default::default(),
             joins: JoinBook::settled_after(std::time::Duration::ZERO),
         });
         (fleet, msg_rx)
@@ -7931,6 +8034,80 @@ mod tests {
         fleet.edit_access(|a| a.update = Some(r)).await;
         assert!(Access::load(&dir).update.is_some());
         fleet.end_update(&Access::load(&dir).update.unwrap()).await;
+        assert_eq!(Access::load(&dir).update, None);
+        let _ = std::fs::remove_dir_all(dir.path());
+    }
+
+    /// A machine behind the gateway is caught up once per version: not again after it fails, not
+    /// when it is away, not when it is level or ahead, not after a rollout already told it.
+    #[test]
+    fn catch_up_picks_each_machine_behind_once_per_version() {
+        let c = CatchUp::default();
+        let on = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        c.reported("mac", "0.73.0");
+        c.reported("pve", "0.73.2");
+        c.reported("win", "0.74.0");
+        c.reported("old", "");
+        // Away: nothing, and nothing is spent on it
+        assert_eq!(c.next("0.73.2", &on(&["pve", "win", "old"])), None);
+        assert_eq!(c.next("0.73.2", &on(&["mac", "pve", "win", "old"])), Some(("mac".into(), "0.73.0".into())));
+        // Comes back still behind (the update failed): not again for the same version
+        c.gone("mac");
+        c.reported("mac", "0.73.0");
+        assert_eq!(c.next("0.73.2", &on(&["mac", "pve"])), None);
+        // A newer gateway tries again
+        assert_eq!(c.next("0.74.0", &on(&["mac", "pve"])), Some(("mac".into(), "0.73.0".into())));
+        assert_eq!(c.next("0.74.0", &on(&["mac", "pve"])), Some(("pve".into(), "0.73.2".into())));
+        // A machine a rollout already told counts as tried
+        let c = CatchUp::default();
+        c.reported("nuc", "0.73.0");
+        c.tried("nuc", "0.73.2");
+        assert_eq!(c.next("0.73.2", &on(&["nuc"])), None);
+        // A link that went away leaves nothing to judge it on
+        c.reported("pi", "0.70.0");
+        c.gone("pi");
+        assert_eq!(c.next("0.73.2", &on(&["pi"])), None);
+    }
+
+    /// A machine that links on an older version gets a rollout of its own, to the gateway's version
+    /// — the gateway is not in it — and only once.
+    #[tokio::test]
+    async fn a_machine_back_behind_the_gateway_is_updated_alone() {
+        let dir = StateDir::at(std::env::temp_dir().join(format!("agentgw-catch-up-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let (fleet, _rx) = a_fleet_in(dir.clone());
+        fleet.edit_access(|a| a.home_channel = Some("C_HOME".into())).await;
+        let say = |version: &str| {
+            serde_json::to_string(&link::LinkFrame::MachineVersion {
+                version: version.into(),
+                build: format!("{version}+abc"),
+                triple: "aarch64-apple-darwin".into(),
+                asks: true,
+            })
+            .unwrap()
+        };
+        let mine = env!("CARGO_PKG_VERSION");
+        // Level with the gateway: nothing
+        let (_level, _lrx) = fleet.attach("pve").await;
+        fleet.on_machine_text("pve", &say(mine)).await;
+        fleet.catch_up_one().await;
+        assert_eq!(Access::load(&dir).update, None);
+        // Behind: a rollout of that machine alone
+        let (_conn, _crx) = fleet.attach("mac").await;
+        fleet.on_machine_text("mac", &say("0.1.0")).await;
+        fleet.catch_up_one().await;
+        let r = Access::load(&dir).update.expect("a rollout was written down");
+        assert_eq!(r.target, mine);
+        assert_eq!(r.build, "", "the version decides — a machine on a local build is never behind it");
+        assert_eq!(r.channel, "C_HOME");
+        let ids: Vec<&str> = r.machines.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["mac"]);
+        assert_eq!(r.machines[0].from, "0.1.0");
+        // It came back still behind: not asked again
+        fleet.end_update(&r).await;
+        fleet.on_machine_text("mac", &say("0.1.0")).await;
+        fleet.catch_up_one().await;
         assert_eq!(Access::load(&dir).update, None);
         let _ = std::fs::remove_dir_all(dir.path());
     }
@@ -9611,6 +9788,7 @@ mod ask_tests {
             reads: Default::default(),
             departed: Default::default(),
             ask_capable: Default::default(),
+            catch_up: Default::default(),
             joins: JoinBook::settled_after(std::time::Duration::ZERO),
         });
         Rig { fleet, api, msgs, _notes: notes }
