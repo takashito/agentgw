@@ -175,6 +175,9 @@ impl ActivityBook {
         // A tool call means a turn is running, even if its start was missed (a restart in between)
         row.in_turn = true;
         row.turn_ended_ms = None;
+        // A new tool means the agent got past whatever it was waiting on, even if the answer was
+        // given where this Bridge does not hear it (on the agent's own screen)
+        row.waiting_for_person = false;
         row.running.retain(|r| r.id != id);
         row.running.push(ToolRun {
             id: id.to_string(),
@@ -717,6 +720,21 @@ mod tests {
         b.session_end(&key(), 2_000);
         assert_eq!(b.snapshot(&key(), true, 3_000)["state"], "no_agent");
         assert_eq!(b.snapshot(&key(), false, 3_000)["state"], "no_agent");
+    }
+
+    /// A new tool means the agent is past the prompt, even when the answer never reached this
+    /// Bridge (it was given on the agent's own screen).
+    #[test]
+    fn a_new_tool_ends_the_wait_for_a_person() {
+        let mut b = ActivityBook::default();
+        b.turn_start(&key(), 0);
+        b.tool_start(&key(), "t1", "Bash", "rm -rf x", 0);
+        b.waiting_for_person(&key(), true, 0);
+        b.tool_done(&key(), "t1", "Bash", "rm -rf x", "ok", None, 1_000);
+        b.tool_start(&key(), "t2", "Write", "notes.md", 2_000);
+        assert_eq!(b.snapshot(&key(), true, 3_000)["state"], "running_tool");
+        b.tool_done(&key(), "t2", "Write", "notes.md", "ok", None, 4_000);
+        assert_eq!(b.snapshot(&key(), true, 5_000)["state"], "thinking");
     }
 
     /// A crashed agent sends no more hooks: the book alone would say `running_tool` forever.

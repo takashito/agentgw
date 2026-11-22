@@ -3819,6 +3819,110 @@ mod tests {
         );
     }
 
+    /// **The "waiting for a person" mark comes down once nothing is waiting any more.** Seen on a
+    /// real thread: a permission prompt went up, a screen dialog came up on top of it, the prompt
+    /// expired and the person answered the dialog two seconds later. Expiry did not take the mark
+    /// down and the dialog's answer found nothing to take down, so `thread_activity` read
+    /// `waiting_for_person` (and Slack showed the thread waiting) for the seven minutes the agent
+    /// went on working.
+    #[tokio::test]
+    async fn the_waiting_mark_comes_down_when_an_expired_prompt_and_a_dialog_are_both_settled() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (d, slack, agent, clock) = flow_deps("perm-then-dialog");
+        let ((mut b, _fx), mut deliv) = Bridge::for_test_with_deliveries(d);
+        let sid = running_thread(&mut b, &agent).await;
+        settle().await;
+        let key = ThreadKey::new("C1", ROOT);
+        let state = |b: &Bridge| b.activity.lock().unwrap().snapshot(&key, true, 0)["state"].clone();
+        let last_status = |s: &FakeChat| s.calls().into_iter().filter(|c| c.starts_with("status C1")).last();
+
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        b.on_hook(HookEvent {
+            kind: "perm".into(),
+            session_id: sid,
+            payload: serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": "rm -rf build"},
+                "tool_use_id": "toolu_1",
+            }),
+            respond: Some(tx),
+        })
+        .await;
+        settle().await;
+        assert_eq!(state(&b), "waiting_for_person");
+
+        // The agent's own screen asks on top of it; a message sent now is refused by that dialog,
+        // which is how the thread is shown it
+        agent.fail_deliver.store(true, SeqCst);
+        *agent.dialog.lock().unwrap() = Some(crate::agent::Dialog {
+            title: "Dangerous rm operation".into(),
+            footer: "Enter to confirm \u{b7} Esc to cancel".into(),
+            options: vec!["Yes".into(), "No".into()],
+            details: vec![String::new(), String::new()],
+            selected: 0,
+            asked: false,
+        });
+        b.on_inbound(&in_thread("1782000000.000200", "how is it going")).await;
+        settle_deliveries(&mut b, &mut deliv).await;
+        agent.fail_deliver.store(false, SeqCst);
+        assert_eq!(b.dialog_pending.len(), 1, "{:?}", slack.calls());
+
+        // The permission prompt runs out while the dialog is still up: still waiting
+        clock.advance(120_000);
+        b.expire_perm_prompts().await;
+        settle().await;
+        assert!(b.perm_pending.is_empty());
+        assert_eq!(state(&b), "waiting_for_person", "the dialog is still up");
+        assert_eq!(last_status(&slack), Some(format!("status C1 {ROOT} waiting")));
+
+        // The person answers the dialog: nothing is waiting any more
+        let req_id = b.dialog_pending.keys().next().unwrap().clone();
+        b.on_perm_click(slack::PermClick {
+            req_id,
+            action: "dlg-0".into(),
+            by: "U_OWNER".into(),
+            state: serde_json::Value::Null,
+            value: String::new(),
+            message_ts: String::new(),
+        })
+        .await;
+        settle().await;
+        assert_ne!(state(&b), "waiting_for_person", "{:?}", slack.calls());
+        assert_eq!(last_status(&slack), Some(format!("status C1 {ROOT} busy")), "{:?}", slack.calls());
+    }
+
+    /// A prompt that expires on its own takes the mark down too: the agent has moved on.
+    #[tokio::test]
+    async fn an_expired_prompt_takes_the_waiting_mark_down() {
+        let (d, slack, agent, clock) = flow_deps("perm-expired");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let sid = running_thread(&mut b, &agent).await;
+        settle().await;
+        let key = ThreadKey::new("C1", ROOT);
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        b.on_hook(HookEvent {
+            kind: "perm".into(),
+            session_id: sid,
+            payload: serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": "cargo test"},
+                "tool_use_id": "toolu_1",
+            }),
+            respond: Some(tx),
+        })
+        .await;
+        clock.advance(120_000);
+        b.expire_perm_prompts().await;
+        settle().await;
+        assert_ne!(b.activity.lock().unwrap().snapshot(&key, true, 0)["state"], "waiting_for_person");
+        assert_eq!(
+            slack.calls().into_iter().filter(|c| c.starts_with("status C1")).last(),
+            Some(format!("status C1 {ROOT} busy")),
+            "{:?}",
+            slack.calls()
+        );
+    }
+
     /// **Nobody has to speak first.** A modal that is not a tool call fires no hook, so it used
     /// to be noticed only when someone happened to send a message and the delivery was refused
     /// — a thread nobody was talking to just stopped. The quiet screens are looked at instead.

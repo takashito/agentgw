@@ -443,6 +443,8 @@ impl Bridge {
                     // waiting for it any more -- including a question answered on the machine,
                     // which sends nothing back through the thread
                     self.resume_stall_after_perm(key, false);
+                    // A prompt left over from the finished turn holds nothing any more
+                    self.presence_remove(key, &Reason::Perm);
                 }
                 if let Some(respond) = ev.respond.take() {
                     let _ = respond.send(out);
@@ -1470,6 +1472,8 @@ impl Bridge {
             "bridge",
             &format!("dialog reqId={req_id} retired — the screen has moved on"),
         );
+        // The screen moved past it, so the thread is not waiting on it any more
+        self.resume_stall_after_perm(&ThreadKey::new(&p.channel, &p.thread_ts), false);
         if let Some(e) = self.threads.entries.get_mut(&p.thread_ts)
             && e.dialog_prompt.as_ref().is_some_and(|d| d.req_id == req_id)
         {
@@ -1746,21 +1750,33 @@ impl Bridge {
     /// A permission was settled. `rearm` = a person clicked (restart measuring silence).
     /// **false** on expiry — having just said "timed out", don't re-arm the watch
     /// (real activity will re-arm it via touch_thread).
+    ///
+    /// **The "waiting on a person" mark comes down however the prompt was settled** — answered,
+    /// expired or moved past — unless another prompt in the same thread is still up. It used to
+    /// come down only on an answer: a permission prompt that expired while a screen dialog sat on
+    /// top of it left the mark up, and the dialog's answer then found nothing to take down, so the
+    /// thread read "waiting for a person" for the seven minutes the agent went on working.
     fn resume_stall_after_perm(&mut self, key: &ThreadKey, rearm: bool) {
-        let Some(e) = self.stall.get_mut(key) else {
-            return;
-        };
-        let was_waiting = std::mem::replace(&mut e.awaiting_perm, false);
-        e.shown = false;
-        if rearm {
-            e.last_activity_ms = self.deps.clock.now_ms();
-            // A person answered, so the turn goes on. **Said here, not left to the next hook**:
-            // ordinary activity only re-arms the silence watch, so the thread would have kept its
-            // "waiting on you" mark while the agent was already back at work
-            if was_waiting {
-                self.presence_remove(&key, &Reason::Perm);
+        if self.waits_on_person(key) {
+            return; // still held at another prompt: the watch stays down, the mark stays up
+        }
+        let now = self.deps.clock.now_ms();
+        if let Some(e) = self.stall.get_mut(key) {
+            e.awaiting_perm = false;
+            e.shown = false;
+            if rearm {
+                e.last_activity_ms = now;
             }
         }
+        // **Said here, not left to the next hook**: ordinary activity only re-arms the silence
+        // watch, so the thread would keep its mark while the agent was already back at work
+        self.presence_remove(key, &Reason::Perm);
+    }
+
+    /// Whether a permission prompt or a dialog posted to this thread is still waiting for a click.
+    fn waits_on_person(&self, key: &ThreadKey) -> bool {
+        self.perm_pending.values().any(|p| ThreadKey::new(&p.channel, &p.thread_ts) == *key)
+            || self.dialog_pending.values().any(|p| ThreadKey::new(&p.channel, &p.thread_ts) == *key)
     }
 
     /// Puts a question dialog's own question in the thread, rows and all, and remembers it so
