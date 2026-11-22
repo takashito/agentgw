@@ -412,7 +412,16 @@ pub struct IdleSnapshot {
     /// already having a pending termination.
     /// **Also false when the transcript cannot be read and idle cannot be measured** — never touch what we cannot judge.
     pub eligible: bool,
+    /// The thread asked Claude in another channel for something, and that exchange is still open
+    /// (the answer may have come, but no `end_ask` yet). Taken down **after** every other free
+    /// agent: it is likely to be spoken to again when the rest of the answer arrives.
+    pub open_ask: bool,
 }
+
+/// How long an agent waiting for the answer to its own ask is kept no matter what. Past this the
+/// answer is taken as not coming (the asked thread was lost without word), so a stuck record
+/// cannot hold a seat forever.
+pub const ASK_WAIT_MAX_MS: u64 = 6 * 60 * 60_000;
 
 /// How many to keep, and how cold before tearing down.
 pub struct CleanupPolicy {
@@ -436,7 +445,9 @@ pub struct CleanupPolicy {
 /// under the cap, return as is (the next round looks again).
 pub fn select_cleanup_keys(snaps: Vec<IdleSnapshot>, p: &CleanupPolicy) -> Vec<ThreadKey> {
     let mut snaps = snaps;
-    snaps.sort_by(|a, b| b.idle_ms.cmp(&a.idle_ms)); // coldest first; all three rules drop in this order
+    // Coldest first, all three rules drop in this order — **threads with an open ask last**, so
+    // the cold cap and the concurrency cap reach them only once nobody else is left to take
+    snaps.sort_by(|a, b| a.open_ask.cmp(&b.open_ask).then(b.idle_ms.cmp(&a.idle_ms)));
     let mut evict = Vec::new();
 
     // 1. Absolute idle limit
@@ -1274,6 +1285,20 @@ impl Bridge {
             .values()
             .map(|p| ThreadKey::new(&p.channel, &p.thread_ts))
             .collect();
+        // **Threads waiting for the answer to their own ask.** The record of an exchange sits on
+        // the asked thread's row (`asked_from`), which every Bridge on the gateway holds for all
+        // asks; the asking thread itself owes nobody anything, so before this the cleanup took
+        // an agent down in the middle of waiting for an answer (a Lead, seen twice in ten minutes).
+        // `outstanding` = a request went out and no answer has come back: kept outright.
+        // Open but answered = may be followed up: taken down last
+        let mut asking: HashMap<ThreadKey, bool> = HashMap::new();
+        for a in self.threads.entries.values().filter_map(|e| e.asked_from.as_ref()) {
+            if a.state == crate::bridge::state::AskState::Ended || a.origin_closed {
+                continue;
+            }
+            let owed = asking.entry(ThreadKey::new(&a.channel, &a.thread_ts)).or_default();
+            *owed |= a.outstanding;
+        }
         for (tts, e) in &self.threads.entries {
             let (Some(channel_id), Some(sid)) = (e.channel_id.as_deref(), e.agent_id.as_deref())
             else {
@@ -1311,10 +1336,13 @@ impl Bridge {
                 && !self.workers.is_draining(&key)
                 && self.ledger.pending(&key).is_empty()
                 && !waiting.contains(&key);
+            let ask = asking.get(&key).copied();
+            let awaiting_answer = ask == Some(true) && idle_ms <= worker::ASK_WAIT_MAX_MS;
             snaps.push(worker::IdleSnapshot {
                 key: key.clone(),
                 idle_ms,
-                eligible,
+                eligible: eligible && !awaiting_answer,
+                open_ask: ask.is_some(),
             });
             sid_of.insert(key, sid.to_string());
         }
@@ -1608,6 +1636,7 @@ mod tests {
             key: ThreadKey::new("C1", &n.to_string()),
             idle_ms: idle_min * MIN,
             eligible: true,
+            open_ask: false,
         }
     }
 

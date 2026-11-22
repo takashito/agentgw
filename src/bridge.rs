@@ -5066,6 +5066,58 @@ mod tests {
         );
     }
 
+    /// **An agent waiting for the answer to its own ask is not taken down**, and one whose ask was
+    /// answered but is still open goes only after every other free agent.
+    #[tokio::test]
+    async fn over_the_cap_an_agent_waiting_on_its_ask_stays() {
+        let (d, _slack, agent, _clock) = flow_deps("evict-asking");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let keys = seated(&mut b, &agent, 11);
+        let now = b.deps.clock.now_ms();
+        {
+            let mut a = b.activity.lock().unwrap();
+            for k in &keys[..8] {
+                a.turn_start(k, now); // at work
+            }
+            for k in &keys[8..] {
+                a.turn_end(k, now); // finished
+            }
+        }
+        let ask = |k: &ThreadKey, outstanding: bool| {
+            let (channel, ts) = k.split();
+            crate::bridge::state::AskedFrom {
+                channel: channel.to_string(),
+                thread_ts: ts.unwrap().to_string(),
+                state: crate::bridge::state::AskState::Approved,
+                outstanding,
+                missed: 0,
+                origin_closed: false,
+                line: None,
+                title: None,
+            }
+        };
+        // keys[8] asked another channel and waits; keys[9]'s ask was answered, still open.
+        // The asked threads' rows carry the record (as on the gateway)
+        b.threads.set_asked("7.1", "C_ASKED", Some(ask(&keys[8], true)));
+        b.threads.set_asked("7.2", "C_ASKED", Some(ask(&keys[9], false)));
+
+        let (snaps, _) = b.idle_snapshots(&b.live_windows());
+        let free: Vec<ThreadKey> = snaps.iter().filter(|s| s.eligible).map(|s| s.key.clone()).collect();
+        assert!(!free.contains(&keys[8]), "waiting for its answer: kept");
+        assert!(free.contains(&keys[9]) && free.contains(&keys[10]));
+        // One over the cap: the one with no ask goes, the open ask is spared
+        assert_eq!(
+            crate::bridge::worker::select_cleanup_keys(snaps, &crate::bridge::worker::CLEANUP)[0],
+            keys[10]
+        );
+        // Ended: no longer protected
+        let mut done = ask(&keys[8], true);
+        done.state = crate::bridge::state::AskState::Ended;
+        b.threads.set_asked("7.1", "C_ASKED", Some(done));
+        let (snaps, _) = b.idle_snapshots(&b.live_windows());
+        assert!(snaps.iter().any(|s| s.key == keys[8] && s.eligible));
+    }
+
     /// **Every agent at work: run over the cap** rather than take one down, and say so once.
     #[tokio::test]
     async fn over_the_cap_with_everyone_at_work_nobody_is_taken_down() {

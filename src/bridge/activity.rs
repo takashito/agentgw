@@ -261,8 +261,17 @@ impl ActivityBook {
                 None => prefix.to_string(),
             },
         };
-        let (state, summary) = if !has_agent || row.session_ended {
+        let (state, summary) = if !has_agent {
             ("no_agent", "This thread's agent has ended.".to_string())
+        } else if row.session_ended {
+            // **The record is kept, so this is a rest, not an end**: the cleanup frees seats this
+            // way, and `no_agent` read as "it stopped" to the agent waiting on this thread
+            (
+                "resting",
+                "This thread's agent is resting (stopped to free a seat, or by exit); its conversation is kept, \
+                 and a new message to the thread wakes it again where it left off."
+                    .to_string(),
+            )
         } else if row.lost {
             (
                 "agent_gone",
@@ -733,8 +742,14 @@ mod tests {
         b.waiting_for_person(&key(), true, 0);
         assert_eq!(b.snapshot(&key(), true, 1_000)["state"], "waiting_for_person");
         b.session_end(&key(), 2_000);
-        assert_eq!(b.snapshot(&key(), true, 3_000)["state"], "no_agent");
+        // Its record is kept: resting, and a message wakes it
+        let s = b.snapshot(&key(), true, 3_000);
+        assert_eq!(s["state"], "resting");
+        assert!(s["summary"].as_str().unwrap().contains("wakes it again"), "{s}");
         assert_eq!(b.snapshot(&key(), false, 3_000)["state"], "no_agent");
+        // Woken by a message: at work again
+        b.turn_start(&key(), 4_000);
+        assert_eq!(b.snapshot(&key(), true, 5_000)["state"], "thinking");
     }
 
     /// A new tool means the agent is past the prompt, even when the answer never reached this
