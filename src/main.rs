@@ -75,6 +75,12 @@ async fn main() {
             let dir = agentgw::state_dir::StateDir::resolve();
             std::process::exit(agentgw::bridge::gateway::Cli::update(&dir, &rest).await);
         }
+        // Change which machine handles a channel, or forget a machine (run on the gateway)
+        "route" | "unroute" | "remove-machine" => {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            let dir = agentgw::state_dir::StateDir::resolve();
+            std::process::exit(agentgw::bridge::gateway::admin::cli(&dir, &cmd, &rest).await);
+        }
         "install" | "uninstall" => {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             std::process::exit(agentgw::setup::run(&cmd, &rest));
@@ -116,8 +122,12 @@ async fn main() {
                      Day to day: status | restart | shutdown | start | uninstall\n\
                      Update:    update [version]   the gateway, then every machine one at a time\n\
                      \n\
-                     Add a machine (run on the gateway):\n  \
-                     add-machine user@host   install agentgw on another machine and connect it here\n\
+                     Machines and channels (run on the gateway):\n  \
+                     add-machine user@host   install agentgw on another machine and connect it here\n  \
+                     route <channel> <machine>[:<folder>]   hand a channel to a machine\n  \
+                     unroute <channel>       take a channel's assignment away\n  \
+                     remove-machine <name>   forget a machine that is gone\n  \
+                     (these three show what would change; add --yes to do it)\n\
                      \n\
                      `serve` is what the service runs; you don't need to type it.",
                     "agentgw {v}\n\
@@ -126,8 +136,12 @@ async fn main() {
                      ふだん: status | restart | shutdown | start | uninstall\n\
                      上げる: update [版]         ゲートウェイ、次に各マシンを1台ずつ\n\
                      \n\
-                     マシンを足すとき(ゲートウェイで):\n  \
-                     add-machine user@host   ほかのマシンに agentgw を入れて、ここにつなぐ\n\
+                     マシンとチャンネル(ゲートウェイで):\n  \
+                     add-machine user@host   ほかのマシンに agentgw を入れて、ここにつなぐ\n  \
+                     route <チャンネル> <マシン>[:<フォルダ>]   チャンネルをマシンに任せる\n  \
+                     unroute <チャンネル>    チャンネルの割り当てを外す\n  \
+                     remove-machine <名前>   もう無いマシンを外す\n  \
+                     (この3つは何が変わるかを出すだけ。--yes で実行)\n\
                      \n\
                      serve はサービスが呼ぶ本体です(手で打つ必要はありません)。"
                 )

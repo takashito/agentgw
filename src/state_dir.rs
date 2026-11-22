@@ -91,6 +91,18 @@ impl StateDir {
         self.write_json_atomic(name, &root)
     }
 
+    /// Drop one top-level key from a JSON file. For a map that has just become empty: a typed save
+    /// skips an empty map (so the old one stays on disk), and a `null` in its place would make the
+    /// whole file unreadable to a `#[serde(default)]` map.
+    pub fn remove_json_key(&self, name: &str, key: &str) -> std::io::Result<()> {
+        let mut root = self.read_json_or(name, serde_json::json!({}));
+        let removed = root.as_object_mut().and_then(|map| map.remove(key)).is_some();
+        match removed {
+            true => self.write_json_atomic(name, &root),
+            false => Ok(()),
+        }
+    }
+
     /// Where the **generated files** passed to claude live (`--settings` / `--mcp-config`).
     ///
     /// **They are not state, so they don't go in the state directory.** They are rewritten on every start,

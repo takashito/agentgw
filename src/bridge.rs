@@ -1281,6 +1281,7 @@ impl Bridge {
                 ask_capable: Default::default(),
                 catch_up: Default::default(),
                 joins: Default::default(),
+                admin_waits: Default::default(),
             });
             // One listener per address: loopback for whatever terminates TLS in front, the LAN address
             // for machines on the same network

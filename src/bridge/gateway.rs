@@ -18,6 +18,8 @@
 //! were separate files grep could check that; now that they share a module, this ordering and how the tests run are the guard.
 
 // ── Section 1: protocol ─────────────────────────────────────
+pub mod admin;
+
 pub mod link {
     //! The Relay ⇄ Bridge link protocol — the frames carried over WebSocket and the connection
     //! string that says where to dial. Pure data, no I/O (it's a contract **both** Relay and Bridge
@@ -2585,6 +2587,8 @@ pub struct Fleet {
     pub catch_up: CatchUp,
     /// What the gateway knows about the bot being brought into channels (see [`JoinBook`]).
     pub joins: JoinBook,
+    /// `agentgw route` waiting for a machine to check the folder (channel → the machine asked, the answer).
+    pub admin_waits: std::sync::Mutex<HashMap<String, (String, tokio::sync::oneshot::Sender<Result<String, String>>)>>,
 }
 
 /// A machine that was away during an `update` comes back on the old version, and nothing brought it
@@ -3413,7 +3417,16 @@ impl Fleet {
         missing: Option<String>,
         created: bool,
     ) {
+        // `agentgw route` from the terminal is waiting on this answer: it records the change itself
+        if thread_ts.is_empty() && self.admin_answer(bridge_id, channel, &result) {
+            return;
+        }
         if thread_ts.is_empty() {
+            // A channel taken away from this machine: its replay of the old row must not take it back
+            if self.access().released.get(channel).is_some_and(|m| m == bridge_id) {
+                rlog("info", &format!("{bridge_id} still had {channel}, which was unassigned from it — ignored"));
+                return;
+            }
             // A folder set on the machine itself: record it so `route` shows where the work happens
             //
             // **A machine may only describe a channel that is already its own.** Every machine
@@ -3443,6 +3456,9 @@ impl Fleet {
                     r.repo_path = Some(abs);
                 })
                 .await;
+                if self.access().routes.get(channel).and_then(|r| r.bridge.as_deref()) == Some(bridge_id) {
+                    self.unrelease(channel).await;
+                }
             }
             return;
         }
@@ -3463,6 +3479,7 @@ impl Fleet {
                     r.repo_path = Some(folder);
                 })
                 .await;
+                self.unrelease(channel).await;
                 reply.push('\n');
                 reply.push_str(&crate::t!("Project folder: `{abs}`", "作業ディレクトリ: `{abs}`"));
                 self.bind_and_link(bridge_id, channel, thread_ts).await;
@@ -6129,7 +6146,7 @@ pub(super) async fn bind_link_port(addr: std::net::SocketAddr, what: &str) -> Op
     }
 }
 
-/// **Only the three link routes live on this port.** The hook intake (`bridge.rs`) and MCP are on
+/// **Only the link routes (and the key-guarded `update` and `admin` asks) live on this port.** The hook intake (`bridge.rs`) and MCP are on
 /// **a different port**, guarded by loopback + token. This one is exposed through a front proxy, so putting
 /// them on the same port would let hooks and MCP be hit from outside.
 async fn serve_children_on(fleet: Arc<Fleet>, listener: tokio::net::TcpListener) {
@@ -6137,6 +6154,7 @@ async fn serve_children_on(fleet: Arc<Fleet>, listener: tokio::net::TcpListener)
         .route("/status", get(on_status))
         .route("/update", axum::routing::post(on_start_update))
         .route("/update/local", axum::routing::post(on_start_update_local))
+        .route("/admin", axum::routing::post(admin::on_admin))
         // **No size limit**: the body streams to disk, so axum's 2MB guard for bodies read into memory
         // has nothing to guard here
         .route(
@@ -7593,6 +7611,7 @@ mod tests {
             ask_capable: Default::default(),
             catch_up: Default::default(),
             joins: JoinBook::settled_after(std::time::Duration::ZERO),
+            admin_waits: Default::default(),
         });
         (fleet, msg_rx)
     }
@@ -9737,6 +9756,191 @@ mod tests {
             Beat::Gone(_)
         ));
     }
+
+    // ── agentgw route / unroute / remove-machine ─────────────────────────────────────────
+
+    /// A gateway ("parent") whose `mac` handles C1 (with a folder and an allowed tool), with `mac` recorded.
+    fn admin_fleet(name: &str) -> (Arc<Fleet>, Arc<crate::chat::fake::FakeChat>) {
+        let dir = StateDir::at(std::env::temp_dir().join(format!("agentgw-admin-{name}-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(dir.path());
+        let mut access = Access::load(&dir);
+        access.owner = "U_OWNER".into();
+        access.routes.insert(
+            "C1".into(),
+            crate::bridge::state::Route {
+                bridge: Some("mac".into()),
+                repo_path: Some("/Users/x/audit".into()),
+                allowed_tools: Some(vec!["Bash(ls)".into()]),
+                ..Default::default()
+            },
+        );
+        access.machines.insert("mac".into(), Default::default());
+        access.save(&dir).unwrap();
+        let api = Arc::new(crate::chat::fake::FakeChat::in_channels(&[("C1", "audit")]));
+        let (fleet, _rx) = a_fleet_with(dir, api.clone());
+        (fleet, api)
+    }
+
+    fn admin(op: admin::AdminOp, apply: bool) -> admin::AdminRequest {
+        admin::AdminRequest { op, apply }
+    }
+
+    fn on_disk(fleet: &Fleet) -> serde_json::Value {
+        fleet.dir.read_json_or("access.json", serde_json::Value::Null)
+    }
+
+    #[tokio::test]
+    async fn without_yes_nothing_changes() {
+        let (fleet, api) = admin_fleet("preview");
+        let before = on_disk(&fleet);
+        let said = fleet
+            .admin(admin(admin::AdminOp::Unroute { channel: "#audit".into() }, false))
+            .await
+            .unwrap();
+        assert!(said.contains("#audit (C1)") && said.contains("Bash(ls)"), "{said}");
+        assert!(said.contains("--yes"), "{said}");
+        assert_eq!(on_disk(&fleet), before);
+        assert!(!posts(&api).contains("post_md"), "{}", posts(&api));
+    }
+
+    #[tokio::test]
+    async fn route_to_the_gateway_checks_the_folder_then_hands_the_channel_over() {
+        let (fleet, api) = admin_fleet("route-here");
+        let missing = fleet.dir.path().join("nope").to_string_lossy().to_string();
+        let op = |path: &str| admin::AdminOp::Route { channel: "C1".into(), machine: "parent".into(), path: Some(path.into()) };
+        assert!(fleet.admin(admin(op(&missing), true)).await.is_err());
+        assert_eq!(fleet.access().routes["C1"].bridge.as_deref(), Some("mac"), "a missing folder changes nothing");
+
+        let here = fleet.dir.path().to_string_lossy().to_string();
+        let said = fleet.admin(admin(op(&here), true)).await.unwrap();
+        assert!(said.contains("mac → parent"), "{said}");
+        let row = &fleet.access().routes["C1"];
+        assert_eq!((row.bridge.as_deref(), row.repo_path.as_deref()), (Some("parent"), Some(here.as_str())));
+        assert!(posts(&api).contains("post_md C1 -"), "the channel hears of it: {}", posts(&api));
+    }
+
+    #[tokio::test]
+    async fn route_to_a_machine_waits_for_it_to_find_the_folder() {
+        let (fleet, _api) = admin_fleet("route-there");
+        let (c, mut frames) = conn();
+        fleet.links.register("pve", c);
+        let op = admin::AdminOp::Route { channel: "C1".into(), machine: "pve".into(), path: Some("~/dev/audit".into()) };
+
+        // pve says the folder is not there: nothing moves
+        let f = fleet.clone();
+        let asked = tokio::spawn(async move { f.admin(admin(op, true)).await });
+        let told = loop {
+            if let Ok(t) = frames.try_recv() {
+                break link::decode(&t).unwrap();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        assert!(matches!(&told, link::LinkFrame::SetProject { channel, thread_ts, path, .. } if channel == "C1" && thread_ts.is_empty() && path == "~/dev/audit"), "{told:?}");
+        fleet
+            .on_machine_frame("pve", link::LinkFrame::ProjectSet {
+                channel: "C1".into(), thread_ts: String::new(), result: Err("no such folder".into()),
+                thread_only: false, missing: None, created: false,
+            })
+            .await;
+        assert_eq!(asked.await.unwrap().unwrap_err(), "no such folder");
+        assert_eq!(fleet.access().routes["C1"].bridge.as_deref(), Some("mac"));
+
+        // It is there: the channel is pve's, in the folder pve resolved
+        let op = admin::AdminOp::Route { channel: "C1".into(), machine: "pve".into(), path: Some("~/dev/audit".into()) };
+        let f = fleet.clone();
+        let asked = tokio::spawn(async move { f.admin(admin(op, true)).await });
+        while frames.try_recv().is_err() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        fleet
+            .on_machine_frame("pve", link::LinkFrame::ProjectSet {
+                channel: "C1".into(), thread_ts: String::new(), result: Ok("/home/p/dev/audit".into()),
+                thread_only: false, missing: None, created: false,
+            })
+            .await;
+        asked.await.unwrap().unwrap();
+        let row = &fleet.access().routes["C1"];
+        assert_eq!((row.bridge.as_deref(), row.repo_path.as_deref()), (Some("pve"), Some("/home/p/dev/audit")));
+    }
+
+    #[tokio::test]
+    async fn route_to_a_machine_that_never_answers_changes_nothing() {
+        let (fleet, _api) = admin_fleet("route-silent");
+        let (c, _frames) = conn();
+        fleet.links.register("pve", c);
+        let op = admin::AdminOp::Route { channel: "C1".into(), machine: "pve".into(), path: None };
+        assert!(fleet.admin(admin(op, true)).await.is_err());
+        assert_eq!(fleet.access().routes["C1"].bridge.as_deref(), Some("mac"));
+        assert!(fleet.admin_waits.lock().unwrap().is_empty(), "the wait is cleared");
+    }
+
+    /// **Regression for the reason this exists**: the machine still has its own row and replays it on
+    /// every handshake. Without the note, an unassigned channel went straight back to it.
+    #[tokio::test]
+    async fn an_unrouted_channel_does_not_go_back_on_the_machines_next_handshake() {
+        let (fleet, _api) = admin_fleet("unroute");
+        fleet.admin(admin(admin::AdminOp::Unroute { channel: "C1".into() }, true)).await.unwrap();
+        assert!(!fleet.access().routes.contains_key("C1"));
+        assert_eq!(fleet.access().released.get("C1").map(String::as_str), Some("mac"));
+
+        // mac's replay of its old row
+        fleet
+            .on_machine_frame("mac", link::LinkFrame::ProjectSet {
+                channel: "C1".into(), thread_ts: String::new(), result: Ok("/Users/x/audit".into()),
+                thread_only: false, missing: None, created: false,
+            })
+            .await;
+        assert!(!fleet.access().routes.contains_key("C1"), "{:?}", fleet.access().routes);
+
+        // Assigned again: the note goes, key and all
+        let here = fleet.dir.path().to_string_lossy().to_string();
+        let op = admin::AdminOp::Route { channel: "C1".into(), machine: "parent".into(), path: Some(here) };
+        fleet.admin(admin(op, true)).await.unwrap();
+        assert!(on_disk(&fleet).get("released").is_none(), "{}", on_disk(&fleet));
+    }
+
+    #[tokio::test]
+    async fn removing_the_last_machine_takes_its_record_and_channels_off_disk() {
+        let (fleet, _api) = admin_fleet("remove");
+        let (c, _frames) = conn();
+        fleet.links.register("mac", c.clone());
+        let op = || admin::AdminOp::RemoveMachine { machine: "mac".into() };
+        assert!(fleet.admin(admin(op(), true)).await.unwrap_err().contains("connected"));
+        fleet.links.unregister("mac", &c);
+
+        let said = fleet.admin(admin(op(), true)).await.unwrap();
+        assert!(said.contains("#audit (C1)"), "{said}");
+        let disk = on_disk(&fleet);
+        assert!(disk.get("machines").is_none(), "{disk}");
+        assert!(disk["routes"].get("C1").is_none(), "{disk}");
+        assert_eq!(disk["released"]["C1"], "mac");
+        assert_eq!(disk["owner"], "U_OWNER", "the rest of the file stays");
+    }
+
+    #[tokio::test]
+    async fn the_admin_ask_needs_the_key() {
+        let (fleet, _api) = admin_fleet("http");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_children_on(fleet.clone(), listener));
+        let post = |token: &'static str| async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let body = r#"{"op":"unroute","channel":"C1","apply":true}"#;
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            s.write_all(format!(
+                "POST /admin HTTP/1.1\r\nHost: x\r\nx-api-token: {token}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ).as_bytes()).await.unwrap();
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf).await;
+            String::from_utf8_lossy(&buf).to_string()
+        };
+        assert!(post("wrong").await.starts_with("HTTP/1.1 401"));
+        assert!(fleet.access().routes.contains_key("C1"));
+        let ok = post("s3cret").await;
+        assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+        assert!(!fleet.access().routes.contains_key("C1"));
+    }
 }
 
 #[cfg(test)]
@@ -9790,6 +9994,7 @@ mod ask_tests {
             ask_capable: Default::default(),
             catch_up: Default::default(),
             joins: JoinBook::settled_after(std::time::Duration::ZERO),
+            admin_waits: Default::default(),
         });
         Rig { fleet, api, msgs, _notes: notes }
     }

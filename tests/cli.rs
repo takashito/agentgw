@@ -103,3 +103,24 @@ fn update_local_stops_where_there_is_nothing_built() {
     assert!(text.contains("cargo dist"), "{text}");
     let _ = std::fs::remove_dir_all(&empty);
 }
+
+#[test]
+fn route_unroute_and_remove_machine_answer_with_their_own_usage() {
+    for (cmd, usage) in [
+        ("route", "agentgw route <channel>"),
+        ("unroute", "agentgw unroute <channel>"),
+        ("remove-machine", "agentgw remove-machine <name>"),
+    ] {
+        let (code, text) = agentgw(&[cmd]);
+        assert_eq!(code, 2, "{cmd}: {text}");
+        assert!(text.contains(usage), "{cmd}: {text}");
+    }
+}
+
+#[test]
+fn route_is_refused_off_the_gateway() {
+    // A state directory with no link key is not a gateway that can be asked
+    let (code, text) = agentgw(&["unroute", "C1"]);
+    assert_eq!(code, 2, "{text}");
+    assert!(text.contains("gateway"), "{text}");
+}

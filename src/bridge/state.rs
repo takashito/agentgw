@@ -1105,6 +1105,15 @@ pub struct Access {
     /// finishing it every 2 seconds. The gateway clears the key itself (`Fleet::end_update`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub update: Option<Rollout>,
+    /// **Channels taken away from a machine that still has its own row for them** (channel → that
+    /// machine), on the gateway. A machine replays every folder it has on each handshake, and a
+    /// channel with no row here is taken on that word — so a channel unassigned with `unroute` or
+    /// `remove-machine` would go straight back to the machine the next time it connected. A replay
+    /// from the machine named here is ignored instead. The row goes once the channel is assigned
+    /// again. **Emptying it can't go through [`Access::save`]** (an empty map isn't written), so the
+    /// gateway clears the key itself, like `update`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub released: BTreeMap<String, String>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }

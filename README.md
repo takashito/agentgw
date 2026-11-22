@@ -242,6 +242,21 @@ address a machine turns out to need.
 `agentgw status` on the gateway lists each machine and how it is connected, and `machines` in Slack shows
 where each one is reachable.
 
+### Reassigning channels and removing machines
+
+The same changes can be made from the gateway's terminal, without being in the channel:
+
+```bash
+agentgw route C0123456789 build-box:~/dev/app   # hand a channel (ID or #name) to a machine and folder
+agentgw unroute '#old-project'                  # take a channel's assignment away; the gateway handles it afterwards
+agentgw remove-machine build-box                # forget a machine that is gone, with its channel assignments
+```
+
+Each command first shows what would change and changes nothing; add `--yes` to apply it. `route` checks
+that the folder exists on that machine before anything changes. Threads already running in a channel stay
+on the machine they are on. `remove-machine` refuses a machine that is still connected (stop agentgw on it
+first), and a removed machine that connects again does not get its old channels back.
+
 ### Windows machines
 
 Windows is supported as a machine; the gateway requires macOS or Linux. Windows does not run an SSH server by default, so a Windows machine is installed on the machine itself with `install.ps1` rather than with `add-machine user@host`.

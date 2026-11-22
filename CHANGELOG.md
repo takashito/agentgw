@@ -8,6 +8,9 @@ in [README.md](README.md#release-notes).
 
 ## [Unreleased]
 
+### Added
+- New gateway commands `route`, `unroute` and `remove-machine` reassign a channel, take its assignment away, or forget a machine that is gone, from the terminal. Each shows what would change first and applies only with `--yes`.
+
 ## [0.74.1] - 2026-11-22
 
 ### Fixed
