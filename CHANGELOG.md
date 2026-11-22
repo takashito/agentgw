@@ -8,6 +8,8 @@ in [README.md](README.md#release-notes).
 
 ## [Unreleased]
 
+## [0.74.0] - 2026-11-22
+
 ### Added
 - A machine that was offline during an update is brought up to the gateway's version as soon as it connects again, without restarting the others. The notice channel shows it.
 
