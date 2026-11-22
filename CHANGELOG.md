@@ -8,6 +8,8 @@ in [README.md](README.md#release-notes).
 
 ## [Unreleased]
 
+## [0.74.1] - 2026-11-22
+
 ### Fixed
 - An agent waiting for the answer to a request it sent to another channel is no longer stopped to free a seat. Agents with a request still open are stopped only after every other idle agent.
 - Checking on a thread whose agent was stopped to free a seat now says it is resting and wakes up when a message arrives, instead of saying it has ended.
