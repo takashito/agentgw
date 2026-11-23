@@ -131,7 +131,11 @@ pub(crate) struct LeadConf {
     pub id: String,
     pub channel: String,
     pub class: crate::bridge::perm_class::Class,
-    /// The tool call it is about; empty for a screen confirmation. Its end closes the prompt.
+    /// The tool the prompt asks about; empty for a confirmation found on the screen.
+    #[serde(default)]
+    pub tool: String,
+    /// The tool call it is about, when the hook says (the permission hook may not): its end
+    /// closes the prompt.
     pub tool_use_id: String,
     /// What the call runs, as the notice showed it: a screen that shows the same is the same stop.
     pub shown: String,
@@ -2295,7 +2299,7 @@ impl Bridge {
             .get(thread_ts)
             .is_some_and(|c| !c.shown.is_empty() && notice_snippet(&d.title).contains(&c.shown));
         let restates = crate::bridge::perm_class::dialog_defers_to_tool(&d.title) || same_command;
-        if restates && self.lead_confs.get(thread_ts).is_some_and(|c| !c.tool_use_id.is_empty()) {
+        if restates && self.lead_confs.get(thread_ts).is_some_and(|c| !c.tool.is_empty()) {
             return; // the prompt the gateway already holds answers this screen too
         }
         let why = if restates {
@@ -2366,6 +2370,7 @@ impl Bridge {
                 id: conf_id.to_string(),
                 channel: channel.to_string(),
                 class: v.class,
+                tool: tool.to_string(),
                 tool_use_id: tool_use_id.to_string(),
                 shown: if tool.is_empty() { String::new() } else { perm_shown(input) },
             },
@@ -2457,7 +2462,7 @@ impl Bridge {
         if allow && lead && conf.class != Class::Lead {
             return Err("only the Owner can allow this confirmation".into());
         }
-        let from_tool = !conf.tool_use_id.is_empty();
+        let from_tool = !conf.tool.is_empty();
         let conf_shown = conf.shown.clone();
         let label = if reason.is_empty() { by.to_string() } else { format!("{by} — {reason}") };
         // The prompt's hook, while it is still open: the agent's own way of being answered

@@ -3611,7 +3611,8 @@ mod tests {
         let ev = HookEvent {
             kind: "perm".into(),
             session_id: sid.to_string(),
-            payload: serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}, "tool_use_id": "toolu_7"}),
+            // **No tool_use_id**: the permission hook did not carry one on a real machine (2026-11-23)
+            payload: serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}}),
             respond: Some(tx),
         };
         (ev, rx)
@@ -3679,6 +3680,8 @@ mod tests {
         b.ask_gateway = Some(tx);
         b.on_inbound(&agent_msg(ROOT, ROOT, "check it", crate::chat::DeliveryKind::Ask)).await;
         let sid = b.threads.get(ROOT).and_then(|e| e.agent_id.clone()).expect("an agent");
+        on_hook_user_prompt_for_test(&mut b, &sid).await;
+        settle().await;
         let (ev, _rx) = perm_with(&sid, "rm -rf /tmp/claude-1000/wk195/x");
         b.on_hook(ev).await;
         let (asks, _) = perm_frames(&mut up);
@@ -3692,6 +3695,13 @@ mod tests {
             asked: false,
             selected: 0,
         });
+        // The watch finds the screen the expired prompt left: the same stop, still the Lead's
+        // (on a real machine it was taken for a new prompt and sent to the Owner, 2026-11-23)
+        b.stall.clear();
+        clock.advance(30_000);
+        b.dialog_tick().await;
+        let (more, rest) = perm_frames(&mut up);
+        assert!(more.is_empty() && !rest.iter().any(|f| f.contains("PermClosed")), "{more:?} {rest:?}");
         b.on_perm_click(gateway_says(&asks[0].0, true, true)).await;
         assert_eq!(*agent.answered.lock().unwrap(), vec![Some(0)]);
         let (more, rest) = perm_frames(&mut up);
