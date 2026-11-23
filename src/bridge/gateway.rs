@@ -11033,6 +11033,20 @@ mod ask_tests {
     }
 
     #[tokio::test]
+    async fn observing_adds_the_verdict_to_the_plain_notice_and_records_it() {
+        let (r, thread, seen) = perm_rig("observe", "observe", Ok("x".into())).await;
+        let before = calls(&r.api).len();
+        r.fleet.on_machine_frame("parent", perm_ask(&thread, "c1", "touch /tmp/claude-1000/wk/ok", crate::bridge::perm_class::Class::Lead)).await;
+        let said = calls(&r.api)[before..].to_vec();
+        let notice = said.iter().find(|c| c.starts_with("post_md C1 1.1 ")).expect("the plain notice");
+        assert!(notice.contains("A person is needed") && notice.contains("the Lead could decide this"), "{notice}");
+        assert_eq!(records(&r)[0]["event"], "observed");
+        let refused = r.fleet.answer_permission("parent", "C1", "1.1", "c1", true, "scratch").await;
+        assert!(refused.unwrap_err().contains("not switched on"));
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn the_lead_is_told_and_its_allow_goes_to_the_machine_and_the_record() {
         let (mut r, thread, seen) = perm_rig("lead", "on", Ok("allowed Bash through its permission prompt".into())).await;
         let before = calls(&r.api).len();
