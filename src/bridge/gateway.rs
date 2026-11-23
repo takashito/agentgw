@@ -11186,14 +11186,15 @@ mod ask_tests {
         let (r, thread, _) = perm_rig("ja", "on", Ok("denied".into())).await;
         r.fleet.on_machine_frame("parent", perm_ask(&thread, "j1", "curl -X POST http://127.0.0.1:9/", crate::bridge::perm_class::Class::Owner)).await;
         let notice = calls(&r.api).into_iter().find(|c| c.starts_with("post_blocks C1 1.1 ")).expect("the Owner is asked");
-        for part in ["のエージェントが、あなたの許可を待っています", "しようとしていること: `curl -X POST http://127.0.0.1:9/`(Bash で実行)",
+        for part in ["のエージェントが、あなたの許可を待っています", "しようとしていること: `curl -X POST http://127.0.0.1:9/` (Bash で実行)",
                      "あなたに聞く理由: curl は Lead が決めてよいコマンドではありません", "「許可」か「拒否」を押してください", "30分たつと", "\"許可\"", "\"拒否\""] {
             assert!(notice.contains(part), "missing {part}: {notice}");
         }
         assert!(!notice.contains("j1") || notice.contains("perm:owner-allow:j1"), "the id only in the button: {notice}");
-        r.fleet.answer_permission("parent", "C1", "1.1", "j1", false, "試験なので実行しない").await.unwrap();
+        r.fleet.answer_permission("parent", "C1", "1.1", "j1", false, "試験なので実行しない。").await.unwrap();
         let rewritten = calls(&r.api).into_iter().find(|c| c.starts_with("update_md C1 ") && c.contains("あなたの許可を待っています")).expect("rewritten");
         assert!(rewritten.contains("拒否されました(依頼元の Lead、<#C1>) — 理由: 試験なので実行しない。実行されません"), "{rewritten}");
+        assert!(!rewritten.contains("。。"), "one full stop: {rewritten}");
     }
 
     #[tokio::test]

@@ -305,7 +305,9 @@ impl Fleet {
                 "エージェントの画面に確認が出ています「{shown}」"
             )
         } else {
-            crate::t!("`{shown}` (with {tool})", "`{shown}`({tool} で実行)")
+            // **A space after the closing backtick**: a full-width bracket right after it let
+            // Slack stretch a URL in the command past the backtick and break the code span
+            crate::t!("`{shown}` (with {tool})", "`{shown}` ({tool} で実行)")
         };
         let because = match (p.class, late) {
             (Class::Owner, _) => why.clone(),
@@ -549,6 +551,8 @@ impl Fleet {
             serde_json::json!({"by": who, "decision": outcome, "reason": reason, "result": note}),
         );
         let shown = &p.shown;
+        // The sentence that follows brings its own full stop
+        let reason = reason.trim().trim_end_matches(['。', '.', '．']);
         let reason_part = if reason.is_empty() { String::new() } else { crate::t!(" \u{2014} reason: {reason}", " \u{2014} 理由: {reason}") };
         let line = match outcome {
             "allow" => crate::t!(
