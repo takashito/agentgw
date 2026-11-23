@@ -236,7 +236,7 @@ impl Fleet {
         };
         self.perms.lock().unwrap_or_else(|e| e.into_inner()).insert(conf_id.clone(), p.clone());
         self.save_perms();
-        let link = self.api.get_permalink(&channel, &ts).await.unwrap_or_default();
+        let link = self.prompt_link(&channel, &thread_ts, &ts).await;
         let name = self.channel_label(&channel).await;
         let shown = p.shown.clone();
         match class {
@@ -272,6 +272,16 @@ impl Fleet {
         }
     }
 
+    /// A link to the prompt, or to its thread once the prompt's post is gone: the machine deletes
+    /// a permission prompt when its hook's wait runs out, which is before the Lead's three minutes
+    /// (an escalation notice went out with an empty link, 2026-11-23).
+    async fn prompt_link(&self, channel: &str, thread_ts: &str, ts: &str) -> String {
+        match self.api.get_permalink(channel, ts).await {
+            Ok(l) if !l.is_empty() => l,
+            _ => self.api.get_permalink(channel, thread_ts).await.unwrap_or_default(),
+        }
+    }
+
     /// Ask the Owner, with Allow and Deny on the notice. `late` = the Lead's wait ran out.
     async fn ask_owner(&self, conf_id: &str, late: bool) {
         let Some(p) = self.perms.lock().unwrap_or_else(|e| e.into_inner()).get(conf_id).cloned() else {
@@ -281,7 +291,7 @@ impl Fleet {
         let Some(top) = targets.iter().find(|t| t.mention_owner).or(targets.first()).cloned() else {
             return;
         };
-        let link = self.api.get_permalink(&p.channel, &p.ts).await.unwrap_or_default();
+        let link = self.prompt_link(&p.channel, &p.thread_ts, &p.ts).await;
         let name = self.channel_label(&p.channel).await;
         let mention = self.owner().map(|o| format!("<@{o}> ")).unwrap_or_default();
         let why = &p.why;
