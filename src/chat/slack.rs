@@ -1400,6 +1400,14 @@ pub struct PermClick {
     pub message_ts: String,
 }
 
+/// The `action` of an answer the gateway hands over for a permission prompt (the Lead's, or the
+/// Owner's press on the gateway's notice). No Slack button carries it.
+pub const GW_ALLOW: &str = "gw-allow";
+pub const GW_DENY: &str = "gw-deny";
+/// The buttons on the gateway's notice to the Owner: `perm:<action>:<confirmation id>`.
+pub const OWNER_ALLOW: &str = "owner-allow";
+pub const OWNER_DENY: &str = "owner-deny";
+
 /// The `action` of the two answers to a [`FolderOffer`](crate::bridge::state::FolderOffer).
 pub const FOLDER_YES: &str = "mkdir-yes";
 pub const FOLDER_NO: &str = "mkdir-no";
@@ -2197,6 +2205,13 @@ pub fn answered_questions(
 
 /// What the prompt becomes once someone has pressed a button: the same question and rows, the
 /// one that was taken marked, and who took it. `chosen` is None when it was cancelled.
+/// Who answered, as a thread shows it: a Slack user as a mention, anything else (the Lead's
+/// label) as written.
+pub fn who(by: &str) -> String {
+    let is_user = by.len() > 2 && by.starts_with(['U', 'W']) && by.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if is_user { format!("<@{by}>") } else { by.to_string() }
+}
+
 pub fn answered_dialog(d: &crate::agent::Dialog, chosen: Option<usize>, by: &str) -> String {
     let what = match chosen.and_then(|i| d.options.get(i)) {
         Some(label) => format!("\u{2705} {label}"),
@@ -2204,7 +2219,7 @@ pub fn answered_dialog(d: &crate::agent::Dialog, chosen: Option<usize>, by: &str
     };
     // **Under the question, not over it.** The answer read as a headline with the question
     // buried beneath it; what was asked comes first and the verdict closes it
-    format!("{}\n{what} \u{2014} <@{by}>", dialog_body(d, false))
+    format!("{}\n{what} \u{2014} {}", dialog_body(d, false), who(by))
 }
 
 /// What the prompt becomes when the answer could not be given: why, and the question again, so
@@ -2239,6 +2254,10 @@ pub fn perm_click_from_relay(
         return None;
     }
     let (action_name, req_id) = (parts.next()?, parts.next()?);
+    // Only the gateway hands these over, never a button
+    if action_name.starts_with("gw-") {
+        return None;
+    }
     Some(PermClick {
         req_id: req_id.to_string(),
         action: action_name.to_string(),

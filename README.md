@@ -338,12 +338,25 @@ When the bot is added to a channel that has no machine yet, it asks the Owner in
 
 The Claudes in different channels ask each other for work with the `ask_channel` tool. A request starts in the other channel at once, its reply comes back to the thread that asked, and the asking Claude closes the thread it asked with `end_ask` once it is done — as completed (✅) or as no longer wanted. A Claude can also end its own session with `end_session` when the person says the work is finished. The whole exchange stays in Slack.
 
-While a request is running, the asking Claude can check on it with `thread_activity` instead of interrupting it. The answer always carries a one-word `state` — `running_tool`, `thinking`, `waiting_for_person`, `turn_ended`, `turn_failed`, `idle`, `no_agent`, `machine_offline` or `no_answer` — with a one-line summary, the tools running and for how many seconds, the last tool with its outcome, and when the asked Claude last posted to its thread. Reading changes nothing in the asked thread.
+While a request is running, the asking Claude can check on it with `thread_activity` instead of interrupting it. The answer always carries a one-word `state` — `running_tool`, `thinking`, `waiting_for_permission`, `waiting_for_person`, `turn_ended`, `turn_failed`, `idle`, `no_agent`, `machine_offline` or `no_answer` — with a one-line summary, the tools running and for how many seconds, the last tool with its outcome, and when the asked Claude last posted to its thread. Reading changes nothing in the asked thread.
 
 Any thread of the channel that asked can do this, not only the thread that sent the request. This lets a request that has gone quiet be picked up from a fresh thread. A follow-up (`ask_channel` with the asked `thread_ts`) sent from another thread of the same channel takes the exchange over: replies, notices that a person is needed, and `end_ask` move to that thread, and the thread that asked first gets a one-line note. Threads in other channels cannot read or follow up a request, and a closed request stays closed.
 
 - **Scope:** only threads asked from the calling thread with `ask_channel` (ended ones included). Any other thread is refused.
 - **Masking:** command lines are cut to 200 characters and output to its last 300. Only a command's output or a failure's message is passed on, never a file's contents or search hits. Values that look like secrets are replaced with `***`: tokens with a known prefix (`xoxb-`, `ghp_`, `sk-`, `AKIA` and others), values of variables and fields whose name contains `TOKEN`, `SECRET`, `PASSWORD`, `API_KEY` and the like, the word after `--token`, `--password`, `Bearer` and similar, passwords in URLs, and long random-looking strings.
+
+### Permission prompts in asked threads
+
+When the agent in an asked thread stops at a permission prompt, the gateway decides who answers it. The asking Claude (the *Lead*) may allow a short list of safe actions: reading files that hold no secrets, building and testing in the channel's folder, editing files there (except Claude's settings, hooks, git hooks and CI configuration), and deleting fully written-out paths inside `/tmp/claude-*/` or `~/.local/state/<project>/`. Everything else — deleting elsewhere, pushing, releasing, sending data out, connecting to other machines, `sudo`, signing in, reading keys or tokens, Claude Code's own safety checks, and any command that cannot be read — is the Owner's.
+
+- **The Lead's prompts** go to the asking thread. The Lead answers with the `answer_permission` tool (allow or deny, with a reason). If nobody answers within three minutes, the Owner is asked too; the first answer counts.
+- **The Owner's prompts** go to the Owner at once, with **Allow** and **Deny** buttons on the notice. The Lead can only deny them.
+- **Who answered is checked by the gateway**: an answer counts only from the thread that asked for the work, or from the Owner's own button press. Text that an agent writes cannot allow anything.
+- **Every step is recorded** in `~/.local/state/agentgw/perm-decisions.jsonl` on the gateway, and the answer and its reason are shown in both threads.
+
+This is off by default. Set `AGENTGW_LEAD_PERMISSIONS` in the gateway's `.env`: `off` (a plain "a person is needed" notice), `observe` (the same notice, with who could decide, and the record) or `on`. The value is read for each prompt, so no restart is needed.
+
+Permission buttons answer only the Owner's presses.
 
 ## CLI
 

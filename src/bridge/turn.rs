@@ -63,10 +63,7 @@ pub(super) struct HumanNotice {
 impl HumanNotice {
     /// A tool's permission prompt: the command (or the file, or the input) it wants to run.
     pub fn permission(tool: &str, input: &serde_json::Value) -> Self {
-        let field = ["command", "file_path", "path", "url", "pattern"]
-            .iter()
-            .find_map(|k| input.get(*k).and_then(|v| v.as_str()).map(str::to_string));
-        let shown = notice_snippet(&field.unwrap_or_else(|| input.to_string()));
+        let shown = perm_shown(input);
         Self {
             what: crate::t!(
                 "its agent is waiting for permission to use {tool}: `{shown}`",
@@ -116,6 +113,27 @@ impl HumanNotice {
 fn notice_snippet(s: &str) -> String {
     let one_line = s.split_whitespace().collect::<Vec<_>>().join(" ");
     crate::bridge::activity::detail(&one_line).replace('`', "'")
+}
+
+/// The part of a tool call a person needs to judge it: the command, the file, or the input.
+fn perm_shown(input: &serde_json::Value) -> String {
+    let field = ["command", "file_path", "path", "url", "pattern"]
+        .iter()
+        .find_map(|k| input.get(*k).and_then(|v| v.as_str()).map(str::to_string));
+    notice_snippet(&field.unwrap_or_else(|| input.to_string()))
+}
+
+/// A permission prompt in an asked thread that the gateway was told about (`LinkFrame::PermAsk`):
+/// what to press when the gateway hands back an answer.
+pub(crate) struct LeadConf {
+    /// The id the gateway knows it by.
+    pub id: String,
+    pub channel: String,
+    pub class: crate::bridge::perm_class::Class,
+    /// The tool call it is about; empty for a screen confirmation. Its end closes the prompt.
+    pub tool_use_id: String,
+    /// What the call runs, as the notice showed it: a screen that shows the same is the same stop.
+    pub shown: String,
 }
 
 /// Reads the question tool's questions out of its hook payload: `questions[]`, each with its
@@ -507,6 +525,9 @@ impl Bridge {
                         self.delete_sticky(key, ts);
                     }
                     self.note_activity(|b, now| b.turn_end(key, now));
+                    if let (_, Some(thread)) = key.split() {
+                        self.close_lead_conf_for_tool(&thread, None);
+                    }
                     // Whatever the thread was waiting for, the turn is over and it is not
                     // waiting for it any more -- including a question answered on the machine,
                     // which sends nothing back through the thread
@@ -1573,6 +1594,9 @@ impl Bridge {
         );
         // The screen moved past it, so the thread is not waiting on it any more
         self.resume_stall_after_perm(&ThreadKey::new(&p.channel, &p.thread_ts), false);
+        if !self.perm_pending.values().any(|q| q.thread_ts == p.thread_ts) {
+            self.close_lead_conf(&p.thread_ts, "", "moved_on");
+        }
         if let Some(e) = self.threads.entries.get_mut(&p.thread_ts)
             && e.dialog_prompt.as_ref().is_some_and(|d| d.req_id == req_id)
         {
@@ -1808,7 +1832,9 @@ impl Bridge {
                  awaiting click"
             ),
         );
-        self.needs_human(&channel, &thread_ts, &prompt_ts, false, HumanNotice::permission(&tool, &input));
+        let tool_use_id = ev.payload["tool_use_id"].as_str().unwrap_or_default().to_string();
+        let cwd = ev.payload["cwd"].as_str().unwrap_or_default().to_string();
+        self.perm_to_gateway(&req_id, &channel, &thread_ts, &prompt_ts, &tool, &input, &tool_use_id, &cwd);
         // From here the agent is silent waiting for a person. Stop the watch
         self.suspend_stall_for_perm(&ThreadKey::new(&channel, &thread_ts));
         self.remember_perm_prompt(&thread_ts, &prompt_ts);
@@ -1984,11 +2010,10 @@ impl Bridge {
             ),
         );
         // A screen dialog holds the agent before or between turns, where nobody may be looking
-        let notice = match questions.first() {
-            Some(q) => HumanNotice::question(&q.title),
-            None => HumanNotice::screen(&d),
-        };
-        self.needs_human(channel, thread_ts, &prompt_ts, questions.is_empty(), notice);
+        match questions.first() {
+            Some(q) => self.needs_human(channel, thread_ts, &prompt_ts, false, HumanNotice::question(&q.title)),
+            None => self.dialog_to_gateway(&req_id, channel, thread_ts, &prompt_ts, &d),
+        }
 
         // **Written down, not only remembered.** A restart empties the map, and a button whose
         // id nobody recognises is ignored in silence -- while the dialog it belongs to is still
@@ -2025,14 +2050,14 @@ impl Bridge {
     ///
     /// **The queued message is let go at once** (`delivery_trouble` cleared): the whole point of
     /// answering was to unblock it, and the retry wait would otherwise hold it back a while longer.
-    async fn on_dialog_click(&mut self, click: &slack::PermClick, p: DialogPending) {
+    async fn on_dialog_click(&mut self, click: &slack::PermClick, p: DialogPending) -> Result<(), String> {
         let ctx = LogCtx {
             session_id: None,
             thread_key: Some(ThreadKey::new(&p.channel, &p.thread_ts)),
         };
         if !p.questions.is_empty() && click.action == "dlg-submit" {
             self.on_questions_submit(click, p, &ctx).await;
-            return;
+            return Ok(());
         }
         let choice = click
             .action
@@ -2085,52 +2110,86 @@ impl Bridge {
         {
             ctx.debug("bridge", &format!("dialog prompt update failed: {e}"));
         }
+        answered.map_err(|e| e.to_string())
     }
 
     /// An approval button was clicked. **Answer the agent the moment it's clicked** — then redraw the prompt
     /// to show the result (the agent doesn't wait even if rewriting the post is slow).
+    ///
+    /// **Only the Owner's presses count** on a permission prompt or a screen confirmation: the
+    /// buttons stand for the Owner's own say. The gateway's answers (the Lead's, or the Owner's on
+    /// the gateway's notice) come this way too, under an action no button carries.
     pub(super) async fn on_perm_click(&mut self, click: slack::PermClick) {
         if click.action == slack::FOLDER_YES || click.action == slack::FOLDER_NO {
             self.on_folder_answer(click).await;
             return;
         }
+        if click.action == slack::GW_ALLOW || click.action == slack::GW_DENY {
+            self.on_gateway_decision(click).await;
+            return;
+        }
+        if !self.access.owner.is_empty() && click.by != self.access.owner {
+            LogCtx::default().info(
+                "bridge",
+                &format!("perm reqId={}: ignored a press by {} (not the Owner)", click.req_id, click.by),
+            );
+            return;
+        }
+        // Which prompt the gateway knows this press settles, to tell it who answered
+        let settles = self
+            .dialog_pending
+            .get(&click.req_id)
+            .map(|p| p.thread_ts.clone())
+            .or_else(|| self.perm_pending.get(&click.req_id).map(|p| p.thread_ts.clone()));
         // Dialog buttons ride the same wiring as the permission ones -- same action id shape, same
         // relay hop, same channel -- and are told apart here by which table holds the id
         if let Some(p) = self.dialog_pending.remove(&click.req_id) {
-            self.on_dialog_click(&click, p).await;
+            let row = click.action.strip_prefix("dlg-").and_then(|a| a.parse::<usize>().ok());
+            let yes = row
+                .and_then(|i| p.dialog.options.get(i))
+                .is_some_and(|o| o.trim().to_lowercase().starts_with("yes"));
+            let _ = self.on_dialog_click(&click, p).await;
+            if let Some(thread_ts) = settles {
+                self.close_lead_conf(&thread_ts, &click.by, if yes { "allow" } else { "deny" });
+            }
             return;
         }
-        let answered = self.perm_pending.remove(&click.req_id);
-        if let Some(p) = &answered {
-            let (thread_ts, prompt_ts) = (p.thread_ts.clone(), p.prompt_ts.clone());
-            self.forget_perm_prompt(&thread_ts, &prompt_ts);
-        }
-        let Some(p) = answered else {
+        let Some(p) = self.perm_pending.remove(&click.req_id) else {
             // Already clicked / folded on expiry. A second click does nothing
             return;
         };
+        let allow = click.action != "deny";
+        self.settle_perm(&click.req_id, p, allow, &click.action, &click.by).await;
+        if let Some(thread_ts) = settles {
+            self.close_lead_conf(&thread_ts, &click.by, if allow { "allow" } else { "deny" });
+        }
+    }
+
+    /// Answer a permission prompt's hook and redraw its post. `action` is the button's
+    /// (`allow-thread` / `allow-channel` also remember the grant); `by` is who answered, a Slack
+    /// user or a label such as the Lead's.
+    async fn settle_perm(&mut self, req_id: &str, p: PermPending, allow: bool, action: &str, by: &str) {
+        self.forget_perm_prompt(&p.thread_ts, &p.prompt_ts);
         let ctx = LogCtx {
             session_id: None,
             thread_key: Some(ThreadKey::new(&p.channel, &p.thread_ts)),
         };
-        let allow = click.action != "deny";
-        let by = &click.action;
         ctx.info(
             "bridge",
             &format!(
                 "perm reqId={} tool={} -> {} (by {} {})",
-                click.req_id,
+                req_id,
                 p.tool_name,
                 if allow { "allow" } else { "deny" },
-                click.by,
-                by
+                by,
+                action
             ),
         );
         let _ = p
             .respond
             .send(crate::bridge::command::ToolPermission::decision_output(
                 if allow { "allow" } else { "deny" },
-                &format!("Slack bridge ({by})"),
+                &format!("Slack bridge ({action})"),
             ));
         let key = ThreadKey::new(&p.channel, &p.thread_ts);
         self.resume_stall_after_perm(&key, true);
@@ -2139,16 +2198,13 @@ impl Bridge {
             self.sticky.on_perm_denied(&key, &p.tool_use_id);
         }
         // Remember "don't ask again in this scope". **Only written when a person clicks**
-        match click.action.as_str() {
+        match action {
             "allow-thread" => self.grant_tool(&p.thread_ts, &p.tool_name, true, &ctx),
             "allow-channel" => self.grant_tool(&p.channel, &p.tool_name, false, &ctx),
             _ => {}
         }
         let mark = if allow { "✅" } else { "🚫" };
-        let done = format!(
-            "{mark} `{}` — {} by <@{}>",
-            p.tool_name, click.action, click.by
-        );
+        let done = format!("{mark} `{}` — {} by {}", p.tool_name, action, slack::who(by));
         if let Err(e) = self
             .deps.slack
             .update_message(&p.channel, &p.prompt_ts, &done)
@@ -2156,6 +2212,283 @@ impl Bridge {
         {
             ctx.debug("bridge", &format!("perm prompt update failed: {e}"));
         }
+    }
+
+    // ── Permission prompts in asked threads: the gateway's side of them ─────────────────────
+
+    /// Where the agent of this thread works, to place the paths a tool call names.
+    fn perm_place(&self, channel: &str, thread_ts: &str, cwd: &str) -> crate::bridge::perm_class::Place {
+        let home = Host::home();
+        let work = self
+            .threads
+            .get(thread_ts)
+            .and_then(|e| e.repo_path.clone())
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| self.access.repo_path(channel, &home).0);
+        crate::bridge::perm_class::Place { home, work, cwd: cwd.to_string() }
+    }
+
+    fn is_asked(&self, thread_ts: &str) -> bool {
+        self.ask_gateway.is_some() && self.threads.get(thread_ts).is_some_and(|e| e.asked_from.is_some())
+    }
+
+    /// A permission prompt went up in this thread. In an asked thread the gateway hears of it, and
+    /// decides whether the Lead or the Owner is told; elsewhere nobody else is involved.
+    #[allow(clippy::too_many_arguments)]
+    fn perm_to_gateway(
+        &mut self,
+        conf_id: &str,
+        channel: &str,
+        thread_ts: &str,
+        prompt_ts: &str,
+        tool: &str,
+        input: &serde_json::Value,
+        tool_use_id: &str,
+        cwd: &str,
+    ) {
+        if !self.is_asked(thread_ts) {
+            return;
+        }
+        let place = self.perm_place(channel, thread_ts, cwd);
+        let v = crate::bridge::perm_class::classify(tool, input, &place);
+        // Marked told, so the same stop seen again on the screen is not news
+        let key = ThreadKey::new(channel, thread_ts);
+        if let Ok(mut b) = self.activity.lock() {
+            b.tell_person_once(&key);
+        }
+        let n = HumanNotice::permission(tool, input);
+        self.send_perm_ask(conf_id, channel, thread_ts, prompt_ts, tool, input, &place, v, n, false, tool_use_id);
+    }
+
+    /// A confirmation was found on the agent's screen. One that only restates the rule a prompt
+    /// already asked about is answered with that prompt; any other (Claude Code's own safety
+    /// checks among them) is the Owner's, and replaces the prompt the gateway held.
+    fn dialog_to_gateway(&mut self, req_id: &str, channel: &str, thread_ts: &str, prompt_ts: &str, d: &Dialog) {
+        use crate::bridge::perm_class::{Class, Verdict};
+        if !self.is_asked(thread_ts) {
+            self.needs_human(channel, thread_ts, prompt_ts, true, HumanNotice::screen(d));
+            return;
+        }
+        let same_command = self
+            .lead_confs
+            .get(thread_ts)
+            .is_some_and(|c| !c.shown.is_empty() && notice_snippet(&d.title).contains(&c.shown));
+        let restates = crate::bridge::perm_class::dialog_defers_to_tool(&d.title) || same_command;
+        if restates && self.lead_confs.get(thread_ts).is_some_and(|c| !c.tool_use_id.is_empty()) {
+            return; // the prompt the gateway already holds answers this screen too
+        }
+        let why = if restates {
+            "a rule's confirmation on the screen, with no command to judge it by"
+        } else if d.title.starts_with("Dangerous") {
+            "Claude Code's own safety check"
+        } else {
+            "a confirmation on the screen that is not a known permission rule"
+        };
+        if let Some(old) = self.lead_confs.remove(thread_ts) {
+            self.send_perm_closed(&old, thread_ts, "", "superseded");
+        }
+        let place = self.perm_place(channel, thread_ts, "");
+        let v = Verdict { class: Class::Owner, why: why.to_string() };
+        self.send_perm_ask(req_id, channel, thread_ts, prompt_ts, "", &serde_json::Value::Null, &place, v, HumanNotice::screen(d), true, "");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_perm_ask(
+        &mut self,
+        conf_id: &str,
+        channel: &str,
+        thread_ts: &str,
+        prompt_ts: &str,
+        tool: &str,
+        input: &serde_json::Value,
+        place: &crate::bridge::perm_class::Place,
+        v: crate::bridge::perm_class::Verdict,
+        n: HumanNotice,
+        closed_too: bool,
+        tool_use_id: &str,
+    ) {
+        let Some(up) = &self.ask_gateway else { return };
+        let shown = if tool.is_empty() { n.what.clone() } else { perm_shown(input) };
+        let (n_what_for_activity, v_why_for_activity) = (shown.clone(), v.why.clone());
+        LogCtx { session_id: None, thread_key: Some(ThreadKey::new(channel, thread_ts)) }.info(
+            "bridge",
+            &format!("perm conf={conf_id} tool={tool} -> gateway (class {:?}: {})", v.class, v.why),
+        );
+        let frame = crate::bridge::gateway::link::LinkFrame::PermAsk {
+            conf_id: conf_id.to_string(),
+            channel: channel.to_string(),
+            thread_ts: thread_ts.to_string(),
+            ts: prompt_ts.to_string(),
+            tool: tool.to_string(),
+            input: input.clone(),
+            home: place.home.clone(),
+            work: place.work.clone(),
+            cwd: place.cwd.clone(),
+            class: v.class,
+            why: v.why,
+            shown,
+            what: n.what,
+            todo: n.todo,
+            closed_too,
+        };
+        if up.send(frame).is_err() {
+            return;
+        }
+        let key = ThreadKey::new(channel, thread_ts);
+        let shown_now = if tool.is_empty() { n_what_for_activity.clone() } else { perm_shown(input) };
+        let record = serde_json::json!({"confirmation_id": conf_id, "command": shown_now, "class": v.class, "why": v_why_for_activity});
+        self.note_activity(|b, now| b.permission(&key, Some(record), now));
+        self.lead_confs.insert(
+            thread_ts.to_string(),
+            LeadConf {
+                id: conf_id.to_string(),
+                channel: channel.to_string(),
+                class: v.class,
+                tool_use_id: tool_use_id.to_string(),
+                shown: if tool.is_empty() { String::new() } else { perm_shown(input) },
+            },
+        );
+    }
+
+    fn send_perm_closed(&self, c: &LeadConf, thread_ts: &str, by: &str, outcome: &str) {
+        let Some(up) = &self.ask_gateway else { return };
+        let _ = up.send(crate::bridge::gateway::link::LinkFrame::PermClosed {
+            conf_id: c.id.clone(),
+            channel: c.channel.clone(),
+            thread_ts: thread_ts.to_string(),
+            by: by.to_string(),
+            outcome: outcome.to_string(),
+        });
+    }
+
+    /// Forget the prompt the gateway holds for this thread without telling it (it settled it).
+    fn drop_lead_conf(&mut self, thread_ts: &str) {
+        if let Some(c) = self.lead_confs.remove(thread_ts) {
+            let key = ThreadKey::new(&c.channel, thread_ts);
+            self.note_activity(|b, now| b.permission(&key, None, now));
+        }
+    }
+
+    /// The prompt the gateway holds for this thread was settled here: tell it how.
+    fn close_lead_conf(&mut self, thread_ts: &str, by: &str, outcome: &str) {
+        if let Some(c) = self.lead_confs.remove(thread_ts) {
+            let key = ThreadKey::new(&c.channel, thread_ts);
+            self.note_activity(|b, now| b.permission(&key, None, now));
+            self.send_perm_closed(&c, thread_ts, by, outcome);
+        }
+    }
+
+    /// A tool call ended (or the turn did): a prompt about it is over, answered or not.
+    pub(super) fn close_lead_conf_for_tool(&mut self, thread_ts: &str, tool_use_id: Option<&str>) {
+        let over = self.lead_confs.get(thread_ts).is_some_and(|c| match tool_use_id {
+            Some(id) => !c.tool_use_id.is_empty() && c.tool_use_id == id,
+            None => true,
+        });
+        if over {
+            self.close_lead_conf(thread_ts, "", "moved_on");
+        }
+    }
+
+    /// The gateway hands back an answer to a prompt it holds: the Lead's, or the Owner's press on
+    /// the gateway's notice. Says back what was pressed, or why nothing was.
+    async fn on_gateway_decision(&mut self, click: slack::PermClick) {
+        let st = &click.state;
+        let text = |k: &str| st[k].as_str().unwrap_or_default().to_string();
+        let (req_id, channel, thread_ts, reason) = (text("req_id"), text("channel"), text("thread_ts"), text("reason"));
+        let lead = st["lead"].as_bool().unwrap_or(true);
+        let allow = click.action == slack::GW_ALLOW;
+        let result = self
+            .apply_gateway_decision(&click.req_id, &channel, &thread_ts, allow, lead, &click.by, &reason)
+            .await;
+        LogCtx { session_id: None, thread_key: Some(ThreadKey::new(&channel, &thread_ts)) }.info(
+            "bridge",
+            &format!(
+                "perm conf={} -> {} by {} (reason: {reason}): {result:?}",
+                click.req_id,
+                if allow { "allow" } else { "deny" },
+                click.by
+            ),
+        );
+        if let Some(up) = &self.ask_gateway {
+            let _ = up.send(crate::bridge::gateway::link::LinkFrame::PermApplied { req_id, result });
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_gateway_decision(
+        &mut self,
+        conf_id: &str,
+        channel: &str,
+        thread_ts: &str,
+        allow: bool,
+        lead: bool,
+        by: &str,
+        reason: &str,
+    ) -> Result<String, String> {
+        use crate::bridge::perm_class::{Class, dialog_defers_to_tool, dialog_row};
+        let Some(conf) = self.lead_confs.get(thread_ts).filter(|c| c.id == conf_id) else {
+            return Err("that confirmation is no longer open on its machine".into());
+        };
+        if allow && lead && conf.class != Class::Lead {
+            return Err("only the Owner can allow this confirmation".into());
+        }
+        let from_tool = !conf.tool_use_id.is_empty();
+        let conf_shown = conf.shown.clone();
+        let label = if reason.is_empty() { by.to_string() } else { format!("{by} — {reason}") };
+        // The prompt's hook, while it is still open: the agent's own way of being answered
+        if let Some(req) = self
+            .perm_pending
+            .iter()
+            .find(|(id, p)| p.thread_ts == thread_ts && (id.as_str() == conf_id || from_tool))
+            .map(|(id, _)| id.clone())
+        {
+            let p = self.perm_pending.remove(&req).expect("found above");
+            let tool = p.tool_name.clone();
+            self.settle_perm(&req, p, allow, if allow { "allow" } else { "deny" }, &label).await;
+            self.drop_lead_conf(thread_ts);
+            return Ok(format!("{} {tool} through its permission prompt", if allow { "allowed" } else { "denied" }));
+        }
+        // Past the hook's wait the same question sits on the agent's screen: press its row
+        if !self.dialog_pending.values().any(|p| p.thread_ts == thread_ts) {
+            let window = self
+                .threads
+                .get(thread_ts)
+                .and_then(|e| e.agent_id.clone())
+                .map(|sid| self.workers.window_for(&sid));
+            let ctx = LogCtx { session_id: None, thread_key: Some(ThreadKey::new(channel, thread_ts)) };
+            match window {
+                Some(w) => {
+                    self.offer_dialog(&w, channel, thread_ts, &ctx).await;
+                }
+                None => return Err("the thread has no agent now".into()),
+            }
+        }
+        let Some(dreq) = self.dialog_pending.iter().find(|(_, p)| p.thread_ts == thread_ts).map(|(id, _)| id.clone()) else {
+            self.close_lead_conf(thread_ts, "", "moved_on");
+            return Err("no confirmation is on the agent's screen now; it has moved on".into());
+        };
+        let d = self.dialog_pending[&dreq].dialog.clone();
+        // A screen about something else (a safety check that came up after the prompt) is not
+        // what this answer was about — unless it only says no
+        let same_command = !conf_shown.is_empty() && notice_snippet(&d.title).contains(&conf_shown);
+        if allow && from_tool && !dialog_defers_to_tool(&d.title) && !same_command {
+            return Err(format!("the agent's screen now shows a different confirmation: {}", notice_snippet(&d.title)));
+        }
+        let Some(row) = dialog_row(&d.options, allow) else {
+            return Err(format!("the screen has no {} row to press: {}", if allow { "yes" } else { "no" }, d.options.join(" / ")));
+        };
+        let p = self.dialog_pending.remove(&dreq).expect("found above");
+        let press = slack::PermClick {
+            req_id: dreq,
+            action: format!("dlg-{row}"),
+            by: label,
+            state: serde_json::Value::Null,
+            value: String::new(),
+            message_ts: String::new(),
+        };
+        let pressed = self.on_dialog_click(&press, p).await;
+        self.drop_lead_conf(thread_ts);
+        pressed.map(|()| format!("pressed \u{201c}{}\u{201d} on the agent's screen", d.options[row]))
     }
 
     /// Write down a prompt that is waiting for a person, so the **next** Bridge can fold it.
@@ -2379,6 +2712,12 @@ impl Bridge {
             id => id.to_string(),
         };
         self.note_tool_activity(key, &id, name, &summary, status, p, &result_text);
+        if !matches!(status, slack::ToolStatus::Pending) {
+            let (_, thread) = key.split();
+            if let Some(thread) = thread {
+                self.close_lead_conf_for_tool(&thread, Some(&id));
+            }
+        }
         // **The question gets its own post, with the rows as buttons.** A line on the board
         // saying the agent called a tool adds nothing, and it is the one tool whose whole point
         // is already visible in the thread
@@ -3045,7 +3384,7 @@ impl crate::mcp::ToolExecutor for ToolExec {
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
         let (slack, dir, dispo, ask) = (self.slack.clone(), self.state_dir.clone(), self.dispo.clone(), self.ask.clone());
         Box::pin(async move {
-            if matches!(tool.as_str(), "ask_channel" | "end_ask" | "thread_activity" | "list_channels" | "set_channel_info" | "create_channel" | "join_channel" | "invite_to_channel") {
+            if matches!(tool.as_str(), "ask_channel" | "end_ask" | "thread_activity" | "answer_permission" | "list_channels" | "set_channel_info" | "create_channel" | "join_channel" | "invite_to_channel") {
                 return execute_ask_tool(slack.as_ref(), &dir, &session_id, &tool, &args, ask.as_ref(), &dispo).await;
             }
             execute_tool(slack.as_ref(), &dir, &session_id, &tool, &args, &dispo).await
@@ -3137,6 +3476,23 @@ pub async fn execute_ask_tool(
         };
         let out = ask
             .ask(|req_id| LinkFrame::EndAsk { req_id, from_channel, from_thread, to_channel, to_thread, canceled })
+            .await?;
+        return Ok(out.to_string());
+    }
+    if tool == "answer_permission" {
+        let Some(conf_id) = opt("confirmation_id") else {
+            return Err("confirmation_id is required".into());
+        };
+        let allow = match opt("decision").as_deref() {
+            Some("allow") => true,
+            Some("deny") => false,
+            _ => return Err("decision must be allow or deny".into()),
+        };
+        let Some(reason) = opt("reason") else {
+            return Err("reason is required: it is kept in the record".into());
+        };
+        let out = ask
+            .ask(|req_id| LinkFrame::AnswerPermission { req_id, from_channel, from_thread, conf_id, allow, reason })
             .await?;
         return Ok(out.to_string());
     }

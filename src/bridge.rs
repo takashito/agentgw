@@ -17,6 +17,7 @@ pub mod state;
 pub mod worker;
 pub mod asks;
 pub mod activity;
+pub mod perm_class;
 
 use crate::agent::claude::HookIntake;
 use crate::agent::claude::Claude;
@@ -228,6 +229,9 @@ pub struct Bridge {
     sticky: slack::StickyBoard,
     /// Tool permissions waiting for a person's click. reqId → the waiting agent and the prompt to delete.
     perm_pending: HashMap<String, PermPending>,
+    /// Permission prompts in asked threads the gateway was told about (thread_ts → the prompt), so the
+    /// answer the gateway hands back (the Lead's, or the Owner's on its notice) finds what to press.
+    lead_confs: HashMap<String, crate::bridge::turn::LeadConf>,
     /// Sessions whose agent was at work but had no window at the last cleanup round. Missing again
     /// at the next round = it died (`notice_lost_agents`); one round of grace keeps a single failed
     /// window listing from reading as a crash.
@@ -485,6 +489,7 @@ impl Bridge {
             lifecycle: bridge::Lifecycle::new(),
             sticky: slack::StickyBoard::default(),
             perm_pending: HashMap::new(),
+            lead_confs: HashMap::new(),
             lost_suspects: Default::default(),
             dialog_watch_at_ms: 0,
             dialog_pending: HashMap::new(),
@@ -1282,6 +1287,7 @@ impl Bridge {
                 catch_up: Default::default(),
                 joins: Default::default(),
                 admin_waits: Default::default(),
+                perms: Default::default(),
             });
             // One listener per address: loopback for whatever terminates TLS in front, the LAN address
             // for machines on the same network
@@ -1291,6 +1297,7 @@ impl Bridge {
             tokio::spawn(fleet.clone().watch_presence());
             tokio::spawn(fleet.clone().drive_updates());
             tokio::spawn(fleet.clone().sweep_gone_channels());
+            tokio::spawn(fleet.clone().drive_lead_perms());
             {
                 // Frames the gateway addresses to itself, handled exactly as a machine handles the
                 // ones that come down its link
@@ -2129,6 +2136,21 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
             let (folder, _) = bridge::Access::load(dir).repo_path(&channel, &Host::home());
             let text = crate::bridge::asks::read_project(std::path::Path::new(&folder));
             let _ = up.send(crate::bridge::gateway::link::LinkFrame::ProjectRead { req_id, text });
+        }
+        // An answer to a permission prompt the gateway holds: into the main loop with the button
+        // presses, under an action no Slack button carries (`perm_click_from_relay` refuses it)
+        machine::FromRelay::PermDecision { req_id, conf_id, channel, thread_ts, allow, lead, by, reason } => {
+            let click = slack::PermClick {
+                req_id: conf_id,
+                action: if allow { slack::GW_ALLOW } else { slack::GW_DENY }.to_string(),
+                by,
+                state: serde_json::json!({"req_id": req_id, "lead": lead, "reason": reason, "channel": channel, "thread_ts": thread_ts}),
+                value: String::new(),
+                message_ts: String::new(),
+            };
+            if click_tx.send(click).await.is_err() {
+                return;
+            }
         }
         // `thread_activity`: the gateway asks what one of this machine's threads is doing
         machine::FromRelay::ReadActivity { req_id, channel, thread_ts } => {
@@ -3476,8 +3498,10 @@ mod tests {
     fn needs_human_up(rx: &mut mpsc::UnboundedReceiver<crate::bridge::gateway::link::LinkFrame>) -> Vec<String> {
         let mut out = Vec::new();
         while let Ok(f) = rx.try_recv() {
-            if let crate::bridge::gateway::link::LinkFrame::NeedsHuman { thread_ts, .. } = f {
-                out.push(thread_ts);
+            match f {
+                crate::bridge::gateway::link::LinkFrame::NeedsHuman { thread_ts, .. }
+                | crate::bridge::gateway::link::LinkFrame::PermAsk { thread_ts, .. } => out.push(thread_ts),
+                _ => {}
             }
         }
         out
@@ -3508,7 +3532,8 @@ mod tests {
         let notices = |up: &mut mpsc::UnboundedReceiver<crate::bridge::gateway::link::LinkFrame>| -> Vec<(String, String)> {
             std::iter::from_fn(|| up.try_recv().ok())
                 .filter_map(|f| match f {
-                    crate::bridge::gateway::link::LinkFrame::NeedsHuman { what, todo, .. } => Some((what, todo)),
+                    crate::bridge::gateway::link::LinkFrame::NeedsHuman { what, todo, .. }
+                    | crate::bridge::gateway::link::LinkFrame::PermAsk { what, todo, .. } => Some((what, todo)),
                     _ => None,
                 })
                 .collect()
@@ -3577,6 +3602,164 @@ mod tests {
         let frames: Vec<_> = std::iter::from_fn(|| up.try_recv().ok()).collect();
         assert!(frames.iter().any(|f| matches!(f, crate::bridge::gateway::link::LinkFrame::AgentReply { needs_human: true, .. })));
         assert!(!frames.iter().any(|f| matches!(f, crate::bridge::gateway::link::LinkFrame::NeedsHuman { .. })));
+    }
+
+    // ── Permission prompts the gateway answers (WORK-195) ──────────────────────────────────
+
+    fn perm_with(sid: &str, command: &str) -> (HookEvent, tokio::sync::oneshot::Receiver<serde_json::Value>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let ev = HookEvent {
+            kind: "perm".into(),
+            session_id: sid.to_string(),
+            payload: serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}, "tool_use_id": "toolu_7"}),
+            respond: Some(tx),
+        };
+        (ev, rx)
+    }
+
+    /// The frames sent up so far: (conf id, class) of each PermAsk, and everything else as text.
+    fn perm_frames(up: &mut mpsc::UnboundedReceiver<crate::bridge::gateway::link::LinkFrame>) -> (Vec<(String, crate::bridge::perm_class::Class, bool)>, Vec<String>) {
+        let (mut asks, mut rest) = (Vec::new(), Vec::new());
+        while let Ok(f) = up.try_recv() {
+            match f {
+                crate::bridge::gateway::link::LinkFrame::PermAsk { conf_id, class, closed_too, .. } => asks.push((conf_id, class, closed_too)),
+                other => rest.push(format!("{other:?}")),
+            }
+        }
+        (asks, rest)
+    }
+
+    fn gateway_says(conf: &str, allow: bool, lead: bool) -> slack::PermClick {
+        slack::PermClick {
+            req_id: conf.into(),
+            action: if allow { slack::GW_ALLOW } else { slack::GW_DENY }.into(),
+            by: "the Lead (<#C_LAN>)".into(),
+            state: serde_json::json!({"req_id": "g1", "lead": lead, "reason": "scratch only", "channel": "C_ADMIN", "thread_ts": ROOT}),
+            value: String::new(),
+            message_ts: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_leads_allow_answers_the_prompt_it_may_decide() {
+        let (mut b, mut up, sid) = asked_thread("lead-allow").await;
+        let (ev, rx) = perm_with(&sid, "touch /tmp/claude-1000/wk195/ok");
+        b.on_hook(ev).await;
+        let (asks, _) = perm_frames(&mut up);
+        assert_eq!(asks.len(), 1, "{asks:?}");
+        assert_eq!(asks[0].1, crate::bridge::perm_class::Class::Lead);
+        b.on_perm_click(gateway_says(&asks[0].0, true, true)).await;
+        assert!(rx.await.unwrap().to_string().contains("\"allow\""));
+        let (_, rest) = perm_frames(&mut up);
+        assert!(rest.iter().any(|f| f.contains("PermApplied") && f.contains("g1") && f.contains("Ok(")), "{rest:?}");
+        assert!(b.lead_confs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_lead_cannot_allow_the_owners_prompt_but_can_deny_it() {
+        let (mut b, mut up, sid) = asked_thread("lead-refused").await;
+        let (ev, mut rx) = perm_with(&sid, "rm -r build");
+        b.on_hook(ev).await;
+        let (asks, _) = perm_frames(&mut up);
+        assert_eq!(asks[0].1, crate::bridge::perm_class::Class::Owner);
+        b.on_perm_click(gateway_says(&asks[0].0, true, true)).await;
+        let (_, rest) = perm_frames(&mut up);
+        assert!(rest.iter().any(|f| f.contains("PermApplied") && f.contains("only the Owner")), "{rest:?}");
+        assert!(rx.try_recv().is_err(), "the hook is still waiting");
+        // The Owner's press on the gateway's notice is not the Lead's: it may allow
+        b.on_perm_click(gateway_says(&asks[0].0, false, true)).await;
+        assert!(rx.await.unwrap().to_string().contains("\"deny\""));
+    }
+
+    #[tokio::test]
+    async fn past_the_hooks_wait_the_leads_answer_presses_the_screen() {
+        let (d, _slack, agent, clock) = flow_deps("lead-screen");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let (tx, mut up) = mpsc::unbounded_channel();
+        b.ask_gateway = Some(tx);
+        b.on_inbound(&agent_msg(ROOT, ROOT, "check it", crate::chat::DeliveryKind::Ask)).await;
+        let sid = b.threads.get(ROOT).and_then(|e| e.agent_id.clone()).expect("an agent");
+        let (ev, _rx) = perm_with(&sid, "rm -rf /tmp/claude-1000/wk195/x");
+        b.on_hook(ev).await;
+        let (asks, _) = perm_frames(&mut up);
+        clock.advance(130_000);
+        b.expire_perm_prompts().await;
+        *agent.dialog.lock().unwrap() = Some(crate::agent::Dialog {
+            title: "Rule Bash(rm -rf /tmp/claude-1000/* *) from shared project settings overrides auto mode.".into(),
+            footer: "Esc to cancel".into(),
+            options: vec!["Yes".into(), "No".into()],
+            details: vec![String::new(), String::new()],
+            asked: false,
+            selected: 0,
+        });
+        b.on_perm_click(gateway_says(&asks[0].0, true, true)).await;
+        assert_eq!(*agent.answered.lock().unwrap(), vec![Some(0)]);
+        let (more, rest) = perm_frames(&mut up);
+        assert!(more.is_empty(), "the same rule's screen is not a new prompt: {more:?}");
+        assert!(rest.iter().any(|f| f.contains("PermApplied") && f.contains("Yes")), "{rest:?}");
+    }
+
+    #[tokio::test]
+    async fn a_safety_check_on_the_screen_replaces_the_leads_prompt_with_the_owners() {
+        let (d, _slack, agent, clock) = flow_deps("lead-superseded");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let (tx, mut up) = mpsc::unbounded_channel();
+        b.ask_gateway = Some(tx);
+        b.on_inbound(&agent_msg(ROOT, ROOT, "check it", crate::chat::DeliveryKind::Ask)).await;
+        let sid = b.threads.get(ROOT).and_then(|e| e.agent_id.clone()).expect("an agent");
+        on_hook_user_prompt_for_test(&mut b, &sid).await;
+        settle().await;
+        let (ev, _rx) = perm_with(&sid, "rm -rf /tmp/claude-1000/wk195/x");
+        b.on_hook(ev).await;
+        let (first, _) = perm_frames(&mut up);
+        *agent.dialog.lock().unwrap() = Some(crate::agent::Dialog {
+            title: "Dangerous rm operation on working directory or its ancestor: /tmp/claude-1000/wk195/x".into(),
+            footer: "Esc to cancel".into(),
+            options: vec!["Yes".into(), "No".into()],
+            details: vec![String::new(), String::new()],
+            asked: false,
+            selected: 0,
+        });
+        // Found the way it was on a real machine: a delivery refused by the screen (the watch
+        // leaves a thread with an open prompt alone)
+        let _ = clock;
+        let window = b.workers.window_for(&sid);
+        assert!(b.offer_dialog(&window, "C_ADMIN", ROOT, &LogCtx::default()).await);
+        let (asks, rest) = perm_frames(&mut up);
+        assert!(rest.iter().any(|f| f.contains("PermClosed") && f.contains(&first[0].0) && f.contains("superseded")), "{rest:?}");
+        assert_eq!(asks.len(), 1, "{asks:?}");
+        assert_eq!((asks[0].1, asks[0].2), (crate::bridge::perm_class::Class::Owner, true));
+        // The Lead's allow is refused there; nothing is pressed
+        b.on_perm_click(gateway_says(&asks[0].0, true, true)).await;
+        assert!(agent.answered.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_press_by_anyone_but_the_owner_does_nothing() {
+        let (mut b, _up, sid) = asked_thread("not-owner").await;
+        let (ev, mut rx) = perm_with(&sid, "ls");
+        b.on_hook(ev).await;
+        let req = b.perm_pending.keys().next().cloned().expect("a prompt");
+        let press = |by: &str| slack::PermClick {
+            req_id: req.clone(),
+            action: "allow".into(),
+            by: by.into(),
+            state: serde_json::Value::Null,
+            value: String::new(),
+            message_ts: String::new(),
+        };
+        b.on_perm_click(press("U_OTHER")).await;
+        assert!(rx.try_recv().is_err());
+        assert!(b.perm_pending.contains_key(&req));
+        b.on_perm_click(press("U_OWNER")).await;
+        assert!(rx.await.unwrap().to_string().contains("\"allow\""));
+    }
+
+    #[test]
+    fn no_slack_button_can_pose_as_the_gateway() {
+        let action = serde_json::json!({"action_id": "perm:gw-allow:c1"});
+        let body = serde_json::json!({"user": {"id": "U_OWNER"}});
+        assert!(slack::perm_click_from_relay(&action, &body).is_none());
     }
 
     #[tokio::test]
@@ -3667,7 +3850,8 @@ mod tests {
         b.dialog_tick().await;
         let raised: Vec<bool> = std::iter::from_fn(|| up.try_recv().ok())
             .filter_map(|f| match f {
-                crate::bridge::gateway::link::LinkFrame::NeedsHuman { closed_too, .. } => Some(closed_too),
+                crate::bridge::gateway::link::LinkFrame::NeedsHuman { closed_too, .. }
+                | crate::bridge::gateway::link::LinkFrame::PermAsk { closed_too, .. } => Some(closed_too),
                 _ => None,
             })
             .collect();

@@ -19,6 +19,7 @@
 
 // ── Section 1: protocol ─────────────────────────────────────
 pub mod admin;
+pub mod perms;
 
 pub mod link {
     //! The Relay ⇄ Bridge link protocol — the frames carried over WebSocket and the connection
@@ -371,6 +372,83 @@ pub mod link {
             /// What the person has to do to let it go on.
             #[serde(default, skip_serializing_if = "String::is_empty")]
             todo: String,
+        },
+        /// machine → gateway: a permission prompt in an asked thread. The gateway decides who hears
+        /// about it — the agent that asked for the work (the Lead), or the Owner — and keeps the
+        /// record of who answered (`bridge::perm_class`).
+        ///
+        /// `what` / `todo` are the plain "a person is needed" notice, sent as before while the
+        /// Lead's answers are switched off.
+        PermAsk {
+            conf_id: String,
+            channel: String,
+            thread_ts: String,
+            /// The prompt's post in the asked thread, to link to.
+            ts: String,
+            /// The tool and its input, raw, so the gateway judges the call itself. Empty for a
+            /// screen confirmation, which is always the Owner's unless it restates a known rule.
+            #[serde(default, skip_serializing_if = "String::is_empty")]
+            tool: String,
+            #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+            input: serde_json::Value,
+            /// Where the agent works, to place the paths in the call.
+            #[serde(default)]
+            home: String,
+            #[serde(default)]
+            work: String,
+            /// Where the agent's shell is (the hook's `cwd`).
+            #[serde(default, skip_serializing_if = "String::is_empty")]
+            cwd: String,
+            /// The machine's own verdict. The gateway takes the stricter of its own and this one.
+            class: crate::bridge::perm_class::Class,
+            why: String,
+            /// The command (or file, or screen line) in one line, secrets masked.
+            shown: String,
+            what: String,
+            todo: String,
+            #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+            closed_too: bool,
+        },
+        /// machine → gateway: the agent in `from_thread` answers a permission prompt in a thread it
+        /// asked (`answer_permission`). Answered with [`LinkFrame::AskAnswer`].
+        AnswerPermission {
+            req_id: String,
+            from_channel: String,
+            from_thread: String,
+            conf_id: String,
+            allow: bool,
+            reason: String,
+        },
+        /// gateway → machine: answer this prompt. `lead` = the answer is the Lead's (an allow is
+        /// taken only for a prompt the Lead may decide); otherwise the Owner pressed a button.
+        /// Answered with [`LinkFrame::PermApplied`].
+        PermDecision {
+            req_id: String,
+            conf_id: String,
+            channel: String,
+            thread_ts: String,
+            allow: bool,
+            lead: bool,
+            /// Who answered, as the thread will show it.
+            by: String,
+            reason: String,
+        },
+        /// machine → gateway: how the answer went (what was pressed, or why nothing was).
+        PermApplied {
+            req_id: String,
+            result: Result<String, String>,
+        },
+        /// machine → gateway: a prompt the gateway knows was settled here — a person pressed its
+        /// button in the thread, or the agent moved on without it.
+        PermClosed {
+            conf_id: String,
+            channel: String,
+            thread_ts: String,
+            /// The Slack user who pressed, or empty when nobody did.
+            #[serde(default, skip_serializing_if = "String::is_empty")]
+            by: String,
+            /// allow / deny / moved_on / superseded.
+            outcome: String,
         },
         /// machine → gateway: a person typed `exit` in this thread (asked or asking — the gateway works out which).
         AskEnded { channel: String, thread_ts: String },
@@ -2589,6 +2667,9 @@ pub struct Fleet {
     pub joins: JoinBook,
     /// `agentgw route` waiting for a machine to check the folder (channel → the machine asked, the answer).
     pub admin_waits: std::sync::Mutex<HashMap<String, (String, tokio::sync::oneshot::Sender<Result<String, String>>)>>,
+    /// Permission prompts in asked threads the machines reported (confirmation id → the prompt).
+    /// **Memory only**: a prompt's way back to the agent does not outlive the machine's Bridge either.
+    pub perms: std::sync::Mutex<HashMap<String, perms::GwPerm>>,
 }
 
 /// A machine that was away during an `update` comes back on the old version, and nothing brought it
@@ -3921,6 +4002,23 @@ impl Fleet {
             link::LinkFrame::NeedsHuman { channel, thread_ts, ts, closed_too, what, todo } => {
                 self.on_needs_human(&channel, &thread_ts, &ts, closed_too, &what, &todo).await
             }
+            link::LinkFrame::PermAsk { conf_id, channel, thread_ts, ts, tool, input, home, work, cwd, class, why, shown, what, todo, closed_too } => {
+                let place = crate::bridge::perm_class::Place { home, work, cwd };
+                self.on_perm_ask(bridge_id, conf_id, channel, thread_ts, ts, tool, input, place, class, why, shown, what, todo, closed_too)
+                    .await
+            }
+            link::LinkFrame::PermClosed { conf_id, by, outcome, .. } => self.on_perm_closed(&conf_id, &by, &outcome).await,
+            link::LinkFrame::PermApplied { req_id, result } => self.on_perm_applied(&req_id, result),
+            // Off the link loop: the answer goes down to a machine (maybe this one) and waits for it
+            link::LinkFrame::AnswerPermission { req_id, from_channel, from_thread, conf_id, allow, reason } => {
+                let (fleet, machine) = (self.clone(), bridge_id.to_string());
+                tokio::spawn(async move {
+                    let result = fleet.answer_permission(&machine, &from_channel, &from_thread, &conf_id, allow, &reason).await;
+                    if !fleet.send_frame(&machine, &link::LinkFrame::AskAnswer { req_id, result }).await {
+                        rlog("info", &format!("{machine}: could not return a permission answer's result (link dropped)"));
+                    }
+                });
+            }
             link::LinkFrame::ProjectRead { req_id, text } => {
                 if let Some(tx) = self.reads.lock().unwrap_or_else(|e| e.into_inner()).remove(&req_id) {
                     let _ = tx.send(text);
@@ -4653,6 +4751,15 @@ impl Fleet {
     }
 
     async fn on_click(self: &Arc<Self>, action: serde_json::Value, body: serde_json::Value) {
+        // The Owner's buttons on a permission notice: the gateway holds that prompt, wherever the
+        // notice was posted
+        if let Some(click) = crate::chat::slack::perm_click_from_relay(&action, &body)
+            && [crate::chat::slack::OWNER_ALLOW, crate::chat::slack::OWNER_DENY].contains(&click.action.as_str())
+        {
+            let fleet = self.clone();
+            tokio::spawn(async move { fleet.on_owner_perm_click(click).await });
+            return;
+        }
         // "Which machine should handle this channel?" is the gateway's own question: only it can
         // hand a channel over
         if let Some(click) = crate::chat::slack::perm_click_from_relay(&action, &body)
@@ -7612,6 +7719,7 @@ mod tests {
             catch_up: Default::default(),
             joins: JoinBook::settled_after(std::time::Duration::ZERO),
             admin_waits: Default::default(),
+            perms: Default::default(),
         });
         (fleet, msg_rx)
     }
@@ -9966,6 +10074,10 @@ mod ask_tests {
     }
 
     fn rig_at(dir: StateDir, api: Arc<FakeChat>) -> Rig {
+        rig_at_with(dir, api, tokio::sync::mpsc::channel(4).0)
+    }
+
+    fn rig_at_with(dir: StateDir, api: Arc<FakeChat>, to_self: Sender<crate::bridge::machine::FromRelay>) -> Rig {
         let (msg_tx, msgs) = tokio::sync::mpsc::channel(8);
         let (remember, notes) = tokio::sync::mpsc::channel(32);
         let fleet = Arc::new(Fleet {
@@ -9986,7 +10098,7 @@ mod ask_tests {
             reload: tokio::sync::mpsc::channel(4).0,
             thread_routes: Default::default(),
             remember,
-            to_self: tokio::sync::mpsc::channel(4).0,
+            to_self,
             tunnels: Default::default(),
             renaming: Default::default(),
             reads: Default::default(),
@@ -9995,6 +10107,7 @@ mod ask_tests {
             catch_up: Default::default(),
             joins: JoinBook::settled_after(std::time::Duration::ZERO),
             admin_waits: Default::default(),
+            perms: Default::default(),
         });
         Rig { fleet, api, msgs, _notes: notes }
     }
@@ -10844,5 +10957,195 @@ mod ask_tests {
         assert_eq!(calls(&r.api).len(), before, "nothing posted");
         assert!(r.msgs.try_recv().is_err());
         assert_eq!(r.fleet.asks.lock().await[&thread].1.state, AskState::Approved);
+    }
+
+    // ── Permission prompts in asked threads (WORK-195) ─────────────────────────────────────
+
+    /// A rig whose own machine answers every permission decision the way `answer` says, and an
+    /// asked thread in C2 (asked from C1:1.1). Returns the thread and the decisions seen.
+    async fn perm_rig(
+        name: &str,
+        mode: &str,
+        answer: Result<String, String>,
+    ) -> (Rig, String, Arc<std::sync::Mutex<Vec<(String, bool, bool, String)>>>) {
+        let dir = StateDir::at(std::env::temp_dir().join(format!("agentgw-perms-{name}-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(dir.path());
+        let mut access = Access::load(&dir);
+        access.owner = "U_OWNER".into();
+        access.save(&dir).unwrap();
+        std::fs::write(dir.path().join(".env"), format!("AGENTGW_LEAD_PERMISSIONS={mode}\n")).unwrap();
+        let (to_self, mut downs) = tokio::sync::mpsc::channel(16);
+        let mut r = rig_at_with(dir, Arc::new(FakeChat::in_channels(&[("C1", "lead"), ("C2", "repo")])), to_self);
+        let seen: Arc<std::sync::Mutex<Vec<(String, bool, bool, String)>>> = Default::default();
+        let (fleet, log) = (r.fleet.clone(), seen.clone());
+        tokio::spawn(async move {
+            while let Some(f) = downs.recv().await {
+                if let crate::bridge::machine::FromRelay::PermDecision { req_id, conf_id, allow, lead, by, .. } = f {
+                    log.lock().unwrap().push((conf_id, allow, lead, by));
+                    fleet.on_perm_applied(&req_id, answer.clone());
+                }
+            }
+        });
+        let out = r.fleet.ask("C1", "1.1", "C2", None, "clean up the scratch output", None, &[]).await.unwrap();
+        let _ = r.msgs.try_recv();
+        let thread = out["thread_ts"].as_str().unwrap().to_string();
+        (r, thread, seen)
+    }
+
+    fn perm_ask(thread: &str, conf: &str, command: &str, class: crate::bridge::perm_class::Class) -> link::LinkFrame {
+        link::LinkFrame::PermAsk {
+            conf_id: conf.into(),
+            channel: "C2".into(),
+            thread_ts: thread.into(),
+            ts: "9.9".into(),
+            tool: "Bash".into(),
+            input: serde_json::json!({"command": command}),
+            home: "/home/u".into(),
+            work: "/home/u/dev/repo".into(),
+            cwd: String::new(),
+            class,
+            why: "machine's reason".into(),
+            shown: command.into(),
+            what: format!("its agent is waiting for permission to use Bash: `{command}`"),
+            todo: "To let it go on, open it and press Allow or Deny.".into(),
+            closed_too: false,
+        }
+    }
+
+    fn records(r: &Rig) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(r.fleet.dir.path().join("perm-decisions.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn switched_off_a_permission_prompt_is_the_plain_notice() {
+        let (r, thread, _) = perm_rig("off", "off", Ok("x".into())).await;
+        let before = calls(&r.api).len();
+        r.fleet.on_machine_frame("parent", perm_ask(&thread, "c1", "touch /tmp/claude-1000/wk/ok", crate::bridge::perm_class::Class::Lead)).await;
+        let said = calls(&r.api)[before..].to_vec();
+        assert!(said.iter().any(|c| c.starts_with("post_md C1 1.1 ") && c.contains("A person is needed")), "{said:?}");
+        assert!(records(&r).is_empty(), "nothing is recorded while it is off");
+        let refused = r.fleet.answer_permission("parent", "C1", "1.1", "c1", true, "scratch").await;
+        assert!(refused.unwrap_err().contains("not switched on"));
+    }
+
+    #[tokio::test]
+    async fn the_lead_is_told_and_its_allow_goes_to_the_machine_and_the_record() {
+        let (mut r, thread, seen) = perm_rig("lead", "on", Ok("allowed Bash through its permission prompt".into())).await;
+        let before = calls(&r.api).len();
+        r.fleet.on_machine_frame("parent", perm_ask(&thread, "c1", "touch /tmp/claude-1000/wk/ok", crate::bridge::perm_class::Class::Lead)).await;
+        let said = calls(&r.api)[before..].to_vec();
+        let told = said.iter().find(|c| c.starts_with("post_md C1 1.1 ")).expect("a line in the Lead's thread");
+        assert!(told.contains("the Lead decides") && told.contains("`c1`"), "{told}");
+        assert!(!said.iter().any(|c| c.starts_with("post_blocks")), "the Owner is not asked yet: {said:?}");
+        // The Lead's agent hears of it, with the id to answer
+        let delivered = r.msgs.try_recv().expect("delivered to the Lead");
+        assert!(format!("{delivered:?}").contains("confirmation_id: c1"), "{delivered:?}");
+
+        let out = r.fleet.answer_permission("parent", "C1", "1.1", "c1", true, "only a scratch file").await.unwrap();
+        assert_eq!(out["status"], "allowed");
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert_eq!((seen[0].0.as_str(), seen[0].1, seen[0].2), ("c1", true, true));
+        let rec = records(&r);
+        let events: Vec<&str> = rec.iter().map(|v| v["event"].as_str().unwrap()).collect();
+        assert_eq!(events, ["opened", "answered"], "{rec:?}");
+        assert_eq!(rec[1]["decision"], "allow");
+        assert_eq!(rec[1]["by"], "C1:1.1");
+        assert_eq!(rec[1]["reason"], "only a scratch file");
+        // A second answer finds it settled
+        let again = r.fleet.answer_permission("parent", "C1", "1.1", "c1", false, "changed my mind").await;
+        assert!(again.unwrap_err().contains("already settled"));
+    }
+
+    #[tokio::test]
+    async fn only_the_asking_thread_answers_and_never_allows_the_owners() {
+        let (r, thread, seen) = perm_rig("refuse", "on", Ok("denied".into())).await;
+        r.fleet.on_machine_frame("parent", perm_ask(&thread, "lead1", "ls", crate::bridge::perm_class::Class::Lead)).await;
+        // The asked thread's own agent, approving itself
+        let own = r.fleet.answer_permission("parent", "C2", &thread, "lead1", true, "fine").await;
+        assert!(own.unwrap_err().contains("only the thread that asked"));
+        // Another thread of the asking channel is not the asker either
+        let other = r.fleet.answer_permission("parent", "C1", "7.7", "lead1", true, "fine").await;
+        assert!(other.unwrap_err().contains("only the thread that asked"));
+        // A machine that does not run the asking thread
+        let elsewhere = r.fleet.answer_permission("pve", "C1", "1.1", "lead1", true, "fine").await;
+        assert!(elsewhere.unwrap_err().contains("not run by the machine"));
+
+        let before = calls(&r.api).len();
+        r.fleet.on_machine_frame("parent", perm_ask(&thread, "own1", "git push origin main", crate::bridge::perm_class::Class::Owner)).await;
+        let said = calls(&r.api)[before..].to_vec();
+        let notice = said.iter().find(|c| c.starts_with("post_blocks C1 1.1 ")).expect("the Owner is asked at once");
+        assert!(notice.contains("<@U_OWNER>") && notice.contains("perm:owner-allow:own1") && notice.contains("perm:owner-deny:own1"), "{notice}");
+        let allow = r.fleet.answer_permission("parent", "C1", "1.1", "own1", true, "looks fine").await;
+        assert!(allow.unwrap_err().contains("only the Owner can allow"));
+        assert!(seen.lock().unwrap().is_empty(), "nothing reached the machine");
+        // …but the Lead may deny it
+        r.fleet.answer_permission("parent", "C1", "1.1", "own1", false, "not now").await.unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        // The gateway judges the call itself: a machine that calls a push the Lead's is overruled
+        r.fleet.on_machine_frame("parent", perm_ask(&thread, "own2", "git push origin main", crate::bridge::perm_class::Class::Lead)).await;
+        let lied = r.fleet.answer_permission("parent", "C1", "1.1", "own2", true, "fine").await;
+        assert!(lied.unwrap_err().contains("only the Owner can allow"));
+        let refused = records(&r).iter().filter(|v| v["event"] == "refused").count();
+        assert_eq!(refused, 5, "{:?}", records(&r));
+    }
+
+    #[tokio::test]
+    async fn a_lead_who_does_not_answer_brings_the_owner_in_and_can_still_answer() {
+        let (r, thread, seen) = perm_rig("late", "on", Ok("pressed \u{201c}Yes\u{201d} on the agent's screen".into())).await;
+        r.fleet.on_machine_frame("parent", perm_ask(&thread, "c9", "rm -rf /tmp/claude-1000/wk/x", crate::bridge::perm_class::Class::Lead)).await;
+        let opened = r.fleet.perms.lock().unwrap()["c9"].opened_ms;
+        r.fleet.escalate_lead_perms(opened + perms::LEAD_WAIT_MS - 1).await;
+        assert!(!calls(&r.api).iter().any(|c| c.starts_with("post_blocks")), "not yet");
+        r.fleet.escalate_lead_perms(opened + perms::LEAD_WAIT_MS).await;
+        let notice = calls(&r.api).into_iter().find(|c| c.starts_with("post_blocks C1 1.1 ")).expect("the Owner is asked");
+        assert!(notice.contains("3 minutes") && notice.contains("perm:owner-allow:c9"), "{notice}");
+        r.fleet.escalate_lead_perms(opened + perms::LEAD_WAIT_MS * 2).await;
+        assert_eq!(calls(&r.api).iter().filter(|c| c.starts_with("post_blocks")).count(), 1, "asked once");
+        // The Lead answers after all: it counts, and the Owner's notice loses its buttons
+        r.fleet.answer_permission("parent", "C1", "1.1", "c9", true, "scratch output").await.unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        let rewritten = calls(&r.api).into_iter().find(|c| c.starts_with("update_md C1 ") && c.contains("A person is needed")).expect("the notice rewritten");
+        assert!(rewritten.contains("Allowed by the Lead") && rewritten.contains("scratch output"), "{rewritten}");
+        let events: Vec<String> = records(&r).iter().map(|v| v["event"].as_str().unwrap().to_string()).collect();
+        assert_eq!(events, ["opened", "escalated", "answered"]);
+    }
+
+    #[tokio::test]
+    async fn the_owners_buttons_count_only_for_the_owner() {
+        let (r, thread, seen) = perm_rig("owner", "on", Ok("allowed".into())).await;
+        r.fleet.on_machine_frame("parent", perm_ask(&thread, "o1", "git push", crate::bridge::perm_class::Class::Owner)).await;
+        let press = |by: &str| PermClick {
+            req_id: "o1".into(),
+            action: crate::chat::slack::OWNER_ALLOW.into(),
+            by: by.into(),
+            state: serde_json::Value::Null,
+            value: String::new(),
+            message_ts: String::new(),
+        };
+        r.fleet.on_owner_perm_click(press("U_SOMEONE")).await;
+        assert!(seen.lock().unwrap().is_empty());
+        r.fleet.on_owner_perm_click(press("U_OWNER")).await;
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen, vec![("o1".to_string(), true, false, "<@U_OWNER>".to_string())]);
+        // The Lead hears the Owner answered
+        let told = calls(&r.api).into_iter().filter(|c| c.starts_with("post_md C1 1.1 ")).last().unwrap();
+        assert!(told.contains("Allowed by <@U_OWNER>"), "{told}");
+    }
+
+    #[tokio::test]
+    async fn a_prompt_settled_on_its_machine_closes_here() {
+        let (r, thread, _) = perm_rig("closed", "on", Ok("x".into())).await;
+        r.fleet.on_machine_frame("parent", perm_ask(&thread, "c5", "ls", crate::bridge::perm_class::Class::Lead)).await;
+        r.fleet
+            .on_machine_frame("parent", link::LinkFrame::PermClosed { conf_id: "c5".into(), channel: "C2".into(), thread_ts: thread.clone(), by: String::new(), outcome: "moved_on".into() })
+            .await;
+        let late = r.fleet.answer_permission("parent", "C1", "1.1", "c5", true, "ok").await;
+        assert!(late.unwrap_err().contains("already settled"));
+        assert_eq!(records(&r).last().unwrap()["event"], "closed");
     }
 }
