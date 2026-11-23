@@ -356,6 +356,8 @@ When the agent in an asked thread stops at a permission prompt, the gateway deci
 
 This is off by default. Set `AGENTGW_LEAD_PERMISSIONS` in the gateway's `.env`: `off` (a plain "a person is needed" notice), `observe` (the same notice, with who could decide, and the record) or `on`. The value is read for each prompt, so no restart is needed.
 
+PowerShell prompts on Windows machines stay the Owner's unless `AGENTGW_LEAD_PERMISSIONS_POWERSHELL=on` is also set.
+
 Permission buttons answer only the Owner's presses.
 
 ## CLI

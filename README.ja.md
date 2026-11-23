@@ -345,6 +345,8 @@ Microsoft Store 版の PowerShell 7 は、ユーザーがサインインして�
 
 既定は off です。gateway の `.env` の `AGENTGW_LEAD_PERMISSIONS` で切り替えます。`off`(これまでどおり「人の確認が必要です」の知らせだけ)、`observe`(同じ知らせに、誰が決められるかを添え、記録も残す)、`on` のどれかです。確認のたびに読み直すので、再起動は要りません。
 
+Windows のマシンの PowerShell の確認は、`AGENTGW_LEAD_PERMISSIONS_POWERSHELL=on` も入れないかぎり Owner が答えます。
+
 許可のボタンは Owner の操作だけを受けます。
 
 ## CLI

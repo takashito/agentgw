@@ -25,6 +25,19 @@ pub const LEAD_WAIT_MS: u64 = 3 * 60 * 1000;
 /// How long the machine has to say how an answer went.
 const APPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 const MODE_KEY: &str = "AGENTGW_LEAD_PERMISSIONS";
+/// PowerShell prompts are the Owner's until this is `on`: its reading was written before a real
+/// Windows prompt was seen.
+const POWERSHELL_KEY: &str = "AGENTGW_LEAD_PERMISSIONS_POWERSHELL";
+/// Where the open prompts are kept, so a restart of the gateway does not lose them.
+const OPEN_FILE: &str = "perm-open.json";
+
+/// The prompts a previous run of the gateway left open.
+pub fn load_open(dir: &StateDir) -> HashMap<String, GwPerm> {
+    std::fs::read_to_string(dir.path().join(OPEN_FILE))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LeadMode {
@@ -44,7 +57,7 @@ impl LeadMode {
 }
 
 /// One prompt the gateway was told about.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct GwPerm {
     pub machine: String,
     pub channel: String,
@@ -93,10 +106,24 @@ fn owner_blocks(text: &str, conf_id: &str) -> serde_json::Value {
 }
 
 impl Fleet {
+    fn setting(&self, key: &str) -> Option<String> {
+        let from_file = self.dir.load_env().ok().and_then(|m| m.into_iter().find(|(k, _)| k == key).map(|(_, v)| v));
+        from_file.or_else(|| std::env::var(key).ok())
+    }
+
     fn lead_mode(&self) -> LeadMode {
-        let from_file = self.dir.load_env().ok().and_then(|m| m.into_iter().find(|(k, _)| k == MODE_KEY).map(|(_, v)| v));
-        let v = from_file.or_else(|| std::env::var(MODE_KEY).ok());
-        LeadMode::of(v.as_deref())
+        LeadMode::of(self.setting(MODE_KEY).as_deref())
+    }
+
+    /// Write the open prompts down (after every change to them).
+    fn save_perms(&self) {
+        let text = {
+            let book = self.perms.lock().unwrap_or_else(|e| e.into_inner());
+            serde_json::to_string_pretty(&*book).unwrap_or_default()
+        };
+        if let Err(e) = self.dir.write_atomic(OPEN_FILE, &text) {
+            rlog("error", &format!("perm: could not save {OPEN_FILE}: {e}"));
+        }
     }
 
     /// One line in `perm-decisions.jsonl`: what happened to which prompt, by whom, why.
@@ -156,8 +183,11 @@ impl Fleet {
             return;
         }
         // The gateway's own verdict counts as much as the machine's: the stricter of the two
+        let powershell_checked = self.setting(POWERSHELL_KEY).is_some_and(|v| v.trim().eq_ignore_ascii_case("on"));
         let (class, why) = if tool.is_empty() {
             (Class::Owner, why)
+        } else if tool == "PowerShell" && !powershell_checked {
+            (Class::Owner, "PowerShell prompts are the Owner's until their reading is checked on a real machine".to_string())
         } else {
             let mine = perm_class::classify(&tool, &input, &place);
             match stricter(class, mine.class) {
@@ -205,6 +235,7 @@ impl Fleet {
             return;
         };
         self.perms.lock().unwrap_or_else(|e| e.into_inner()).insert(conf_id.clone(), p.clone());
+        self.save_perms();
         let link = self.api.get_permalink(&channel, &ts).await.unwrap_or_default();
         let name = self.channel_label(&channel).await;
         let shown = p.shown.clone();
@@ -277,6 +308,7 @@ impl Fleet {
             }
             Err(e) => rlog("error", &format!("perm: could not ask the Owner about {conf_id}: {e}")),
         }
+        self.save_perms();
         let p = self.perms.lock().unwrap_or_else(|e| e.into_inner()).get(conf_id).cloned();
         if let Some(p) = p {
             self.perm_log(if late { "escalated" } else { "owner_asked" }, conf_id, &p, serde_json::Value::Null);
@@ -447,6 +479,7 @@ impl Fleet {
             p.settled = Some(format!("{outcome}{}", if by.is_empty() { String::new() } else { format!(" by {by}") }));
             p.clone()
         };
+        self.save_perms();
         self.perm_log(
             if outcome == "allow" || outcome == "deny" { "answered" } else { "closed" },
             conf_id,
@@ -508,6 +541,24 @@ mod tests {
         assert_eq!(LeadMode::of(Some("yes")), LeadMode::Off);
         assert_eq!(LeadMode::of(Some(" Observe ")), LeadMode::Observe);
         assert_eq!(LeadMode::of(Some("on")), LeadMode::On);
+    }
+
+    #[test]
+    fn open_prompts_survive_a_restart_on_disk() {
+        let dir = StateDir::at(std::env::temp_dir().join(format!("agentgw-perm-open-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        assert!(load_open(&dir).is_empty());
+        let p = GwPerm {
+            machine: "dock".into(), channel: "C2".into(), thread_ts: "2.1".into(), ts: "2.2".into(),
+            asker: Some(("C1".into(), "1.1".into())), class: Class::Lead, why: "w".into(), tool: "Bash".into(),
+            shown: "ls".into(), what: String::new(), todo: String::new(), opened_ms: 1, owner_asked: false,
+            owner_notice: None, settled: None,
+        };
+        let all: HashMap<String, GwPerm> = [("c1".to_string(), p)].into();
+        dir.write_atomic(OPEN_FILE, &serde_json::to_string(&all).unwrap()).unwrap();
+        let back = load_open(&dir);
+        assert_eq!(back["c1"].asker, Some(("C1".to_string(), "1.1".to_string())));
     }
 
     #[test]

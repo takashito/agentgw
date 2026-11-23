@@ -474,6 +474,7 @@ impl Bridge {
             threads,
             pools: bridge::Pools::load(&deps.dir),
             access: bridge::Access::load(&deps.dir),
+            lead_confs: crate::bridge::turn::LeadConf::load(&deps.dir),
             deps,
             dedup: inbound::RecentDeliveries::new(),
             workers: worker::Workers::default(),
@@ -489,7 +490,6 @@ impl Bridge {
             lifecycle: bridge::Lifecycle::new(),
             sticky: slack::StickyBoard::default(),
             perm_pending: HashMap::new(),
-            lead_confs: HashMap::new(),
             lost_suspects: Default::default(),
             dialog_watch_at_ms: 0,
             dialog_pending: HashMap::new(),
@@ -1287,7 +1287,7 @@ impl Bridge {
                 catch_up: Default::default(),
                 joins: Default::default(),
                 admin_waits: Default::default(),
-                perms: Default::default(),
+                perms: std::sync::Mutex::new(crate::bridge::gateway::perms::load_open(&dir)),
             });
             // One listener per address: loopback for whatever terminates TLS in front, the LAN address
             // for machines on the same network

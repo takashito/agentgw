@@ -11152,6 +11152,24 @@ mod ask_tests {
     }
 
     #[tokio::test]
+    async fn powershell_prompts_stay_the_owners_until_switched_on() {
+        let (r, thread, _) = perm_rig("pwsh", "on", Ok("x".into())).await;
+        let mut f = perm_ask(&thread, "w1", "Get-ChildItem C:\\work", crate::bridge::perm_class::Class::Lead);
+        if let link::LinkFrame::PermAsk { tool, input, .. } = &mut f {
+            *tool = "PowerShell".into();
+            *input = serde_json::json!({"command": "Get-ChildItem C:\\work"});
+        }
+        r.fleet.on_machine_frame("parent", f.clone()).await;
+        assert_eq!(r.fleet.perms.lock().unwrap()["w1"].class, crate::bridge::perm_class::Class::Owner);
+        std::fs::write(r.fleet.dir.path().join(".env"), "AGENTGW_LEAD_PERMISSIONS=on\nAGENTGW_LEAD_PERMISSIONS_POWERSHELL=on\n").unwrap();
+        if let link::LinkFrame::PermAsk { conf_id, .. } = &mut f {
+            *conf_id = "w2".into();
+        }
+        r.fleet.on_machine_frame("parent", f).await;
+        assert_eq!(r.fleet.perms.lock().unwrap()["w2"].class, crate::bridge::perm_class::Class::Lead);
+    }
+
+    #[tokio::test]
     async fn a_prompt_settled_on_its_machine_closes_here() {
         let (r, thread, _) = perm_rig("closed", "on", Ok("x".into())).await;
         r.fleet.on_machine_frame("parent", perm_ask(&thread, "c5", "ls", crate::bridge::perm_class::Class::Lead)).await;

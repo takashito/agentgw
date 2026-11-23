@@ -125,6 +125,7 @@ fn perm_shown(input: &serde_json::Value) -> String {
 
 /// A permission prompt in an asked thread that the gateway was told about (`LinkFrame::PermAsk`):
 /// what to press when the gateway hands back an answer.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LeadConf {
     /// The id the gateway knows it by.
     pub id: String,
@@ -134,6 +135,26 @@ pub(crate) struct LeadConf {
     pub tool_use_id: String,
     /// What the call runs, as the notice showed it: a screen that shows the same is the same stop.
     pub shown: String,
+}
+
+/// Where the prompts the gateway holds are kept, so an answer still finds them after a restart
+/// (the screen confirmation behind a prompt outlives the Bridge; the gateway keeps its side too).
+const LEAD_CONFS_FILE: &str = "lead-confs.json";
+
+impl LeadConf {
+    pub(crate) fn load(dir: &crate::state_dir::StateDir) -> HashMap<String, LeadConf> {
+        std::fs::read_to_string(dir.path().join(LEAD_CONFS_FILE))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(dir: &crate::state_dir::StateDir, all: &HashMap<String, LeadConf>) {
+        let text = serde_json::to_string_pretty(all).unwrap_or_default();
+        if let Err(e) = dir.write_atomic(LEAD_CONFS_FILE, &text) {
+            LogCtx::default().error("bridge", &format!("{LEAD_CONFS_FILE} save failed: {e}"));
+        }
+    }
 }
 
 /// Reads the question tool's questions out of its hook payload: `questions[]`, each with its
@@ -2286,6 +2307,7 @@ impl Bridge {
         };
         if let Some(old) = self.lead_confs.remove(thread_ts) {
             self.send_perm_closed(&old, thread_ts, "", "superseded");
+            LeadConf::save(&self.deps.dir, &self.lead_confs);
         }
         let place = self.perm_place(channel, thread_ts, "");
         let v = Verdict { class: Class::Owner, why: why.to_string() };
@@ -2348,6 +2370,7 @@ impl Bridge {
                 shown: if tool.is_empty() { String::new() } else { perm_shown(input) },
             },
         );
+        LeadConf::save(&self.deps.dir, &self.lead_confs);
     }
 
     fn send_perm_closed(&self, c: &LeadConf, thread_ts: &str, by: &str, outcome: &str) {
@@ -2366,6 +2389,7 @@ impl Bridge {
         if let Some(c) = self.lead_confs.remove(thread_ts) {
             let key = ThreadKey::new(&c.channel, thread_ts);
             self.note_activity(|b, now| b.permission(&key, None, now));
+            LeadConf::save(&self.deps.dir, &self.lead_confs);
         }
     }
 
@@ -2375,6 +2399,7 @@ impl Bridge {
             let key = ThreadKey::new(&c.channel, thread_ts);
             self.note_activity(|b, now| b.permission(&key, None, now));
             self.send_perm_closed(&c, thread_ts, by, outcome);
+            LeadConf::save(&self.deps.dir, &self.lead_confs);
         }
     }
 
