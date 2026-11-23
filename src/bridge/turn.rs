@@ -2282,7 +2282,7 @@ impl Bridge {
             b.tell_person_once(&key);
         }
         let n = HumanNotice::permission(tool, input);
-        self.send_perm_ask(conf_id, channel, thread_ts, prompt_ts, tool, input, &place, v, n, false, tool_use_id);
+        self.send_perm_ask(conf_id, channel, thread_ts, prompt_ts, tool, input, &place, v, n, false, tool_use_id, perm_shown(input));
     }
 
     /// A confirmation was found on the agent's screen. One that only restates the rule a prompt
@@ -2315,7 +2315,7 @@ impl Bridge {
         }
         let place = self.perm_place(channel, thread_ts, "");
         let v = Verdict { class: Class::Owner, why: why.to_string() };
-        self.send_perm_ask(req_id, channel, thread_ts, prompt_ts, "", &serde_json::Value::Null, &place, v, HumanNotice::screen(d), true, "");
+        self.send_perm_ask(req_id, channel, thread_ts, prompt_ts, "", &serde_json::Value::Null, &place, v, HumanNotice::screen(d), true, "", notice_snippet(&d.title));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2332,9 +2332,9 @@ impl Bridge {
         n: HumanNotice,
         closed_too: bool,
         tool_use_id: &str,
+        shown: String,
     ) {
         let Some(up) = &self.ask_gateway else { return };
-        let shown = if tool.is_empty() { n.what.clone() } else { perm_shown(input) };
         let (n_what_for_activity, v_why_for_activity) = (shown.clone(), v.why.clone());
         LogCtx { session_id: None, thread_key: Some(ThreadKey::new(channel, thread_ts)) }.info(
             "bridge",

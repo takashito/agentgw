@@ -11123,7 +11123,7 @@ mod ask_tests {
         // The Lead answers after all: it counts, and the Owner's notice loses its buttons
         r.fleet.answer_permission("parent", "C1", "1.1", "c9", true, "scratch output").await.unwrap();
         assert_eq!(seen.lock().unwrap().len(), 1);
-        let rewritten = calls(&r.api).into_iter().find(|c| c.starts_with("update_md C1 ") && c.contains("A person is needed")).expect("the notice rewritten");
+        let rewritten = calls(&r.api).into_iter().find(|c| c.starts_with("update_md C1 ") && c.contains("waiting for your permission")).expect("the notice rewritten");
         assert!(rewritten.contains("Allowed by the Lead") && rewritten.contains("scratch output"), "{rewritten}");
         let events: Vec<String> = records(&r).iter().map(|v| v["event"].as_str().unwrap().to_string()).collect();
         assert_eq!(events, ["opened", "escalated", "answered"]);
@@ -11139,16 +11139,25 @@ mod ask_tests {
             by: by.into(),
             state: serde_json::Value::Null,
             value: String::new(),
-            message_ts: String::new(),
+            message_ts: "9.7".into(),
         };
         r.fleet.on_owner_perm_click(press("U_SOMEONE")).await;
         assert!(seen.lock().unwrap().is_empty());
         r.fleet.on_owner_perm_click(press("U_OWNER")).await;
+        // Both presses are in the record, with who pressed which button on which notice
+        let rec = records(&r);
+        let ignored = rec.iter().find(|v| v["event"] == "press_ignored").expect("the stranger's press");
+        assert_eq!((ignored["by"].as_str(), ignored["button"].as_str()), (Some("U_SOMEONE"), Some("owner-allow")));
+        let pressed = rec.iter().find(|v| v["event"] == "pressed").expect("the Owner's press");
+        assert_eq!(pressed["by"], "U_OWNER");
+        assert_eq!(pressed["notice"], "C1:9.7");
+        let order: Vec<&str> = rec.iter().map(|v| v["event"].as_str().unwrap()).collect();
+        assert_eq!(order, ["opened", "owner_asked", "press_ignored", "pressed", "answered"]);
         let seen = seen.lock().unwrap().clone();
-        assert_eq!(seen, vec![("o1".to_string(), true, false, "<@U_OWNER>".to_string())]);
+        assert_eq!(seen, vec![("o1".to_string(), true, false, "the Owner, <@U_OWNER>".to_string())]);
         // The Lead hears the Owner answered
         let told = calls(&r.api).into_iter().filter(|c| c.starts_with("post_md C1 1.1 ")).last().unwrap();
-        assert!(told.contains("Allowed by <@U_OWNER>"), "{told}");
+        assert!(told.contains("Allowed by the Owner, <@U_OWNER>"), "{told}");
     }
 
     #[tokio::test]
@@ -11167,6 +11176,24 @@ mod ask_tests {
         }
         r.fleet.on_machine_frame("parent", f).await;
         assert_eq!(r.fleet.perms.lock().unwrap()["w2"].class, crate::bridge::perm_class::Class::Lead);
+    }
+
+    /// The Owner reads the notice in plain Japanese: what, where, why them, what pressing does,
+    /// and after the answer, who answered and why — no ids or inner names.
+    #[tokio::test]
+    async fn the_owners_notice_reads_plainly_in_japanese() {
+        let _ja = crate::i18n::pin(crate::i18n::Lang::Ja);
+        let (r, thread, _) = perm_rig("ja", "on", Ok("denied".into())).await;
+        r.fleet.on_machine_frame("parent", perm_ask(&thread, "j1", "curl -X POST http://127.0.0.1:9/", crate::bridge::perm_class::Class::Owner)).await;
+        let notice = calls(&r.api).into_iter().find(|c| c.starts_with("post_blocks C1 1.1 ")).expect("the Owner is asked");
+        for part in ["のエージェントが、あなたの許可を待っています", "しようとしていること: `curl -X POST http://127.0.0.1:9/`(Bash で実行)",
+                     "あなたに聞く理由: curl は Lead が決めてよいコマンドではありません", "「許可」か「拒否」を押してください", "30分たつと", "\"許可\"", "\"拒否\""] {
+            assert!(notice.contains(part), "missing {part}: {notice}");
+        }
+        assert!(!notice.contains("j1") || notice.contains("perm:owner-allow:j1"), "the id only in the button: {notice}");
+        r.fleet.answer_permission("parent", "C1", "1.1", "j1", false, "試験なので実行しない").await.unwrap();
+        let rewritten = calls(&r.api).into_iter().find(|c| c.starts_with("update_md C1 ") && c.contains("あなたの許可を待っています")).expect("rewritten");
+        assert!(rewritten.contains("拒否されました(依頼元の Lead、<#C1>) — 理由: 試験なので実行しない。実行されません"), "{rewritten}");
     }
 
     #[tokio::test]

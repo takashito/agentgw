@@ -64,8 +64,8 @@ pub fn classify(tool: &str, input: &Value, place: &Place) -> Verdict {
             let path = [field("file_path"), field("notebook_path")].into_iter().find(|p| !p.is_empty()).unwrap_or("");
             write_tool(path, place)
         }
-        _ if SHELL_TOOLS.contains(&tool) => Verdict::owner("unreadable command"),
-        _ => Verdict::owner(format!("{tool} is not a tool the Lead may decide for")),
+        _ if SHELL_TOOLS.contains(&tool) => Verdict::owner(crate::t!("unreadable command", "中身を読み取れないコマンドです")),
+        _ => Verdict::owner(crate::t!("{tool} is not a tool the Lead may decide for", "{tool} は Lead が決めてよい道具ではありません")),
     }
 }
 
@@ -75,6 +75,23 @@ pub fn classify(tool: &str, input: &Value, place: &Place) -> Verdict {
 pub fn dialog_defers_to_tool(title: &str) -> bool {
     let t = title.trim();
     (t.starts_with("Rule ") && t.contains("overrides auto mode")) || t.starts_with("Do you want to proceed")
+}
+
+/// Why a confirmation found on the agent's screen is the Owner's, from its first line.
+pub fn screen_why(title: &str) -> String {
+    if title.trim_start().starts_with("Dangerous") {
+        crate::t!("Claude Code's own safety check", "Claude Code 自身の安全確認です")
+    } else if dialog_defers_to_tool(title) {
+        crate::t!(
+            "a rule's confirmation on the screen, with no command to judge it by",
+            "画面に出た確認で、判断の材料になるコマンドが分かりません"
+        )
+    } else {
+        crate::t!(
+            "a confirmation on the screen that is not a known permission rule",
+            "画面に出た、見知らぬ確認です"
+        )
+    }
 }
 
 /// The rows of a permission dialog that mean "yes, once" and "no". None when the screen has no
@@ -222,33 +239,33 @@ fn is_harness_config(abs: &str) -> bool {
 
 fn read_tool(path: &str, place: &Place) -> Verdict {
     if is_secret(path) {
-        return Verdict::owner("reads a file that holds secrets");
+        return Verdict::owner(crate::t!("reads a file that holds secrets", "秘密(鍵・トークン・.env など)の入ったファイルを読みます"));
     }
     // A search of the whole home or the whole disk reaches the secrets too
     if let Some(abs) = absolute(path, place)
         && (abs == place.home.trim_end_matches('/') || abs == "/" || abs.is_empty())
     {
-        return Verdict::owner("reads across the whole home folder");
+        return Verdict::owner(crate::t!("reads across the whole home folder", "ホームフォルダ全体を読みます"));
     }
-    Verdict::lead("reads only")
+    Verdict::lead(crate::t!("reads only", "読むだけです"))
 }
 
 fn write_tool(path: &str, place: &Place) -> Verdict {
     if is_secret(path) {
-        return Verdict::owner("writes a file that holds secrets");
+        return Verdict::owner(crate::t!("writes a file that holds secrets", "秘密の入ったファイルに書きます"));
     }
     let Some(abs) = absolute(path, place) else {
-        return Verdict::owner("writes a path that cannot be placed");
+        return Verdict::owner(crate::t!("writes a path that cannot be placed", "どこに書くのか分からないパスです"));
     };
     if is_harness_config(&abs) {
-        return Verdict::owner("edits Claude's settings, hooks, git hooks or CI");
+        return Verdict::owner(crate::t!("edits Claude's settings, hooks, git hooks or CI", "Claude の設定・hook・git の hook・CI の設定を書き換えます"));
     }
     if in_scratch(&abs, place) {
-        return Verdict::lead("writes a scratch file");
+        return Verdict::lead(crate::t!("writes a scratch file", "一時フォルダに書くだけです"));
     }
     match work_folder(place) {
-        Some(w) if under(&abs, w) => Verdict::lead("edits a file in the work folder"),
-        _ => Verdict::owner("writes outside the work folder"),
+        Some(w) if under(&abs, w) => Verdict::lead(crate::t!("edits a file in the work folder", "作業フォルダの中のファイルを編集します")),
+        _ => Verdict::owner(crate::t!("writes outside the work folder", "作業フォルダの外に書きます")),
     }
 }
 
@@ -377,11 +394,11 @@ fn bash_tokens(line: &str) -> Result<Vec<Tok>, &'static str> {
 /// What a command line does, judged part by part; the heaviest part decides.
 fn bash(line: &str, place: &Place) -> Verdict {
     if line.trim().is_empty() {
-        return Verdict::owner("empty command");
+        return Verdict::owner(crate::t!("empty command", "コマンドが空です"));
     }
     let toks = match bash_tokens(line) {
         Ok(t) => t,
-        Err(what) => return Verdict::owner(format!("cannot be read: {what}")),
+        Err(what) => return Verdict::owner(crate::t!("cannot be read: {what}", "読み解けない形です({what})")),
     };
     let first_words: Vec<&str> = toks
         .split(|t| *t == Tok::Sep)
@@ -391,7 +408,7 @@ fn bash(line: &str, place: &Place) -> Verdict {
         })
         .collect();
     if first_words.iter().any(|w| matches!(*w, "cd" | "pushd")) && first_words.iter().any(|w| matches!(*w, "rm" | "rmdir" | "mv")) {
-        return Verdict::owner("changes folder and deletes in one command (Claude Code's own safety check may stand behind it)");
+        return Verdict::owner(crate::t!("changes folder and deletes in one command (Claude Code's own safety check may stand behind it)", "フォルダを移ってから消す操作を1つのコマンドでしています(Claude Code 自身の安全確認が控えている形です)"));
     }
     let mut whys: Vec<String> = Vec::new();
     for part in toks.split(|t| *t == Tok::Sep) {
@@ -405,7 +422,7 @@ fn bash(line: &str, place: &Place) -> Verdict {
                 Tok::Word(w) => words.push(w),
                 Tok::Redirect(op) => {
                     let Some(Tok::Word(target)) = iter.next() else {
-                        return Verdict::owner("cannot be read: a redirect without a target");
+                        return Verdict::owner(crate::t!("cannot be read: a redirect without a target", "読み解けない形です(出力先の無いリダイレクト)"));
                     };
                     if let Some(v) = redirect(op, target, place) {
                         return v;
@@ -427,16 +444,16 @@ fn bash(line: &str, place: &Place) -> Verdict {
         }
     }
     if whys.is_empty() {
-        return Verdict::owner("empty command");
+        return Verdict::owner(crate::t!("empty command", "コマンドが空です"));
     }
-    Verdict::lead(whys.join("; "))
+    Verdict::lead(whys.join(&crate::t!("; ", "。")))
 }
 
 /// A redirect is fine into `/dev/null` or a scratch file; a read from a secret, or a write
 /// anywhere else, is the Owner's.
 fn redirect(op: &str, target: &str, place: &Place) -> Option<Verdict> {
     if is_secret(target) {
-        return Some(Verdict::owner("redirects to or from a file that holds secrets"));
+        return Some(Verdict::owner(crate::t!("redirects to or from a file that holds secrets", "秘密の入ったファイルを読み書きします")));
     }
     if op.contains('<') {
         return None;
@@ -446,7 +463,7 @@ fn redirect(op: &str, target: &str, place: &Place) -> Option<Verdict> {
     }
     match absolute(target, place) {
         Some(abs) if in_scratch(&abs, place) => None,
-        _ => Some(Verdict::owner("writes output outside the scratch folders")),
+        _ => Some(Verdict::owner(crate::t!("writes output outside the scratch folders", "一時フォルダの外へ出力を書きます"))),
     }
 }
 
@@ -480,50 +497,50 @@ fn bash_part(words: &[&str], place: &Place) -> Verdict {
     let cmd = words[0];
     let args = &words[1..];
     if cmd.contains('=') {
-        return Verdict::owner("sets environment variables for the command");
+        return Verdict::owner(crate::t!("sets environment variables for the command", "コマンドに環境変数を渡しています"));
     }
     if let Some(w) = words.iter().find(|w| has_unknown_var(w)) {
-        return Verdict::owner(format!("uses a variable whose value is not known: {w}"));
+        return Verdict::owner(crate::t!("uses a variable whose value is not known: {w}", "中身の分からない変数を使っています: {w}"));
     }
     if let Some(w) = args.iter().find(|w| path_like(w) && is_secret(w)) {
-        return Verdict::owner(format!("touches a file that holds secrets: {w}"));
+        return Verdict::owner(crate::t!("touches a file that holds secrets: {w}", "秘密の入ったファイルに触れます: {w}"));
     }
     let name = cmd.rsplit('/').next().unwrap_or(cmd);
     if READ_COMMANDS.contains(&name) {
-        return Verdict::lead("reads only");
+        return Verdict::lead(crate::t!("reads only", "読むだけです"));
     }
     match name {
         "find" => {
             const ACTS: [&str; 8] = ["-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf", "-fls"];
             if args.iter().any(|a| ACTS.contains(a)) {
-                return Verdict::owner("find that deletes, runs or writes");
+                return Verdict::owner(crate::t!("find that deletes, runs or writes", "find で消す・実行する・書く操作をします"));
             }
-            Verdict::lead("reads only")
+            Verdict::lead(crate::t!("reads only", "読むだけです"))
         }
         "git" => git(args),
         "cargo" => match args.first().copied() {
             Some("build" | "check" | "test" | "clippy" | "doc" | "tree" | "metadata" | "fmt" | "nextest" | "bench") => {
-                Verdict::lead("builds or tests in the work folder")
+                Verdict::lead(crate::t!("builds or tests in the work folder", "作業フォルダでのビルドかテストです"))
             }
-            _ => Verdict::owner("a cargo command that installs or publishes"),
+            _ => Verdict::owner(crate::t!("a cargo command that installs or publishes", "インストールや公開をする cargo のコマンドです")),
         },
         "npm" | "pnpm" | "yarn" => match args {
-            ["test", ..] | ["run", "test" | "build" | "lint" | "typecheck", ..] => Verdict::lead("builds or tests in the work folder"),
-            _ => Verdict::owner("a package-manager command that installs or publishes"),
+            ["test", ..] | ["run", "test" | "build" | "lint" | "typecheck", ..] => Verdict::lead(crate::t!("builds or tests in the work folder", "作業フォルダでのビルドかテストです")),
+            _ => Verdict::owner(crate::t!("a package-manager command that installs or publishes", "インストールや公開をするパッケージ管理のコマンドです")),
         },
-        "pytest" => Verdict::lead("builds or tests in the work folder"),
-        "python" | "python3" if matches!(args, ["-m", "pytest", ..]) => Verdict::lead("builds or tests in the work folder"),
-        "go" if matches!(args.first(), Some(&("test" | "build" | "vet"))) => Verdict::lead("builds or tests in the work folder"),
+        "pytest" => Verdict::lead(crate::t!("builds or tests in the work folder", "作業フォルダでのビルドかテストです")),
+        "python" | "python3" if matches!(args, ["-m", "pytest", ..]) => Verdict::lead(crate::t!("builds or tests in the work folder", "作業フォルダでのビルドかテストです")),
+        "go" if matches!(args.first(), Some(&("test" | "build" | "vet"))) => Verdict::lead(crate::t!("builds or tests in the work folder", "作業フォルダでのビルドかテストです")),
         "make" => {
             const RISKY: [&str; 6] = ["install", "deploy", "release", "publish", "push", "clean"];
             if args.iter().any(|a| RISKY.iter().any(|r| a.contains(r))) {
-                Verdict::owner("a make target that installs, publishes or cleans")
+                Verdict::owner(crate::t!("a make target that installs, publishes or cleans", "インストール・公開・削除をする make です"))
             } else {
-                Verdict::lead("builds or tests in the work folder")
+                Verdict::lead(crate::t!("builds or tests in the work folder", "作業フォルダでのビルドかテストです"))
             }
         }
         _ if SCRATCH_COMMANDS.contains(&name) => scratch(name, args, place),
-        _ => Verdict::owner(format!("{name} is not a command the Lead may decide for")),
+        _ => Verdict::owner(crate::t!("{name} is not a command the Lead may decide for", "{name} は Lead が決めてよいコマンドではありません")),
     }
 }
 
@@ -541,16 +558,16 @@ fn git(args: &[&str]) -> Verdict {
     match rest.first().copied() {
         Some(sub) if GIT_READ.contains(&sub) => {
             if sub == "reflog" && rest.get(1).is_some_and(|a| *a == "delete" || *a == "expire") {
-                return Verdict::owner("git that rewrites history");
+                return Verdict::owner(crate::t!("git that rewrites history", "git の履歴を書き換えます"));
             }
-            Verdict::lead("reads only")
+            Verdict::lead(crate::t!("reads only", "読むだけです"))
         }
         Some("branch" | "tag" | "remote" | "stash")
             if rest[1..].iter().all(|a| matches!(*a, "-a" | "-v" | "-vv" | "--list" | "-l" | "-r" | "list" | "--show-current")) =>
         {
-            Verdict::lead("reads only")
+            Verdict::lead(crate::t!("reads only", "読むだけです"))
         }
-        _ => Verdict::owner("a git command that changes the repository or talks to a remote"),
+        _ => Verdict::owner(crate::t!("a git command that changes the repository or talks to a remote", "リポジトリを変えるか、外のサーバーとやり取りする git のコマンドです")),
     }
 }
 
@@ -574,17 +591,17 @@ fn scratch(name: &str, args: &[&str], place: &Place) -> Verdict {
         paths = paths.saturating_add(1);
         match absolute(a, place) {
             Some(abs) if matches!(name, "rm" | "rmdir" | "mv") && holds_cwd(&abs, place) => {
-                return Verdict::owner(format!("{name} of the folder the shell is in, or one above it (Claude Code's own safety check)"));
+                return Verdict::owner(crate::t!("{name} of the folder the shell is in, or one above it (Claude Code's own safety check)", "シェルのいるフォルダか、その上のフォルダを {name} します(Claude Code 自身の安全確認に当たります)"));
             }
             Some(abs) if in_scratch(&abs, place) => {}
-            Some(_) => return Verdict::owner(format!("{name} outside the scratch folders: {a}")),
-            None => return Verdict::owner(format!("{name} on a path that cannot be placed: {a}")),
+            Some(_) => return Verdict::owner(crate::t!("{name} outside the scratch folders: {a}", "一時フォルダの外で {name} します: {a}")),
+            None => return Verdict::owner(crate::t!("{name} on a path that cannot be placed: {a}", "どこか分からないパスに {name} します: {a}")),
         }
     }
     if paths == 0 || paths == usize::MAX {
-        return Verdict::owner(format!("{name} without a path"));
+        return Verdict::owner(crate::t!("{name} without a path", "{name} の対象のパスがありません"));
     }
-    Verdict::lead(format!("{name} inside the scratch folders only"))
+    Verdict::lead(crate::t!("{name} inside the scratch folders only", "一時フォルダの中だけで {name} します"))
 }
 
 // ── PowerShell ───────────────────────────────────────────────────────────────────────────
@@ -593,19 +610,19 @@ fn scratch(name: &str, args: &[&str], place: &Place) -> Verdict {
 /// runs (script blocks, `&`, `iex`, encoded commands, other shells) is the Owner's.
 fn powershell(line: &str, place: &Place) -> Verdict {
     if line.trim().is_empty() {
-        return Verdict::owner("empty command");
+        return Verdict::owner(crate::t!("empty command", "コマンドが空です"));
     }
     let lower = line.to_lowercase();
     for bad in ["{", "}", "$(", "@(", "`", "<#", ">", "iex", "invoke-expression", "invoke-command", "-encodedcommand", "-enc ", "start-process", "frombase64"] {
         if lower.contains(bad) {
-            return Verdict::owner(format!("cannot be read: contains {bad}"));
+            return Verdict::owner(crate::t!("cannot be read: contains {bad}", "読み解けない形です({bad} を含む)"));
         }
     }
     let mut whys: Vec<String> = Vec::new();
     for part in lower.split(['\n', ';', '|']).flat_map(|p| p.split("&&")) {
         let words = match ps_words(part) {
             Ok(w) => w,
-            Err(why) => return Verdict::owner(format!("cannot be read: {why}")),
+            Err(why) => return Verdict::owner(crate::t!("cannot be read: {why}", "読み解けない形です({why})")),
         };
         if words.is_empty() {
             continue;
@@ -620,9 +637,9 @@ fn powershell(line: &str, place: &Place) -> Verdict {
         }
     }
     if whys.is_empty() {
-        return Verdict::owner("empty command");
+        return Verdict::owner(crate::t!("empty command", "コマンドが空です"));
     }
-    Verdict::lead(whys.join("; "))
+    Verdict::lead(whys.join(&crate::t!("; ", "。")))
 }
 
 fn ps_words(part: &str) -> Result<Vec<String>, &'static str> {
@@ -664,7 +681,7 @@ fn ps_part(words: &[String], place: &Place) -> Verdict {
     let cmd = words[0].as_str();
     let args: Vec<&str> = words[1..].iter().map(String::as_str).collect();
     if cmd.starts_with('.') || cmd.starts_with('$') {
-        return Verdict::owner("runs a script or an expression");
+        return Verdict::owner(crate::t!("runs a script or an expression", "スクリプトや式を実行します"));
     }
     let unknown_var = |w: &&str| {
         let mut rest = *w;
@@ -678,10 +695,10 @@ fn ps_part(words: &[String], place: &Place) -> Verdict {
         false
     };
     if let Some(w) = words.iter().map(String::as_str).find(unknown_var) {
-        return Verdict::owner(format!("uses a variable whose value is not known: {w}"));
+        return Verdict::owner(crate::t!("uses a variable whose value is not known: {w}", "中身の分からない変数を使っています: {w}"));
     }
     if let Some(w) = args.iter().find(|w| path_like(w) && is_secret(w)) {
-        return Verdict::owner(format!("touches a file that holds secrets: {w}"));
+        return Verdict::owner(crate::t!("touches a file that holds secrets: {w}", "秘密の入ったファイルに触れます: {w}"));
     }
     const READ: &[&str] = &[
         "get-childitem", "gci", "ls", "dir", "get-content", "gc", "cat", "type", "select-string", "sls", "test-path",
@@ -690,7 +707,7 @@ fn ps_part(words: &[String], place: &Place) -> Verdict {
         "join-path", "cd", "set-location",
     ];
     if READ.contains(&cmd) {
-        return Verdict::lead("reads only");
+        return Verdict::lead(crate::t!("reads only", "読むだけです"));
     }
     match cmd {
         "git" | "git.exe" => git(&args),
@@ -701,7 +718,7 @@ fn ps_part(words: &[String], place: &Place) -> Verdict {
         "remove-item" | "rm" | "del" | "erase" | "rd" | "rmdir" | "ri" | "new-item" | "ni" | "mkdir" | "md" => {
             ps_scratch(cmd, &args, place)
         }
-        _ => Verdict::owner(format!("{cmd} is not a command the Lead may decide for")),
+        _ => Verdict::owner(crate::t!("{cmd} is not a command the Lead may decide for", "{cmd} は Lead が決めてよいコマンドではありません")),
     }
 }
 
@@ -714,7 +731,7 @@ fn ps_scratch(cmd: &str, args: &[&str], place: &Place) -> Verdict {
         if a == "-path" || a == "-literalpath" {
             i += 1;
             if i >= args.len() {
-                return Verdict::owner(format!("{cmd} without a path"));
+                return Verdict::owner(crate::t!("{cmd} without a path", "{cmd} の対象のパスがありません"));
             }
         } else if a == "-itemtype" || a == "-erroraction" {
             i += 2;
@@ -723,20 +740,20 @@ fn ps_scratch(cmd: &str, args: &[&str], place: &Place) -> Verdict {
             i += 1;
             continue;
         } else if a.starts_with('-') {
-            return Verdict::owner(format!("{cmd} with {a}"));
+            return Verdict::owner(crate::t!("{cmd} with {a}", "{cmd} に {a} が付いています"));
         }
         let p = args[i];
         paths += 1;
         match absolute(p, place) {
             Some(abs) if in_scratch(&abs, place) => {}
-            _ => return Verdict::owner(format!("{cmd} outside the scratch folders: {p}")),
+            _ => return Verdict::owner(crate::t!("{cmd} outside the scratch folders: {p}", "一時フォルダの外で {cmd} します: {p}")),
         }
         i += 1;
     }
     if paths == 0 {
-        return Verdict::owner(format!("{cmd} without a path"));
+        return Verdict::owner(crate::t!("{cmd} without a path", "{cmd} の対象のパスがありません"));
     }
-    Verdict::lead(format!("{cmd} inside the scratch folders only"))
+    Verdict::lead(crate::t!("{cmd} inside the scratch folders only", "一時フォルダの中だけで {cmd} します"))
 }
 
 #[cfg(test)]

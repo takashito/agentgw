@@ -184,17 +184,21 @@ impl Fleet {
         }
         // The gateway's own verdict counts as much as the machine's: the stricter of the two
         let powershell_checked = self.setting(POWERSHELL_KEY).is_some_and(|v| v.trim().eq_ignore_ascii_case("on"));
+        // The reason is said in the gateway's own words (and language) wherever its verdict agrees
         let (class, why) = if tool.is_empty() {
-            (Class::Owner, why)
+            (Class::Owner, perm_class::screen_why(&shown))
         } else if tool == "PowerShell" && !powershell_checked {
-            (Class::Owner, "PowerShell prompts are the Owner's until their reading is checked on a real machine".to_string())
+            (
+                Class::Owner,
+                crate::t!(
+                    "PowerShell prompts are the Owner's until their reading is checked on a real machine",
+                    "PowerShell の確認は、読み取りを実機で確かめるまで Owner が答えます"
+                ),
+            )
         } else {
             let mine = perm_class::classify(&tool, &input, &place);
-            match stricter(class, mine.class) {
-                Class::Owner if class == Class::Owner => (Class::Owner, why),
-                Class::Owner => (Class::Owner, mine.why),
-                Class::Lead => (Class::Lead, why),
-            }
+            let strict = stricter(class, mine.class);
+            (strict, if mine.class == strict { mine.why } else { why })
         };
         let asker = self
             .asks
@@ -294,20 +298,35 @@ impl Fleet {
         let link = self.prompt_link(&p.channel, &p.thread_ts, &p.ts).await;
         let name = self.channel_label(&p.channel).await;
         let mention = self.owner().map(|o| format!("<@{o}> ")).unwrap_or_default();
-        let why = &p.why;
+        let (why, shown, tool) = (&p.why, &p.shown, &p.tool);
+        let doing = if tool.is_empty() {
+            crate::t!(
+                "a confirmation is on the agent's screen: \u{201c}{shown}\u{201d}",
+                "エージェントの画面に確認が出ています「{shown}」"
+            )
+        } else {
+            crate::t!("`{shown}` (with {tool})", "`{shown}`({tool} で実行)")
+        };
         let because = match (p.class, late) {
-            (Class::Owner, _) => crate::t!("The Owner's call: {why}", "Owner の判断が要る理由: {why}"),
+            (Class::Owner, _) => why.clone(),
             (Class::Lead, _) => crate::t!(
-                "The Lead has not answered in 3 minutes ({why}). The Lead may still answer.",
-                "Lead が3分答えていません({why})。Lead はまだ答えられます。"
+                "the agent that asked for this work could decide it ({why}), but has not answered in 3 minutes. If it answers first, that answer counts.",
+                "依頼した Lead が決めてよい確認です({why})が、3分のうちに答えなかったので、あなたにも聞いています。Lead が先に答えれば、それで決まります。"
             ),
         };
-        let what = &p.what;
         let text = crate::t!(
-            "{mention}:raising_hand: **A person is needed in {name}**: {what}\n{because}\nPress Allow or Deny here. [Open it]({link})",
-            "{mention}:raising_hand: **{name} で人の確認が必要です**: {what}\n{because}\nここで「許可」か「拒否」を押してください。[開く]({link})"
+            "{mention}:raising_hand: **The agent in {name} is waiting for your permission**\n\
+             \u{2022} What it wants to do: {doing}\n\
+             \u{2022} Why you are asked: {because}\n\
+             \u{2022} What to do: press Allow or Deny below. Allow runs it this once; Deny stops it. Until you press, the agent waits here (after 30 minutes it gives up on this work).\n\
+             [Open the agent's thread]({link})",
+            "{mention}:raising_hand: **{name} のエージェントが、あなたの許可を待っています**\n\
+             \u{2022} しようとしていること: {doing}\n\
+             \u{2022} あなたに聞く理由: {because}\n\
+             \u{2022} お願い: 下の「許可」か「拒否」を押してください。許可するとこの1回だけ実行され、拒否すると実行されません。押さないうちは、エージェントはこの手前で待ち続けます(30分たつと、この作業を止めます)。\n\
+             [エージェントのスレッドを開く]({link})"
         );
-        let fallback = crate::t!("A person is needed in {name}", "{name} で人の確認が必要です");
+        let fallback = crate::t!("The agent in {name} is waiting for your permission", "{name} のエージェントが、あなたの許可を待っています");
         match self.api.post_blocks(&top.channel, &fallback, owner_blocks(&text, conf_id), Some(&top.thread_ts)).await {
             Ok(ts) => {
                 let mut book = self.perms.lock().unwrap_or_else(|e| e.into_inner());
@@ -406,7 +425,7 @@ impl Fleet {
         if reason.trim().is_empty() {
             return Err("give a reason: it is kept in the record".into());
         }
-        let by = crate::t!("the Lead (<#{from_channel}>)", "Lead(<#{from_channel}>)");
+        let by = crate::t!("the Lead, <#{from_channel}>", "依頼元の Lead、<#{from_channel}>");
         let who = format!("{from_channel}:{from_thread}");
         let note = self.decide_perm(conf_id, allow, true, &by, &who, reason).await?;
         Ok(serde_json::json!({"status": if allow {"allowed"} else {"denied"}, "result": note}))
@@ -414,12 +433,45 @@ impl Fleet {
 
     /// The Owner pressed a button on the gateway's notice.
     pub(super) async fn on_owner_perm_click(&self, click: PermClick) {
-        if self.owner().as_deref() != Some(click.by.as_str()) {
-            rlog("info", &format!("perm: ignored a press on {} by {} (not the Owner)", click.req_id, click.by));
+        // **Every press is written down, by whom and on which notice**, before anything is decided:
+        // the answer's record alone could only be traced back to a press by the shape of its line
+        let owner_pressed = self.owner().as_deref() == Some(click.by.as_str());
+        let notice_channel = self
+            .perms
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&click.req_id)
+            .and_then(|p| p.owner_notice.as_ref().map(|(ch, _, _)| ch.clone()))
+            .unwrap_or_default();
+        rlog(
+            "info",
+            &format!(
+                "perm: Owner button {} pressed on notice {notice_channel}:{} by {} for conf={}{}",
+                click.action,
+                click.message_ts,
+                click.by,
+                click.req_id,
+                if owner_pressed { "" } else { " — not the Owner, ignored" }
+            ),
+        );
+        let known = self.perms.lock().unwrap_or_else(|e| e.into_inner()).get(&click.req_id).cloned();
+        if let Some(p) = &known {
+            self.perm_log(
+                if owner_pressed { "pressed" } else { "press_ignored" },
+                &click.req_id,
+                p,
+                serde_json::json!({
+                    "by": click.by,
+                    "button": click.action,
+                    "notice": format!("{notice_channel}:{}", click.message_ts),
+                }),
+            );
+        }
+        if !owner_pressed {
             return;
         }
         let allow = click.action == crate::chat::slack::OWNER_ALLOW;
-        let by = format!("<@{}>", click.by);
+        let by = crate::t!("the Owner, <@{}>", "Owner、<@{}>", click.by);
         if let Err(e) = self.decide_perm(&click.req_id, allow, false, &by, &click.by, "").await {
             rlog("info", &format!("perm: the Owner's answer to {} did not go through: {e}", click.req_id));
             let p = self.perms.lock().unwrap_or_else(|e| e.into_inner()).get(&click.req_id).cloned();
@@ -497,12 +549,24 @@ impl Fleet {
             serde_json::json!({"by": who, "decision": outcome, "reason": reason, "result": note}),
         );
         let shown = &p.shown;
-        let reason_part = if reason.is_empty() { String::new() } else { format!(" — {reason}") };
+        let reason_part = if reason.is_empty() { String::new() } else { crate::t!(" \u{2014} reason: {reason}", " \u{2014} 理由: {reason}") };
         let line = match outcome {
-            "allow" => crate::t!(":white_check_mark: Allowed by {by}{reason_part}: `{shown}`", ":white_check_mark: {by} が許可しました{reason_part}: `{shown}`"),
-            "deny" => crate::t!(":no_entry_sign: Denied by {by}{reason_part}: `{shown}`", ":no_entry_sign: {by} が拒否しました{reason_part}: `{shown}`"),
-            "superseded" => crate::t!("Replaced by another confirmation on the agent's screen: `{shown}`", "エージェントの画面に別の確認が出たので、置き換わりました: `{shown}`"),
-            _ => crate::t!("No longer waiting — the agent moved on without an answer: `{shown}`", "もう待っていません(答えなしにエージェントが先へ進みました): `{shown}`"),
+            "allow" => crate::t!(
+                ":white_check_mark: Allowed by {by}{reason_part}. It runs this once: `{shown}`",
+                ":white_check_mark: 許可されました({by}){reason_part}。この1回だけ実行されます: `{shown}`"
+            ),
+            "deny" => crate::t!(
+                ":no_entry_sign: Denied by {by}{reason_part}. It does not run: `{shown}`",
+                ":no_entry_sign: 拒否されました({by}){reason_part}。実行されません: `{shown}`"
+            ),
+            "superseded" => crate::t!(
+                "Another confirmation came up on the agent's screen, so this one is closed: `{shown}`",
+                "エージェントの画面に別の確認が出たので、こちらは閉じました: `{shown}`"
+            ),
+            _ => crate::t!(
+                "The agent went on without an answer; nothing to do here: `{shown}`",
+                "答えを待たずに、エージェントが先へ進みました。何もしなくて大丈夫です: `{shown}`"
+            ),
         };
         if let Some((ch, ts, text)) = &p.owner_notice {
             let said = format!("{text}\n{line}");
@@ -528,7 +592,7 @@ impl Fleet {
 
     /// A machine says a prompt it reported was settled there.
     pub(super) async fn on_perm_closed(&self, conf_id: &str, by: &str, outcome: &str) {
-        let label = if by.is_empty() { String::new() } else { format!("<@{by}>") };
+        let label = if by.is_empty() { String::new() } else { crate::t!("the Owner, <@{by}>", "Owner、<@{by}>") };
         self.settle_perm(conf_id, &label, by, outcome, "", None).await;
     }
 
