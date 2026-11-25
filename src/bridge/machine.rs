@@ -185,6 +185,18 @@ pub enum FromRelay {
     ReadProject { req_id: String, channel: String },
     /// Say what one of this machine's threads is doing, for the gateway (`thread_activity`).
     ReadActivity { req_id: String, channel: String, thread_ts: String },
+    /// Answer a permission prompt the gateway holds for this thread (the Lead's answer, or the
+    /// Owner's press on the gateway's notice).
+    PermDecision {
+        req_id: String,
+        conf_id: String,
+        channel: String,
+        thread_ts: String,
+        allow: bool,
+        lead: bool,
+        by: String,
+        reason: String,
+    },
     /// A refusal that talking won't fix. **No retry.**
     Fatal(Fatal),
 }
@@ -382,6 +394,9 @@ impl FromRelay {
             F::AgentMessage { msg } => FromRelay::AgentMessage(serde_json::from_value(msg).ok()?),
             F::ReadProject { req_id, channel } => FromRelay::ReadProject { req_id, channel },
             F::ReadActivity { req_id, channel, thread_ts } => FromRelay::ReadActivity { req_id, channel, thread_ts },
+            F::PermDecision { req_id, conf_id, channel, thread_ts, allow, lead, by, reason } => {
+                FromRelay::PermDecision { req_id, conf_id, channel, thread_ts, allow, lead, by, reason }
+            }
             // Answers and asks only ever go the other way
             F::ProjectSet { .. }
             | F::AskChannel { .. }
@@ -395,6 +410,10 @@ impl FromRelay {
             | F::InviteToChannel { .. }
             | F::AgentReply { .. }
             | F::NeedsHuman { .. }
+            | F::PermAsk { .. }
+            | F::AnswerPermission { .. }
+            | F::PermApplied { .. }
+            | F::PermClosed { .. }
             | F::AskEnded { .. }
             | F::ProjectRead { .. }
             | F::Routes { .. }

@@ -58,6 +58,9 @@ struct ThreadActivity {
     /// since. A permission whose button expires comes back as the agent's own screen for the same
     /// command: telling the asker again then is the same news twice.
     person_told: bool,
+    /// The permission prompt the agent is stopped at, as the gateway was told of it: its
+    /// confirmation id, what it runs, and who decides (`bridge::perm_class`).
+    permission: Option<serde_json::Value>,
 }
 
 /// One row per thread this Bridge has seen work in since it started (memory only).
@@ -153,6 +156,11 @@ impl ActivityBook {
     }
 
     /// A permission prompt or a question is up (`true`), or answered (`false`).
+    /// The permission prompt holding this thread (None once it is settled).
+    pub fn permission(&mut self, key: &ThreadKey, p: Option<serde_json::Value>, now: u64) {
+        self.row(key, now).permission = p;
+    }
+
     pub fn waiting_for_person(&mut self, key: &ThreadKey, on: bool, now: u64) {
         self.row(key, now).waiting_for_person = on;
     }
@@ -279,6 +287,19 @@ impl ActivityBook {
                  It will not answer by itself; a new message to the thread starts it again from the conversation."
                     .to_string(),
             )
+        } else if let Some(p) = row.permission.as_ref().filter(|_| row.waiting_for_person) {
+            let whose = match p["class"].as_str() {
+                Some("lead") => "the asking thread may decide it with answer_permission",
+                _ => "only the Owner can allow it (the asking thread may deny it)",
+            };
+            (
+                "waiting_for_permission",
+                format!(
+                    "Waiting for permission to run: {} — {whose}. confirmation_id {}.",
+                    p["command"].as_str().unwrap_or_default(),
+                    p["confirmation_id"].as_str().unwrap_or_default()
+                ),
+            )
         } else if row.waiting_for_person {
             ("waiting_for_person", "Waiting for a person to answer a permission prompt or a question in the thread.".to_string())
         } else if let Some(r) = row.running.iter().min_by_key(|r| r.started_ms) {
@@ -305,6 +326,9 @@ impl ActivityBook {
             "last_report": row.last_report_ms.map(|t| serde_json::json!({"at": crate::clock::iso8601(t), "seconds_ago": secs(t)})),
             "last_activity_seconds_ago": secs(row.last_activity_ms),
         });
+        if let Some(p) = row.permission.as_ref().filter(|_| row.waiting_for_person) {
+            out["permission"] = p.clone();
+        }
         if row.in_turn {
             out["turn_started_seconds_ago"] = row.turn_started_ms.map(secs).into();
         } else if let Some(t) = row.turn_ended_ms {
