@@ -36,7 +36,21 @@ fn refuse_other_bots_state_dir() {
 #[tokio::main]
 async fn main() {
     let cmd = std::env::args().nth(1).unwrap_or_default();
-    if !matches!(cmd.as_str(), "--version" | "-V" | "version" | "--build" | "") {
+    // `--help` and unknown options stop here, before the subcommand runs (or reads the state directory)
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    match agentgw::cli::check(&cmd, &args) {
+        agentgw::cli::Check::Run => {}
+        agentgw::cli::Check::Help(text) => {
+            println!("{text}");
+            return;
+        }
+        agentgw::cli::Check::Refuse(text) => {
+            eprintln!("{text}");
+            std::process::exit(2);
+        }
+    }
+    let asked_for_help = matches!(cmd.as_str(), "--help" | "-h" | "help");
+    if !matches!(cmd.as_str(), "--version" | "-V" | "version" | "--build" | "") && !asked_for_help {
         refuse_other_bots_state_dir();
     }
     match cmd.as_str() {
@@ -113,9 +127,7 @@ async fn main() {
             // A line users read. **Don't show internals (implementation language, issue
             // numbers)** — someone who mistyped needs only the right usage. Names match the real commands
             let v = env!("CARGO_PKG_VERSION");
-            eprintln!(
-                "{}",
-                agentgw::t!(
+            let text = agentgw::t!(
                     "agentgw {v}\n\
                      \n\
                      First:      install  set up this machine (as the gateway or as a machine) and start it\n\
@@ -129,7 +141,9 @@ async fn main() {
                      remove-machine <name>   forget a machine that is gone\n  \
                      (these three show what would change; add --yes to do it)\n\
                      \n\
-                     `serve` is what the service runs; you don't need to type it.",
+                     `serve` is what the service runs; you don't need to type it.\n\
+                     \n\
+                     agentgw <command> --help shows how to use each one.",
                     "agentgw {v}\n\
                      \n\
                      まず:   install            このマシンを設定して起動する(ゲートウェイかマシンかを訊きます)\n\
@@ -143,10 +157,17 @@ async fn main() {
                      remove-machine <名前>   もう無いマシンを外す\n  \
                      (この3つは何が変わるかを出すだけ。--yes で実行)\n\
                      \n\
-                     serve はサービスが呼ぶ本体です(手で打つ必要はありません)。"
-                )
+                     serve はサービスが呼ぶ本体です(手で打つ必要はありません)。\n\
+                     \n\
+                     agentgw <command> --help で、それぞれの使い方が出ます。"
             );
-            std::process::exit(2);
+            // Asked for: the usage is the answer. Mistyped: it's an error
+            if asked_for_help {
+                println!("{text}");
+            } else {
+                eprintln!("{text}");
+                std::process::exit(2);
+            }
         }
     }
 }

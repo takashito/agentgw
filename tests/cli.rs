@@ -124,3 +124,32 @@ fn route_is_refused_off_the_gateway() {
     assert_eq!(code, 2, "{text}");
     assert!(text.contains("gateway"), "{text}");
 }
+
+#[test]
+fn help_explains_and_does_nothing() {
+    // `uninstall --help` once removed the service and took the gateway down; `install --help`
+    // went on to install
+    for cmd in ["install", "uninstall", "restart", "shutdown", "update"] {
+        for h in ["--help", "-h"] {
+            let (code, text) = agentgw(&[cmd, h]);
+            assert_eq!(code, 0, "{cmd} {h}: {text}");
+            assert!(text.starts_with(&format!("Usage: agentgw {cmd}")), "{cmd} {h}: {text}");
+        }
+    }
+}
+
+#[test]
+fn an_unknown_option_stops_before_doing_anything() {
+    let (code, text) = agentgw(&["install", "--bogus"]);
+    assert_eq!(code, 2, "{text}");
+    assert!(text.contains("unknown option --bogus") && text.contains("nothing was done"), "{text}");
+}
+
+#[test]
+fn top_level_help_is_an_answer_not_an_error() {
+    for h in ["--help", "-h", "help"] {
+        let (code, text) = agentgw(&[h]);
+        assert_eq!(code, 0, "{h}: {text}");
+        assert!(text.contains("--help"), "{h}: {text}");
+    }
+}
