@@ -937,6 +937,27 @@ impl Rollout {
         runs == self.target || (!self.build.is_empty() && runs == self.build)
     }
 
+    /// Whether `id` has been told to update and is on its way (restarting, then reconnecting).
+    pub fn updating(&self, id: &str) -> bool {
+        self.machines
+            .iter()
+            .any(|s| s.id == id && s.state == RolloutStep::UPDATING)
+    }
+
+    /// The machines this rollout could not bring up to its goal, with why: those that failed or
+    /// timed out, and those too old to be told. One away when its turn came is not here — home was
+    /// already told it was lost.
+    pub fn not_updated(&self) -> Vec<(String, String)> {
+        self.machines
+            .iter()
+            .filter_map(|s| match s.state.as_str() {
+                RolloutStep::FAILED => Some((s.id.clone(), s.note.clone())),
+                RolloutStep::TOO_OLD => Some((s.id.clone(), "too old to be updated this way".to_string())),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// What to compare for a machine that runs `version` and says `build` (see [`Self::done_on`]).
     pub fn runs(&self, version: &str, build: &str) -> String {
         if self.build.is_empty() || build.is_empty() {
@@ -2217,6 +2238,27 @@ mod tests {
     }
 
     const T0: u64 = 1_000_000;
+
+    /// Which machines a quiet update stays silent about (on their way) and which it posts (not brought up).
+    #[test]
+    fn a_rollout_says_who_is_on_its_way_and_who_was_not_updated() {
+        let mut r = rollout(&[("gw", "0.55.0"), ("a", "0.55.0"), ("b", "0.55.0"), ("c", ""), ("d", "0.55.0")]);
+        r.machines[1].state = RolloutStep::UPDATING.into();
+        r.machines[2].state = RolloutStep::FAILED.into();
+        r.machines[2].note = "the download failed".into();
+        r.machines[3].state = RolloutStep::TOO_OLD.into();
+        r.machines[4].state = RolloutStep::OFFLINE.into();
+        assert!(r.updating("a"));
+        assert!(!r.updating("b") && !r.updating("gw"));
+        assert_eq!(
+            r.not_updated(),
+            vec![
+                ("b".to_string(), "the download failed".to_string()),
+                ("c".to_string(), "too old to be updated this way".to_string()),
+            ],
+            "an away machine is not here: home was told it was lost"
+        );
+    }
 
     #[test]
     fn machines_go_one_at_a_time() {

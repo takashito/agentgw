@@ -109,6 +109,8 @@ pub enum FromRelay {
         home: Option<String>,
         /// Who the gateway is (`status` says so).
         gateway: Option<String>,
+        /// The gateway tells an `update` in its progress message alone (`AGENTGW_UPDATE_NOTICES`).
+        quiet_updates: bool,
     },
     /// One Slack event.
     Event {
@@ -306,10 +308,12 @@ impl FromRelay {
                 bot_token,
                 home,
                 gateway,
+                quiet_updates,
             } => FromRelay::Ready {
                 bot_token,
                 home,
                 gateway,
+                quiet_updates,
             },
             F::Event { name, event } => FromRelay::Event { name, event },
             F::Action { action, body } => FromRelay::Action { action, body },

@@ -8,6 +8,14 @@ in [README.md](README.md#release-notes).
 
 ## [Unreleased]
 
+### Changed
+- An update now keeps its progress in one edited message: the machines it restarts no longer post when they go offline, lose the connection and come back. A machine that fails to update, or does not come back in time, still gets its own post. Set `AGENTGW_UPDATE_NOTICES=verbose` on the gateway for the previous behavior.
+- Messages agentgw posts in Slack are now always in English. `AGENTGW_LANG=ja` applies to the command line and the installer only.
+- Machines no longer post "online" when they only reconnect because the gateway restarted. A machine reported as lost gets one line when it is connected again.
+
+### Fixed
+- The "going offline" notice names the machine as every other notice does, instead of the computer's host name.
+
 ## [0.76.0] - 2026-11-26
 
 ### Added

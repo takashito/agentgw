@@ -685,8 +685,18 @@ impl Bridge {
             }
         }
         // (d) Tell home once that we're going down (the successor posts the online notice)
-        let offline = offline_notice(&Host::name().await, crate::build_label::LABEL, "restart");
-        self.post_notice(&offline, ctx).await;
+        // An `update` the gateway is carrying through already says so in its one progress message:
+        // going quietly here (and leaving a note so the successor's start is quiet too) keeps a
+        // rollout from posting a stop and a start for every machine
+        if quiet_updates() && is_update_restart(source) {
+            match write_quiet_start(&self.deps.dir, self.deps.clock.now_ms()) {
+                Ok(()) => ctx.info("bridge", &format!("restart for {source}: no offline notice (update notices are quiet)")),
+                Err(e) => ctx.error("bridge", &format!("could not leave the quiet-start note (the next start will post online): {e}")),
+            }
+        } else {
+            let offline = offline_notice(&self.machine_name, crate::build_label::LABEL, "restart");
+            self.post_notice(&offline, ctx).await;
+        }
         // (e) Mark up to "stop the Bridge" as done before going down. The list freezes for the few seconds until the successor connects
         if let (Some((channel, _)), Some(ts)) = (req, &progress_ts) {
             let switching = RestartPhase::Switching.render(None);
@@ -773,7 +783,7 @@ impl Bridge {
         });
         // Post offline **before tearing down**. Teardown takes seconds, so leaving it for later
         // gets the notice eaten by the hard exit above
-        let offline = offline_notice(&Host::name().await, crate::build_label::LABEL, reason);
+        let offline = offline_notice(&self.machine_name, crate::build_label::LABEL, reason);
         self.post_notice(&offline, &ctx).await;
         self.teardown_all_workers("shutdown", "", &ctx).await;
         ctx.info("bridge", &format!("shutdown complete ({reason})"));
@@ -1161,7 +1171,8 @@ impl Bridge {
                 // Nothing can be written to Slack until the first Ready. **Wait**
                 let (token, home, gateway) = loop {
                     match rx.recv().await {
-                        Some(machine::FromRelay::Ready { bot_token, home, gateway }) => {
+                        Some(machine::FromRelay::Ready { bot_token, home, gateway, quiet_updates }) => {
+                            set_quiet_updates(quiet_updates);
                             break (bot_token, home, gateway);
                         }
                         // **Don't exit when the handshake is refused.** Exiting makes the supervisor restart at once,
@@ -1257,6 +1268,9 @@ impl Bridge {
                     ),
                 );
             }
+            // How an `update` is told in home. The gateway's choice; machines take it from the handshake
+            let notices = dir.load_env().unwrap_or_default().into_iter().find(|(k, _)| k == UPDATE_NOTICES_KEY).map(|(_, v)| v);
+            set_quiet_updates(quiet_updates_of(notices.as_deref()));
             let fleet = Arc::new(crate::bridge::gateway::Fleet {
                 links: crate::bridge::gateway::LinkServer::new(),
                 token: listen.token,
@@ -1542,8 +1556,13 @@ impl Bridge {
         b.restore_pending(&LogCtx::default());
         // Re-deliver requests that never got handed over (start an agent to hand them to if there is none)
         b.resume_pending_from_disk().await;
-        // Tell home once about the start
-        b.announce_online().await;
+        // Tell home once about the start — unless the predecessor went down for an `update` whose
+        // progress message already tells it (a warning about the shells is still worth a post)
+        if take_quiet_start(&b.deps.dir, b.deps.clock.now_ms()) && b.shells_problem.is_none() {
+            LogCtx::default().info("bridge", "started after an update — no online notice (update notices are quiet)");
+        } else {
+            b.announce_online().await;
+        }
         // tokio's signal is in features = ["full"] (no new dependency).
         // slack-morphism grabs TERM_SIGNALS first via signal-hook, but the registry
         // allows several receivers per signal, so both get it
@@ -1629,10 +1648,11 @@ impl Bridge {
                 },
                 // A slice of a conversation being moved here
                 Some(part) = arriving_rx.recv() => b.take_thread_chunk(part).await,
-                // The link to the gateway was re-established. **Post online again** — for a machine
-                // this one line is the only way to tell a person "connected" (the gateway's presence
-                // only reports 🔴. Don't say the same thing in two places)
-                Some(()) = relink_rx.recv() => b.announce_online().await,
+                // The link to the gateway was re-established. **Nothing is posted**: this process never
+                // stopped, so "online" would tell nobody anything new — it used to post one from every
+                // machine each time the gateway restarted. When the gateway had told home the link was
+                // lost, the gateway itself says it is back (`Presence::on_connect`)
+                Some(()) = relink_rx.recv() => LogCtx::default().info("bridge", "link to the gateway re-established (no notice)"),
                 // A restart request from the operator. Joins the same path as Slack's `restart`,
                 // skipping the checklist, status and marker since there's no requester thread
                 _ = signals.usr1.recv() => b.maintenance_restart("SIGUSR1", None, &LogCtx::default()).await,
@@ -1986,7 +2006,8 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
         }
         // Comes with every handshake. Apply the home Relay holds to our current value
         // (a machine that missed a `set-home` catches up on reconnect)
-        machine::FromRelay::Ready { home, .. } => {
+        machine::FromRelay::Ready { home, quiet_updates, .. } => {
+            set_quiet_updates(quiet_updates);
             if adopt_home(dir, home) {
                 let _ = reload.send(()).await;
             }
@@ -2410,6 +2431,54 @@ fn online_notice(label: &str, version: &str, pools: &[String], pending_count: u3
     )
 }
 
+/// The `.env` key that says how an `update` is told in home: `quiet` (the default) or `verbose`.
+pub const UPDATE_NOTICES_KEY: &str = "AGENTGW_UPDATE_NOTICES";
+
+/// Whether an `update` is told in its one progress message alone. Anything but `verbose` is quiet.
+pub fn quiet_updates_of(value: Option<&str>) -> bool {
+    !value.is_some_and(|v| v.trim().eq_ignore_ascii_case("verbose"))
+}
+
+/// The gateway's choice, in this process: the gateway reads it from its `.env`, a machine takes it
+/// from each handshake (`LinkFrame::Ready`).
+static QUIET_UPDATES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn quiet_updates() -> bool {
+    QUIET_UPDATES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_quiet_updates(quiet: bool) {
+    QUIET_UPDATES.store(quiet, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A restart into a binary an `update` put in place (both the release and the local way say
+/// `update to …`). The one after the gateway refused an old version is not part of a rollout.
+fn is_update_restart(source: &str) -> bool {
+    source.starts_with("update to ")
+}
+
+/// The note a process going down for an `update` leaves, so its successor starts without a notice.
+const QUIET_START_FILE: &str = "quiet-start";
+/// A note older than this is not from the restart that just happened (the process stopped some
+/// other way in between), so it is not obeyed.
+const QUIET_START_MAX_AGE_MS: u64 = 10 * 60 * 1000;
+
+fn write_quiet_start(dir: &crate::state_dir::StateDir, now_ms: u64) -> std::io::Result<()> {
+    dir.write_atomic(QUIET_START_FILE, &now_ms.to_string())
+}
+
+/// Read and delete the note. True = start quietly.
+fn take_quiet_start(dir: &crate::state_dir::StateDir, now_ms: u64) -> bool {
+    let path = dir.join(QUIET_START_FILE);
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let _ = std::fs::remove_file(&path);
+    raw.trim()
+        .parse::<u64>()
+        .is_ok_and(|at| now_ms.saturating_sub(at) <= QUIET_START_MAX_AGE_MS)
+}
+
 /// The stop notice in home. `reason` is the internal name for why it stopped, so turn it into human words before showing.
 fn offline_notice(label: &str, version: &str, reason: &str) -> String {
     let why = if reason.starts_with("signal:") {
@@ -2430,6 +2499,53 @@ fn offline_notice(label: &str, version: &str, reason: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `verbose` is the one word that turns the per-machine notices back on; anything else is quiet.
+    #[test]
+    fn update_notices_are_quiet_unless_verbose() {
+        assert!(quiet_updates_of(None));
+        assert!(quiet_updates_of(Some("quiet")));
+        assert!(quiet_updates_of(Some("anything")));
+        assert!(!quiet_updates_of(Some("verbose")));
+        assert!(!quiet_updates_of(Some(" Verbose ")));
+    }
+
+    /// Both ways an `update` restarts say `update to`; the restart after a refused version is not a rollout's.
+    #[test]
+    fn only_a_rollouts_restart_counts_as_an_update() {
+        assert!(is_update_restart("update to v0.76.0"));
+        assert!(is_update_restart("update to 0.76.0+abc1234 (from dock)"));
+        assert!(!is_update_restart("update after the gateway refused this version"));
+        assert!(!is_update_restart("SIGUSR1"));
+        assert!(!is_update_restart("slack restart command"));
+    }
+
+    /// The quiet-start note is read once, and a stale one is not obeyed.
+    #[test]
+    fn the_quiet_start_note_is_taken_once_and_only_when_fresh() {
+        let dir = crate::state_dir::StateDir::at(
+            std::env::temp_dir().join(format!("sc-quietstart-{}", std::process::id())),
+        );
+        let _ = std::fs::remove_dir_all(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        assert!(!take_quiet_start(&dir, 1_000), "no note, a normal start");
+        write_quiet_start(&dir, 1_000).unwrap();
+        assert!(take_quiet_start(&dir, 5_000));
+        assert!(!take_quiet_start(&dir, 5_000), "taken once");
+        write_quiet_start(&dir, 1_000).unwrap();
+        assert!(!take_quiet_start(&dir, 1_000 + QUIET_START_MAX_AGE_MS + 1), "too old");
+        assert!(!dir.join(QUIET_START_FILE).exists(), "a stale note is removed too");
+        let _ = std::fs::remove_dir_all(dir.path());
+    }
+
+    /// The stop notice names the machine as every other notice does, not the computer's host name.
+    #[test]
+    fn the_offline_notice_names_the_machine() {
+        assert_eq!(
+            offline_notice("nucbox", "0.76.0+abc", "restart"),
+            "🔴 *nucbox* is going offline (restarting) — agentgw v0.76.0+abc"
+        );
+    }
     use crate::agent::HookEvent;
     use crate::agent::{Pid, WindowRow};
     use std::collections::HashSet;

@@ -3,6 +3,10 @@
 //! English by default; `AGENTGW_LANG=ja` switches to Japanese. The setting is read from
 //! the process environment first, then from the state directory's `.env`, once per process.
 //!
+//! **What agentgw posts to Slack is always English** ([`english_only`], called before `serve`
+//! starts): a fleet whose machines are set differently would otherwise post in two languages
+//! side by side. The setting reaches the command line and the installer only.
+//!
 //! Logs are **not** translated — they stay English so they can be searched and compared.
 //!
 //! Every translated message is written with [`t!`](crate::t), which keeps the two languages
@@ -61,6 +65,12 @@ pub fn lang() -> Lang {
         });
         Lang::parse(value.as_deref())
     })
+}
+
+/// Speak English in this process whatever `AGENTGW_LANG` says. For `serve`, whose words go to
+/// Slack. Call it before anything is said: the language is decided once per process.
+pub fn english_only() {
+    let _ = LANG.set(Lang::En);
 }
 
 /// Speak `l` on this thread until the guard is dropped (tests only).
