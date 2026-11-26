@@ -1244,6 +1244,7 @@ impl Bridge {
         let (relink_tx, mut relink_rx) = mpsc::channel(4);
         // A new binary is in place (`update`): restart into it the way `restart` does
         let (updated_tx, mut updated_rx) = mpsc::channel::<String>(4);
+        PROCESS_START.get_or_init(std::time::Instant::now);
         consume_restart_marker(&dir, api.as_ref()).await;
 
         // When accepting machines, Slack events go here **before being folded**. Once it's decided whose they are,
@@ -1940,8 +1941,12 @@ fn version_frame() -> crate::bridge::gateway::link::LinkFrame {
         build: crate::build_label::LABEL.to_string(),
         triple: crate::setup::update::this_triple().unwrap_or_default().to_string(),
         asks: true,
+        up_secs: Some(PROCESS_START.get_or_init(std::time::Instant::now).elapsed().as_secs()),
     }
 }
+
+/// When this process started (set first thing in `Bridge::run`), for [`version_frame`]'s `up_secs`.
+static PROCESS_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 /// **Who handles which channel is the gateway's record.** A machine that was the gateway once keeps its
 /// old assignments in access.json, and then names the wrong machine for a channel it now handles itself.
