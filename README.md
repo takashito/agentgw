@@ -311,8 +311,8 @@ Mention the bot followed by the command (the bot is named `agentgw` unless the S
 | Command | What it does |
 |---|---|
 | `stop` | Stop the current turn (a 🛑 reaction works too) |
-| `exit` · `bye` | End this thread's agent; your next message resumes it |
-| `done` | Mark the thread done (✅ on its first message) and end its agent. While the agent is running, `done` goes to it first: if it had asked you to do something, it takes `done` as "I did it" and carries on |
+| `exit` · `bye` | End this thread's agent; your next message resumes it. Requests this thread sent to other channels are closed with it and do not resume; a line in the thread lists them |
+| `done` | Mark the thread done (✅ on its first message) and end its agent. While the agent is running, `done` goes to it first: if it had asked you to do something, it takes `done` as "I did it" and carries on. Like `exit`, it closes the requests this thread sent |
 | `compact` | Compact the context, with a progress bar |
 | `model [fable\|opus\|sonnet\|haiku]` | Show or switch the model |
 | `effort [low\|medium\|high\|xhigh\|max\|…]` | Show or set the effort level |
@@ -338,9 +338,11 @@ When the bot is added to a channel that has no machine yet, it asks the Owner in
 
 The Claudes in different channels ask each other for work with the `ask_channel` tool. A request starts in the other channel at once, its reply comes back to the thread that asked, and the asking Claude closes the thread it asked with `end_ask` once it is done — as completed (✅) or as no longer wanted. A Claude can also end its own session with `end_session` when the person says the work is finished. The whole exchange stays in Slack.
 
+Closing a request stops the asked Claude at once, even in the middle of its work, and closes every request that thread sent in turn, all the way down. A reply that arrives after a request was closed is not passed back. If the asked thread's machine is offline, its agent is stopped when the machine reconnects. Ending a thread with `exit`, `done` or `end_session` closes the requests it sent in the same way.
+
 While a request is running, the asking Claude can check on it with `thread_activity` instead of interrupting it. The answer always carries a one-word `state` — `running_tool`, `thinking`, `waiting_for_permission`, `waiting_for_person`, `turn_ended`, `turn_failed`, `idle`, `no_agent`, `machine_offline` or `no_answer` — with a one-line summary, the tools running and for how many seconds, the last tool with its outcome, and when the asked Claude last posted to its thread. Reading changes nothing in the asked thread.
 
-Any thread of the channel that asked can do this, not only the thread that sent the request. This lets a request that has gone quiet be picked up from a fresh thread. A follow-up (`ask_channel` with the asked `thread_ts`) sent from another thread of the same channel takes the exchange over: replies, notices that a person is needed, and `end_ask` move to that thread, and the thread that asked first gets a one-line note. Threads in other channels cannot read or follow up a request, and a closed request stays closed.
+Any thread of the channel that asked can do this, not only the thread that sent the request. This lets a request that has gone quiet be picked up from a fresh thread. A follow-up (`ask_channel` with the asked `thread_ts`) sent from another thread of the same channel takes the exchange over: replies, notices that a person is needed, and `end_ask` move to that thread, and the thread that asked first gets a one-line note. Threads in other channels cannot read or follow up a request, and a closed request stays closed. Once the thread that asked has ended (`exit`, `done`, `end_session`), its requests are closed too and can no longer be taken over: ask again in a new thread.
 
 - **Scope:** only threads asked from the calling thread with `ask_channel` (ended ones included). Any other thread is refused.
 - **Masking:** command lines are cut to 200 characters and output to its last 300. Only a command's output or a failure's message is passed on, never a file's contents or search hits. Values that look like secrets are replaced with `***`: tokens with a known prefix (`xoxb-`, `ghp_`, `sk-`, `AKIA` and others), values of variables and fields whose name contains `TOKEN`, `SECRET`, `PASSWORD`, `API_KEY` and the like, the word after `--token`, `--password`, `Bearer` and similar, passwords in URLs, and long random-looking strings.

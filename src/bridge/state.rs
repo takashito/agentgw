@@ -262,7 +262,8 @@ pub struct AskedFrom {
     /// Replies that could not be handed over because the asking machine was offline.
     #[serde(default, skip_serializing_if = "no_missed")]
     pub missed: u32,
-    /// A person closed the asking thread (`exit`): replies are no longer delivered there.
+    /// A person closed the asking thread (`exit`): replies are no longer delivered there. Closing a
+    /// thread now also closes what it asked (`state` = `Ended`); this stays for records from before.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub origin_closed: bool,
     /// The line in the asking thread that says what was asked (`📤 …`), rewritten as the ask moves on.

@@ -2462,26 +2462,34 @@ impl SlackId {
     }
 
     /// A message timestamp (`1795667446.465899`) as an agent may have written it: as is, as the
-    /// `p…` part of a link with the dot gone (`p1795667446465899`), or as a whole message link —
-    /// whose `thread_ts=` names the thread when it is a reply. Err when it is none of those: Slack
-    /// answers such a ts as "not found", and that once read as "the thread was deleted".
-    pub fn message_ts(given: &str) -> Result<String, String> {
+    /// `p…` part of a link with the dot gone (`p1795667446465899`), or as a whole message link.
+    /// Err when it is none of those: Slack answers such a ts as "not found", and that once read as
+    /// "the thread was deleted".
+    ///
+    /// `thread`: the ts names a thread (`thread_ts`). A link to a reply then names the thread it is in
+    /// (its `thread_ts=`); otherwise (`message_ts`) it names that reply itself.
+    pub fn message_ts(given: &str, thread: bool) -> Result<String, String> {
         let t = given.trim();
         let dotted = |s: &str| {
             let (secs, frac) = s.split_once('.')?;
             let digits = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
             (digits(secs) && digits(frac)).then(|| s.to_string())
         };
-        // `p` + seconds and six digits run together, as a link writes it
+        // `p` + ten digits of seconds and six of the rest, run together as a link writes them.
+        // Exactly sixteen: a shorter run (seconds alone) is not a ts with its dot dropped
         let from_link_id = |s: &str| {
             let d = s.strip_prefix('p').unwrap_or(s);
-            (d.len() > 6 && d.bytes().all(|b| b.is_ascii_digit())).then(|| format!("{}.{}", &d[..d.len() - 6], &d[d.len() - 6..]))
+            (d.len() == 16 && d.bytes().all(|b| b.is_ascii_digit())).then(|| format!("{}.{}", &d[..10], &d[10..]))
         };
         let found = if t.starts_with("http") {
             let query = t.split_once('?').map(|(_, q)| q).unwrap_or("");
-            let thread = query.split('&').find_map(|kv| kv.strip_prefix("thread_ts=")).and_then(dotted);
+            let in_thread = query.split('&').find_map(|kv| kv.strip_prefix("thread_ts=")).and_then(dotted);
             let path = t.split('?').next().unwrap_or(t);
-            thread.or_else(|| path.rsplit('/').next().and_then(from_link_id))
+            let this = path.rsplit('/').next().and_then(from_link_id);
+            match thread {
+                true => in_thread.or(this),
+                false => this,
+            }
         } else {
             dotted(t).or_else(|| from_link_id(t))
         };
@@ -2497,19 +2505,19 @@ mod tests {
     #[test]
     fn a_message_ts_is_taken_in_the_shapes_an_agent_writes_it() {
         use super::SlackId;
-        let ts = |s: &str| SlackId::message_ts(s);
+        let ts = |s: &str| SlackId::message_ts(s, true);
         assert_eq!(ts("1795667446.465899").unwrap(), "1795667446.465899");
         assert_eq!(ts(" 1795667446.465899 ").unwrap(), "1795667446.465899");
         // The dot lost, as a link writes it: this once came back as "the thread root was deleted"
         assert_eq!(ts("1795667446465899").unwrap(), "1795667446.465899");
         assert_eq!(ts("p1795667446465899").unwrap(), "1795667446.465899");
         assert_eq!(ts("https://x.slack.com/archives/C0CG6UJ578U/p1795667446465899").unwrap(), "1795667446.465899");
-        // A reply's link: the thread is the one named in the query
-        assert_eq!(
-            ts("https://x.slack.com/archives/C0CG/p1795667157981069?thread_ts=1795667076.418239&cid=C0CG").unwrap(),
-            "1795667076.418239"
-        );
-        for bad in ["", "abc", "1795667446.", ".465899", "12345", "1795667446.46x899", "p"] {
+        // A reply's link: as a thread, the thread it is in; as a message, the reply itself
+        let reply = "https://x.slack.com/archives/C0CG/p1795667157981069?thread_ts=1795667076.418239&cid=C0CG";
+        assert_eq!(ts(reply).unwrap(), "1795667076.418239");
+        assert_eq!(SlackId::message_ts(reply, false).unwrap(), "1795667157.981069");
+        // Seconds alone are not a ts with its dot dropped
+        for bad in ["", "abc", "1795667446.", ".465899", "12345", "1795667446", "17956674464658990", "1795667446.46x899", "p"] {
             let e = ts(bad).unwrap_err();
             assert!(e.contains("not a Slack message timestamp"), "{bad:?}: {e}");
         }

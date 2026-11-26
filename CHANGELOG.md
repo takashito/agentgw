@@ -13,12 +13,12 @@ in [README.md](README.md#release-notes).
 - `thread_activity` reports `waiting_for_permission`, with what the agent wants to run and who can decide.
 
 ### Changed
-- Closing a thread that was asked for work, or ending a thread with `exit`, now also closes every request that thread sent to other channels, all the way down the chain.
+- Closing a thread that was asked for work, or ending a thread with `exit`, `done` or `end_session`, now also closes every request that thread sent to other channels, all the way down the chain. A thread ended this way lists the requests it closed.
 - A closed request's agent is stopped at once, even in the middle of its work. If its machine is offline, it is stopped as soon as the machine reconnects.
 
 ### Fixed
 - A thread closed while its own request to another channel was still open no longer wakes up again when that request is answered.
-- On Windows, an agent that was closed in the middle of its work is no longer reported as having stopped unexpectedly.
+- An agent that was closed in the middle of its work is no longer reported as having stopped unexpectedly.
 - A thread timestamp copied from a Slack link without its dot is accepted, and a malformed one is reported as such instead of as a deleted thread.
 
 ### Security

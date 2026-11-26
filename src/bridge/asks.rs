@@ -700,8 +700,8 @@ mod decision_tests {
 
     #[test]
     fn closing_a_thread_lists_every_open_ask_below_it_parents_first() {
-        // CoS(C0/0.1) → Lead(C1/1.1) → two repos (C2/2.1, C3/3.1); C2 asked C4/4.1 in turn.
-        // C5/5.1 was asked from the Lead but has ended (not listed); C6/6.1 hangs off another thread.
+        // Top(C0/0.1) → Middle(C1/1.1) → two leaves (C2/2.1, C3/3.1); C2 asked C4/4.1 in turn.
+        // C5/5.1 was asked from the middle but has ended (not listed); C6/6.1 hangs off another thread.
         let mut rows = HashMap::new();
         rows.insert("1.1".to_string(), ("C1".to_string(), row("C0", "0.1", AskState::Approved)));
         rows.insert("2.1".to_string(), ("C2".to_string(), row("C1", "1.1", AskState::Approved)));
@@ -716,7 +716,7 @@ mod decision_tests {
             open_asks_below(&rows, "C1", "1.1"),
             vec![pair("C2", "2.1"), pair("C3", "3.1"), pair("C4", "4.1"), pair("C8", "8.1")]
         );
-        assert_eq!(open_asks_below(&rows, "C0", "0.1")[0], pair("C1", "1.1"), "from the top, the Lead first");
+        assert_eq!(open_asks_below(&rows, "C0", "0.1")[0], pair("C1", "1.1"), "from the top, the middle first");
         assert!(open_asks_below(&rows, "C4", "4.1").is_empty(), "a leaf asked nobody");
         // Same ts, another channel: not the closed thread's ask
         assert!(open_asks_below(&rows, "C7", "1.1").is_empty());
@@ -738,7 +738,7 @@ mod decision_tests {
 
     #[test]
     fn a_three_level_chain_tells_the_asker_and_the_top_and_mentions_only_the_top() {
-        // CoS(C0/0.1) → Lead(C1/1.1) → project(C2/2.1)
+        // Top(C0/0.1) → Middle(C1/1.1) → project(C2/2.1)
         let mut rows = HashMap::new();
         rows.insert("1.1".to_string(), ("C1".to_string(), row("C0", "0.1", AskState::Approved)));
         rows.insert("2.1".to_string(), ("C2".to_string(), row("C1", "1.1", AskState::Approved)));
@@ -787,7 +787,7 @@ mod decision_tests {
 
     #[test]
     fn a_stuck_agent_reaches_the_asker_of_a_closed_exchange() {
-        // The real case: the Lead (C0/0.1) closed the thread it asked (C1/1.1), and a late reply
+        // The real case: the asker (C0/0.1) closed the thread it asked (C1/1.1), and a late reply
         // woke that thread's agent into a screen nobody answered
         let mut rows = HashMap::new();
         let mut closed = row("C0", "0.1", AskState::Ended);
@@ -803,7 +803,7 @@ mod decision_tests {
 
     #[test]
     fn the_chain_stops_below_an_ended_link() {
-        // CoS(C0/0.1) → Lead(C1/1.1) ended; Lead → project(C2/2.1) still on: the Lead is the top now
+        // Top(C0/0.1) → Middle(C1/1.1) ended; Middle → project(C2/2.1) still on: the middle is the top now
         let mut rows = HashMap::new();
         rows.insert("1.1".to_string(), ("C1".to_string(), row("C0", "0.1", AskState::Ended)));
         rows.insert("2.1".to_string(), ("C2".to_string(), row("C1", "1.1", AskState::Approved)));
@@ -989,9 +989,9 @@ mod owner_link_tests {
             text: text.into(),
             thread_ts: Some("1700000010.000100".into()),
         };
-        // The Lead's thread: CoS's request **as Slack gives it back** — line breaks gone, links in
+        // The middle's thread: the top's request **as Slack gives it back** — line breaks gone, links in
         // `<…>` with `&amp;` (the heading's link to where it was asked, the gateway's mark naming the
-        // Owner's post, then the CoS's words with a link of their own)
+        // Owner's post, then the top's words with a link of their own)
         let request = ":robot_face: follow-up from <#C0COS> ([link](<https://ws.slack.com/archives/C0COS/p1700000009000900?thread_ts=1700000001.000100&amp;cid=C0COS>)) \
                        :bust_in_silhouette: Owner's post, checked by agentgw: <https://ws.slack.com/archives/C0COS/p1700000008000800?thread_ts=1700000001.000100&amp;cid=C0COS>  \
                        deploy it; see also https://ws.slack.com/archives/C0OTHER/p1700000007000700";
@@ -1005,8 +1005,8 @@ mod owner_link_tests {
         };
         let own = |c: &str, t: &str, th: &str, no_url: bool| (c.to_string(), t.to_string(), th.to_string(), no_url);
 
-        // The Lead answers the request: the Owner's post named on the gateway's line is followed —
-        // not the heading's link, and not the link inside the CoS's own words
+        // The middle answers the request: the Owner's post named on the gateway's line is followed —
+        // not the heading's link, and not the link inside the top's own words
         let got = owner_candidates("deploying now", "C0LEAD", "1700000010.000100", &["1700000010.000100".into()], false, &thread, "U_OWNER");
         assert_eq!(ids(got), vec![own("C0COS", "1700000008.000800", "1700000001.000100", false)]);
 

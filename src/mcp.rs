@@ -181,7 +181,7 @@ impl Mcp {
             }),
             serde_json::json!({
                 "name": "end_session",
-                "description": "End your own session in this thread, as the last call of your turn (reply first). outcome done marks the thread done (✅ on its first post); ended only ends it. Call it only when the person told you the work in this thread is finished — in any words (\"done\", \"that's all, thanks\") — never on your own judgment, and never when their words answer something you asked of them (\"done\" meaning \"I did what you asked\", or \"ok\" / \"good\" to a question): then carry on. The thread stays: a later message there starts you again with this conversation.",
+                "description": "End your own session in this thread, as the last call of your turn (reply first). outcome done marks the thread done (✅ on its first post); ended only ends it. Call it only when the person told you the work in this thread is finished — in any words (\"done\", \"that's all, thanks\") — never on your own judgment, and never when their words answer something you asked of them (\"done\" meaning \"I did what you asked\", or \"ok\" / \"good\" to a question): then carry on. The thread stays: a later message there starts you again with this conversation. Requests this thread sent with ask_channel that are still open are closed with it, all the way down, and do not come back when you start again — do not end the session while you still want their answers.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -530,7 +530,7 @@ fn fix_timestamps(args: &mut serde_json::Value) -> Result<(), String> {
     for key in ["thread_ts", "message_ts"] {
         let Some(v) = args.get_mut(key) else { continue };
         let Some(given) = v.as_str().filter(|s| !s.trim().is_empty()) else { continue };
-        let fixed = crate::chat::slack::SlackId::message_ts(given).map_err(|e| format!("{key}: {e}"))?;
+        let fixed = crate::chat::slack::SlackId::message_ts(given, key == "thread_ts").map_err(|e| format!("{key}: {e}"))?;
         *v = serde_json::Value::String(fixed);
     }
     Ok(())
@@ -551,6 +551,11 @@ mod tests {
         let mut none = serde_json::json!({"thread_ts": "", "text": "hi"});
         fix_timestamps(&mut none).unwrap();
         assert_eq!(none["thread_ts"], "");
+        // A link to a reply: the thread it is in for thread_ts, the reply itself for message_ts
+        let link = "https://x.slack.com/archives/C1/p1795667157981069?thread_ts=1795667076.418239&cid=C1";
+        let mut both = serde_json::json!({"thread_ts": link, "message_ts": link});
+        fix_timestamps(&mut both).unwrap();
+        assert_eq!((both["thread_ts"].as_str(), both["message_ts"].as_str()), (Some("1795667076.418239"), Some("1795667157.981069")));
         let mut bad = serde_json::json!({"thread_ts": "yesterday"});
         let e = fix_timestamps(&mut bad).unwrap_err();
         assert!(e.starts_with("thread_ts: ") && e.contains("1795667446.465899"), "{e}");

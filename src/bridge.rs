@@ -1285,6 +1285,7 @@ impl Bridge {
                 departed: Default::default(),
                 ask_capable: Default::default(),
                 catch_up: Default::default(),
+                resending: Default::default(),
                 joins: Default::default(),
                 admin_waits: Default::default(),
                 perms: std::sync::Mutex::new(crate::bridge::gateway::perms::load_open(&dir)),
@@ -1298,6 +1299,12 @@ impl Bridge {
             tokio::spawn(fleet.clone().drive_updates());
             tokio::spawn(fleet.clone().sweep_gone_channels());
             tokio::spawn(fleet.clone().drive_lead_perms());
+            // Stops owed to the gateway's own threads from before a restart (a machine's go out when
+            // it reports in)
+            tokio::spawn({
+                let fleet = fleet.clone();
+                async move { fleet.resend_stops().await }
+            });
             {
                 // Frames the gateway addresses to itself, handled exactly as a machine handles the
                 // ones that come down its link
