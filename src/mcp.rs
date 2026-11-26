@@ -168,7 +168,7 @@ impl Mcp {
             }),
             serde_json::json!({
                 "name": "end_ask",
-                "description": "Close a thread you asked with ask_channel, once you are done with it (the request is finished, or no longer wanted). Its agent ends the way `exit` ends it — after any turn it is in, not in the middle — and a line there says you closed it and whether it was completed. Any threads it asked in turn are closed with it, all the way down, and their late replies are not passed back. Only the thread an exchange belongs to (the one that asked, or the one that took it over with a follow-up) can close it. No more follow-ups go to it afterwards; ask in a new thread if you need more.",
+                "description": "Close a thread you asked with ask_channel, once you are done with it (the request is finished, or no longer wanted). Its agent is stopped at once, even in the middle of its work (only a reply it is already sending goes out first), and a line there says you closed it and whether it was completed. Any threads it asked in turn are closed with it, all the way down, and their late replies are not passed back. Only the thread an exchange belongs to (the one that asked, or the one that took it over with a follow-up) can close it. No more follow-ups go to it afterwards; ask in a new thread if you need more.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

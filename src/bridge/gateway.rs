@@ -5111,8 +5111,8 @@ impl Fleet {
 
     /// `end_ask`: the agent in `from_thread` is done with `to_thread`, a thread it asked. The exchange
     /// ends here (follow-ups are refused from now on), a line in the asked thread says who ended it
-    /// and whether the request was finished, and the agent there ends the way `exit` ends it — after
-    /// its running turn, not in the middle. A finished request gets ✅ there (`done`); a given-up one
+    /// and whether the request was finished, and the agent there is stopped at once — even in the middle
+    /// of its work; only a reply it is already sending goes out first. A finished request gets ✅ there (`done`); a given-up one
     /// (`canceled`) does not.
     ///
     /// **Everything the closed thread asked closes with it**, down the whole chain (`close_below`):
@@ -5134,7 +5134,7 @@ impl Fleet {
 
     /// The thread `channel`/`thread` is closed (`end_ask` into it, or `exit` / `end_session` there):
     /// close every exchange still open below it, parents first, each the way `end_ask` closes one
-    /// (a line in that thread, its agent ends after its running turn), as given up — the work was
+    /// (a line in that thread, its agent stopped at once), as given up — the work was
     /// no longer wanted by the time it would have been answered.
     async fn close_below(&self, channel: &str, thread: &str) {
         let below = {

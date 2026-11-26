@@ -17,6 +17,7 @@ in [README.md](README.md#release-notes).
 
 ### Fixed
 - A thread closed while its own request to another channel was still open no longer wakes up again when that request is answered.
+- On Windows, an agent that was closed in the middle of its work is no longer reported as having stopped unexpectedly.
 - A thread timestamp copied from a Slack link without its dot is accepted, and a malformed one is reported as such instead of as a deleted thread.
 
 ### Security

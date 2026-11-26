@@ -580,6 +580,10 @@ impl Bridge {
             }
             // 3. Drop only the session-key memory (threads.json intact → the next message uses --resume)
             self.workers.forget(sid);
+            // We ended it, so its turn is over now — not when its SessionEnd hook says so. A forced
+            // kill (the only kind on Windows) sends no hook, and an agent still marked at work with
+            // its window gone was reported as "stopped unexpectedly" a couple of minutes later
+            self.note_activity(|b, now| b.session_end(key, now));
         }
         // 4. Discard what was waiting. Keeping it would feed old messages nobody waits for
         // into the next agent's user_prompt

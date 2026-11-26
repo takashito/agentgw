@@ -2776,6 +2776,26 @@ mod tests {
         assert_eq!(told(&slack), 1, "said once");
     }
 
+    /// An agent we end ourselves in the middle of its work (`end_ask`, `exit`) is not "lost" either,
+    /// even when no SessionEnd hook follows the kill — a forced kill, the only kind on Windows,
+    /// sends none, and every such close was reported as "stopped unexpectedly".
+    #[tokio::test]
+    async fn an_agent_we_end_at_work_is_not_reported_lost() {
+        let (d, slack, agent, _clock) = flow_deps("lost-ended-agent");
+        let (mut b, _fx) = Bridge::for_test(d);
+        let sid = running_thread(&mut b, &agent).await;
+        let key = ThreadKey::new("C1", ROOT);
+        b.on_progress(Some(&key), &serde_json::json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_use_id": "t1", "tool_input": {"command": "sleep 120"}}));
+        assert!(b.activity.lock().unwrap().busy(&key));
+        b.terminate(&key, Some(&sid), None).await;
+        assert!(!b.activity.lock().unwrap().busy(&key), "ended by us: its turn is over");
+        for _ in 0..3 {
+            b.notice_lost_agents(&b.live_windows());
+        }
+        settle().await;
+        assert!(!slack.calls().iter().any(|c| c.contains("stopped unexpectedly")), "{:?}", slack.calls());
+    }
+
     /// An agent that finished its turn and was torn down by the cleanup is not "lost".
     #[tokio::test]
     async fn an_idle_agent_without_a_window_is_not_reported() {
