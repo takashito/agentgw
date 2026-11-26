@@ -8,18 +8,21 @@ in [README.md](README.md#release-notes).
 
 ## [Unreleased]
 
+## [0.76.0] - 2026-11-26
+
 ### Added
-- When an agent working on another channel's request stops at a permission prompt, the agent that asked can allow safe actions or deny any, with the new `answer_permission` tool; everything else goes straight to the Owner with Allow and Deny buttons. The answer shows as `allowed by #channel` or `denied by #channel`. Off by default (`AGENTGW_ASKER_PERMISSIONS`).
-- `thread_activity` reports `waiting_for_permission`, with what the agent wants to run and who can decide.
+- When an agent working on another channel's request stops at a permission prompt, the agent that asked can allow safe actions or deny any; everything else goes straight to the Owner with Allow and Deny buttons. The answer shows as `allowed by #channel` or `denied by #channel`. Off by default (`AGENTGW_ASKER_PERMISSIONS`).
+- An agent checking on a request it sent can see when that request is waiting at a permission prompt, what it wants to run, and who can decide.
 
 ### Changed
-- Closing a thread that was asked for work, or ending a thread with `exit`, `done` or `end_session`, now also closes every request that thread sent to other channels, all the way down the chain. A thread ended this way lists the requests it closed.
+- Closing a request, or ending a thread (with `exit` or `done`, or when its agent ends its own session), now also closes every request that thread sent to other channels, all the way down the chain. A thread ended this way lists the requests it closed.
 - A closed request's agent is stopped at once, even in the middle of its work. If its machine is offline, it is stopped as soon as the machine reconnects.
 
 ### Fixed
 - A thread closed while its own request to another channel was still open no longer wakes up again when that request is answered.
 - An agent that was closed in the middle of its work is no longer reported as having stopped unexpectedly.
-- A thread timestamp copied from a Slack link without its dot is accepted, and a malformed one is reported as such instead of as a deleted thread.
+- A Slack message link given where a thread or message is expected is understood, and a malformed one is reported as such instead of as a deleted thread.
+- `--help` (or `-h`) after a command now shows that command's usage instead of running it, and an option a command does not take stops it before it does anything.
 
 ### Security
 - Permission buttons in Slack only take the Owner's presses.
