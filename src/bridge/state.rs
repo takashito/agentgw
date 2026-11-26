@@ -271,6 +271,11 @@ pub struct AskedFrom {
     /// The few words naming the request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The exchange was closed and its agent has not yet been told to stop (`"done"` / `"canceled"`,
+    /// what it closed as): set together with the close, cleared once the stop reaches the machine,
+    /// sent again when an offline machine comes back. Kept in threads.json so a restart keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_owed: Option<String>,
 }
 
 fn no_missed(n: &u32) -> bool {

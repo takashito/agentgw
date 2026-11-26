@@ -93,6 +93,10 @@ pub fn check_end(row: Option<&AskedFrom>, from_channel: &str, from_thread: &str)
 /// of the asked threads, parents before their children. A thread is listed once even if a broken
 /// record loops back to it, and the closed thread itself is never listed.
 ///
+/// The walk **goes on through exchanges that are already closed**, listing only the open ones:
+/// a middle closed before closes cascaded (or whose stop never got through) can still have
+/// open asks below it, and those must not be out of reach.
+///
 /// `rows` maps an asked thread's ts to (its channel, its record).
 pub fn open_asks_below(
     rows: &std::collections::HashMap<String, (String, AskedFrom)>,
@@ -103,16 +107,19 @@ pub fn open_asks_below(
     let mut seen = std::collections::HashSet::from([(channel.to_string(), thread_ts.to_string())]);
     let mut queue = std::collections::VecDeque::from([(channel.to_string(), thread_ts.to_string())]);
     while let Some((ch, th)) = queue.pop_front() {
-        let mut below: Vec<(String, String)> = rows
+        let mut below: Vec<(String, String, bool)> = rows
             .iter()
-            .filter(|(_, (_, r))| r.channel == ch && r.thread_ts == th && r.state != AskState::Ended)
-            .map(|(ts, (c, _))| (c.clone(), ts.clone()))
+            .filter(|(_, (_, r))| r.channel == ch && r.thread_ts == th)
+            .map(|(ts, (c, r))| (c.clone(), ts.clone(), r.state != AskState::Ended))
             .collect();
         // Slack ts sort by time: the oldest ask closes first, and the order is the same every run
         below.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
-        for pair in below {
+        for (c, ts, open) in below {
+            let pair = (c, ts);
             if seen.insert(pair.clone()) {
-                out.push(pair.clone());
+                if open {
+                    out.push(pair.clone());
+                }
                 queue.push_back(pair);
             }
         }
@@ -656,6 +663,7 @@ mod decision_tests {
             origin_closed: false,
             line: None,
             title: None,
+            stop_owed: None,
         }
     }
 
@@ -693,7 +701,7 @@ mod decision_tests {
     #[test]
     fn closing_a_thread_lists_every_open_ask_below_it_parents_first() {
         // CoS(C0/0.1) → Lead(C1/1.1) → two repos (C2/2.1, C3/3.1); C2 asked C4/4.1 in turn.
-        // C5/5.1 was asked from the Lead but has ended; C6/6.1 hangs off another thread.
+        // C5/5.1 was asked from the Lead but has ended (not listed); C6/6.1 hangs off another thread.
         let mut rows = HashMap::new();
         rows.insert("1.1".to_string(), ("C1".to_string(), row("C0", "0.1", AskState::Approved)));
         rows.insert("2.1".to_string(), ("C2".to_string(), row("C1", "1.1", AskState::Approved)));
@@ -701,8 +709,13 @@ mod decision_tests {
         rows.insert("4.1".to_string(), ("C4".to_string(), row("C2", "2.1", AskState::Approved)));
         rows.insert("5.1".to_string(), ("C5".to_string(), row("C1", "1.1", AskState::Ended)));
         rows.insert("6.1".to_string(), ("C6".to_string(), row("C9", "9.1", AskState::Approved)));
+        // C5 ended earlier but its own ask C8/8.1 is still open: reached through it
+        rows.insert("8.1".to_string(), ("C8".to_string(), row("C5", "5.1", AskState::Approved)));
         let pair = |c: &str, t: &str| (c.to_string(), t.to_string());
-        assert_eq!(open_asks_below(&rows, "C1", "1.1"), vec![pair("C2", "2.1"), pair("C3", "3.1"), pair("C4", "4.1")]);
+        assert_eq!(
+            open_asks_below(&rows, "C1", "1.1"),
+            vec![pair("C2", "2.1"), pair("C3", "3.1"), pair("C4", "4.1"), pair("C8", "8.1")]
+        );
         assert_eq!(open_asks_below(&rows, "C0", "0.1")[0], pair("C1", "1.1"), "from the top, the Lead first");
         assert!(open_asks_below(&rows, "C4", "4.1").is_empty(), "a leaf asked nobody");
         // Same ts, another channel: not the closed thread's ask

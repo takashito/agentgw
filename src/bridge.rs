@@ -5309,6 +5309,7 @@ mod tests {
                 origin_closed: false,
                 line: None,
                 title: None,
+                stop_owed: None,
             }
         };
         // keys[8] asked another channel and waits; keys[9]'s ask was answered, still open.

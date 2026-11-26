@@ -14,6 +14,7 @@ in [README.md](README.md#release-notes).
 
 ### Changed
 - Closing a thread that was asked for work, or ending a thread with `exit`, now also closes every request that thread sent to other channels, all the way down the chain.
+- A closed request's agent is stopped at once, even in the middle of its work. If its machine is offline, it is stopped as soon as the machine reconnects.
 
 ### Fixed
 - A thread closed while its own request to another channel was still open no longer wakes up again when that request is answered.
