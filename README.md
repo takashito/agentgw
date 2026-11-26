@@ -357,9 +357,9 @@ When the agent in an asked thread stops at a permission prompt, the gateway deci
 - **The answer is shown in both threads** as `allowed by #channel` or `denied by #channel` (the channel that asked), or `allowed by @person` for the Owner's button, with the reason.
 - **Every step is recorded** in `~/.local/state/agentgw/perm-decisions.jsonl` on the gateway, and the answer and its reason are shown in both threads.
 
-This is off by default. Set `AGENTGW_LEAD_PERMISSIONS` in the gateway's `.env`: `off` (a plain "a person is needed" notice), `observe` (the same notice, with who could decide, and the record) or `on`. The value is read for each prompt, so no restart is needed.
+This is off by default. Set `AGENTGW_ASKER_PERMISSIONS` in the gateway's `.env` (the former name `AGENTGW_LEAD_PERMISSIONS` is still read): `off` (a plain "a person is needed" notice), `observe` (the same notice, with who could decide, and the record) or `on`. The value is read for each prompt, so no restart is needed.
 
-PowerShell prompts on Windows machines stay the Owner's unless `AGENTGW_LEAD_PERMISSIONS_POWERSHELL=on` is also set.
+PowerShell prompts on Windows machines stay the Owner's unless `AGENTGW_ASKER_PERMISSIONS_POWERSHELL=on` is also set (formerly `AGENTGW_LEAD_PERMISSIONS_POWERSHELL`, still read).
 
 Permission buttons answer only the Owner's presses.
 

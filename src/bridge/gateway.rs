@@ -11339,7 +11339,7 @@ mod ask_tests {
         let mut access = Access::load(&dir);
         access.owner = "U_OWNER".into();
         access.save(&dir).unwrap();
-        std::fs::write(dir.path().join(".env"), format!("AGENTGW_LEAD_PERMISSIONS={mode}\n")).unwrap();
+        std::fs::write(dir.path().join(".env"), format!("AGENTGW_ASKER_PERMISSIONS={mode}\n")).unwrap();
         let (to_self, mut downs) = tokio::sync::mpsc::channel(16);
         let mut r = rig_at_with(dir, Arc::new(FakeChat::in_channels(&[("C1", "lead"), ("C2", "repo")])), to_self);
         let seen: Arc<std::sync::Mutex<Vec<(String, bool, bool, String)>>> = Default::default();
@@ -11536,6 +11536,7 @@ mod ask_tests {
         }
         r.fleet.on_machine_frame("parent", f.clone()).await;
         assert_eq!(r.fleet.perms.lock().unwrap()["w1"].class, crate::bridge::perm_class::Class::Owner);
+        // Written with the settings' former names: an existing `.env` keeps working end to end
         std::fs::write(r.fleet.dir.path().join(".env"), "AGENTGW_LEAD_PERMISSIONS=on\nAGENTGW_LEAD_PERMISSIONS_POWERSHELL=on\n").unwrap();
         if let link::LinkFrame::PermAsk { conf_id, .. } = &mut f {
             *conf_id = "w2".into();

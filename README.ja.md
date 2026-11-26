@@ -346,9 +346,9 @@ Microsoft Store 版の PowerShell 7 は、ユーザーがサインインして�
 - **答えは両方のスレッドに出ます**。`allowed by #チャンネル名` か `denied by #チャンネル名`(依頼元のチャンネル)、Owner のボタンなら `allowed by @名前` の形で、理由が付きます。
 - **すべての段階を記録します**。gateway の `~/.local/state/agentgw/perm-decisions.jsonl` に残り、答えと理由は両方のスレッドに出ます。
 
-既定は off です。gateway の `.env` の `AGENTGW_LEAD_PERMISSIONS` で切り替えます。`off`(これまでどおり「人の確認が必要です」の知らせだけ)、`observe`(同じ知らせに、誰が決められるかを添え、記録も残す)、`on` のどれかです。確認のたびに読み直すので、再起動は要りません。
+既定は off です。gateway の `.env` の `AGENTGW_ASKER_PERMISSIONS` で切り替えます(前の名前 `AGENTGW_LEAD_PERMISSIONS` も読みます)。`off`(これまでどおり「人の確認が必要です」の知らせだけ)、`observe`(同じ知らせに、誰が決められるかを添え、記録も残す)、`on` のどれかです。確認のたびに読み直すので、再起動は要りません。
 
-Windows のマシンの PowerShell の確認は、`AGENTGW_LEAD_PERMISSIONS_POWERSHELL=on` も入れないかぎり Owner が答えます。
+Windows のマシンの PowerShell の確認は、`AGENTGW_ASKER_PERMISSIONS_POWERSHELL=on` も入れないかぎり Owner が答えます(前の名前 `AGENTGW_LEAD_PERMISSIONS_POWERSHELL` も読みます)。
 
 許可のボタンは Owner の操作だけを受けます。
 

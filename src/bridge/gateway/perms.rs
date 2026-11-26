@@ -13,7 +13,7 @@
 //! from the thread the gateway's ask record names as the asker, and the Owner's only from the Owner's
 //! own press. Every step is a line in `perm-decisions.jsonl`.
 //!
-//! Switched by `AGENTGW_LEAD_PERMISSIONS` in the gateway's `.env`: `off` (the default — the plain
+//! Switched by `AGENTGW_ASKER_PERMISSIONS` (formerly `AGENTGW_LEAD_PERMISSIONS`, still read) in the gateway's `.env`: `off` (the default — the plain
 //! "a person is needed" notice, as before), `observe` (that notice, with the verdict and a record),
 //! `on`. Read at each prompt, so changing it needs no restart.
 
@@ -24,10 +24,12 @@ use crate::bridge::perm_class::{self, Class, Place};
 pub const LEAD_WAIT_MS: u64 = 3 * 60 * 1000;
 /// How long the machine has to say how an answer went.
 const APPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
-const MODE_KEY: &str = "AGENTGW_LEAD_PERMISSIONS";
+/// The setting's name, then the name it had before (still read, so an existing `.env` keeps working).
+/// The new name wins when both are there.
+const MODE_KEY: [&str; 2] = ["AGENTGW_ASKER_PERMISSIONS", "AGENTGW_LEAD_PERMISSIONS"];
 /// PowerShell prompts are the Owner's until this is `on`: its reading was written before a real
-/// Windows prompt was seen.
-const POWERSHELL_KEY: &str = "AGENTGW_LEAD_PERMISSIONS_POWERSHELL";
+/// Windows prompt was seen. (Name, then the old name, as above.)
+const POWERSHELL_KEY: [&str; 2] = ["AGENTGW_ASKER_PERMISSIONS_POWERSHELL", "AGENTGW_LEAD_PERMISSIONS_POWERSHELL"];
 /// Where the open prompts are kept, so a restart of the gateway does not lose them.
 const OPEN_FILE: &str = "perm-open.json";
 
@@ -105,14 +107,21 @@ fn owner_blocks(text: &str, conf_id: &str) -> serde_json::Value {
     ])
 }
 
+/// The value of the first of `keys` found in `env` (a `.env` read as pairs): the new name before
+/// the old one it replaced.
+fn first_set(env: &[(String, String)], keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()))
+}
+
 impl Fleet {
-    fn setting(&self, key: &str) -> Option<String> {
-        let from_file = self.dir.load_env().ok().and_then(|m| m.into_iter().find(|(k, _)| k == key).map(|(_, v)| v));
-        from_file.or_else(|| std::env::var(key).ok())
+    /// The first of `keys` that is set: the `.env` first, then the environment.
+    fn setting(&self, keys: &[&str]) -> Option<String> {
+        let file = self.dir.load_env().ok().unwrap_or_default();
+        first_set(&file, keys).or_else(|| keys.iter().find_map(|key| std::env::var(key).ok()))
     }
 
     fn lead_mode(&self) -> LeadMode {
-        LeadMode::of(self.setting(MODE_KEY).as_deref())
+        LeadMode::of(self.setting(&MODE_KEY).as_deref())
     }
 
     /// Write the open prompts down (after every change to them).
@@ -183,7 +192,7 @@ impl Fleet {
             return;
         }
         // The gateway's own verdict counts as much as the machine's: the stricter of the two
-        let powershell_checked = self.setting(POWERSHELL_KEY).is_some_and(|v| v.trim().eq_ignore_ascii_case("on"));
+        let powershell_checked = self.setting(&POWERSHELL_KEY).is_some_and(|v| v.trim().eq_ignore_ascii_case("on"));
         // The reason is said in the gateway's own words (and language) wherever its verdict agrees
         let (class, why) = if tool.is_empty() {
             (Class::Owner, perm_class::screen_why(&shown))
@@ -617,6 +626,21 @@ impl Fleet {
 
 #[cfg(test)]
 mod tests {
+    /// The setting has a new name (no role word in it); the old one is still read, so an existing
+    /// `.env` keeps working. Both there: the new one wins.
+    #[test]
+    fn the_setting_is_read_by_its_new_name_and_its_old_one() {
+        let env = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
+        let mode = |e: &[(String, String)]| LeadMode::of(first_set(e, &MODE_KEY).as_deref());
+        assert_eq!(mode(&env(&[("AGENTGW_ASKER_PERMISSIONS", "on")])), LeadMode::On);
+        assert_eq!(mode(&env(&[("AGENTGW_LEAD_PERMISSIONS", "observe")])), LeadMode::Observe, "the old name still works");
+        assert_eq!(mode(&env(&[("AGENTGW_LEAD_PERMISSIONS", "on"), ("AGENTGW_ASKER_PERMISSIONS", "off")])), LeadMode::Off, "the new name wins");
+        assert_eq!(mode(&env(&[])), LeadMode::Off);
+        let ps = |e: &[(String, String)]| first_set(e, &POWERSHELL_KEY);
+        assert_eq!(ps(&env(&[("AGENTGW_LEAD_PERMISSIONS_POWERSHELL", "on")])).as_deref(), Some("on"));
+        assert_eq!(ps(&env(&[("AGENTGW_ASKER_PERMISSIONS_POWERSHELL", "on")])).as_deref(), Some("on"));
+    }
+
     use super::*;
 
     #[test]
