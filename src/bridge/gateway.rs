@@ -2006,6 +2006,8 @@ impl DmOnboardingCtx<'_> {
 
 /// How long a disconnect is held. A machine whose Wi-Fi blinked comes back in 1–2 seconds, so if it
 /// returns within this window nothing is said — from the Owner's view, the machine never left.
+/// A restart takes longer (about 9 seconds measured), which is why a machine an `update` restarts
+/// is not held at all but left out (`Presence::on_disconnect`'s `expected`).
 pub const PRESENCE_GRACE_MS: u64 = 5_000;
 
 /// A closed exchange whose agent is to be stopped (`Fleet::close_tree`).
