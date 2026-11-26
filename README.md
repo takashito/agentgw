@@ -349,11 +349,12 @@ Any thread of the channel that asked can do this, not only the thread that sent 
 
 ### Permission prompts in asked threads
 
-When the agent in an asked thread stops at a permission prompt, the gateway decides who answers it. The asking Claude (the *Lead*) may allow a short list of safe actions: reading files that hold no secrets, building and testing in the channel's folder, editing files there (except Claude's settings, hooks, git hooks and CI configuration), and deleting fully written-out paths inside `/tmp/claude-*/` or `~/.local/state/<project>/`. Everything else — deleting elsewhere, pushing, releasing, sending data out, connecting to other machines, `sudo`, signing in, reading keys or tokens, Claude Code's own safety checks, and any command that cannot be read — is the Owner's.
+When the agent in an asked thread stops at a permission prompt, the gateway decides who answers it. The thread that asked for the work may allow a short list of safe actions: reading files that hold no secrets, building and testing in the channel's folder, editing files there (except Claude's settings, hooks, git hooks and CI configuration), and deleting fully written-out paths inside `/tmp/claude-*/` or `~/.local/state/<project>/`. Everything else — deleting elsewhere, pushing, releasing, sending data out, connecting to other machines, `sudo`, signing in, reading keys or tokens, Claude Code's own safety checks, and any command that cannot be read — is the Owner's.
 
-- **The Lead's prompts** go to the asking thread. The Lead answers with the `answer_permission` tool (allow or deny, with a reason). If nobody answers within three minutes, the Owner is asked too; the first answer counts.
-- **The Owner's prompts** go to the Owner at once, with **Allow** and **Deny** buttons on the notice. The Lead can only deny them.
+- **Prompts the asking thread may decide** go to that thread. Its Claude answers with the `answer_permission` tool (allow or deny, with a reason). If nobody answers within three minutes, the Owner is asked too; the first answer counts.
+- **The Owner's prompts** go to the Owner at once, with **Allow** and **Deny** buttons on the notice. The asking thread can only deny them.
 - **Who answered is checked by the gateway**: an answer counts only from the thread that asked for the work, or from the Owner's own button press. Text that an agent writes cannot allow anything.
+- **The answer is shown in both threads** as `allowed by #channel` or `denied by #channel` (the channel that asked), or `allowed by @person` for the Owner's button, with the reason.
 - **Every step is recorded** in `~/.local/state/agentgw/perm-decisions.jsonl` on the gateway, and the answer and its reason are shown in both threads.
 
 This is off by default. Set `AGENTGW_LEAD_PERMISSIONS` in the gateway's `.env`: `off` (a plain "a person is needed" notice), `observe` (the same notice, with who could decide, and the record) or `on`. The value is read for each prompt, so no restart is needed.

@@ -227,7 +227,10 @@ impl Fleet {
         self.perm_log(if mode == LeadMode::On { "opened" } else { "observed" }, &conf_id, &p, serde_json::Value::Null);
         if mode == LeadMode::Observe {
             let whose = match class {
-                Class::Lead => crate::t!("the Lead could decide this ({why})", "Lead が決められる確認です({why})"),
+                Class::Lead => {
+                    let asker = asker.as_ref().map(|(c, _)| format!("<#{c}>")).unwrap_or_else(|| crate::t!("the channel that asked", "依頼元").to_string());
+                    crate::t!("{asker} could decide this ({why})", "{asker} が決められる確認です({why})")
+                }
                 Class::Owner => crate::t!("only the Owner can allow this ({why})", "Owner だけが許可できる確認です({why})"),
             };
             self.on_needs_human(&channel, &thread_ts, &ts, closed_too, &format!("{what}\n_{whose}_"), &todo).await;
@@ -246,8 +249,8 @@ impl Fleet {
         match class {
             Class::Lead => {
                 let shown_line = crate::t!(
-                    ":closed_lock_with_key: **{name}: the agent is waiting for permission, and the Lead decides**: `{shown}`\nWhy the Lead may decide: {why} · confirmation `{conf_id}` · [Open it]({link})",
-                    ":closed_lock_with_key: **{name} のエージェントが許可を待っています(Lead が決める確認)**: `{shown}`\nLead が決められる理由: {why} · 確認ID `{conf_id}` · [開く]({link})"
+                    ":closed_lock_with_key: **{name}: the agent is waiting for permission, and <#{asker_ch}> decides**: `{shown}`\nWhy <#{asker_ch}> may decide: {why} · confirmation `{conf_id}` · [Open it]({link})",
+                    ":closed_lock_with_key: **{name} のエージェントが許可を待っています(<#{asker_ch}> が決める確認)**: `{shown}`\n<#{asker_ch}> が決められる理由: {why} · 確認ID `{conf_id}` · [開く]({link})"
                 );
                 let for_agent = format!(
                     "A permission prompt is waiting in the thread you asked ({channel}, thread {thread_ts}), and it is yours to decide.\n\
@@ -311,10 +314,13 @@ impl Fleet {
         };
         let because = match (p.class, late) {
             (Class::Owner, _) => why.clone(),
-            (Class::Lead, _) => crate::t!(
-                "the agent that asked for this work could decide it ({why}), but has not answered in 3 minutes. If it answers first, that answer counts.",
-                "依頼した Lead が決めてよい確認です({why})が、3分のうちに答えなかったので、あなたにも聞いています。Lead が先に答えれば、それで決まります。"
-            ),
+            (Class::Lead, _) => {
+                let asker = p.asker.as_ref().map(|(c, _)| format!("<#{c}>")).unwrap_or_else(|| crate::t!("the channel that asked", "依頼元").to_string());
+                crate::t!(
+                    "{asker} could decide it ({why}), but has not answered in 3 minutes. If it answers first, that answer counts.",
+                    "{asker} が決めてよい確認です({why})が、3分のうちに答えなかったので、あなたにも聞いています。{asker} が先に答えれば、それで決まります。"
+                )
+            }
         };
         let text = crate::t!(
             "{mention}:raising_hand: **The agent in {name} is waiting for your permission**\n\
@@ -427,7 +433,8 @@ impl Fleet {
         if reason.trim().is_empty() {
             return Err("give a reason: it is kept in the record".into());
         }
-        let by = crate::t!("the Lead, <#{from_channel}>", "依頼元の Lead、<#{from_channel}>");
+        // Named by its channel alone: `allowed by #channel` (no role word — a channel is just a channel)
+        let by = format!("<#{from_channel}>");
         let who = format!("{from_channel}:{from_thread}");
         let note = self.decide_perm(conf_id, allow, true, &by, &who, reason).await?;
         Ok(serde_json::json!({"status": if allow {"allowed"} else {"denied"}, "result": note}))
@@ -473,7 +480,7 @@ impl Fleet {
             return;
         }
         let allow = click.action == crate::chat::slack::OWNER_ALLOW;
-        let by = crate::t!("the Owner, <@{}>", "Owner、<@{}>", click.by);
+        let by = format!("<@{}>", click.by);
         if let Err(e) = self.decide_perm(&click.req_id, allow, false, &by, &click.by, "").await {
             rlog("info", &format!("perm: the Owner's answer to {} did not go through: {e}", click.req_id));
             let p = self.perms.lock().unwrap_or_else(|e| e.into_inner()).get(&click.req_id).cloned();
@@ -556,12 +563,12 @@ impl Fleet {
         let reason_part = if reason.is_empty() { String::new() } else { crate::t!(" \u{2014} reason: {reason}", " \u{2014} 理由: {reason}") };
         let line = match outcome {
             "allow" => crate::t!(
-                ":white_check_mark: Allowed by {by}{reason_part}. It runs this once: `{shown}`",
-                ":white_check_mark: 許可されました({by}){reason_part}。この1回だけ実行されます: `{shown}`"
+                ":white_check_mark: allowed by {by}{reason_part}. It runs this once: `{shown}`",
+                ":white_check_mark: allowed by {by}{reason_part}。この1回だけ実行されます: `{shown}`"
             ),
             "deny" => crate::t!(
-                ":no_entry_sign: Denied by {by}{reason_part}. It does not run: `{shown}`",
-                ":no_entry_sign: 拒否されました({by}){reason_part}。実行されません: `{shown}`"
+                ":no_entry_sign: denied by {by}{reason_part}. It does not run: `{shown}`",
+                ":no_entry_sign: denied by {by}{reason_part}。実行されません: `{shown}`"
             ),
             "superseded" => crate::t!(
                 "Another confirmation came up on the agent's screen, so this one is closed: `{shown}`",

@@ -3661,7 +3661,7 @@ mod tests {
         slack::PermClick {
             req_id: conf.into(),
             action: if allow { slack::GW_ALLOW } else { slack::GW_DENY }.into(),
-            by: "the Lead (<#C_LAN>)".into(),
+            by: "<#C_LAN>".into(),
             state: serde_json::json!({"req_id": "g1", "lead": lead, "reason": "scratch only", "channel": "C_ADMIN", "thread_ts": ROOT}),
             value: String::new(),
             message_ts: String::new(),
@@ -4101,7 +4101,7 @@ mod tests {
         assert!(
             slack
                 .calls()
-                .contains(&format!("update C1 {prompt_ts} ✅ `Bash` — allow by <@U_OWNER>")),
+                .contains(&format!("update C1 {prompt_ts} ✅ `Bash` — allowed by <@U_OWNER>")),
             "{:?}",
             slack.calls()
         );

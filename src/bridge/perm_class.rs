@@ -65,7 +65,7 @@ pub fn classify(tool: &str, input: &Value, place: &Place) -> Verdict {
             write_tool(path, place)
         }
         _ if SHELL_TOOLS.contains(&tool) => Verdict::owner(crate::t!("unreadable command", "中身を読み取れないコマンドです")),
-        _ => Verdict::owner(crate::t!("{tool} is not a tool the Lead may decide for", "{tool} は Lead が決めてよい道具ではありません")),
+        _ => Verdict::owner(crate::t!("{tool} is not a tool the channel that asked may decide for", "{tool} は依頼元が決めてよい道具ではありません")),
     }
 }
 
@@ -540,7 +540,7 @@ fn bash_part(words: &[&str], place: &Place) -> Verdict {
             }
         }
         _ if SCRATCH_COMMANDS.contains(&name) => scratch(name, args, place),
-        _ => Verdict::owner(crate::t!("{name} is not a command the Lead may decide for", "{name} は Lead が決めてよいコマンドではありません")),
+        _ => Verdict::owner(crate::t!("{name} is not a command the channel that asked may decide for", "{name} は依頼元が決めてよいコマンドではありません")),
     }
 }
 
@@ -718,7 +718,7 @@ fn ps_part(words: &[String], place: &Place) -> Verdict {
         "remove-item" | "rm" | "del" | "erase" | "rd" | "rmdir" | "ri" | "new-item" | "ni" | "mkdir" | "md" => {
             ps_scratch(cmd, &args, place)
         }
-        _ => Verdict::owner(crate::t!("{cmd} is not a command the Lead may decide for", "{cmd} は Lead が決めてよいコマンドではありません")),
+        _ => Verdict::owner(crate::t!("{cmd} is not a command the channel that asked may decide for", "{cmd} は依頼元が決めてよいコマンドではありません")),
     }
 }
 

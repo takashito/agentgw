@@ -2229,7 +2229,16 @@ impl Bridge {
             _ => {}
         }
         let mark = if allow { "✅" } else { "🚫" };
-        let done = format!("{mark} `{}` — {} by {}", p.tool_name, action, slack::who(by));
+        // `allowed by #channel` / `allowed by @person`: the same few English words in either
+        // language, and nothing in between (a word was once left as the raw action, `allow by`)
+        let did = match action {
+            "allow" => "allowed",
+            "allow-thread" => "allowed for this thread",
+            "allow-channel" => "allowed for this channel",
+            "deny" => "denied",
+            other => other,
+        };
+        let done = format!("{mark} `{}` — {did} by {}", p.tool_name, slack::who(by));
         if let Err(e) = self
             .deps.slack
             .update_message(&p.channel, &p.prompt_ts, &done)

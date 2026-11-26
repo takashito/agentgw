@@ -9,7 +9,7 @@ in [README.md](README.md#release-notes).
 ## [Unreleased]
 
 ### Added
-- When an agent working on another channel's request stops at a permission prompt, the agent that asked can allow safe actions or deny any, with the new `answer_permission` tool; everything else goes straight to the Owner with Allow and Deny buttons. Off by default (`AGENTGW_LEAD_PERMISSIONS`).
+- When an agent working on another channel's request stops at a permission prompt, the agent that asked can allow safe actions or deny any, with the new `answer_permission` tool; everything else goes straight to the Owner with Allow and Deny buttons. The answer shows as `allowed by #channel` or `denied by #channel`. Off by default (`AGENTGW_LEAD_PERMISSIONS`).
 - `thread_activity` reports `waiting_for_permission`, with what the agent wants to run and who can decide.
 
 ### Changed
