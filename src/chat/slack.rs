@@ -2460,10 +2460,60 @@ impl SlackId {
         };
         shape(id).then(|| id.to_string())
     }
+
+    /// A message timestamp (`1795667446.465899`) as an agent may have written it: as is, as the
+    /// `p…` part of a link with the dot gone (`p1795667446465899`), or as a whole message link —
+    /// whose `thread_ts=` names the thread when it is a reply. Err when it is none of those: Slack
+    /// answers such a ts as "not found", and that once read as "the thread was deleted".
+    pub fn message_ts(given: &str) -> Result<String, String> {
+        let t = given.trim();
+        let dotted = |s: &str| {
+            let (secs, frac) = s.split_once('.')?;
+            let digits = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+            (digits(secs) && digits(frac)).then(|| s.to_string())
+        };
+        // `p` + seconds and six digits run together, as a link writes it
+        let from_link_id = |s: &str| {
+            let d = s.strip_prefix('p').unwrap_or(s);
+            (d.len() > 6 && d.bytes().all(|b| b.is_ascii_digit())).then(|| format!("{}.{}", &d[..d.len() - 6], &d[d.len() - 6..]))
+        };
+        let found = if t.starts_with("http") {
+            let query = t.split_once('?').map(|(_, q)| q).unwrap_or("");
+            let thread = query.split('&').find_map(|kv| kv.strip_prefix("thread_ts=")).and_then(dotted);
+            let path = t.split('?').next().unwrap_or(t);
+            thread.or_else(|| path.rsplit('/').next().and_then(from_link_id))
+        } else {
+            dotted(t).or_else(|| from_link_id(t))
+        };
+        found.ok_or_else(|| {
+            format!("{given:?} is not a Slack message timestamp: write it as seconds, a dot and six digits, like 1795667446.465899")
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_message_ts_is_taken_in_the_shapes_an_agent_writes_it() {
+        use super::SlackId;
+        let ts = |s: &str| SlackId::message_ts(s);
+        assert_eq!(ts("1795667446.465899").unwrap(), "1795667446.465899");
+        assert_eq!(ts(" 1795667446.465899 ").unwrap(), "1795667446.465899");
+        // The dot lost, as a link writes it: this once came back as "the thread root was deleted"
+        assert_eq!(ts("1795667446465899").unwrap(), "1795667446.465899");
+        assert_eq!(ts("p1795667446465899").unwrap(), "1795667446.465899");
+        assert_eq!(ts("https://x.slack.com/archives/C0CG6UJ578U/p1795667446465899").unwrap(), "1795667446.465899");
+        // A reply's link: the thread is the one named in the query
+        assert_eq!(
+            ts("https://x.slack.com/archives/C0CG/p1795667157981069?thread_ts=1795667076.418239&cid=C0CG").unwrap(),
+            "1795667076.418239"
+        );
+        for bad in ["", "abc", "1795667446.", ".465899", "12345", "1795667446.46x899", "p"] {
+            let e = ts(bad).unwrap_err();
+            assert!(e.contains("not a Slack message timestamp"), "{bad:?}: {e}");
+        }
+    }
 
     /// A page with a block kind the library's types do not know (`rich_text_header`, made from a
     /// Markdown `##`) still reads: once it failed the whole thread, and with it the Owner's links.

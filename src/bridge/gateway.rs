@@ -5114,6 +5114,9 @@ impl Fleet {
     /// and whether the request was finished, and the agent there ends the way `exit` ends it — after
     /// its running turn, not in the middle. A finished request gets ✅ there (`done`); a given-up one
     /// (`canceled`) does not.
+    ///
+    /// **Everything the closed thread asked closes with it**, down the whole chain (`close_below`):
+    /// otherwise a reply from below wakes the closed thread's agent up again.
     pub(crate) async fn end_ask(
         &self,
         from_channel: &str,
@@ -5121,6 +5124,44 @@ impl Fleet {
         to_channel: &str,
         to_thread: &str,
         canceled: bool,
+    ) -> Result<serde_json::Value, String> {
+        let out = self.end_one(from_channel, from_thread, to_channel, to_thread, canceled, false).await?;
+        if out["status"] == "ended" {
+            self.close_below(to_channel, to_thread).await;
+        }
+        Ok(out)
+    }
+
+    /// The thread `channel`/`thread` is closed (`end_ask` into it, or `exit` / `end_session` there):
+    /// close every exchange still open below it, parents first, each the way `end_ask` closes one
+    /// (a line in that thread, its agent ends after its running turn), as given up — the work was
+    /// no longer wanted by the time it would have been answered.
+    async fn close_below(&self, channel: &str, thread: &str) {
+        let below = {
+            let rows = self.asks.lock().await;
+            crate::bridge::asks::open_asks_below(&rows, channel, thread)
+        };
+        for (ch, ts) in below {
+            // The record names who asked; a takeover may have moved it since the list was made
+            let Some(from) = self.asks.lock().await.get(&ts).filter(|(c, _)| *c == ch).map(|(_, r)| (r.channel.clone(), r.thread_ts.clone()))
+            else {
+                continue;
+            };
+            if let Err(e) = self.end_one(&from.0, &from.1, &ch, &ts, true, true).await {
+                rlog("error", &format!("ask {ch}:{ts}: could not close it with {channel}:{thread}: {e}"));
+            }
+        }
+    }
+
+    /// One exchange of [`Self::end_ask`]. `cascaded`: it closes because the thread that asked was closed.
+    async fn end_one(
+        &self,
+        from_channel: &str,
+        from_thread: &str,
+        to_channel: &str,
+        to_thread: &str,
+        canceled: bool,
+        cascaded: bool,
     ) -> Result<serde_json::Value, String> {
         use crate::bridge::asks::{AgentDelivery, DeliveryKind, check_end};
         use crate::bridge::state::AskState;
@@ -5140,6 +5181,10 @@ impl Fleet {
         })
         .await;
         let said = match canceled {
+            _ if cascaded => crate::t!(
+                "The thread in <#{from_channel}> that asked for this was closed, so this thread is closed too, without completing it.",
+                "このスレッドに依頼した <#{from_channel}> のスレッドが閉じられたので、このスレッドも完了にせずに閉じました。"
+            ),
             false => crate::t!("<#{from_channel}> marked this thread done.", "<#{from_channel}> がこのスレッドを完了にしました。"),
             true => crate::t!(
                 "<#{from_channel}> closed this thread without completing it.",
@@ -5161,7 +5206,8 @@ impl Fleet {
             })
             .await;
         let outcome = if canceled { "canceled" } else { "done" };
-        rlog("info", &format!("ask {to_channel}:{to_thread}: ended ({outcome}) by {from_channel}:{from_thread}"));
+        let why = if cascaded { ", which was closed" } else { "" };
+        rlog("info", &format!("ask {to_channel}:{to_thread}: ended ({outcome}) by {from_channel}:{from_thread}{why}"));
         Ok(match delivered {
             Ok(()) => serde_json::json!({"status": "ended", "outcome": outcome}),
             // The exchange is over either way; its agent is left to whoever looks at that machine
@@ -5466,6 +5512,20 @@ impl Fleet {
         }
         if row.origin_closed && interim {
             return; // nobody is waiting there to hear it
+        }
+        // The exchange was closed before this came (`end_ask`, `exit`, or the thread above closed):
+        // passing it on would wake up an agent that was ended on purpose. Said once in the thread
+        // that answered, for its final answer (an agent still in its last turn when it was closed)
+        if row.state == AskState::Ended {
+            rlog("info", &format!("ask: the {outcome} from {channel}:{thread} came after the exchange was closed; not passed on"));
+            if outcome == "reply" {
+                let said = crate::t!(
+                    "This exchange was closed, so this reply was not passed on to the thread that asked.",
+                    "この依頼は閉じられているので、この返事は依頼元のスレッドに届けていません。"
+                );
+                self.post(channel, Some(thread), &said).await;
+            }
+            return;
         }
         if row.origin_closed {
             // Said once per request: the next answer finds `outstanding` already down
@@ -5797,9 +5857,12 @@ impl Fleet {
         }
     }
 
-    /// `exit` in `channel`/`thread`: an exchange asked into it ends, and one asked from it stops
-    /// passing replies back.
+    /// `exit` (or `end_session`) in `channel`/`thread`: an exchange asked into it ends, and every
+    /// exchange still open below it is closed the way `end_ask` closes one, down the whole chain.
+    /// (They used to keep running and only stop passing replies back; the agents below worked on
+    /// for nobody.) A person writing in the thread again resumes its agent, not the closed asks.
     async fn on_ask_ended(&self, channel: &str, thread: &str) {
+        self.close_below(channel, thread).await;
         let touched: Vec<(String, String)> = self
             .asks
             .lock()
@@ -5849,7 +5912,7 @@ impl Fleet {
             .lock()
             .await
             .iter()
-            .filter(|(_, (_, r))| r.missed > 0 && !r.origin_closed)
+            .filter(|(_, (_, r))| r.missed > 0 && !r.origin_closed && r.state != crate::bridge::state::AskState::Ended)
             .map(|(ts, (ch, r))| (ch.clone(), ts.clone(), r.channel.clone(), r.thread_ts.clone(), r.missed))
             .collect();
         for (ch, ts, origin, origin_thread, n) in owed {
@@ -10447,19 +10510,16 @@ mod ask_tests {
         assert!(r.fleet.ask("C1", "9.9", "C2", Some(&thread), "more", None, &[]).await.unwrap_err().contains("new thread"), "closed stays closed");
     }
 
-    /// The thread that asked was closed (`exit`), which drops replies: picking the request up from
-    /// another thread brings them back there.
+    /// The thread that asked was closed (`exit`), which closes what it asked: another thread of the
+    /// channel can no longer pick the request up, and asks again in a new thread instead. (Before
+    /// the close cascaded, the request kept running and a takeover got its replies back.)
     #[tokio::test]
-    async fn taking_over_from_a_closed_thread_gets_the_replies_again() {
+    async fn after_exit_another_thread_asks_anew_instead_of_taking_over() {
         let (mut r, thread) = approved("takeoverclosed").await;
         r.fleet.on_machine_frame("parent", link::LinkFrame::AskEnded { channel: "C1".into(), thread_ts: "1.1".into() }).await;
-        assert!(r.fleet.asks.lock().await[&thread].1.origin_closed);
-        r.fleet.ask("C1", "9.9", "C2", Some(&thread), "go on", None, &[]).await.unwrap();
-        let _ = r.msgs.try_recv();
-        assert!(!r.fleet.asks.lock().await[&thread].1.origin_closed);
-        r.fleet.on_machine_frame("parent", reply_frame(&thread, "reply", "done")).await;
-        let m = r.msgs.try_recv().expect("delivered to the thread that took over");
-        assert_eq!((m.thread_ts.as_deref(), m.text.as_str()), (Some("9.9"), "done"));
+        while r.msgs.try_recv().is_ok() {}
+        assert!(r.fleet.ask("C1", "9.9", "C2", Some(&thread), "go on", None, &[]).await.unwrap_err().contains("new thread"));
+        assert!(r.fleet.ask("C1", "9.9", "C2", None, "go on", None, &[]).await.is_ok());
     }
 
     #[tokio::test]
@@ -10514,33 +10574,89 @@ mod ask_tests {
         assert!(!r.fleet.asks.lock().await[&thread].1.outstanding);
     }
 
+    /// `exit` in the asking thread closes what it asked (it used to only stop passing replies back,
+    /// and the agent below worked on for nobody); replies that still come are not passed on.
     #[tokio::test]
-    async fn a_closed_asker_is_not_woken() {
+    async fn exit_in_the_asking_thread_closes_what_it_asked() {
         let (mut r, thread) = approved("closed").await;
+        let before = calls(&r.api).len();
         r.fleet.on_machine_frame("parent", link::LinkFrame::AskEnded { channel: "C1".into(), thread_ts: "1.1".into() }).await;
+        assert_eq!(r.fleet.asks.lock().await[&thread].1.state, AskState::Ended);
+        let m = r.msgs.try_recv().expect("the asked thread is told to end");
+        assert_eq!((m.channel.as_str(), m.thread_ts.as_deref(), m.text.as_str()), ("C2", Some(thread.as_str()), crate::chat::END_CANCELED));
+        assert_eq!(m.from_agent.unwrap().kind, DeliveryKind::End);
+        assert!(
+            calls(&r.api)[before..].iter().any(|c| c.starts_with(&format!("post_md C2 {thread} ")) && c.contains("was closed, so this thread is closed too")),
+            "{:?}",
+            &calls(&r.api)[before..]
+        );
+        // The last turn's answer still comes: the closed thread is not woken
         r.fleet.on_machine_frame("parent", reply_frame(&thread, "reply", "one")).await;
-        r.fleet.on_machine_frame("parent", reply_frame(&thread, "reply", "two")).await;
+        r.fleet.on_machine_frame("parent", reply_frame(&thread, "stopped", "")).await;
         assert!(r.msgs.try_recv().is_err(), "nothing delivered to a closed thread");
-        let told: Vec<String> = calls(&r.api).into_iter().filter(|c| c.contains(&format!(" C2 {thread} ")) && c.contains("ended")).collect();
-        assert_eq!(told.len(), 1, "{told:?}");
+        let told: Vec<String> = calls(&r.api).into_iter().filter(|c| c.contains(&format!(" C2 {thread} ")) && c.contains("not passed on")).collect();
+        assert_eq!(told.len(), 1, "said once, for the answer: {told:?}");
     }
 
+    /// A person writing again after `exit` resumes the thread's agent, not the asks it closed.
     #[tokio::test]
-    async fn a_person_back_in_the_asking_thread_after_exit_reopens_its_asks() {
+    async fn a_person_back_after_exit_does_not_reopen_the_asks_it_closed() {
         let (mut r, thread) = approved("reopen").await;
         r.fleet.on_machine_frame("parent", link::LinkFrame::AskEnded { channel: "C1".into(), thread_ts: "1.1".into() }).await;
-        assert!(r.fleet.asks.lock().await[&thread].1.origin_closed);
-        // The bot's own post there does not count; a person's does
-        let post = |user: &str| serde_json::json!({"channel": "C1", "user": user, "text": "go on", "ts": "1.9", "thread_ts": "1.1"});
-        let mut own = post("U_BOT");
-        own["bot_id"] = "B1".into();
-        r.fleet.on_event("message", &own).await;
-        assert!(r.fleet.asks.lock().await[&thread].1.origin_closed);
-        r.fleet.on_event("message", &post("U_OWNER")).await;
-        assert!(!r.fleet.asks.lock().await[&thread].1.origin_closed);
+        let post = serde_json::json!({"channel": "C1", "user": "U_OWNER", "text": "go on", "ts": "1.9", "thread_ts": "1.1"});
+        r.fleet.on_event("message", &post).await;
         while r.msgs.try_recv().is_ok() {}
+        assert_eq!(r.fleet.asks.lock().await[&thread].1.state, AskState::Ended);
         r.fleet.on_machine_frame("parent", reply_frame(&thread, "reply", "done")).await;
-        assert_eq!(r.msgs.try_recv().expect("delivered to the asker again").text, "done");
+        assert!(r.msgs.try_recv().is_err());
+    }
+
+    /// CoS → Lead → repo: the CoS closes the Lead's thread, and the repo's thread closes with it.
+    /// The repo's answer then wakes nobody (it once brought the closed Lead back to life).
+    #[tokio::test]
+    async fn closing_a_thread_closes_the_threads_it_asked() {
+        let mut r = rig("cascade", FakeChat::in_channels(&[("C2", "lead"), ("C3", "repo"), ("C4", "deeper")]));
+        let lead = r.fleet.ask("C1", "1.1", "C2", None, "find out", None, &[]).await.unwrap()["thread_ts"].as_str().unwrap().to_string();
+        let repo = r.fleet.ask("C2", &lead, "C3", None, "look", None, &[]).await.unwrap()["thread_ts"].as_str().unwrap().to_string();
+        let deeper = r.fleet.ask("C3", &repo, "C4", None, "dig", None, &[]).await.unwrap()["thread_ts"].as_str().unwrap().to_string();
+        while r.msgs.try_recv().is_ok() {}
+        let before = calls(&r.api).len();
+        let out = r.fleet.end_ask("C1", "1.1", "C2", &lead, true).await.unwrap();
+        assert_eq!(out["status"], "ended");
+        let asks = r.fleet.asks.lock().await.clone();
+        for t in [&lead, &repo, &deeper] {
+            assert_eq!(asks[t].1.state, AskState::Ended, "{t}");
+        }
+        // Each is told to end, top first, given up (no ✅)
+        let ends: Vec<(String, String)> = std::iter::from_fn(|| r.msgs.try_recv().ok())
+            .inspect(|m| assert_eq!((m.from_agent.as_ref().unwrap().kind, m.text.as_str()), (DeliveryKind::End, crate::chat::END_CANCELED)))
+            .map(|m| (m.channel, m.thread_ts.unwrap()))
+            .collect();
+        assert_eq!(ends, vec![("C2".into(), lead.clone()), ("C3".into(), repo.clone()), ("C4".into(), deeper.clone())]);
+        let said = &calls(&r.api)[before..];
+        assert!(said.iter().any(|c| c.starts_with(&format!("post_md C3 {repo} ")) && c.contains("<#C2>") && c.contains("closed too")), "{said:?}");
+        assert!(said.iter().any(|c| c.starts_with(&format!("post_md C4 {deeper} ")) && c.contains("<#C3>") && c.contains("closed too")), "{said:?}");
+        // The repo's answer comes after: not handed to the closed Lead
+        let mut f = reply_frame(&repo, "reply", "found it");
+        if let link::LinkFrame::AgentReply { channel, .. } = &mut f {
+            *channel = "C3".into();
+        }
+        r.fleet.on_machine_frame("parent", f).await;
+        assert!(r.msgs.try_recv().is_err(), "the closed Lead is not woken");
+        // Closing again closes nothing more
+        let again = calls(&r.api).len();
+        assert_eq!(r.fleet.end_ask("C1", "1.1", "C2", &lead, true).await.unwrap()["status"], "already_ended");
+        assert_eq!(calls(&r.api).len(), again);
+    }
+
+    /// Only what the closed thread asked closes: a sibling exchange from the same top goes on.
+    #[tokio::test]
+    async fn closing_one_thread_leaves_its_siblings_alone() {
+        let mut r = rig("cascadesib", FakeChat::in_channels(&[("C2", "lead"), ("C3", "other")]));
+        let lead = r.fleet.ask("C1", "1.1", "C2", None, "a", None, &[]).await.unwrap()["thread_ts"].as_str().unwrap().to_string();
+        let other = r.fleet.ask("C1", "1.1", "C3", None, "b", None, &[]).await.unwrap()["thread_ts"].as_str().unwrap().to_string();
+        r.fleet.end_ask("C1", "1.1", "C2", &lead, false).await.unwrap();
+        assert_eq!(r.fleet.asks.lock().await[&other].1.state, AskState::Approved);
     }
 
     #[tokio::test]

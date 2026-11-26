@@ -168,7 +168,7 @@ impl Mcp {
             }),
             serde_json::json!({
                 "name": "end_ask",
-                "description": "Close a thread you asked with ask_channel, once you are done with it (the request is finished, or no longer wanted). Its agent ends the way `exit` ends it — after any turn it is in, not in the middle — and a line there says you closed it and whether it was completed. Only the thread an exchange belongs to (the one that asked, or the one that took it over with a follow-up) can close it. No more follow-ups go to it afterwards; ask in a new thread if you need more.",
+                "description": "Close a thread you asked with ask_channel, once you are done with it (the request is finished, or no longer wanted). Its agent ends the way `exit` ends it — after any turn it is in, not in the middle — and a line there says you closed it and whether it was completed. Any threads it asked in turn are closed with it, all the way down, and their late replies are not passed back. Only the thread an exchange belongs to (the one that asked, or the one that took it over with a follow-up) can close it. No more follow-ups go to it afterwards; ask in a new thread if you need more.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -482,11 +482,15 @@ impl ServerHandler for McpServer {
     ) -> Result<CallToolResult, McpError> {
         let session_id = Self::session_header(&context);
         let tool = request.name.to_string();
-        let args = serde_json::Value::Object(request.arguments.unwrap_or_default());
+        let mut args = serde_json::Value::Object(request.arguments.unwrap_or_default());
         let ctx = LogCtx {
             session_id: Some(session_id.clone()),
             thread_key: None,
         };
+        if let Err(e) = fix_timestamps(&mut args) {
+            ctx.info("mcp", &format!("tool {tool} refused: {e}"));
+            return Ok(CallToolResult::error(vec![Content::text(e)]));
+        }
         if session_id.is_empty() {
             ctx.error("mcp", &format!("{tool} call without session header"));
             return Ok(CallToolResult::error(vec![Content::text(
@@ -518,10 +522,39 @@ impl ServerHandler for McpServer {
     }
 }
 
+/// The message timestamps a tool is given (`thread_ts`, `message_ts`), set right before any tool
+/// sees them: a dot-less one copied from a link is put back in shape, and one that is no timestamp
+/// at all is refused here, saying so — Slack would answer it as "not found", which read as
+/// "the thread was deleted". An empty or missing one is left as it is.
+fn fix_timestamps(args: &mut serde_json::Value) -> Result<(), String> {
+    for key in ["thread_ts", "message_ts"] {
+        let Some(v) = args.get_mut(key) else { continue };
+        let Some(given) = v.as_str().filter(|s| !s.trim().is_empty()) else { continue };
+        let fixed = crate::chat::slack::SlackId::message_ts(given).map_err(|e| format!("{key}: {e}"))?;
+        *v = serde_json::Value::String(fixed);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::header::CONTENT_TYPE;
+
+    #[test]
+    fn tool_timestamps_are_put_in_shape_or_refused() {
+        let mut a = serde_json::json!({"thread_ts": "1795667446465899", "message_ts": "1.2", "text": "hi"});
+        fix_timestamps(&mut a).unwrap();
+        assert_eq!(a["thread_ts"], "1795667446.465899");
+        assert_eq!(a["message_ts"], "1.2");
+        assert_eq!(a["text"], "hi");
+        let mut none = serde_json::json!({"thread_ts": "", "text": "hi"});
+        fix_timestamps(&mut none).unwrap();
+        assert_eq!(none["thread_ts"], "");
+        let mut bad = serde_json::json!({"thread_ts": "yesterday"});
+        let e = fix_timestamps(&mut bad).unwrap_err();
+        assert!(e.starts_with("thread_ts: ") && e.contains("1795667446.465899"), "{e}");
+    }
 
     struct FakeExec;
     impl ToolExecutor for FakeExec {

@@ -12,6 +12,13 @@ in [README.md](README.md#release-notes).
 - When an agent working on another channel's request stops at a permission prompt, the agent that asked can allow safe actions or deny any, with the new `answer_permission` tool; everything else goes straight to the Owner with Allow and Deny buttons. Off by default (`AGENTGW_LEAD_PERMISSIONS`).
 - `thread_activity` reports `waiting_for_permission`, with what the agent wants to run and who can decide.
 
+### Changed
+- Closing a thread that was asked for work, or ending a thread with `exit`, now also closes every request that thread sent to other channels, all the way down the chain.
+
+### Fixed
+- A thread closed while its own request to another channel was still open no longer wakes up again when that request is answered.
+- A thread timestamp copied from a Slack link without its dot is accepted, and a malformed one is reported as such instead of as a deleted thread.
+
 ### Security
 - Permission buttons in Slack only take the Owner's presses.
 
