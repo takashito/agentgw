@@ -6848,6 +6848,27 @@ mod tests {
         assert!(!calls.iter().any(|c| c.contains("Already signed in")), "{calls:?}");
     }
 
+    /// After `logout` the Owner is gone; `login` sent in the channel (where the person signed out)
+    /// must start the sign-in, not be dropped as `no-owner`. Other chatter stays dropped.
+    #[tokio::test]
+    async fn login_in_a_channel_starts_the_sign_in_when_there_is_no_owner() {
+        let (d, slack, agent, _clock) = flow_deps("login-no-owner-channel");
+        *agent.signed_in.lock().unwrap() = Some(Some(false));
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.access.owner.clear();
+        b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "hello")).await;
+        settle().await;
+        assert!(slack.calls().is_empty(), "chatter without an Owner stays dropped: {:?}", slack.calls());
+
+        let mut login = channel_msg("1782000002.000100", "U_OWNER", "login");
+        login.thread_ts = Some("1782000000.000100".into());
+        b.on_inbound(&login).await;
+        settle().await;
+        let calls = slack.calls();
+        assert!(calls.iter().any(|c| c.starts_with("status C1") && c.ends_with("busy")), "{calls:?}");
+        assert!(b.sign_in.awaiting_code("C1"), "the sign-in waits for the code in the channel");
+    }
+
     #[tokio::test]
     async fn login_on_a_signed_in_machine_says_so() {
         let (d, slack, _agent, _clock) = flow_deps("login-signed-in");

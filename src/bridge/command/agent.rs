@@ -886,13 +886,21 @@ impl Bridge {
     /// **true = consumed** — the caller stops there. It is reached in two places:
     ///   • A human's DM — if a sign-in is in progress, the next message is read as the pasted code. Bare `login`
     ///     starts a new sign-in. Anything else gets a short hint
-    ///   • A channel the Owner routed — it accepts **only the pasted code**, and only from
-    ///     the person who started that sign-in (a bystander never gets to touch the code prompt)
+    ///   • A channel — bare `login` while there is no Owner and no sign-in waiting there starts one
+    ///     (after `logout` the Owner is gone, and the person is still in the channel they signed out
+    ///     from). Otherwise it accepts **only the pasted code**, and only from the person who started
+    ///     that sign-in (a bystander never gets to touch the code prompt). Other chatter is left to
+    ///     the gate, which drops it silently
     pub(in crate::bridge) fn login_carve_out(&mut self, msg: &InboundMsg) -> bool {
         let dm = msg.channel_kind == crate::chat::ChannelKind::Dm;
         let sender = msg.user.as_deref().unwrap_or("");
         let pending = self.sign_in.pending.get(&msg.channel).cloned();
-        if !dm && pending.as_deref() != Some(sender) {
+        let channel_login = !dm
+            && pending.is_none()
+            && self.access.owner.is_empty()
+            && crate::bridge::command::Message::new(&msg.text, self.bot_user_id.as_deref())
+                .is("login");
+        if !dm && pending.as_deref() != Some(sender) && !channel_login {
             return false; // passers-by are outside this branch — fall through to the gate as usual
         }
         // Hang the reply under "the message that person sent". Posting it at the DM/channel root would land

@@ -16,6 +16,7 @@ in [README.md](README.md#release-notes).
 ### Fixed
 - The "going offline" notice names the machine as every other notice does, instead of the computer's host name.
 - Sending `login` in Slack works again with recent Claude Code versions; it had stopped with "Couldn't start the sign-in".
+- After `logout`, sending `login` in a channel starts the sign-in on the machine that handles that channel; it used to be ignored until `login` was sent in a direct message.
 - When `login` cannot start a sign-in, the reply says why, shows what the sign-in screen said, and how to sign in on the machine instead.
 
 ## [0.76.0] - 2026-11-26
