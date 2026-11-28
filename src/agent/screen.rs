@@ -559,17 +559,20 @@ impl<'a> Pane<'a> {
         }
     }
 
-    /// Extract `https://claude.com/cai/oauth/authorize?…` from the `claude auth login` pane.
-    /// The URL is printed after `visit: `. A **wide** pane (the driver uses `-x 400`) fits it on
-    /// one line; if a narrow pane wraps it, the continuation lines contain no whitespace, so they
-    /// are joined back (stopping at a blank line, a line with spaces like "Paste code", or the
-    /// end). None if absent.
+    /// Extract the sign-in URL (`https://…/oauth/authorize?…`) from the `claude auth login` pane.
+    /// The URL follows `visit:` — on the same line in older CLIs (`claude.com/cai/…`), on the next
+    /// line since 2.1.332 (`claude.ai/…`). So only the shape is pinned, not the host or the layout.
+    /// A **wide** pane (the driver uses `-x 400`) fits it on one line; if a narrow pane wraps it,
+    /// the continuation lines contain no whitespace, so they are joined back (stopping at a blank
+    /// line, a line with spaces like "Paste code", or the end). None if absent.
     pub fn auth_login_url(&self) -> Option<String> {
-        const MARKER: &str = "visit: ";
-        const URL: &str = "https://claude.com/cai/oauth/authorize?";
+        const MARKER: &str = "visit:";
+        const SCHEME: &str = "https://";
+        const PATH: &str = "/oauth/authorize?";
         let pane = self.0;
         let idx = pane.find(MARKER)?;
-        let mut lines = pane[idx + MARKER.len()..].split('\n');
+        let rest = pane[idx + MARKER.len()..].trim_start(); // skip the space or the line break
+        let mut lines = rest.split('\n');
         let mut joined = lines.next().unwrap_or("").trim().to_string();
         for seg in lines {
             let seg = seg.trim();
@@ -578,12 +581,13 @@ impl<'a> Pane<'a> {
             }
             joined.push_str(seg); // soft-wrap continuation: join it back
         }
-        let i = joined.find(URL)?;
+        let i = joined.find(SCHEME)?;
         let url: String = joined[i..]
             .chars()
             .take_while(|c| !c.is_whitespace())
             .collect();
-        (url.len() > URL.len()).then_some(url) // `\S+` needs at least one char
+        let query = url.find(PATH)? + PATH.len();
+        (url.len() > query).then_some(url) // needs at least one char of query
     }
 
     /// Classify the pane by the real markers of `claude auth login` (checked against real success
@@ -1331,6 +1335,24 @@ the full history gets re-read on your next message.
             Pane::new(pane).auth_login_url().unwrap(),
             "https://claude.com/cai/oauth/authorize?code=abcdef"
         ); // soft-wrap joined back
+        // Claude Code 2.1.332: the URL moved to the line after `visit:` and to another host
+        let pane = "takashi@host:~$ claude auth login\nOpening browser to sign in…\n\
+                    If the browser didn't open, visit:\n\
+                    https://claude.ai/oauth/authorize?code=true&state=xyz\n\
+                    Paste code here if prompted >";
+        assert_eq!(
+            Pane::new(pane).auth_login_url().unwrap(),
+            "https://claude.ai/oauth/authorize?code=true&state=xyz"
+        );
+        // ...and a narrow pane wraps it there too
+        let pane = "If the browser didn't open, visit:\nhttps://claude.ai/oauth/auth\norize?a=1\nPaste code here";
+        assert_eq!(
+            Pane::new(pane).auth_login_url().unwrap(),
+            "https://claude.ai/oauth/authorize?a=1"
+        );
+        // Still waiting for the URL to print, or some other link
+        assert!(Pane::new("If the browser didn't open, visit:\n").auth_login_url().is_none());
+        assert!(Pane::new("visit: https://example.com/help\n").auth_login_url().is_none());
         assert!(Pane::new("no marker").auth_login_url().is_none());
         assert!(matches!(
             Pane::new("… Login successful.").login_outcome(),

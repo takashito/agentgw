@@ -8,6 +8,9 @@ in [README.md](README.md#release-notes).
 
 ## [Unreleased]
 
+### Fixed
+- Sending `login` in Slack works again with recent Claude Code versions; it had stopped with "Couldn't start the sign-in".
+
 ## [0.76.0] - 2026-11-26
 
 ### Added

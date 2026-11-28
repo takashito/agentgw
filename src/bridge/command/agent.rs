@@ -984,11 +984,15 @@ impl Bridge {
                 }
             }
             let Some(url) = url else {
+                // Read the screen before the session is killed: without it, a CLI that changed how it
+                // prints the URL leaves nothing to tell "slow" from "different shape" from "stuck"
+                let screen = login_screen_report(&agent.login_screen(), "");
                 ctx.error(
                     "bridge",
                     &format!(
                         "login: no sign-in URL captured within {URL_POLL_MAX}s for {user} \
-                         (channel {channel}) — aborting"
+                         (channel {channel}) — aborting; screen: {}",
+                        screen.replace('\n', " | ")
                     ),
                 );
                 // Main frees the seat (and kills the session too). If this isn't sent back,
