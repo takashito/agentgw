@@ -36,6 +36,11 @@ fn refuse_other_bots_state_dir() {
 #[tokio::main]
 async fn main() {
     let cmd = std::env::args().nth(1).unwrap_or_default();
+    // What `serve` says goes to Slack, where every machine speaks the same language. Decided
+    // before anything is said: the language is fixed once per process
+    if cmd == "serve" {
+        agentgw::i18n::english_only();
+    }
     // `--help` and unknown options stop here, before the subcommand runs (or reads the state directory)
     let args: Vec<String> = std::env::args().skip(2).collect();
     match agentgw::cli::check(&cmd, &args) {

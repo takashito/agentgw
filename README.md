@@ -347,6 +347,14 @@ Any thread of the channel that asked can do this, not only the thread that sent 
 - **Scope:** only threads asked from the calling thread with `ask_channel` (ended ones included). Any other thread is refused.
 - **Masking:** command lines are cut to 200 characters and output to its last 300. Only a command's output or a failure's message is passed on, never a file's contents or search hits. Values that look like secrets are replaced with `***`: tokens with a known prefix (`xoxb-`, `ghp_`, `sk-`, `AKIA` and others), values of variables and fields whose name contains `TOKEN`, `SECRET`, `PASSWORD`, `API_KEY` and the like, the word after `--token`, `--password`, `Bearer` and similar, passwords in URLs, and long random-looking strings.
 
+### Notices during an update
+
+`update` keeps its progress in one message, edited as each machine is updated. While it runs, the machines it restarts post nothing of their own: no "going offline", no "lost the connection", no "online". Editing a message does not notify anyone, so a whole rollout makes one new post. A machine that fails to update, or does not come back within five minutes, gets a new post of its own in the notice channel. A machine that drops while it is not being updated is reported as usual.
+
+A machine that only reconnected — because the gateway restarted — no longer posts "online": its process kept running. When the gateway has reported a machine as lost, it posts one line when that machine is connected again.
+
+To have every machine post its own stop and start during an update, as before, set `AGENTGW_UPDATE_NOTICES=verbose` in the gateway's `.env` and run `agentgw restart`. The default is `quiet`.
+
 ### Permission prompts in asked threads
 
 When the agent in an asked thread stops at a permission prompt, the gateway decides who answers it. The thread that asked for the work may allow a short list of safe actions: reading files that hold no secrets, building and testing in the channel's folder, editing files there (except Claude's settings, hooks, git hooks and CI configuration), and deleting fully written-out paths inside `/tmp/claude-*/` or `~/.local/state/<project>/`. Everything else — deleting elsewhere, pushing, releasing, sending data out, connecting to other machines, `sudo`, signing in, reading keys or tokens, Claude Code's own safety checks, and any command that cannot be read — is the Owner's.
@@ -375,7 +383,7 @@ agentgw uninstall            # remove the service definition (tokens and state a
 agentgw --version
 ```
 
-agentgw speaks English. For Japanese — in Slack, the CLI and the installer — add `AGENTGW_LANG=ja` to `~/.local/state/agentgw/.env` and run `agentgw restart`.
+agentgw speaks English. Messages in Slack are always in English, so that machines set up differently do not post in different languages. For Japanese in the CLI and the installer, add `AGENTGW_LANG=ja` to `~/.local/state/agentgw/.env`.
 
 <details>
 <summary><b>Files on disk</b></summary>

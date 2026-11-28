@@ -84,6 +84,11 @@ pub mod link {
             /// The gateway's own name, so a machine can say in `status` who it is linked to.
             #[serde(default, skip_serializing_if = "Option::is_none")]
             gateway: Option<String>,
+            /// An `update` is told in the gateway's one progress message alone, so a machine going
+            /// down and coming back for one posts nothing (`AGENTGW_UPDATE_NOTICES`). Missing (an
+            /// older gateway) = each machine posts its own stop and start, as before.
+            #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+            quiet_updates: bool,
         },
         /// Forward one Slack event to the machine in charge of that channel.
         ///
@@ -208,6 +213,11 @@ pub mod link {
             /// old to say would drop those frames unread, so the gateway refuses to send it asks.
             #[serde(default, skip_serializing_if = "std::ops::Not::not")]
             asks: bool,
+            /// Seconds since its process started. A machine that has just started posts its own
+            /// online notice, so the gateway does not also say it is connected again. Absent from an
+            /// older machine.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            up_secs: Option<u64>,
         },
         /// `update [version]`, asked from wherever the Owner typed it — only the gateway knows every
         /// machine. `None` = the latest release.
@@ -654,11 +664,13 @@ pub mod link {
                     bot_token: "xoxb-1".into(),
                     home: Some("C_HOME".into()),
                     gateway: Some("hub".into()),
+                    quiet_updates: true,
                 },
                 LinkFrame::Ready {
                     bot_token: "xoxb-1".into(),
                     home: None,
                     gateway: None,
+                    quiet_updates: false,
                 },
                 LinkFrame::Event {
                     name: "message".into(),
@@ -733,6 +745,13 @@ pub mod link {
             }
         }
 
+        /// An older gateway says nothing of quiet updates: each machine posts its own notices, as before.
+        #[test]
+        fn ready_from_an_older_gateway_is_not_quiet() {
+            let f: LinkFrame = serde_json::from_str(r#"{"t":"ready","bot_token":"xoxb-1"}"#).unwrap();
+            assert!(matches!(f, LinkFrame::Ready { quiet_updates: false, .. }));
+        }
+
         /// A Ready without home omits the key entirely — so the Bridge keeps its current value.
         #[test]
         fn ready_without_home_omits_the_key() {
@@ -740,6 +759,7 @@ pub mod link {
                 bot_token: "xoxb-1".into(),
                 home: None,
                 gateway: None,
+                quiet_updates: false,
             };
             assert_eq!(encode(&f), r#"{"t":"ready","bot_token":"xoxb-1"}"#);
         }
@@ -1991,7 +2011,12 @@ impl DmOnboardingCtx<'_> {
 
 /// How long a disconnect is held. A machine whose Wi-Fi blinked comes back in 1–2 seconds, so if it
 /// returns within this window nothing is said — from the Owner's view, the machine never left.
+/// A restart takes longer (about 9 seconds measured), which is why a machine an `update` restarts
+/// is not held at all but left out (`Presence::on_disconnect`'s `expected`).
 pub const PRESENCE_GRACE_MS: u64 = 5_000;
+
+/// A machine whose process is younger than this posts its own online notice.
+const JUST_STARTED_SECS: u64 = 120;
 
 /// A closed exchange whose agent is to be stopped (`Fleet::close_tree`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2019,6 +2044,8 @@ struct Seen {
     up: bool,
     /// When the grace period ends (`Some` only while a disconnect is being held).
     down_due_ms: Option<u64>,
+    /// Home was told it was lost and it has reconnected: its return is still to be told.
+    back_owed: bool,
 }
 
 /// Turns joins / drops into one line in home. The clock is passed in by the caller (no timers here).
@@ -2043,23 +2070,51 @@ impl Presence {
         }
     }
 
-    /// Connected. **Say nothing** — telling people "connected" is the machine's own `online` notice
-    /// (with version, pid and warm pool), so the same thing isn't said in two places. This only
-    /// tracks the state for "the one that dropped came back".
+    /// Connected. **Says nothing yet.** When home was told this machine was lost, its return is
+    /// told by [`Presence::take_back`] once the machine says how long it has been running. A first
+    /// connection, and a blink inside the grace period, say nothing at all — and one that only
+    /// reconnected (the gateway restarted) has nothing new to tell.
     pub fn on_connect(&mut self, bridge_id: &str) {
+        let told_lost = self
+            .seen
+            .get(bridge_id)
+            .is_some_and(|e| !e.up && e.down_due_ms.is_none());
         let e = self.seen.entry(bridge_id.to_string()).or_default();
         // A blink (dropped and back within the grace period) and a first connection are treated the same —
         // throw away the held "disconnect" and mark it connected
         e.down_due_ms = None;
         e.up = true;
+        e.back_owed = told_lost;
+    }
+
+    /// The machine said what it runs (it does on every connect). The line that it is back, when
+    /// home was told it was lost — unless it `just_started`: then its own online notice says so.
+    pub fn take_back(&mut self, bridge_id: &str, just_started: bool) -> Option<String> {
+        let e = self.seen.get_mut(bridge_id)?;
+        let owed = std::mem::take(&mut e.back_owed);
+        (owed && !just_started).then(|| format!("🟢 *{bridge_id}* is connected again"))
     }
 
     /// Disconnected. **Not said right away** — after the grace period [`Presence::due`] picks it up.
-    pub fn on_disconnect(&mut self, bridge_id: &str, now_ms: u64) {
+    /// `expected` (an `update` told it to restart) holds nothing: nothing is said when it drops, and
+    /// nothing when it comes back.
+    pub fn on_disconnect(&mut self, bridge_id: &str, now_ms: u64, expected: bool) {
+        if expected {
+            return;
+        }
         if let Some(e) = self.seen.get_mut(bridge_id) {
             if e.up && e.down_due_ms.is_none() {
                 e.down_due_ms = Some(now_ms + self.grace_ms);
             }
+        }
+    }
+
+    /// Home has been told this machine is gone some other way (its `update` failed while it was
+    /// away): count it lost without a line of its own, so its return is told.
+    pub fn mark_lost(&mut self, bridge_id: &str) {
+        if let Some(e) = self.seen.get_mut(bridge_id) {
+            e.down_due_ms = None;
+            e.up = false;
         }
     }
 
@@ -2070,7 +2125,7 @@ impl Presence {
             if e.down_due_ms.is_some_and(|due| now_ms >= due) {
                 e.down_due_ms = None;
                 e.up = false;
-                out.push(crate::t!("🔴 Lost the connection to *{id}*", "🔴 *{id}* との接続が切れました"));
+                out.push(format!("🔴 Lost the connection to *{id}*"));
             }
         }
         out.sort();
@@ -2415,6 +2470,11 @@ pub fn missing_triples(
 
 /// Held while the gateway reads, changes and writes access.json — see `Fleet::edit_access`.
 static EDITING: Mutex<()> = Mutex::new(());
+
+/// The one post a quiet `update` makes on its own: a machine it could not bring up to `goal`.
+pub fn update_failure_line(goal: &str, id: &str, why: &str) -> String {
+    format!("⚠️ *{id}* was not updated to v{goal}: {why}")
+}
 
 /// The progress message of an `update`, redrawn from the rollout each time (so the process that
 /// finishes draws the same message the one that started did). **Pure function.**
@@ -3093,6 +3153,7 @@ impl Fleet {
             bot_token: self.bot_token.clone(),
             home: self.home(),
             gateway: Some(self.self_id.clone()),
+            quiet_updates: crate::bridge::quiet_updates(),
         });
         // Replies that waited for an asking machine to come back
         self.catch_up_asks().await;
@@ -3111,10 +3172,13 @@ impl Fleet {
             .is_some_and(|r| r.from == bridge_id);
         if self.links.unregister(bridge_id, conn) && !renamed {
             self.catch_up.gone(bridge_id);
+            // A machine an `update` told to restart is expected to drop: its progress message says
+            // how it went, and a failure is posted on its own (`tell_update_failures`)
+            let expected = crate::bridge::quiet_updates() && self.access().update.is_some_and(|r| r.updating(bridge_id));
             self.presence
                 .lock()
                 .await
-                .on_disconnect(bridge_id, now_ms());
+                .on_disconnect(bridge_id, now_ms(), expected);
             self.departed.lock().unwrap_or_else(|e| e.into_inner()).insert(bridge_id.to_string(), now_ms());
         }
     }
@@ -3966,8 +4030,13 @@ impl Fleet {
                 self.assign_project(&channel, &thread_ts, &machine, path, thread_only, false)
                     .await
             }
-            link::LinkFrame::MachineVersion { version, build, triple, asks } => {
+            link::LinkFrame::MachineVersion { version, build, triple, asks, up_secs } => {
                 let id = bridge_id.to_string();
+                // Home was told it was lost: say it is back, unless it has just started and says so itself
+                let back = self.presence.lock().await.take_back(&id, up_secs.is_some_and(|s| s < JUST_STARTED_SECS));
+                if let Some(line) = back {
+                    self.post_home(&line).await;
+                }
                 self.catch_up.reported(&id, &version);
                 {
                     let mut able = self.ask_capable.lock().unwrap_or_else(|e| e.into_inner());
@@ -4595,6 +4664,8 @@ impl Fleet {
         use crate::bridge::state::RolloutNext;
         let born = std::time::Instant::now();
         let mut shown = String::new();
+        // The failures already posted to home, as `goal/machine`
+        let mut told = std::collections::HashSet::new();
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
         let mut swept_at = std::time::Instant::now();
         // Leftovers of the last process: half uploads, and files nobody is handing out any more
@@ -4637,6 +4708,7 @@ impl Fleet {
                 now_ms(),
             );
             let finished = next == RolloutNext::Finished;
+            self.tell_update_failures(&r, &connected, &mut told).await;
             // **Written down before the machine is told** — telling the gateway itself restarts it
             if finished {
                 // A machine the rollout reached was told once; one it skipped as away was not
@@ -4671,6 +4743,31 @@ impl Fleet {
                     rlog("error", &format!("update: could not update the progress message: {e}"));
                 }
                 shown = text;
+            }
+        }
+    }
+
+    /// A machine the rollout could not bring up is the one thing about a quiet `update` worth a new
+    /// post in home (the progress message is edited, and an edit notifies nobody). Each one once.
+    /// Verbose: the machines' own stop and start notices tell it, as they always did.
+    async fn tell_update_failures(
+        &self,
+        r: &crate::bridge::state::Rollout,
+        connected: &[String],
+        told: &mut std::collections::HashSet<String>,
+    ) {
+        if !crate::bridge::quiet_updates() {
+            return;
+        }
+        let goal = r.goal().to_string();
+        for (id, why) in r.not_updated() {
+            if !told.insert(format!("{goal}/{id}")) {
+                continue;
+            }
+            self.post_home(&update_failure_line(&goal, &id, &why)).await;
+            // Away now, and nobody said so (its drop was expected): count it lost, so its return is told
+            if id != self.self_id && !connected.contains(&id) {
+                self.presence.lock().await.mark_lost(&id);
             }
         }
     }
@@ -7231,6 +7328,7 @@ mod tests {
             bot_token: "xoxb-1".into(),
             home: None,
             gateway: Some("vps".into()),
+            quiet_updates: crate::bridge::quiet_updates(),
         }
     }
 
@@ -8269,7 +8367,7 @@ mod tests {
             .map(|id| {
                 let (fleet, id) = (fleet.clone(), id.clone());
                 tokio::spawn(async move {
-                    let frame = link::LinkFrame::MachineVersion { version: "0.57.0".into(), build: String::new(), triple: String::new(), asks: false };
+                    let frame = link::LinkFrame::MachineVersion { version: "0.57.0".into(), build: String::new(), triple: String::new(), asks: false, up_secs: None };
                     fleet.on_machine_frame(&id, frame).await;
                 })
             })
@@ -8379,6 +8477,7 @@ mod tests {
                 build: format!("{version}+abc"),
                 triple: "aarch64-apple-darwin".into(),
                 asks: true,
+                up_secs: None,
             })
             .unwrap()
         };
@@ -9330,7 +9429,7 @@ mod tests {
     fn a_drop_is_announced_only_after_the_grace() {
         let mut p = Presence::new();
         p.on_connect("desktop");
-        p.on_disconnect("desktop", 1_000);
+        p.on_disconnect("desktop", 1_000, false);
         assert!(p.due(1_000).is_empty());
         assert!(p.due(5_999).is_empty());
         assert_eq!(p.due(6_000), ["🔴 Lost the connection to *desktop*"]);
@@ -9342,15 +9441,66 @@ mod tests {
     fn a_flap_says_nothing_at_all() {
         let mut p = Presence::new();
         p.on_connect("desktop");
-        p.on_disconnect("desktop", 1_000);
+        p.on_disconnect("desktop", 1_000, false);
         p.on_connect("desktop"); // it came back
         assert!(p.due(60_000).is_empty()); // the held 🔴 is gone
+    }
+
+    /// Told lost, then back: one line says so. Nothing else does — the machine's process never
+    /// stopped, or it says it started on its own.
+    #[test]
+    fn a_return_after_a_told_drop_says_it_is_back() {
+        let mut p = Presence::new();
+        p.on_connect("desktop");
+        assert_eq!(p.take_back("desktop", false), None, "a first connection says nothing");
+        p.on_disconnect("desktop", 1_000, false);
+        assert_eq!(p.due(6_000), ["🔴 Lost the connection to *desktop*"]);
+        p.on_connect("desktop");
+        assert_eq!(p.take_back("desktop", false).as_deref(), Some("🟢 *desktop* is connected again"));
+        assert_eq!(p.take_back("desktop", false), None, "said once");
+        p.on_disconnect("desktop", 10_000, false);
+        p.on_connect("desktop");
+        assert_eq!(p.take_back("desktop", false), None, "a blink is not a return");
+    }
+
+    /// A machine that restarted posts its own online notice: the gateway does not say it twice.
+    #[test]
+    fn a_machine_that_just_started_tells_its_own_return() {
+        let mut p = Presence::new();
+        p.on_connect("desktop");
+        p.on_disconnect("desktop", 1_000, false);
+        assert_eq!(p.due(6_000).len(), 1);
+        p.on_connect("desktop");
+        assert_eq!(p.take_back("desktop", true), None);
+    }
+
+    /// A machine an `update` told to restart drops and comes back without a word either way.
+    #[test]
+    fn an_expected_drop_says_nothing() {
+        let mut p = Presence::new();
+        p.on_connect("desktop");
+        p.on_disconnect("desktop", 1_000, true);
+        assert!(p.due(600_000).is_empty());
+        p.on_connect("desktop");
+        assert_eq!(p.take_back("desktop", false), None);
+    }
+
+    /// Its update failed while it was away: home has the failure, so its return is told.
+    #[test]
+    fn a_machine_marked_lost_is_told_when_it_returns() {
+        let mut p = Presence::new();
+        p.on_connect("desktop");
+        p.on_disconnect("desktop", 1_000, true);
+        p.mark_lost("desktop");
+        assert!(p.due(600_000).is_empty(), "the failure was the line; no second one");
+        p.on_connect("desktop");
+        assert_eq!(p.take_back("desktop", false).as_deref(), Some("🟢 *desktop* is connected again"));
     }
 
     #[test]
     fn a_machine_that_was_never_up_never_drops() {
         let mut p = Presence::new();
-        p.on_disconnect("ghost", 0);
+        p.on_disconnect("ghost", 0, false);
         assert!(p.due(60_000).is_empty());
     }
 
@@ -9586,6 +9736,7 @@ mod tests {
                 build: String::new(),
                 triple: String::new(),
                 asks: false,
+                up_secs: None,
             })
         );
         assert_eq!(
@@ -9605,6 +9756,7 @@ mod tests {
             build: "0.65.0+e1a48c9".into(),
             triple: "x86_64-unknown-linux-musl".into(),
             asks: true,
+            up_secs: Some(3),
         };
         fleet.on_machine_frame("pve", frame).await;
         let l = Access::load(&dir).machines.get("pve").cloned().unwrap();
@@ -9813,12 +9965,13 @@ mod tests {
             link::LinkFrame::Update { version: "0.56.0".into(), build: String::new() },
             link::LinkFrame::Update { version: "0.65.0".into(), build: "0.65.0+aaa".into() },
             link::LinkFrame::UpdateFailed { version: "0.56.0".into(), why: "404".into() },
-            link::LinkFrame::MachineVersion { version: "0.55.0".into(), build: String::new(), triple: String::new(), asks: false },
+            link::LinkFrame::MachineVersion { version: "0.55.0".into(), build: String::new(), triple: String::new(), asks: false, up_secs: None },
             link::LinkFrame::MachineVersion {
                 version: "0.65.0".into(),
                 build: "0.65.0+aaa".into(),
                 triple: "aarch64-apple-darwin".into(),
                 asks: true,
+                up_secs: Some(42),
             },
             link::LinkFrame::StartUpdate { channel: "D1".into(), thread_ts: "1.0".into(), version: None },
             link::LinkFrame::FileReady {
@@ -9930,10 +10083,10 @@ mod tests {
         // 🔴 once per disconnect. After it comes back, it can be said again
         let mut p = Presence::with_grace(10);
         p.on_connect("desktop");
-        p.on_disconnect("desktop", 0);
+        p.on_disconnect("desktop", 0, false);
         assert_eq!(p.due(10).len(), 1);
         p.on_connect("desktop");
-        p.on_disconnect("desktop", 100);
+        p.on_disconnect("desktop", 100, false);
         assert_eq!(p.due(110).len(), 1, "2度目の切断も言う");
     }
 
@@ -11174,7 +11327,7 @@ mod ask_tests {
         r.fleet.thread_routes.lock().await.insert("2.1".into(), "pve".into());
         assert!(r.fleet.deliver_agent(d("2.1")).await.unwrap_err().contains("update"));
         r.fleet
-            .on_machine_frame("pve", link::LinkFrame::MachineVersion { version: "0.68.0".into(), build: String::new(), triple: String::new(), asks: true })
+            .on_machine_frame("pve", link::LinkFrame::MachineVersion { version: "0.68.0".into(), build: String::new(), triple: String::new(), asks: true, up_secs: None })
             .await;
         assert!(r.fleet.deliver_agent(d("2.1")).await.is_ok());
     }
