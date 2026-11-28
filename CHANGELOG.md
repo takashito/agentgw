@@ -8,6 +8,8 @@ in [README.md](README.md#release-notes).
 
 ## [Unreleased]
 
+## [0.77.0] - 2026-11-28
+
 ### Added
 - The owner is now set with a setup code: the gateway's installer shows it, the bot asks for it when it is invited to a channel or sent a direct message, and whoever sends it signs Claude Code in and becomes the owner once the sign-in succeeds. `agentgw status` shows the code until then.
 
