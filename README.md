@@ -164,14 +164,14 @@ Pick a machine that stays on — a home server, a NAS or a small VM. Everything 
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/takashito/agentgw/main/scripts/install.sh)"
 ```
 
-It downloads the binary, installs the service, and asks for the two tokens.
+It downloads the binary, installs the service, asks for the two tokens, and shows a **setup code** (`agentgw status` shows it again until an owner is set).
 
 > [!NOTE]
 > Use `bash -c "$(curl …)"`, not `curl … | bash` — piping takes the terminal away, and the installer can't ask for your tokens.
 
-**3. Sign in**
+**3. Become the owner**
 
-DM the bot **`login`**. It signs Claude Code on that machine in to **your** Claude account — you get a sign-in link, and paste the code back into the DM. The person who signs in becomes the **owner**, the only person the bot works for.
+Invite the bot to a channel or send it a DM. While it has no owner, it asks for the setup code. Send the code, and the bot signs Claude Code on the gateway in to **your** Claude account: you get a sign-in link, and paste the code from that page back. When the sign-in succeeds you become the **owner**, the only person the bot works for, and the setup code stops working.
 
 > Already use an API key? If Claude Code on the machine is set up with one, agents use it. agentgw itself never sees model credentials.
 
@@ -201,7 +201,7 @@ Create an app **From a manifest** at [api.slack.com/apps](https://api.slack.com/
 
 - **Socket Mode** on — agentgw never opens a public endpoint.
 - **Interactivity** on, even with Socket Mode — otherwise the Allow / Deny buttons never arrive.
-- **App Home → Messages Tab** on and not read-only — otherwise nobody can DM the bot, and `login` is a DM.
+- **App Home → Messages Tab** on and not read-only — otherwise nobody can DM the bot.
 
 </details>
 
@@ -412,7 +412,7 @@ On Windows, the binary is `%USERPROFILE%\.local\bin\agentgw.exe` and the state d
 
 ## Security
 
-- **Only the owner can start work or run commands** — the person who first signed Claude Code in with `login`. In a thread that's already running, other people's messages reach the agent as context only. agentgw is not a shared bot running on somebody else's account.
+- **Only the owner can start work or run commands** — the person who sent the gateway's setup code and then signed Claude Code in. Machines take the owner from the gateway. In a thread that's already running, other people's messages reach the agent as context only. agentgw is not a shared bot running on somebody else's account.
 - **Agents run on your own credentials** — your Claude subscription, or an API key set up for Claude Code on that machine. agentgw never handles model credentials: signing in goes through Claude Code's own sign-in flow. Each machine keeps its own sign-in; if one lapses, send `login` in a channel that machine handles.
 - **Agents run as the user that installed agentgw** and can do anything that user can. Install under a dedicated account (e.g. `agentgw add-machine agent@host`) rather than `root`.
 - **Tokens stay local**, in `.env` with mode 600. Other machines never get the app token; they hold the bot token in memory only.

@@ -339,7 +339,7 @@ pub(crate) fn sweep_write_leftovers(dir: &Path) {
 /// there every agent's shell. An agent once started a program that reads `SLACK_APP_TOKEN` from
 /// the environment, and it connected to Slack as this app: Slack then split the events between
 /// the two and about a third of them never reached the Bridge.
-pub const SECRET_ENV_KEYS: [&str; 3] = ["SLACK_APP_TOKEN", "SLACK_BOT_TOKEN", "AGENTGW_LINK_TOKEN"];
+pub const SECRET_ENV_KEYS: [&str; 4] = ["SLACK_APP_TOKEN", "SLACK_BOT_TOKEN", "AGENTGW_LINK_TOKEN", "AGENTGW_SETUP_CODE"];
 
 /// Whether a `.env` key holds a secret. The known ones, and by name anything that looks like one,
 /// so a key added later is kept out by default.

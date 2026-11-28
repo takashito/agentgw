@@ -114,6 +114,9 @@ async fn main() {
                 let env = dir.load_env().unwrap_or_default().into_iter().collect();
                 let access = agentgw::bridge::state::Access::load(&dir);
                 println!("\n{}", agentgw::bridge::machine::role_line(&env, &access));
+                if let Some(line) = agentgw::owner_code::status_line(&dir, &env, &access) {
+                    println!("{line}");
+                }
                 agentgw::bridge::gateway::Cli::print_fleet(&dir).await;
             }
             std::process::exit(rc);

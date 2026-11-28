@@ -882,72 +882,74 @@ impl Bridge {
         api.post_now(&channel, &root, out, &key).await;
     }
 
-    /// The sign-in shortcut, taken only while there is no Owner yet.
-    /// **true = consumed** — the caller stops there. It is reached in two places:
-    ///   • A human's DM — if a sign-in is in progress, the next message is read as the pasted code. Bare `login`
-    ///     starts a new sign-in. Anything else gets a short hint
-    ///   • A channel — bare `login` while there is no Owner and no sign-in waiting there starts one
-    ///     (after `logout` the Owner is gone, and the person is still in the channel they signed out
-    ///     from). Otherwise it accepts **only the pasted code**, and only from the person who started
-    ///     that sign-in (a bystander never gets to touch the code prompt). Other chatter is left to
-    ///     the gate, which drops it silently
+    /// The way in while there is no Owner, and the pasted code of a sign-in in progress.
+    /// **true = consumed** — the caller stops there (the gate would drop all of it otherwise).
+    ///   • A sign-in waiting in this channel: the next message from the person who started it is the
+    ///     code from the sign-in page (with or without an Owner — a machine's re-sign-in starts with one)
+    ///   • No Owner, on the gateway: the setup code `agentgw install` showed. A match starts a Claude
+    ///     sign-in, and whoever finishes it becomes the Owner ([`CmdFx::LoginFinished`]) — so the Owner's
+    ///     Slack account is tied to a Claude account. A DM, a mention or `login` without the code is
+    ///     asked for it; a wrong code is told so. Other chatter is left to the gate, which drops it
+    ///   • No Owner, on a machine: it never decides one; it waits for the gateway's
     pub(in crate::bridge) fn login_carve_out(&mut self, msg: &InboundMsg) -> bool {
         let dm = msg.channel_kind == crate::chat::ChannelKind::Dm;
         let sender = msg.user.as_deref().unwrap_or("");
         let pending = self.sign_in.pending.get(&msg.channel).cloned();
-        let channel_login = !dm
-            && pending.is_none()
-            && self.access.owner.is_empty()
-            && crate::bridge::command::Message::new(&msg.text, self.bot_user_id.as_deref())
-                .is("login");
-        if !dm && pending.as_deref() != Some(sender) && !channel_login {
-            return false; // passers-by are outside this branch — fall through to the gate as usual
-        }
         // Hang the reply under "the message that person sent". Posting it at the DM/channel root would land
         // somewhere other than the thread they are watching
         let reply_ts = msg.thread_ts.clone().unwrap_or_else(|| msg.ts.clone());
         let key = ThreadKey::new(&msg.channel, &reply_ts);
         let venue = if dm { "dm" } else { "channel" };
-        let ch = &msg.channel;
+        let ch = msg.channel.clone();
         let ctx = LogCtx::default();
-        match pending {
-            Some(user) => {
-                ctx.info(
-                    "bridge",
-                    &format!("slack-events: login code from {sender} ({venue} {ch})"),
-                );
-                self.submit_code(ch.clone(), msg.text.trim().to_string(), reply_ts, user);
+        if let Some(user) = pending {
+            if user != sender {
+                return false; // a bystander never gets to touch the code prompt
             }
-            None if crate::bridge::command::Message::new(
-                &msg.text,
-                self.bot_user_id.as_deref(),
-            )
-            .is("login") =>
-            {
-                ctx.info(
-                    "bridge",
-                    &format!("slack-events: login command from {sender} ({venue} {ch})"),
-                );
-                self.start_login(ch.clone(), sender.to_string(), reply_ts);
+            ctx.info("bridge", &format!("slack-events: login code from {sender} ({venue} {ch})"));
+            self.submit_code(ch, msg.text.trim().to_string(), reply_ts, user);
+            return true;
+        }
+        if !self.access.owner.is_empty() {
+            return false;
+        }
+        let body = crate::bridge::command::Message::new(&msg.text, self.bot_user_id.as_deref());
+        let addressed = dm || body.mentions_bot() || body.is("login");
+        if self.link.is_some() {
+            if !addressed {
+                return false;
             }
-            None => {
-                ctx.info(
-                    "bridge",
-                    &format!(
-                        "slack-events: owner-less {venue} from {sender} — login guidance \
-                         ({venue} {ch})"
-                    ),
-                );
-                self.post(
-                    ch,
-                    &reply_ts,
-                    crate::t!(
-                        "Claude Code isn't signed in yet. Send `login` to sign in.",
-                        "Claude Code はまだサインインしていません。`login` と送るとサインインを始めます。"
-                    ),
-                    &key,
-                );
+            ctx.info("bridge", &format!("slack-events: no owner from the gateway yet ({venue} {ch})"));
+            self.post(&ch, &reply_ts, crate::t!(
+                "This machine hasn't got its owner from the gateway yet. The owner is set on the gateway with its setup code; this machine follows once it is connected.",
+                "このマシンはまだゲートウェイから Owner を受け取っていません。Owner はゲートウェイでセットアップコードを使って決まり、つながっていればこのマシンにも届きます。"
+            ), &key);
+            return true;
+        }
+        let code = match crate::owner_code::ensure(&self.deps.dir) {
+            Ok(c) => c,
+            Err(e) => {
+                ctx.error("bridge", &format!("owner: could not read or save the setup code: {e}"));
+                return false;
             }
+        };
+        match crate::owner_code::check(&body.normalized(), &code) {
+            crate::owner_code::Check::Match => {
+                ctx.info("bridge", &format!("owner: setup code accepted from {sender} ({venue} {ch}) — starting the sign-in"));
+                self.start_login(ch, sender.to_string(), reply_ts);
+            }
+            crate::owner_code::Check::Wrong => {
+                ctx.info("bridge", &format!("owner: wrong setup code from {sender} ({venue} {ch})"));
+                self.post(&ch, &reply_ts, crate::t!(
+                    "That setup code doesn't match. `agentgw status` on the gateway shows the right one.",
+                    "セットアップコードが違います。ゲートウェイで `agentgw status` を実行すると正しいコードが出ます。"
+                ), &key);
+            }
+            crate::owner_code::Check::NotACode if addressed => {
+                ctx.info("bridge", &format!("owner: none yet — asked {sender} for the setup code ({venue} {ch})"));
+                self.post(&ch, &reply_ts, crate::owner_code::ask_text(), &key);
+            }
+            crate::owner_code::Check::NotACode => return false,
         }
         true
     }
@@ -1287,14 +1289,22 @@ impl Bridge {
                 self.deps.agent.login_kill();
                 self.sign_in.pending.remove(&channel);
                 let Some(user) = bound else { return };
-                if self.access.owner.is_empty() {
+                // Only the gateway decides the Owner (the setup code got this far); a machine takes the
+                // gateway's and never binds whoever signed it in
+                if self.access.owner.is_empty() && self.link.is_none() {
                     let mut access = self.access.clone();
                     access.owner.clone_from(&user);
                     self.adopt_access(access, &ctx);
+                    // Used: the next person can't make themselves the Owner with it
+                    if let Err(e) = crate::owner_code::clear(&self.deps.dir) {
+                        ctx.error("bridge", &format!("owner: could not remove the setup code: {e}"));
+                    }
                     ctx.info(
                         "bridge",
-                        &format!("login: SUCCESS — {user} bound as Owner (channel {channel})"),
+                        &format!("login: SUCCESS — {user} bound as Owner (channel {channel}); setup code removed"),
                     );
+                } else if self.access.owner.is_empty() {
+                    ctx.info("bridge", &format!("login: SUCCESS — signed in by {user}; the Owner comes from the gateway (channel {channel})"));
                 } else {
                     // The Owner is already set — this is re-signing-in on this machine
                     ctx.info(

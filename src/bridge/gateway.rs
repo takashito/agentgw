@@ -7,7 +7,7 @@
 //! 2. Admission                 `Admit`
 //! 3. Connection book           `Conn` / `LinkServer`
 //! 4. Reading what arrives and where it goes `Event` / `Click` / `Delivery` / `NoticeCooldown`
-//! 5. Command decisions         `CommandCtx` / `DmOnboardingCtx`
+//! 5. Command decisions         `CommandCtx` / `connection_string_in_dm`
 //! 6. presence                  `Presence` / `FleetView`
 //! 7. Gateway side              `Fleet` (axum handlers, the life of one link, gateway→machine dial)
 //! 8. Link watch                `IdleWatch` / `beat` — both ends read the link through it (the only I/O shared with `machine.rs`)
@@ -89,6 +89,10 @@ pub mod link {
             /// older gateway) = each machine posts its own stop and start, as before.
             #[serde(default, skip_serializing_if = "std::ops::Not::not")]
             quiet_updates: bool,
+            /// The gateway's Owner, on every handshake: a machine takes it as its own and never decides
+            /// one itself. Missing = no Owner yet, or an older gateway (the machine keeps what it has).
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            owner: Option<String>,
         },
         /// Forward one Slack event to the machine in charge of that channel.
         ///
@@ -665,12 +669,14 @@ pub mod link {
                     home: Some("C_HOME".into()),
                     gateway: Some("hub".into()),
                     quiet_updates: true,
+                    owner: Some("U_OWNER".into()),
                 },
                 LinkFrame::Ready {
                     bot_token: "xoxb-1".into(),
                     home: None,
                     gateway: None,
                     quiet_updates: false,
+                    owner: None,
                 },
                 LinkFrame::Event {
                     name: "message".into(),
@@ -749,7 +755,7 @@ pub mod link {
         #[test]
         fn ready_from_an_older_gateway_is_not_quiet() {
             let f: LinkFrame = serde_json::from_str(r#"{"t":"ready","bot_token":"xoxb-1"}"#).unwrap();
-            assert!(matches!(f, LinkFrame::Ready { quiet_updates: false, .. }));
+            assert!(matches!(f, LinkFrame::Ready { quiet_updates: false, owner: None, .. }));
         }
 
         /// A Ready without home omits the key entirely — so the Bridge keeps its current value.
@@ -760,6 +766,7 @@ pub mod link {
                 home: None,
                 gateway: None,
                 quiet_updates: false,
+                owner: None,
             };
             assert_eq!(encode(&f), r#"{"t":"ready","bot_token":"xoxb-1"}"#);
         }
@@ -1549,7 +1556,7 @@ impl NoticeCooldown {
 
 // ── Section 5: commands the gateway answers itself ───────────────────────────────
 // Only "things no machine can be asked" live here: `pwd <machine>` / `route` (the machine you'd ask is the thing being changed),
-// `set-home` (a broadcast to the whole fleet), and the DM name-claim (the moment the Owner is born).
+// `set-home` (a broadcast to the whole fleet).
 // Decisions are pure functions; the caller does the execution (saving, posting, forwarding).
 
 /// The context one command decision needs.
@@ -1867,144 +1874,19 @@ pub enum SetHomeOutcome {
     Set(String),
 }
 
-// ── DM name-claim — the moment the Owner is born ───────────────────────────
-// A new Relay has no Owner. The person who set it up proves they did by **DMing the connection string**
-// (only the Relay's operator has that secret). After that: with 0 machines connected there's nothing to bind to,
-// with 1 it's automatic, with several it asks for the name. This isn't `pwd <machine>` — it's the moment the Owner is born,
-// and the `Linked` sent right after tells the Bridge "this person is your Owner".
+// ── A connection string pasted in a DM ─────────────────────────────────────
+// A connection string carries the gateway's key and belongs in `agentgw install` on a machine, never in
+// Slack. Pasting one never made anyone the Owner any more (that is the setup code plus a Claude sign-in);
+// it is only kept from reaching an agent.
 
-pub struct DmOnboardingCtx<'a> {
-    pub text: &'a str,
-    /// The author (`None` for a bot / anonymous — that person can't become the Owner).
-    pub user_id: Option<&'a str>,
-    /// The Relay's own api token. A DMed connection string containing it is the proof of ownership.
-    pub api_token: &'a str,
-    pub current_owner: Option<&'a str>,
-    pub connected: &'a [String],
-    /// Whether the Owner has claimed and we're waiting for a machine name.
-    pub awaiting_selection: bool,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum DmOnboarding {
-    NotOnboarding,
-    /// Looked like a connection string, but not this bot's (different token / torn paste).
-    BadToken(String),
-    /// Right token, but there's already an Owner. **No re-claiming. The secret isn't forwarded either.**
-    AlreadyConfigured(String),
-    ClaimedAuto {
-        owner_user_id: String,
-        bridge_id: String,
-        reply: String,
-    },
-    ClaimedPending {
-        owner_user_id: String,
-        reply: String,
-    },
-    ClaimedNoMachine {
-        owner_user_id: String,
-        reply: String,
-    },
-    Selected {
-        bridge_id: String,
-        reply: String,
-    },
-    SelectRetry(String),
-}
-
-impl DmOnboardingCtx<'_> {
-    /// The moment a connection string pasted in a DM decides the Owner.
-    pub fn decide(&self) -> DmOnboarding {
-        let ctx = self;
-        let list = if ctx.connected.is_empty() {
-            crate::t!("none", "なし")
-        } else {
-            ctx.connected.join(", ")
-        };
-
-        // (1) Waiting for a name: only the Owner's reply can end it.
-        if ctx.awaiting_selection
-            && ctx.current_owner.is_some()
-            && ctx.user_id.is_some()
-            && ctx.user_id == ctx.current_owner
-        {
-            let name = ctx.text.trim();
-            if ctx.connected.iter().any(|c| c == name) {
-                return DmOnboarding::Selected {
-                    bridge_id: name.to_string(),
-                    reply: crate::t!(
-                        "*{name}* will handle this DM.",
-                        "この DM は *{name}* が受け持ちます。"
-                    ),
-                };
-            }
-            return DmOnboarding::SelectRetry(crate::t!(
-                "There's no online machine named *{name}*. Reply with just a machine name.\nOnline now: {list}",
-                "*{name}* という名前のオンラインのマシンはありません。マシンの名前だけを返信してください。\nオンラインのマシン: {list}"
-            ));
-        }
-
-        let text = ctx.text.trim();
-        let token = if !text.starts_with("SCLINK1-") {
-            None
-        } else {
-            Some(
-                link::decode_connection(text).is_ok_and(|c| secret_eq(&c.api_token, ctx.api_token)),
-            )
-        };
-
-        // (2) There's already an Owner: a DMed token isn't a re-claim, and the secret isn't passed on.
-        if ctx.current_owner.is_some() {
-            return match token {
-                Some(true) => DmOnboarding::AlreadyConfigured(crate::t!(
-                    "This bot already has an owner.",
-                    "このボットには既に Owner がいます。"
-                )),
-                _ => DmOnboarding::NotOnboarding,
-            };
-        }
-
-        // (3) No Owner yet.
-        match token {
-            None => DmOnboarding::NotOnboarding, // an ordinary DM before setup
-            Some(false) => DmOnboarding::BadToken(crate::t!(
-                "That connection string doesn't match this bot — it belongs to another bot, or the paste was cut off.",
-                "接続文字列がこのボットのものと一致しません。別のボットのものか、貼り付けが途中で切れています。"
-            )),
-            Some(true) => {
-                let Some(owner) = ctx.user_id else {
-                    return DmOnboarding::NotOnboarding;
-                };
-                match ctx.connected.len() {
-                    0 => DmOnboarding::ClaimedNoMachine {
-                        owner_user_id: owner.to_string(),
-                        reply: crate::t!(
-                            "You're now the owner. No machine is connected yet — add one with `agentgw add-machine`.",
-                            "あなたが Owner になりました。まだつながっているマシンがありません。`agentgw add-machine` でマシンを加えてください。"
-                        ),
-                    },
-                    1 => DmOnboarding::ClaimedAuto {
-                        owner_user_id: owner.to_string(),
-                        bridge_id: ctx.connected[0].clone(),
-                        reply: {
-                            let only = &ctx.connected[0];
-                            crate::t!(
-                                "You're now the owner. *{only}*, the only machine online, will handle this DM.",
-                                "あなたが Owner になりました。この DM は、ただ1台オンラインの *{only}* が受け持ちます。"
-                            )
-                        },
-                    },
-                    _ => DmOnboarding::ClaimedPending {
-                        owner_user_id: owner.to_string(),
-                        reply: crate::t!(
-                            "You're now the owner. Which machine should handle this DM? Reply with just its name.\nOnline now: {list}",
-                            "あなたが Owner になりました。この DM をどのマシンに任せますか? マシンの名前だけを返信してください。\nオンラインのマシン: {list}"
-                        ),
-                    },
-                }
-            }
-        }
-    }
+/// The reply to a DM that is a connection string, which is then not delivered. `None` for anything else.
+pub fn connection_string_in_dm(text: &str) -> Option<String> {
+    text.trim().starts_with("SCLINK1-").then(|| {
+        crate::t!(
+            "That is a machine's connection string. It goes into `agentgw install` on the machine, not into Slack; it was not passed on. To become the owner, send the setup code `agentgw install` showed on the gateway.",
+            "それはマシンの接続文字列です。マシンの `agentgw install` に入れる物で、Slack には貼りません(どこにも渡していません)。Owner になるには、ゲートウェイの `agentgw install` が表示したセットアップコードを送ってください。"
+        )
+    })
 }
 
 // ── Section 6: presence (post machines joining and leaving the fleet to home) ──────────────────────
@@ -2703,8 +2585,8 @@ pub struct Fleet {
     pub dir: StateDir,
     pub cooldown: AsyncMutex<NoticeCooldown>,
     pub presence: AsyncMutex<Presence>,
-    /// Where a DM name-claim is stuck "waiting for a machine name". Memory only.
-    pub pending_selection: AsyncMutex<Option<(String, String)>>,
+    /// The Owner last handed to the connected machines (`watch_presence` sends a change to all).
+    pub owner_sent: std::sync::Mutex<Option<String>>,
     /// Our own Slack user id (for detecting `@mention`). Filled after auth.test.
     pub bot_user_id: AsyncMutex<Option<String>>,
     /// Local delivery. Flows into **the same two channels as direct mode**.
@@ -3154,6 +3036,7 @@ impl Fleet {
             home: self.home(),
             gateway: Some(self.self_id.clone()),
             quiet_updates: crate::bridge::quiet_updates(),
+            owner: self.owner(),
         });
         // Replies that waited for an asking machine to come back
         self.catch_up_asks().await;
@@ -3212,6 +3095,7 @@ impl Fleet {
     /// The watcher that picks up presence grace expiries. The design has no timers, so this is the only clock.
     pub async fn watch_presence(self: Arc<Self>) {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut n: u64 = 0;
         loop {
             tick.tick().await;
             let lines = self.presence.lock().await.due(now_ms());
@@ -3219,6 +3103,28 @@ impl Fleet {
                 self.post_home(&line).await;
             }
             self.asks_check_departed(now_ms()).await;
+            n += 1;
+            if n % 5 == 0 {
+                self.send_owner_if_changed();
+            }
+        }
+    }
+
+    /// The Owner changed (it is decided by the gateway's own Bridge, which writes access.json): hand it
+    /// to every connected machine. A machine that connects later gets it in its `Ready`.
+    fn send_owner_if_changed(&self) {
+        let Some(owner) = self.owner() else { return };
+        {
+            let mut sent = self.owner_sent.lock().unwrap_or_else(|e| e.into_inner());
+            if sent.as_deref() == Some(owner.as_str()) {
+                return;
+            }
+            *sent = Some(owner.clone());
+        }
+        let frame = link::LinkFrame::Linked { owner_user_id: owner.clone(), channel: String::new(), thread_ts: String::new() };
+        let to: Vec<String> = self.links.connected().into_iter().filter(|m| self.links.send_to(m, &frame)).collect();
+        if !to.is_empty() {
+            rlog("info", &format!("owner {owner} sent to {}", to.join(", ")));
         }
     }
 
@@ -3420,60 +3326,13 @@ impl Fleet {
         let owner = self.owner();
         let machines = self.machines();
 
-        // ── DM name-claim. Before `pwd <machine>` / `route` (they assume there's already an Owner)
-        if crate::chat::slack::SlackId::is_dm(channel) {
-            let awaiting = self.pending_selection.lock().await.is_some();
-            let outcome = DmOnboardingCtx {
-                text,
-                user_id,
-                api_token: &self.token,
-                current_owner: owner.as_deref(),
-                connected: &machines,
-                awaiting_selection: awaiting,
-            }
-            .decide();
-            let reply = match &outcome {
-                DmOnboarding::NotOnboarding => None,
-                DmOnboarding::BadToken(r)
-                | DmOnboarding::AlreadyConfigured(r)
-                | DmOnboarding::SelectRetry(r) => Some(r.clone()),
-                DmOnboarding::ClaimedAuto {
-                    owner_user_id,
-                    bridge_id,
-                    reply,
-                } => {
-                    let owner_user_id = owner_user_id.clone();
-                    self.edit_access(move |a| a.owner = owner_user_id).await;
-                    self.bind_and_link(bridge_id, channel, &thread).await;
-                    *self.pending_selection.lock().await = None;
-                    Some(reply.clone())
-                }
-                DmOnboarding::ClaimedPending {
-                    owner_user_id,
-                    reply,
-                }
-                | DmOnboarding::ClaimedNoMachine {
-                    owner_user_id,
-                    reply,
-                } => {
-                    let owner_user_id = owner_user_id.clone();
-                    self.edit_access(move |a| a.owner = owner_user_id).await;
-                    *self.pending_selection.lock().await =
-                        Some((channel.to_string(), thread.clone()));
-                    Some(reply.clone())
-                }
-                DmOnboarding::Selected { bridge_id, reply } => {
-                    let pending = self.pending_selection.lock().await.take();
-                    if let Some((ch, ts)) = pending {
-                        self.bind_and_link(bridge_id, &ch, &ts).await;
-                    }
-                    Some(reply.clone())
-                }
-            };
-            if let Some(reply) = reply {
-                self.post(channel, Some(&thread), &reply).await;
-                return true;
-            }
+        // A connection string pasted in a DM: say where it goes and keep it from the agent
+        if crate::chat::slack::SlackId::is_dm(channel)
+            && let Some(reply) = connection_string_in_dm(text)
+        {
+            self.post(channel, Some(&thread), &reply).await;
+            rlog("info", &format!("connection string pasted in a DM chan={channel} — not passed on"));
+            return true;
         }
 
         let ctx = CommandCtx {
@@ -3720,7 +3579,9 @@ impl Fleet {
     /// there is only one to pick, which then takes it without a question.
     async fn on_bot_joined(self: &Arc<Self>, channel: &str) {
         let Some(owner) = self.owner() else {
-            rlog("info", &format!("bot joined {channel}: no Owner to ask, left with the gateway"));
+            // The way the Owner is born: ask for the setup code right where the bot was brought in
+            rlog("info", &format!("bot joined {channel}: no Owner yet — asked for the setup code"));
+            self.post(channel, None, &crate::owner_code::ask_text()).await;
             return;
         };
         if !self.joins.asked.lock().unwrap().insert(channel.to_string()) {
@@ -7329,6 +7190,7 @@ mod tests {
             home: None,
             gateway: Some("vps".into()),
             quiet_updates: crate::bridge::quiet_updates(),
+            owner: None,
         }
     }
 
@@ -7778,15 +7640,40 @@ mod tests {
         assert!(said.contains("post_md C1 - ") && said.contains("**parent**") && said.contains("`pc`"), "{said}");
     }
 
+    /// No Owner yet: the bot brought into a channel asks for the setup code there (that is how the
+    /// Owner is born), and asks nothing about machines.
     #[tokio::test]
-    async fn no_owner_means_no_question() {
+    async fn no_owner_asks_for_the_setup_code_where_the_bot_was_invited() {
         let dir = StateDir::at(std::env::temp_dir().join(format!("slack-relay-join-noowner-{}", std::process::id())));
         let _ = std::fs::remove_dir_all(dir.path());
         let api = Arc::new(crate::chat::fake::FakeChat::default());
         let (fleet, _rx) = a_fleet_with(dir, api.clone());
         fleet.links.register("mac", conn().0);
         fleet.on_bot_joined("C1").await;
-        assert!(posts(&api).is_empty(), "{}", posts(&api));
+        let said = posts(&api);
+        assert!(said.contains("post C1 - ") && said.contains("setup code"), "{said}");
+        assert!(!said.contains("post_blocks"), "no machine question: {said}");
+        assert!(fleet.access().routes.get("C1").and_then(|r| r.bridge.clone()).is_none());
+    }
+
+    /// The Owner is handed to every connected machine when it changes, once.
+    #[test]
+    fn a_new_owner_is_sent_to_every_connected_machine_once() {
+        let dir = StateDir::at(std::env::temp_dir().join(format!("slack-relay-owner-sent-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(dir.path());
+        let (fleet, _rx) = a_fleet_with(dir.clone(), Arc::new(crate::chat::fake::FakeChat::default()));
+        let (c, mut frames) = conn();
+        fleet.links.register("mac", c);
+        fleet.send_owner_if_changed();
+        assert!(frames.try_recv().is_err(), "no Owner, nothing sent");
+        let mut a = fleet.access();
+        a.owner = "U_NEW".into();
+        a.save(&dir).unwrap();
+        fleet.send_owner_if_changed();
+        fleet.send_owner_if_changed();
+        let sent: Vec<String> = std::iter::from_fn(|| frames.try_recv().ok()).collect();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].contains(r#""t":"linked""#) && sent[0].contains("U_NEW"), "{sent:?}");
     }
 
     #[tokio::test]
@@ -7967,7 +7854,7 @@ mod tests {
             dir,
             cooldown: Default::default(),
             presence: Default::default(),
-            pending_selection: Default::default(),
+            owner_sent: Default::default(),
             bot_user_id: Default::default(),
             msg_tx,
             click_tx,
@@ -9277,141 +9164,15 @@ mod tests {
         );
     }
 
-    // ── DM name-claim ─────────────────────────────────────────────────────────
+    // ── a connection string pasted in a DM ──────────────────────────────────
 
-    fn conn_string() -> String {
-        link::encode_connection(&link::Invite {
-            url: "wss://relay.example".into(),
-            api_token: TOKEN.into(),
-        })
-    }
-
-    fn dm<'a>(
-        text: &'a str,
-        connected: &'a [String],
-        owner: Option<&'a str>,
-    ) -> DmOnboardingCtx<'a> {
-        DmOnboardingCtx {
-            text,
-            user_id: Some(OWNER),
-            api_token: TOKEN,
-            current_owner: owner,
-            connected,
-            awaiting_selection: false,
-        }
-    }
-
+    /// A connection string in a DM makes nobody the Owner (that's the setup code + a sign-in now)
+    /// and is never passed on; anything else is left alone.
     #[test]
-    fn one_connected_machine_is_bound_automatically() {
-        let one = vec!["desktop".to_string()];
-        match DmOnboardingCtx::decide(&dm(&conn_string(), &one, None)) {
-            DmOnboarding::ClaimedAuto {
-                owner_user_id,
-                bridge_id,
-                reply,
-            } => {
-                assert_eq!(owner_user_id, OWNER);
-                assert_eq!(bridge_id, "desktop");
-                assert!(reply.contains("*desktop*, the only machine online"));
-            }
-            other => panic!("{other:?}"),
-        }
-    }
-
-    #[test]
-    fn several_machines_ask_which_one() {
-        match DmOnboardingCtx::decide(&dm(&conn_string(), &here(), None)) {
-            DmOnboarding::ClaimedPending { reply, .. } => {
-                assert!(reply.contains("Reply with just its name"));
-                assert!(reply.contains("desktop, vps"));
-            }
-            other => panic!("{other:?}"),
-        }
-    }
-
-    #[test]
-    fn no_machine_means_there_is_nothing_to_bind_yet() {
-        match DmOnboardingCtx::decide(&dm(&conn_string(), &[], None)) {
-            DmOnboarding::ClaimedNoMachine { reply, .. } => {
-                assert!(reply.contains("add one with `agentgw add-machine`"))
-            }
-            other => panic!("{other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_pending_selection_is_finished_by_naming_a_connected_machine() {
-        let connected = here();
-        let c = DmOnboardingCtx {
-            text: "vps",
-            awaiting_selection: true,
-            current_owner: Some(OWNER),
-            ..dm("", &connected, Some(OWNER))
-        };
-        match DmOnboardingCtx::decide(&c) {
-            DmOnboarding::Selected { bridge_id, .. } => assert_eq!(bridge_id, "vps"),
-            other => panic!("{other:?}"),
-        }
-
-        let wrong = DmOnboardingCtx {
-            text: "laptop",
-            ..c
-        };
-        assert!(matches!(
-            DmOnboardingCtx::decide(&wrong),
-            DmOnboarding::SelectRetry(_)
-        ));
-    }
-
-    /// **With an Owner already there, no re-claiming.** And the secret isn't passed on.
-    #[test]
-    fn an_existing_owner_is_not_reclaimed() {
-        match DmOnboardingCtx::decide(&dm(&conn_string(), &here(), Some("U_SOMEONE"))) {
-            DmOnboarding::AlreadyConfigured(reply) => {
-                assert!(reply.contains("already has an owner"))
-            }
-            other => panic!("{other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_string_for_another_bot_is_refused() {
-        let other = link::encode_connection(&link::Invite {
-            url: "wss://relay.example".into(),
-            api_token: "a-different-secret".into(),
-        });
-        assert!(matches!(
-            DmOnboardingCtx::decide(&dm(&other, &here(), None)),
-            DmOnboarding::BadToken(_)
-        ));
-        // A torn paste is treated the same
-        let cut = &conn_string()[..conn_string().len() - 6];
-        assert!(matches!(
-            DmOnboardingCtx::decide(&dm(cut, &here(), None)),
-            DmOnboarding::BadToken(_)
-        ));
-    }
-
-    #[test]
-    fn an_ordinary_dm_is_not_onboarding() {
-        for text in ["hello", "", "route desktop"] {
-            assert_eq!(
-                DmOnboardingCtx::decide(&dm(text, &here(), None)),
-                DmOnboarding::NotOnboarding,
-                "{text}"
-            );
-        }
-    }
-
-    /// A DM with an unknown author (a bot) can't become the Owner.
-    #[test]
-    fn an_authorless_dm_cannot_claim() {
-        let (text, connected) = (conn_string(), here());
-        let c = DmOnboardingCtx {
-            user_id: None,
-            ..dm(&text, &connected, None)
-        };
-        assert_eq!(DmOnboardingCtx::decide(&c), DmOnboarding::NotOnboarding);
+    fn a_connection_string_in_a_dm_is_refused_and_claims_nothing() {
+        let r = connection_string_in_dm("  SCLINK1-abc  ").expect("refused");
+        assert!(r.contains("not into Slack") && r.contains("setup code"), "{r}");
+        assert_eq!(connection_string_in_dm("hello"), None);
     }
 
     // ── presence ────────────────────────────────────────────────────────────
@@ -10412,7 +10173,7 @@ mod ask_tests {
             dir,
             cooldown: Default::default(),
             presence: Default::default(),
-            pending_selection: Default::default(),
+            owner_sent: Default::default(),
             bot_user_id: Default::default(),
             msg_tx,
             click_tx: tokio::sync::mpsc::channel(4).0,

@@ -1141,6 +1141,14 @@ impl Bridge {
         // fleet, so both sides go through the same handler
         let (up_tx, up_rx) = mpsc::unbounded_channel();
         let up_is_linked = !matches!(wiring.upstream, machine::Mode::Direct { .. });
+        // No Owner on the gateway: make sure there is a setup code to become one with (an install from
+        // before setup codes has none). Shown by `agentgw status`, never in Slack or the logs
+        if !up_is_linked && bridge::Access::load(&dir).owner.is_empty() {
+            match crate::owner_code::ensure(&dir) {
+                Ok(_) => LogCtx::default().info("bridge", "no Owner yet — waiting for the setup code (`agentgw status` shows it)"),
+                Err(e) => LogCtx::default().error("bridge", &format!("no Owner yet, and the setup code could not be saved: {e}")),
+            }
+        }
         // Whether the link to the gateway is up right now; the link itself keeps it current
         let link_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let uplink: machine::Uplink = Arc::new(tokio::sync::Mutex::new(up_rx));
@@ -1171,8 +1179,10 @@ impl Bridge {
                 // Nothing can be written to Slack until the first Ready. **Wait**
                 let (token, home, gateway) = loop {
                     match rx.recv().await {
-                        Some(machine::FromRelay::Ready { bot_token, home, gateway, quiet_updates }) => {
+                        Some(machine::FromRelay::Ready { bot_token, home, gateway, quiet_updates, owner }) => {
                             set_quiet_updates(quiet_updates);
+                            // Before the Bridge is built, so it starts with the gateway's Owner
+                            adopt_owner(&dir, owner);
                             break (bot_token, home, gateway);
                         }
                         // **Don't exit when the handshake is refused.** Exiting makes the supervisor restart at once,
@@ -1282,7 +1292,7 @@ impl Bridge {
                 cooldown: Default::default(),
                 homes: Default::default(),
                 presence: Default::default(),
-                pending_selection: Default::default(),
+                owner_sent: Default::default(),
                 bot_user_id: Default::default(),
                 msg_tx: msg_tx.clone(),
                 click_tx: click_tx.clone(),
@@ -1806,6 +1816,23 @@ fn split_on_lines(text: &str, max: usize) -> Vec<&str> {
 /// dropped home, so the home the gateway sends once in `attach()` was read by nobody, and a
 /// freshly started machine posted its notices to its own old home (or, unset → the Owner's DM)
 /// (2026-08-02 on a real machine: a machine's online notice went to a different channel than the gateway's home).
+/// Take the gateway's Owner as this machine's. `true` if it changed (the caller reloads). A machine
+/// never decides an Owner itself, so whatever the gateway says wins; `None` leaves it as it is.
+fn adopt_owner(dir: &crate::state_dir::StateDir, owner: Option<String>) -> bool {
+    let Some(owner) = owner.filter(|o| !o.is_empty()) else { return false };
+    let mut access = bridge::Access::load(dir);
+    if access.owner == owner {
+        return false;
+    }
+    access.owner.clone_from(&owner);
+    if let Err(e) = access.save(dir) {
+        LogCtx::default().error("bridge", &format!("could not save the owner: {e}"));
+        return false;
+    }
+    LogCtx::default().info("bridge", &format!("remote link: owner is now {owner} (from the gateway)"));
+    true
+}
+
 fn adopt_home(dir: &crate::state_dir::StateDir, home: Option<String>) -> bool {
     let Some(home) = home else { return false };
     let mut access = bridge::Access::load(dir);
@@ -2011,9 +2038,9 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
         }
         // Comes with every handshake. Apply the home Relay holds to our current value
         // (a machine that missed a `set-home` catches up on reconnect)
-        machine::FromRelay::Ready { home, quiet_updates, .. } => {
+        machine::FromRelay::Ready { home, quiet_updates, owner, .. } => {
             set_quiet_updates(quiet_updates);
-            if adopt_home(dir, home) {
+            if adopt_owner(dir, owner) | adopt_home(dir, home) {
                 let _ = reload.send(()).await;
             }
             // The gateway may have restarted without our folders; say where we work
@@ -2022,25 +2049,11 @@ async fn pump_relay(item: machine::FromRelay, sinks: &RelaySinks) {
             // reconnects get here, so post online each time
             let _ = relink.send(()).await;
         }
-        // The Owner assigned this machine. **Record the Owner** — a Bridge via Relay
-        // knows nothing of its own identity on Slack until this arrives
-        machine::FromRelay::Linked {
-            owner_user_id,
-            channel,
-            ..
-        } => {
-            let mut access = bridge::Access::load(dir);
-            if access.owner != owner_user_id {
-                access.owner = owner_user_id.clone();
-                if let Err(e) = access.save(dir) {
-                    LogCtx::default().error("bridge", &format!("could not save the owner: {e}"));
-                } else {
-                    LogCtx::default().info(
-                        "bridge",
-                        &format!("remote link: owner is {owner_user_id} (in charge of {channel})"),
-                    );
-                    let _ = reload.send(()).await;
-                }
+        // The gateway's Owner: sent when a channel is put on this machine, and to every machine when the
+        // Owner changes (`channel` is empty then). A machine never decides one itself
+        machine::FromRelay::Linked { owner_user_id, .. } => {
+            if adopt_owner(dir, Some(owner_user_id)) {
+                let _ = reload.send(()).await;
             }
         }
         // The gateway decided where notices go. Every machine writes to the same place
@@ -6848,25 +6861,94 @@ mod tests {
         assert!(!calls.iter().any(|c| c.contains("Already signed in")), "{calls:?}");
     }
 
-    /// After `logout` the Owner is gone; `login` sent in the channel (where the person signed out)
-    /// must start the sign-in, not be dropped as `no-owner`. Other chatter stays dropped.
+    /// No Owner on the gateway: only the setup code leads anywhere. `login` and chatter don't start a
+    /// sign-in; a wrong code is told so; the right one starts a Claude sign-in (even on a machine that
+    /// is already signed in), and only when that succeeds does the sender become the Owner — after
+    /// which the code is gone.
     #[tokio::test]
-    async fn login_in_a_channel_starts_the_sign_in_when_there_is_no_owner() {
-        let (d, slack, agent, _clock) = flow_deps("login-no-owner-channel");
-        *agent.signed_in.lock().unwrap() = Some(Some(false));
+    async fn without_an_owner_the_setup_code_and_a_sign_in_make_the_owner() {
+        let (d, slack, agent, _clock) = flow_deps("owner-setup-code");
+        let dir = d.dir.clone();
         let (mut b, _fx) = Bridge::for_test(d);
         b.access.owner.clear();
-        b.on_inbound(&channel_msg("1782000001.000100", "U_OWNER", "hello")).await;
-        settle().await;
-        assert!(slack.calls().is_empty(), "chatter without an Owner stays dropped: {:?}", slack.calls());
+        let code = crate::owner_code::ensure(&dir).unwrap();
+        let said = |slack: &FakeChat, what: &str| slack.calls().iter().filter(|c| c.contains(what)).count();
+        let in_thread = |ts: &str, text: &str| {
+            let mut m = channel_msg(ts, "U_ALICE", text);
+            m.thread_ts = Some("1782000000.000100".into());
+            m
+        };
 
-        let mut login = channel_msg("1782000002.000100", "U_OWNER", "login");
-        login.thread_ts = Some("1782000000.000100".into());
-        b.on_inbound(&login).await;
+        b.on_inbound(&channel_msg("1782000001.000100", "U_ALICE", "hello")).await;
         settle().await;
-        let calls = slack.calls();
-        assert!(calls.iter().any(|c| c.starts_with("status C1") && c.ends_with("busy")), "{calls:?}");
-        assert!(b.sign_in.awaiting_code("C1"), "the sign-in waits for the code in the channel");
+        assert!(slack.calls().is_empty(), "chatter stays dropped: {:?}", slack.calls());
+
+        b.on_inbound(&in_thread("1782000002.000100", "login")).await;
+        settle().await;
+        assert_eq!(said(&slack, "setup code"), 1, "{:?}", slack.calls());
+        assert!(!b.sign_in.awaiting_code("C1"), "login alone starts no sign-in");
+
+        b.on_inbound(&in_thread("1782000003.000100", "AAAA-BBBB")).await;
+        settle().await;
+        assert_eq!(said(&slack, "doesn't match"), 1, "{:?}", slack.calls());
+
+        // Already signed in on this machine: the sign-in is done again all the same
+        *agent.signed_in.lock().unwrap() = Some(Some(true));
+        b.on_inbound(&in_thread("1782000004.000100", &code.to_lowercase())).await;
+        settle().await;
+        assert!(b.sign_in.awaiting_code("C1"), "the right code starts the sign-in: {:?}", slack.calls());
+        assert!(b.access.owner.is_empty(), "no Owner before the sign-in succeeds");
+
+        b.on_cmd_fx(CmdFx::LoginFinished { channel: "C1".into(), bound: Some("U_ALICE".into()) }).await;
+        assert_eq!(b.access.owner, "U_ALICE");
+        assert_eq!(crate::owner_code::load(&dir), None, "the code is used up");
+    }
+
+    /// A machine takes the gateway's Owner from the handshake: a new one replaces its own, and a
+    /// gateway that sends none (none yet, or an older one) changes nothing.
+    #[test]
+    fn a_machine_takes_the_owner_the_gateway_sends() {
+        let dir = crate::state_dir::StateDir::at(std::env::temp_dir().join(format!("agentgw-adopt-owner-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        assert!(!adopt_owner(&dir, None));
+        assert!(adopt_owner(&dir, Some("U_OWNER".into())));
+        assert_eq!(bridge::Access::load(&dir).owner, "U_OWNER");
+        assert!(!adopt_owner(&dir, Some("U_OWNER".into())), "the same Owner is no change");
+        assert!(!adopt_owner(&dir, None), "none sent keeps it");
+        assert_eq!(bridge::Access::load(&dir).owner, "U_OWNER");
+        let _ = std::fs::remove_dir_all(dir.path());
+    }
+
+    /// A DM with no Owner is asked for the setup code too.
+    #[tokio::test]
+    async fn a_dm_without_an_owner_is_asked_for_the_setup_code() {
+        let (d, slack, _agent, _clock) = flow_deps("owner-setup-code-dm");
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.access.owner.clear();
+        let mut m = channel_msg("1782000001.000100", "U_ALICE", "hi");
+        m.channel = "D1".into();
+        m.channel_kind = crate::chat::ChannelKind::Dm;
+        b.on_inbound(&m).await;
+        settle().await;
+        assert!(slack.calls().iter().any(|c| c.starts_with("post D1") && c.contains("setup code")), "{:?}", slack.calls());
+    }
+
+    /// A machine never decides an Owner: with none from the gateway yet it says so, asks for no code,
+    /// and a sign-in finished there binds nobody.
+    #[tokio::test]
+    async fn a_machine_without_an_owner_waits_for_the_gateways() {
+        let (d, slack, _agent, _clock) = flow_deps("owner-machine");
+        let dir = d.dir.clone();
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.access.owner.clear();
+        b.link = Some(LinkStatus { gateway: Some("gw".into()), address: "ws://gw".into(), up: Default::default() });
+        b.on_inbound(&channel_msg("1782000001.000100", "U_ALICE", "<@U_BOT> login")).await;
+        settle().await;
+        assert!(slack.calls().iter().any(|c| c.contains("hasn't got its owner from the gateway")), "{:?}", slack.calls());
+        assert_eq!(crate::owner_code::load(&dir), None, "a machine has no setup code");
+        b.on_cmd_fx(CmdFx::LoginFinished { channel: "C1".into(), bound: Some("U_ALICE".into()) }).await;
+        assert!(b.access.owner.is_empty());
     }
 
     #[tokio::test]

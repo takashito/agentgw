@@ -136,6 +136,7 @@ fn ensure_config(state_dir: &StateDir) -> Result<(), String> {
                 env_file.display()
             )
         );
+        show_setup_code(state_dir);
         return Ok(());
     }
     // A machine goes through a gateway and holds no Slack tokens of its own
@@ -279,7 +280,28 @@ fn ask_parent(state_dir: &StateDir) -> Result<(), String> {
         )
     );
     write_role(state_dir, "gateway");
+    show_setup_code(state_dir);
     Ok(())
+}
+
+/// The setup code that makes the Owner, while there is none. Slack asks for it when the bot is invited
+/// to a channel or sent a DM; whoever sends it then signs Claude Code in, and becomes the Owner.
+fn show_setup_code(state_dir: &StateDir) {
+    if !crate::bridge::state::Access::load(state_dir).owner.is_empty() {
+        return;
+    }
+    match crate::owner_code::ensure(state_dir) {
+        Ok(code) => println!(
+            "{}",
+            crate::t!(
+                "\nSetup code: {code}\n  Invite the bot to a Slack channel or send it a DM; it asks for this code.\n  \
+                 Whoever sends it signs Claude Code in and becomes the owner. (`agentgw status` shows it again.)",
+                "\nセットアップコード: {code}\n  Slack で bot をチャンネルに招待するか DM を送ると、このコードを訊かれます。\n  \
+                 送った人が Claude Code にサインインして Owner になります(`agentgw status` でもう一度見られます)。"
+            )
+        ),
+        Err(e) => eprintln!("{}", crate::t!("Couldn't save the setup code: {e}", "セットアップコードを保存できません: {e}")),
+    }
 }
 
 /// Write down what this Bridge is. **The role is written, not guessed**: which keys happen to be

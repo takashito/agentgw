@@ -8,16 +8,20 @@ in [README.md](README.md#release-notes).
 
 ## [Unreleased]
 
+### Added
+- The owner is now set with a setup code: the gateway's installer shows it, the bot asks for it when it is invited to a channel or sent a direct message, and whoever sends it signs Claude Code in and becomes the owner once the sign-in succeeds. `agentgw status` shows the code until then.
+
 ### Changed
+- A machine's connection string pasted in a direct message no longer makes anyone the owner, and is not passed on.
 - An update now keeps its progress in one edited message: the machines it restarts no longer post when they go offline, lose the connection and come back. A machine that fails to update, or does not come back in time, still gets its own post. Set `AGENTGW_UPDATE_NOTICES=verbose` on the gateway for the previous behavior.
 - Messages agentgw posts in Slack are now always in English. `AGENTGW_LANG=ja` applies to the command line and the installer only.
 - Machines no longer post "online" when they only reconnect because the gateway restarted. A machine reported as lost gets one line when it is connected again.
 
 ### Fixed
+- Machines added with `add-machine` and given channels from the gateway's terminal now get the owner from the gateway, instead of ignoring every message.
 - The "going offline" notice names the machine as every other notice does, instead of the computer's host name.
 - Sending `login` in Slack works again with recent Claude Code versions; it had stopped with "Couldn't start the sign-in".
 - `logout` now only signs the machine's Claude Code out; it no longer removes the owner, which left agentgw ignoring every message.
-- After `logout`, sending `login` in a channel starts the sign-in on the machine that handles that channel; it used to be ignored until `login` was sent in a direct message.
 - When `login` cannot start a sign-in, the reply says why, shows what the sign-in screen said, and how to sign in on the machine instead.
 
 ## [0.76.0] - 2026-11-26

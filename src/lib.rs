@@ -5,6 +5,7 @@ pub mod cli;
 pub mod setup;
 pub mod i18n;
 pub mod mcp;
+pub mod owner_code;
 pub mod chat;
 pub mod clock;
 pub mod files;
