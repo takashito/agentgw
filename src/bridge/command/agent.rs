@@ -42,6 +42,34 @@ fn login_screen_report(screen: &str, code: &str) -> String {
     text.replace("```", "'''")
 }
 
+/// The reply when no sign-in link could be shown: why (the session would not start, or no link
+/// appeared — with what the screen said instead), and what to do next, including the way round
+/// agentgw when the retry fails the same way (a Claude Code whose sign-in screen it cannot read).
+fn login_not_started_reply(start_error: Option<&str>, screen: &str, machine: &str) -> String {
+    let why = match start_error {
+        Some(e) => crate::t!(
+            "Couldn't start the sign-in: the sign-in session on *{machine}* would not open ({e}).",
+            "サインインを始められませんでした: *{machine}* でサインインの画面を開けませんでした({e})。"
+        ),
+        None => crate::t!(
+            "Couldn't start the sign-in: no sign-in link appeared on *{machine}* within {URL_POLL_MAX} seconds.",
+            "サインインを始められませんでした: *{machine}* で {URL_POLL_MAX} 秒たってもサインインのリンクが出ませんでした。"
+        ),
+    };
+    let next = crate::t!(
+        "Send `login` to try again. If it fails the same way, sign in on *{machine}* itself by running `claude auth login` there.",
+        "`login` と送ってやり直してください。同じように失敗するときは、*{machine}* の上で `claude auth login` を実行してサインインしてください。"
+    );
+    if start_error.is_some() || screen.is_empty() {
+        format!("{why}\n{next}")
+    } else {
+        format!(
+            "{why}\n{}\n```\n{screen}\n```\n{next}",
+            crate::t!("The sign-in screen said:", "サインインの画面の表示:")
+        )
+    }
+}
+
 /// The one line returned to a thread with no session (shared by all commands).
 fn no_session() -> String {
     crate::t!(
@@ -958,12 +986,13 @@ impl Bridge {
         // Sign-in takes tens of seconds (show the URL, then wait for the code) — keep the shimmer up the whole time
         let thinking = self.presence_hold(&ThreadKey::new(&channel, &reply_ts), Reason::Command("login"));
         let agent = self.deps.agent.clone();
+        let machine = self.machine_name.clone();
         tokio::spawn(async move {
             let _thinking = thinking; // Drop = clear, whichever path exits
             let ctx = LogCtx::default();
             let started = agent.login_begin(&home);
             let mut url = None;
-            if let Err(e) = started {
+            if let Err(e) = &started {
                 ctx.error(
                     "bridge",
                     &format!(
@@ -1003,11 +1032,8 @@ impl Bridge {
                         bound: None,
                     })
                     .await;
-                api.post_now(&channel, &reply_ts, crate::t!(
-                        "Couldn't start the sign-in. Wait a moment, then send `login` again.",
-                        "サインインを始められませんでした。少し待ってから、もう一度 `login` と送ってください。"
-                    ), &key)
-                .await;
+                let text = login_not_started_reply(started.err().as_deref(), &screen, &machine);
+                api.post_now(&channel, &reply_ts, text, &key).await;
                 return;
             };
             api.post_now(&channel, &reply_ts, crate::t!(
@@ -1720,6 +1746,21 @@ mod tests {
         // Only the code part showing (no #state) is masked too
         let half = login_screen_report("> PwjqVahVDDuJLYaVCRaZ", code);
         assert_eq!(half, "> ***");
+    }
+
+    #[test]
+    fn a_sign_in_that_cannot_start_says_why_and_what_next() {
+        // No link appeared: show what the screen said, and the way round agentgw
+        let r = login_not_started_reply(None, "claude auth login\nSomething new >", "dock");
+        assert!(r.contains("no sign-in link appeared on *dock* within 20 seconds"), "{r}");
+        assert!(r.contains("```\nclaude auth login\nSomething new >\n```"), "{r}");
+        assert!(r.contains("Send `login` to try again"), "{r}");
+        assert!(r.contains("running `claude auth login` there"), "{r}");
+        // The session would not open: the error, no empty screen box
+        let r = login_not_started_reply(Some("tmux: no server"), "", "dock");
+        assert!(r.contains("would not open (tmux: no server)"), "{r}");
+        assert!(!r.contains("```"), "{r}");
+        assert!(r.contains("`claude auth login`"), "{r}");
     }
 
     fn sample_now() -> WallClock {
