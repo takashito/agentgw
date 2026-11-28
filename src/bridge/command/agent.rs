@@ -1163,7 +1163,7 @@ impl Bridge {
     }
 
     /// `logout`. Only the CLI sign-out is spawned;
-    /// cleaning up agents and clearing the Owner is handed back to main.
+    /// cleaning up agents is handed back to main. The Owner is kept.
     pub(super) fn user_logout(&mut self, channel: &str, root_ts: &str) {
         // Unlike the restart flag this one **really matters** — user_logout spawns and returns at once,
         // so a second logout can arrive during the few seconds `claude auth logout` runs
@@ -1330,22 +1330,20 @@ impl Bridge {
                     &ctx,
                 )
                 .await;
-                let mut access = self.access.clone();
-                access.owner.clear();
-                self.adopt_access(access, &ctx);
+                // The Owner stays: `logout` signs this machine's Claude Code out, nothing more. Clearing
+                // the Owner left every machine dropping all messages as `no-owner`, and `login` in the
+                // channel along with them (seen 2026-11-28)
                 self.sign_in.pending.clear();
                 self.sign_in.signing_out = false;
-                ctx.info(
-                    "bridge",
-                    "logout: Owner cleared — bot is now Owner-less (login required)",
-                );
+                ctx.info("bridge", "logout: signed out; Owner kept");
                 let key = ThreadKey::new(&channel, &thread_ts);
+                let machine = &self.machine_name;
                 self.post(
                     &channel,
                     &thread_ts,
                     crate::t!(
-                        "Signed out. Send `login` to sign in again.",
-                        "サインアウトしました。また使うときは `login` と送ってサインインしてください。"
+                        "Signed out of Claude Code on *{machine}*. Send `login` to sign in again.",
+                        "*{machine}* の Claude Code からサインアウトしました。また使うときは `login` と送ってサインインしてください。"
                     ),
                     &key,
                 );

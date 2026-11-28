@@ -6878,6 +6878,19 @@ mod tests {
         assert!(slack.calls().iter().any(|c| c.contains("Already signed in")), "{:?}", slack.calls());
     }
 
+    /// `logout` signs this machine's Claude Code out; the Owner stays, so later messages and `login`
+    /// are still served. (Seen 2026-11-28: clearing it made everything drop as `no-owner`.)
+    #[tokio::test]
+    async fn logout_keeps_the_owner() {
+        let (d, slack, _agent, _clock) = flow_deps("logout-keeps-owner");
+        let (mut b, _fx) = Bridge::for_test(d);
+        b.on_cmd_fx(CmdFx::LogoutFinished { ok: true, channel: "C1".into(), thread_ts: ROOT.into() })
+            .await;
+        settle().await;
+        assert_eq!(b.access.owner, "U_OWNER");
+        assert!(slack.calls().iter().any(|c| c.contains("Signed out of Claude Code on *test-machine*")), "{:?}", slack.calls());
+    }
+
     #[tokio::test]
     async fn signing_in_again_keeps_the_owner() {
         let (d, _slack, _agent, _clock) = flow_deps("login-keeps-owner");

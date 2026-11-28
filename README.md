@@ -331,7 +331,7 @@ Mention the bot followed by the command (the bot is named `agentgw` unless the S
 | `warm on\|off` | Keep an agent started ahead of time for this channel (off by default) |
 | `set-home` | Send notices (online, offline, errors) to this channel |
 | `allow-bot @bot` · `remove-bot @bot` | Let another bot's messages start work |
-| `login` · `logout` | Sign Claude Code in to your account (by DM) · sign out and stop all agents |
+| `login` · `logout` | Sign this machine's Claude Code in to your account · sign it out and stop its agents (the owner is kept) |
 | `help` | All commands |
 
 When the bot is added to a channel that has no machine yet, it asks the Owner in that channel which machine should handle it, with one button per connected machine and a **Later** button. The chosen machine works in its home folder; `route <machine>:<path>` picks another folder. When only the gateway is connected, the gateway takes the channel without asking. A channel that an agent creates with `create_channel`, or brings the bot into with `join_channel`, goes to that agent's machine without asking. A channel that already has a machine keeps it.
